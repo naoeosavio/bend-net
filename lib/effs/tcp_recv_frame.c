@@ -120,5 +120,8 @@ Term recv_frame_run(Env e, Term* f, IoWork* w) {
 }
 
 static void __attribute__((constructor)) recv_frame_use(void) {
+  // Ask IO_READ (park first): the C scheduler's run-first path for this
+  // effect loses wakeups, so buf-completable reads hang here; park-first
+  // is slower on glued bursts but correct. See task-008 D8.
   io_eff(CID_RECV_FRAME, recv_frame_run, IO_READ);
 }

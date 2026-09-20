@@ -115,6 +115,64 @@ type WSIn is Data:
   InMsg{msg: WSMessage}
   InOp{fin: Bool, op: U32, pay: List<&2, U32>}
 
+# Lifecycle events (server_on API): named open/message/ping/pong/close/
+# error over the frozen wire types. WSMessage/WSIn/WSOut stay byte-exact;
+# the persistent server maps each complete frame to one WSEv and answers
+# the handler's single WSOut per step, always sent verbatim — except ping
+# without an OutOp answer, which falls back to pong, and close, which
+# replies and shuts. Return OutRaw{[]} to continue silently on pong
+# (zero-byte send, no wire effect) or OutOp to override and close.
+
+type WSEv is Data:
+  EvOpen{}
+  EvMsg{msg: WSMessage}
+  EvPing{pay: List<&2, U32>}
+  EvPong{pay: List<&2, U32>}
+  EvClose{pay: List<&2, U32>}
+  EvError{code: U32, msg: String}
+
+def op_text() -> U32:
+  1
+
+def op_bin() -> U32:
+  2
+
+def op_close() -> U32:
+  8
+
+def op_ping() -> U32:
+  9
+
+def op_pong() -> U32:
+  10
+
+def out_ping(+pay: List<&2, U32>) -> WSOut:
+  OutOp{op_ping(), pay}
+
+def out_pong(+pay: List<&2, U32>) -> WSOut:
+  OutOp{op_pong(), pay}
+
+def out_close(+pay: List<&2, U32>) -> WSOut:
+  OutOp{op_close(), pay}
+
+def ping_reply(+pay: List<&2, U32>, out: WSOut) -> WSOut:
+  match out:
+    case OutOp{op, pp}:
+      OutOp{op, pp}
+    case OutMsg{msg}:
+      out_pong(pay)
+    case OutRaw{bs}:
+      out_pong(pay)
+
+def close_answer(+pay: List<&2, U32>, out: WSOut) -> WSOut:
+  match out:
+    case OutOp{op, pp}:
+      OutOp{op, pp}
+    case OutMsg{msg}:
+      out_close(pay)
+    case OutRaw{bs}:
+      out_close(pay)
+
 def msg_to_op(msg: WSMessage) -> U32:
   match msg:
     case WSText{text}:
@@ -649,6 +707,20 @@ def send_open_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result
 def send_open_msg(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
   send_open_op(s, msg_to_op(msg), msg_to_bytes(msg))
 
+# Open send from a WSOut (persistent sessions): one verbatim frame, the
+# socket stays open; the session loop owns the close. The closing
+# single-shot send/send_op above is never used on this path.
+
+def out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match out:
+    case OutMsg{msg}:
+      +mm = msg
+      show_frame(True{}, msg_to_op(mm), msg_to_bytes(mm))
+    case OutOp{op, pay}:
+      show_frame(True{}, op, pay)
+    case OutRaw{bs}:
+      Done{bs}
+
 def on_op(s: Socket, fin: Bool, op: U32, +pay: List<&2, U32>) -> IO(Unit):
   match op:
     case 0:
@@ -843,6 +915,27 @@ def recv_in_client_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Resul
     m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- recv_op_client_framed(sock, buf)
     recv_in_client_framed_got(m)
 
+# Loop edges for the persistent server (both leaves: no recursion, they
+# only pack the next hop). recv_after answers a send before reading on:
+# a failed send short-circuits with no syscall and the dispatcher closes
+# on the Fail. hs_open answers the handshake send the same way.
+
+def recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{u}:
+      recv_in_framed(s, buf)
+
+def hs_open(m: Socket & Result<&1, &1, U32 & String, Unit>, out: WSOut) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
+    case Done{u}:
+      send_open_bytes((s, out_bytes(out)))
+
 def frame_echo(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>) -> IO(Unit):
   (s, r) = m
   match r:
@@ -909,6 +1002,148 @@ def ws_serve(l: Listener) -> IO(Unit):
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
     l2 : Listener <- ws_conn(m)
     ws_serve(l2)
+
+# server_on: the generic persistent WS server. The handler rides a
+# template (~H) — a def name baked at the call site (server_on~h) —
+# because a function value can neither be copied nor thread a loop in
+# affine user-land (no function type is Data). The handshake driver
+# (ws_hs, states 0/1/3) accumulates the head until the blank line under
+# the same 16KB cap as HTTP.read_request, answers 101 or closes, emits
+# one EvOpen and enters the frame loop (ws_loop, states 1/2): each
+# complete frame arrives via TCP.recv_frame with its rest threaded as
+# the next buf, maps to one WSEv, and the handler's single WSOut goes
+# out verbatim over send_open_bytes (OutRaw{[]} continues silently).
+# Ping with an OutOp answer sends it verbatim and falls back to pong
+# otherwise; close replies and shuts; transport Fail and EvError close. Two defs, not one: the
+# handshake prefix (String lane) and the frame loop (byte lane) carry
+# different carriers, and a single def would thread two sockets through
+# dummy carriers (affine duplication); the split keeps one direction
+# only (hs into loop, each self-recursive, no mutual recursion) with
+# the template threaded through both.
+
+@unsafe
+def ws_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, ev: WSEv, +buf: List<&2, U32>) -> IO(Unit):
+  match st:
+    case 1:
+      (s, r, rest) = mf
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{inn}:
+          match inn:
+            case InMsg{msg}:
+              ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvMsg{msg}, rest)
+            case InOp{fin, op, pay}:
+              match op:
+                case 8:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvClose{pay}, rest)
+                case 9:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPing{pay}, rest)
+                case 10:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPong{pay}, rest)
+                case 0:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "not data"}, rest)
+                case 1:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                case 2:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                case _:
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "bad frame"}, rest)
+    case 2:
+      (s, r, b) = mf
+      match ev:
+        case EvOpen{}:
+          do IO<Unit>:
+            out : WSOut <- H(EvOpen{})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
+            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvMsg{msg}:
+          do IO<Unit>:
+            out : WSOut <- H(EvMsg{msg})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
+            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvPing{pay}:
+          +pp = pay
+          do IO<Unit>:
+            out : WSOut <- H(EvPing{pp})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(ping_reply(pp, out))))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
+            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvPong{pay}:
+          do IO<Unit>:
+            out : WSOut <- H(EvPong{pay})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
+            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvClose{pay}:
+          +pp = pay
+          do IO<Unit>:
+            out : WSOut <- H(EvClose{pp})
+            u : Unit <- send_bytes((s, out_bytes(close_answer(pp, out))))
+            return u
+        case EvError{code, msg}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{code, msg})
+            x : Unit <- Socket.close(s)
+            return x
+    case _:
+      IO.pure(Unit, Unit{})
+
+@unsafe
+def ws_hs(~H: WSEv -> IO(WSOut), st: U32, mr: Socket & Result<&1, &1, U32 & String, String>, mp: Result<&1, &1, U32 & String, String>, +acc: String, +fit: Bool, +ok: Bool) -> IO(Unit):
+  match st:
+    case 0:
+      (s, r) = mr
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{part}:
+          +acc2 = acc ++ part
+          ws_hs(~H, 1, (s, Done{""}), Fail{(0, "")}, acc2, HTTP.has_blank(acc2), Nat.is_le(String.length(acc2), 16384n))
+    case 1:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          ws_hs(~H, 3, (s, Done{""}), handshake(acc), acc, fit, ok)
+        case False{}:
+          match ok:
+            case True{}:
+              do IO<Unit>:
+                mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
+                ws_hs(~H, 0, mr2, Fail{(0, "")}, acc, fit, ok)
+            case False{}:
+              Socket.close(s)
+    case 3:
+      (s, r) = mr
+      match mp:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{resp}:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, resp)
+            out : WSOut <- H(EvOpen{})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- hs_open(sent, out)
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, [])
+            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+    case _:
+      IO.pure(Unit, Unit{})
+
+def server_conn(~H: WSEv -> IO(WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
+  (l, r) = m
+  do IO<Listener>:
+    s : Socket <- IO.pass(Socket, r)
+    IO.spawn(Unit, ws_hs(~H, 0, (s, Done{""}), Fail{(0, "")}, "", False{}, True{}))
+    return l
+
+@unsafe
+def server_on(~H: WSEv -> IO(WSOut), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    l2 : Listener <- server_conn(~H, m)
+    z : Unit <- server_on(~H, l2)
+    return z
 
 # Client echo (single Hi, fixed mask) for loopback tests.
 # Returns Done{"Hi"} on exact echo, Fail otherwise. Closes always.
