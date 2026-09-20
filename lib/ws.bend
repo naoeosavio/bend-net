@@ -1,13 +1,14 @@
-# WebSocket RFC 6455 full-duplex pure in Bend (no native effects).
+# WebSocket RFC 6455 full-duplex in Bend.
 #
 # Import as: import ./ws.bend as WS (from lib) or
 # import ../../lib/ws.bend as WS (from tests/io).
-# Reuses Base, HTTP, SHA1, B64 plus existing TCP/File effects.
+# Reuses Base, HTTP, SHA1, B64 and the byte effects in lib/tcp.bend
+# (TCP.send_bytes/TCP.recv_bytes).
 #
 # Scope: server and client, text and binary frames, fragmentation,
-# ping/pong/close. No TLS (same limit as HTTP.fetch). Binary IO over
-# TCP.String is ASCII-only on the wire (UTF-8 edge); pure codec is
-# full binary on List<U32>. See DESIGN below.
+# ping/pong/close. No TLS (same limit as HTTP.fetch). Frames ride
+# TCP.send_bytes/TCP.recv_bytes, byte-faithful on List<U32>; the pure
+# codec stays full binary on List<U32>. See DESIGN below.
 #
 # Discipline (user-land Bend has no Base carve-out):
 # - every callee is defined ABOVE its caller; only self-recursion.
@@ -17,6 +18,7 @@ import Base
 import ./http.bend as HTTP
 import ./sha1.bend as SHA1
 import ./b64.bend as B64
+import ./tcp.bend as TCP
 
 # Handshake
 # ---------
@@ -442,29 +444,8 @@ def show_masked(+fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U3
   show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, 1048576))))
 
 # IO: single-shot echo plus parallel accept loop (mold HTTP.echo).
-# TCP.String is UTF-8 on the wire; frames use Latin-1 (byte <-> Chr)
-# so Bend-to-Bend loopbacks preserve 0..255. External interop needs
-# a byte lane in the runtime (documented limit, no new effects here).
-
-def chars_of_bytes(bs: List<&2, U32>) -> List<&2, Char>:
-  match bs:
-    case Nil{}:
-      Nil{}
-    case b <> rest:
-      Char.from_u32(b) <> chars_of_bytes(rest)
-
-def string_of_bytes(+bs: List<&2, U32>) -> String:
-  String.from_list(chars_of_bytes(bs))
-
-def bytes_of_chars(cs: List<&2, Char>) -> List<&2, U32>:
-  match cs:
-    case Nil{}:
-      Nil{}
-    case c <> rest:
-      Char.to_u32(c) <> bytes_of_chars(rest)
-
-def bytes_of_string(s: String) -> List<&2, U32>:
-  bytes_of_chars(String.to_list(s))
+# Frames ride TCP.send_bytes/TCP.recv_bytes (byte-faithful 0..255);
+# only the HTTP handshake stays on TCP.send/recv (ASCII text).
 
 def send_shipped(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
   (s2, r2) = sent
@@ -477,7 +458,7 @@ def send_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Un
       Socket.close(s)
     case Done{bs}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, string_of_bytes(bs))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(s, bs)
         send_shipped(sent)
 
 def send_msg.go(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Unit):
@@ -507,7 +488,7 @@ def send_open_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> 
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
     case Done{bs}:
-      TCP.send(s, string_of_bytes(bs))
+      TCP.send_bytes(s, bs)
 
 def send_open_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
   send_open_bytes((s, show_frame(True{}, op, pay)))
@@ -535,26 +516,13 @@ def on_op(s: Socket, fin: Bool, op: U32, +pay: List<&2, U32>) -> IO(Unit):
 # Recv (generic API): raw wire bytes as List, no parse, no close.
 # The server side reads masked frames, the client side the unmasked
 # echo; only the parse above differs. Handshake recvs stay on
-# TCP.recv(String) directly (no Latin-1 roundtrip); only frame paths
-# migrate here.
-
-def recv_bytes_got(got: Socket & Result<&1, &1, U32 & String, String>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  (s2, r2) = got
-  match r2:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, (s2, Fail{e}))
-    case Done{txt}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, (s2, Done{bytes_of_string(txt)}))
+# TCP.recv(String) directly; frame paths ride TCP.recv_bytes.
 
 def recv_bytes(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-    got : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(sock, 8192)
-    recv_bytes_got(got)
+  TCP.recv_bytes(sock, 8192)
 
 def recv_bytes_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-    got : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(sock, 8192)
-    recv_bytes_got(got)
+  TCP.recv_bytes(sock, 8192)
 
 def recv_op_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>):
   (s, r) = m
@@ -673,6 +641,22 @@ def ws_serve(l: Listener) -> IO(Unit):
 
 # Client echo (single Hi, fixed mask) for loopback tests.
 # Returns Done{"Hi"} on exact echo, Fail otherwise. Closes always.
+# Frames ride the byte lane; only the handshake request stays String.
+
+def eq_bytes(xs: List<&2, U32>, ys: List<&2, U32>) -> Bool:
+  match xs:
+    case Nil{}:
+      match ys:
+        case Nil{}:
+          True{}
+        case _ <> _:
+          False{}
+    case h1 <> t1:
+      match ys:
+        case Nil{}:
+          False{}
+        case h2 <> t2:
+          Bool.and(U32.is_eq(h1, h2), eq_bytes(t1, t2))
 
 def client_validated(m: Socket & Bool & String) -> IO(Result<&1, &1, U32 & String, String>):
   (s, ok, txt) = m
@@ -686,17 +670,7 @@ def client_validated(m: Socket & Bool & String) -> IO(Result<&1, &1, U32 & Strin
         x : Unit <- Socket.close(s)
         return Fail{(400, "bad echo")}
 
-def client_echo_got(m: Socket & Result<&1, &1, U32 & String, String>, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, String>>:
-        x : Unit <- Socket.close(s)
-        return Fail{e}
-    case Done{txt}:
-      client_validated((s, String.eq(txt, want), "Hi"))
-
-def client_echo_got_list(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_echo_got_list(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +want: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (s, r) = m
   match r:
     case Fail{e}:
@@ -704,9 +678,9 @@ def client_echo_got_list(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
         x : Unit <- Socket.close(s)
         return Fail{e}
     case Done{bs}:
-      client_validated((s, String.eq(string_of_bytes(bs), want), "Hi"))
+      client_validated((s, eq_bytes(bs, want), "Hi"))
 
-def client_echo_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt: String, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_echo_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt: List<&2, U32>, +want: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (s, r) = m
   match r:
     case Fail{e}:
@@ -718,7 +692,7 @@ def client_echo_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt:
         m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv_bytes_client(s)
         client_echo_got_list(m2, want)
 
-def client_hs_got(m: Socket & Result<&1, &1, U32 & String, String>, +frame_txt: String, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_hs_got(m: Socket & Result<&1, &1, U32 & String, String>, +frame_txt: List<&2, U32>, +want: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (s, r) = m
   match r:
     case Fail{e}:
@@ -727,10 +701,10 @@ def client_hs_got(m: Socket & Result<&1, &1, U32 & String, String>, +frame_txt: 
         return Fail{e}
     case Done{hsresp}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, frame_txt)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(s, frame_txt)
         client_echo_sent(sent, frame_txt, want)
 
-def client_req_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt: String, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_req_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt: List<&2, U32>, +want: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (s, r) = m
   match r:
     case Fail{e}:
@@ -742,7 +716,7 @@ def client_req_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +frame_txt: 
         got : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
         client_hs_got(got, frame_txt, want)
 
-def client_conn(conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String, +frame_txt: String, +want: String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_conn(conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String, +frame_txt: List<&2, U32>, +want: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
@@ -751,7 +725,7 @@ def client_conn(conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String, +f
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, req_txt)
         client_req_sent(sent, frame_txt, want)
 
-def client_frames_put(mres: Result<&1, &1, U32 & String, List<&2, U32>>, eres: Result<&1, &1, U32 & String, List<&2, U32>>) -> Result<&1, &1, U32 & String, String & String>:
+def client_frames_put(mres: Result<&1, &1, U32 & String, List<&2, U32>>, eres: Result<&1, &1, U32 & String, List<&2, U32>>) -> Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>:
   match mres:
     case Fail{e}:
       Fail{e}
@@ -760,18 +734,18 @@ def client_frames_put(mres: Result<&1, &1, U32 & String, List<&2, U32>>, eres: R
         case Fail{e}:
           Fail{e}
         case Done{eby}:
-          Done{(string_of_bytes(mbytes), string_of_bytes(eby))}
+          Done{(mbytes, eby)}
 
-def client_frames(+msg: String) -> Result<&1, &1, U32 & String, String & String>:
-  client_frames_put(show_masked(True{}, 1, bytes_of_string(msg), 1, 2, 3, 4), show_frame(True{}, 1, bytes_of_string(msg)))
+def client_frames(+msg: String) -> Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>:
+  client_frames_put(show_masked(True{}, 1, HTTP.encode(msg), 1, 2, 3, 4), show_frame(True{}, 1, HTTP.encode(msg)))
 
-def client_go(+host: String, port: U32, +path: String, +key: String, +msg: String, req: String, frames: String & String) -> IO(Result<&1, &1, U32 & String, String>):
+def client_go(+host: String, port: U32, +path: String, +key: String, +msg: String, req: String, frames: List<&2, U32> & List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (frame_txt, want) = frames
   do IO<Result<&1, &1, U32 & String, String>>:
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
     client_conn(conn, req, frame_txt, want)
 
-def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, frames: Result<&1, &1, U32 & String, String & String>) -> IO(Result<&1, &1, U32 & String, String>):
+def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, frames: Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) -> IO(Result<&1, &1, U32 & String, String>):
   match req:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
@@ -794,7 +768,7 @@ def client_send_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
     case Done{bs}:
-      TCP.send(s, string_of_bytes(bs))
+      TCP.send_bytes(s, bs)
 
 def client_send_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
   client_send_bytes((s, show_masked(True{}, op, pay, 1, 2, 3, 4)))
