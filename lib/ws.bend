@@ -243,7 +243,7 @@ def frame_payload(+fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, +k0: U32, +k1: 
   +code = Bool.pick(U32, Bool.not(cap_ok), 413, 400)
   finish_frame(ok, code, fin, op, unmasked)
 
-def mask_keys(fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, masked: Bool, rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+def mask_keys(fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, masked: Bool, rest: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   match masked:
     case True{}:
       match rest:
@@ -264,24 +264,28 @@ def mask_keys(fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, masked: Bool, rest: 
                     case k3 <> payload:
                       frame_payload(fin, rsv_ok, op, len, k0, k1, k2, k3, payload)
     case False{}:
-      Fail{(400, "unmasked client frame")}
+      match unmasked_ok:
+        case True{}:
+          frame_payload(fin, rsv_ok, op, len, 0, 0, 0, 0, rest)
+        case False{}:
+          Fail{(400, "unmasked client frame")}
 
-def len64.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +lo: U32, rest: List<&2, U32>, is0: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+def len64.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +lo: U32, rest: List<&2, U32>, is0: Bool, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   match is0:
     case True{}:
-      mask_keys(fin, rsv_ok, op, lo, masked, rest)
+      mask_keys(fin, rsv_ok, op, lo, masked, rest, unmasked_ok)
     case False{}:
       Fail{(413, "frame too large")}
 
-def len64(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +b0: U32, +b1: U32, +b2: U32, +b3: U32, +b4: U32, +b5: U32, +b6: U32, +b7: U32, rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+def len64(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +b0: U32, +b1: U32, +b2: U32, +b3: U32, +b4: U32, +b5: U32, +b6: U32, +b7: U32, rest: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   +hi = SHA1.word_of4(b0, b1, b2, b3)
   +lo = SHA1.word_of4(b4, b5, b6, b7)
-  len64.go(fin, rsv_ok, op, masked, lo, rest, U32.is_zero(hi))
+  len64.go(fin, rsv_ok, op, masked, lo, rest, U32.is_zero(hi), unmasked_ok)
 
-def len16(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +b0: U32, +b1: U32, rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
-  mask_keys(fin, rsv_ok, op, (b0 * 256 + b1 : U32), masked, rest)
+def len16(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, +b0: U32, +b1: U32, rest: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+  mask_keys(fin, rsv_ok, op, (b0 * 256 + b1 : U32), masked, rest, unmasked_ok)
 
-def len7.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, len7: U32, rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+def len7.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, len7: U32, rest: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   match len7:
     case 126:
       match rest:
@@ -292,7 +296,7 @@ def len7.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, len7: U32, rest: Li
             case Nil{}:
               Fail{(400, "short len")}
             case b1 <> rest2:
-              len16(fin, rsv_ok, op, masked, b0, b1, rest2)
+              len16(fin, rsv_ok, op, masked, b0, b1, rest2, unmasked_ok)
     case 127:
       match rest:
         case Nil{}:
@@ -326,9 +330,9 @@ def len7.go(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, len7: U32, rest: Li
                                     case Nil{}:
                                       Fail{(400, "short len")}
                                     case b7 <> rest2:
-                                      len64(fin, rsv_ok, op, masked, b0, b1, b2, b3, b4, b5, b6, b7, rest2)
+                                      len64(fin, rsv_ok, op, masked, b0, b1, b2, b3, b4, b5, b6, b7, rest2, unmasked_ok)
     case _:
-      mask_keys(fin, rsv_ok, op, len7, masked, rest)
+      mask_keys(fin, rsv_ok, op, len7, masked, rest, unmasked_ok)
 
 def read_frame(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   match bs:
@@ -339,7 +343,21 @@ def read_frame(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & L
         case Nil{}:
           Fail{(400, "short frame")}
         case +b1 <> rest:
-          len7.go(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest)
+          len7.go(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest, False{})
+
+# Client parse: server frames arrive unmasked (RFC 6455 server-to-client).
+# Same caps as read_frame (1MB, control rules); masked frames still parse.
+
+def read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
+  match bs:
+    case Nil{}:
+      Fail{(400, "short frame")}
+    case +b0 <> r1:
+      match r1:
+        case Nil{}:
+          Fail{(400, "short frame")}
+        case +b1 <> rest:
+          len7.go(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest, True{})
 
 def show_b0(fin: Bool, +op: U32) -> U32:
   (Bool.pick(U32, fin, 128, 0) + op : U32)
@@ -479,6 +497,23 @@ def send(s: Socket, out: WSOut) -> IO(Unit):
       send_op(s, op, pay)
     case OutRaw{bs}:
       send_bytes((s, Done{bs}))
+
+# Open sends (server sessions): unmasked like send_op/send_msg but the
+# socket stays open; the session driver closes it.
+
+def send_open_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
+    case Done{bs}:
+      TCP.send(s, string_of_bytes(bs))
+
+def send_open_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  send_open_bytes((s, show_frame(True{}, op, pay)))
+
+def send_open_msg(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  send_open_op(s, msg_to_op(msg), msg_to_bytes(msg))
 
 def on_op(s: Socket, fin: Bool, op: U32, +pay: List<&2, U32>) -> IO(Unit):
   match op:
@@ -749,3 +784,43 @@ def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: S
 
 def client_echo(+host: String, port: U32, +path: String, +key: String, +msg: String) -> IO(Result<&1, &1, U32 & String, String>):
   client_req_ok(host, port, path, key, msg, client_request(host, path, key), client_frames(msg))
+
+# Client session (interop): masked sends with a fixed key, unmasked recvs.
+# The socket stays open across calls; the session driver closes it.
+
+def client_send_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
+    case Done{bs}:
+      TCP.send(s, string_of_bytes(bs))
+
+def client_send_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  client_send_bytes((s, show_masked(True{}, op, pay, 1, 2, 3, 4)))
+
+def client_send_msg(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  client_send_op(s, msg_to_op(msg), msg_to_bytes(msg))
+
+def recv_op_client_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>, (s, Fail{e}))
+    case Done{bs}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>, (s, read_frame_unmasked(bs)))
+
+def recv_op_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>):
+  do IO<Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>>:
+    m : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv_bytes_client(sock)
+    recv_op_client_got(m)
+
+def recv_msg_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSMessage>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> <- recv_op_client(sock)
+    recv_msg_got(m)
+
+def recv_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSIn>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> <- recv_op_client(sock)
+    recv_got(m)
