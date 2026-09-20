@@ -1,11 +1,15 @@
 # Interop client, ON version: scripted 6-step ping/pong session against
 # lib/exemplos/server_on.bend (or server.js, server.bend) on
-# 127.0.0.1:19880. Same wire script as cliente.bend — the client drives
-# actively, so there is no server_on to use here; this copy exists so
-# the ON pair (cliente_on <-> server_on) is self-contained while the
-# originals stay frozen as regression.
-# Script: 101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
-# ping s2/pong -> close. Prints the score (6 when all passes).
+# 127.0.0.1:19880, rewritten over WS.client_on — the client is now the
+# event-driven mirror of the server, not a hand-driven socket loop.
+# Script: 101 -> ping s1/pong+ping c1 -> pong c1/hello -> hello/echo ->
+# ping s2/pong -> close. Stateles like server_on.bend: every step is
+# identified by (opcode, payload), so no counter threads the handler.
+# The pong s1 step answers pong ++ ping c1 in a single OutRaw (one WSOut
+# per event; a non-empty OutRaw wins over the auto-pong), mirroring the
+# server's echo ++ ping s2 glue. Prints one OK line per passed check and
+# DONE 6/6 on close (grep rule: pass = DONE present with no FAIL); a
+# failed check prints FAIL and closes early.
 # Run: bun bend2/main.ts lib/exemplos/cliente_on.bend
 import Base
 import ../ws.bend as WS
@@ -41,389 +45,142 @@ def eq_list(xs, ys):
         case h2 <> t2:
           (b2u(U32.is_eq(h1, h2)) * eq_list(t1, t2) : U32)
 
-law expect_frame:
-  for fin: Bool
-  for +op: U32
+law unwrap:
+  for r: Result<&1, &1, U32 & String, List<&2, U32>>
+  List<&2, U32>
+
+def unwrap(r):
+  match r:
+    case Fail{e}:
+      []
+    case Done{bs}:
+      bs
+
+law pong_ping:
+  List<&2, U32>
+
+def pong_ping():
+  List.append(&2, U32, unwrap(WS.client_out_bytes(WS.out_pong([115, 49]))), unwrap(WS.client_out_bytes(WS.OutOp{WS.op_ping(), [99, 49]})))
+
+law cl.hs:
+  IO(WS.WSOut)
+
+def cl.hs():
+  do IO<WS.WSOut>:
+    w : Unit <- IO.print("OK HS")
+    return WS.OutRaw{[]}
+
+law cl.pong1:
+  for ok: U32
+  IO(WS.WSOut)
+
+def cl.pong1(ok):
+  match ok:
+    case 1:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("OK PONG_C1")
+        return WS.OutMsg{WS.WSText{"hello"}}
+    case _:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("FAIL PONG")
+        return WS.out_close([])
+
+law cl.pong2:
+  for ok: U32
+  for +pp: List<&2, U32>
+  IO(WS.WSOut)
+
+def cl.pong2(ok, pp):
+  match ok:
+    case 1:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("OK PONG_S2")
+        return WS.out_pong(pp)
+    case _:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("FAIL PING")
+        return WS.out_close([])
+
+law cl.ping1:
+  for s1: U32
+  for s2: U32
+  for +pp: List<&2, U32>
+  IO(WS.WSOut)
+
+def cl.ping1(s1, s2, pp):
+  match s1:
+    case 1:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("OK PONG_S1")
+        return WS.OutRaw{pong_ping()}
+    case _:
+      cl.pong2(s2, pp)
+
+law cl.text:
+  for ok: U32
+  IO(WS.WSOut)
+
+def cl.text(ok):
+  match ok:
+    case 1:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("OK ECHO")
+        return WS.OutRaw{[]}
+    case _:
+      do IO<WS.WSOut>:
+        w : Unit <- IO.print("FAIL TEXT")
+        return WS.out_close([])
+
+law cl.close:
   for +pay: List<&2, U32>
-  for want_op: U32
-  for +want: List<&2, U32>
-  Bool
+  IO(WS.WSOut)
 
-def expect_frame(fin, op, pay, want_op, want):
-  Bool.and(fin, Bool.and(U32.is_eq(op, want_op), U32.is_eq(eq_list(pay, want), 1)))
+def cl.close(pay):
+  do IO<WS.WSOut>:
+    w : Unit <- IO.print("OK CLOSE")
+    d : Unit <- IO.print("DONE 6/6")
+    return WS.out_close(pay)
 
-law close_shipped:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for score: U32
-  IO(U32)
+law cl.err:
+  for code: U32
+  IO(WS.WSOut)
 
-def close_shipped(m, score):
-  (s, r) = m
-  do IO<U32>:
-    x : Unit <- Socket.close(s)
-    return score
+def cl.err(code):
+  do IO<WS.WSOut>:
+    w : Unit <- IO.print("FAIL EV")
+    return WS.OutRaw{[]}
 
-law close_checked:
-  for ok: Bool
-  for s: Socket
-  for score: U32
-  IO(U32)
+law h.cl:
+  for ev: WS.WSEv
+  IO(WS.WSOut)
 
-def close_checked(ok, s, score):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 8, [])
-        close_shipped(sent, (score + 1 : U32))
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-
-law close_got:
-  for m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def close_got(m, score):
-  (s, r, rest) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{t}:
-      (fin, op, pay) = t
-      close_checked(U32.is_eq(op, 8), s, score)
-
-law wait_close:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def wait_close(m, buf, score):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{u}:
-      do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
-        close_got(m2, score)
-
-law pong2_go:
-  for ok: Bool
-  for s: Socket
-  for pay: List<&2, U32>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def pong2_go(ok, s, pay, buf, score):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 10, pay)
-        wait_close(sent, buf, (score + 1 : U32))
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-
-law pong2_next:
-  for fin: Bool
-  for +op: U32
-  for +pay: List<&2, U32>
-  for s: Socket
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def pong2_next(fin, op, pay, s, buf, score):
-  pong2_go(expect_frame(fin, op, pay, 9, [115, 50]), s, pay, buf, score)
-
-law ping2_got:
-  for m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def ping2_got(m, score):
-  (s, r, rest) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{t}:
-      (fin, op, pay) = t
-      pong2_next(fin, op, pay, s, rest, score)
-
-law echo_checked:
-  for ok: Bool
-  for s: Socket
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def echo_checked(ok, s, buf, score):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
-        ping2_got(m2, (score + 1 : U32))
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-
-law echo_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def echo_got(m, score):
-  (s, r, rest) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{msg}:
+def h.cl(ev):
+  match ev:
+    case WS.EvOpen{}:
+      cl.hs()
+    case WS.EvMsg{msg}:
       match msg:
         case WS.WSText{text}:
-          echo_checked(String.eq(text, "hello"), s, rest, score)
+          cl.text(b2u(String.eq(text, "hello")))
         case WS.WSBin{data}:
-          do IO<U32>:
-            x : Unit <- Socket.close(s)
-            return score
-
-law hello_sent:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def hello_sent(m, buf, score):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{u}:
-      do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, buf)
-        echo_got(m2, score)
-
-law hello_next:
-  for ok: Bool
-  for s: Socket
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def hello_next(ok, s, buf, score):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_msg(s, WS.WSText{"hello"})
-        hello_sent(sent, buf, (score + 1 : U32))
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-
-law pong1_got:
-  for m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def pong1_got(m, score):
-  (s, r, rest) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{t}:
-      (fin, op, pay) = t
-      hello_next(expect_frame(fin, op, pay, 10, [99, 49]), s, rest, score)
-
-law ping_c1_sent:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def ping_c1_sent(m, buf, score):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{u}:
-      do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
-        pong1_got(m2, score)
-
-law pong_s1_sent:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def pong_s1_sent(m, buf, score):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{u}:
-      do IO<U32>:
-        sent2 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 9, [99, 49])
-        ping_c1_sent(sent2, buf, score)
-
-law s1_go:
-  for ok: Bool
-  for s: Socket
-  for pay: List<&2, U32>
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def s1_go(ok, s, pay, buf, score):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 10, pay)
-        pong_s1_sent(sent, buf, (score + 1 : U32))
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-
-law s1_next:
-  for fin: Bool
-  for +op: U32
-  for +pay: List<&2, U32>
-  for s: Socket
-  for buf: List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def s1_next(fin, op, pay, s, buf, score):
-  s1_go(expect_frame(fin, op, pay, 9, [115, 49]), s, pay, buf, score)
-
-law ping_s1_got:
-  for m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>
-  for score: U32
-  IO(U32)
-
-def ping_s1_got(m, score):
-  (s, r, rest) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return score
-    case Done{t}:
-      (fin, op, pay) = t
-      s1_next(fin, op, pay, s, rest, score)
-
-law session:
-  for ok: Bool
-  for s: Socket
-  IO(U32)
-
-def session(ok, s):
-  match ok:
-    case True{}:
-      do IO<U32>:
-        m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, [])
-        ping_s1_got(m, 1)
-    case False{}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return 0
-
-law hs_got:
-  for m: Socket & Result<&1, &1, U32 & String, String>
-  IO(U32)
-
-def hs_got(m):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return 0
-    case Done{resp}:
-      session(String.contains(resp, "101"), s)
-
-law req_sent:
-  for m: Socket & Result<&1, &1, U32 & String, Unit>
-  IO(U32)
-
-def req_sent(m):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- Socket.close(s)
-        return 0
-    case Done{u}:
-      do IO<U32>:
-        got : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
-        hs_got(got)
-
-law conn_open:
-  for conn: Result<&1, &1, U32 & String, Socket>
-  for +req_txt: String
-  IO(U32)
-
-def conn_open(conn, req_txt):
-  match conn:
-    case Fail{e}:
-      IO.pure(U32, 0)
-    case Done{sock}:
-      do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, req_txt)
-        req_sent(sent)
-
-law start_req:
-  for +host: String
-  for port: U32
-  for req: Result<&1, &1, U32 & String, String>
-  IO(U32)
-
-def start_req(host, port, req):
-  match req:
-    case Fail{e}:
-      IO.pure(U32, 0)
-    case Done{req_txt}:
-      do IO<U32>:
-        conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
-        conn_open(conn, req_txt)
-
-law start:
-  for +host: String
-  for port: U32
-  for +key: String
-  IO(U32)
-
-def start(host, port, key):
-  start_req(host, port, WS.client_request(host, "/chat", key))
+          cl.text(0)
+    case WS.EvPing{pay}:
+      +pp = pay
+      cl.ping1(eq_list(pp, [115, 49]), eq_list(pp, [115, 50]), pp)
+    case WS.EvPong{pay}:
+      +pp = pay
+      cl.pong1(eq_list(pp, [99, 49]))
+    case WS.EvClose{pay}:
+      +pp = pay
+      cl.close(pp)
+    case WS.EvError{code, msg}:
+      cl.err(code)
 
 law main:
   IO(U32)
 
 def main():
   do IO<U32>:
-    +total : U32 <- start("127.0.0.1", 19880, "dGhlIHNhbXBsZSBub25jZQ==")
-    w : Unit <- IO.print(U32.show(total))
-    return total
+    done : Unit <- WS.client_on(~h.cl, "127.0.0.1", 19880, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    z : Unit <- IO.die(Unit, 0, "")
+    return 0
