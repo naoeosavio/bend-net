@@ -106,7 +106,8 @@ def f_of(+idx: Nat, +b: U32, +c: U32, +d: U32) -> U32:
 # Temp = rotl5(a) + f + e + k + w (mod 2^32 via U32.add).
 
 def temp_of(+a: U32, +f: U32, +e: U32, +k: U32, +w: U32) -> U32:
-  ((((rotl5(a) + f : U32) + e : U32) + k : U32) + w : U32)
+  +t = rotl5(a)
+  ((((t + f : U32) + e : U32) + k : U32) + w : U32)
 
 # Sixteen words from sixty-four bytes (single def, nested patterns).
 
@@ -155,7 +156,7 @@ def expand(w16: List<&2, U32>) -> List<&2, U32>:
 # Add working vars back into hash (five element lists).
 
 def add5.go(+h: List<&2, U32>, +s: List<&2, U32>) -> List<&2, U32>:
-  [(list_get(h, 0n) + list_get(s, 0n) : U32), (list_get(h, 1n) + list_get(s, 1n) : U32), (list_get(h, 2n) + list_get(s, 2n) : U32), (list_get(h, 3n) + list_get(s, 3n) : U32), (list_get(h, 4n) + list_get(s, 4n) : U32)]
+  [U32.add(list_get(h, 0n), list_get(s, 0n)), U32.add(list_get(h, 1n), list_get(s, 1n)), U32.add(list_get(h, 2n), list_get(s, 2n)), U32.add(list_get(h, 3n), list_get(s, 3n)), U32.add(list_get(h, 4n), list_get(s, 4n))]
 
 def add5(+h: List<&2, U32>, +s: List<&2, U32>) -> List<&2, U32>:
   add5.go(h, s)
