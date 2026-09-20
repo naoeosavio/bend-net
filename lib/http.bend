@@ -869,6 +869,23 @@ def drop_conn(hs: List<&1, String & String>) -> List<&1, String & String>:
       +vv = v
       drop_conn.put(nn, vv, drop_conn(t), eq_ci(nn, "Connection"))
 
+def drop_host.put(n: String, v: String, rec: List<&1, String & String>, is_host: Bool) ->
+  List<&1, String & String>:
+  match is_host:
+    case True{}:
+      rec
+    case False{}:
+      (n, v) <> rec
+
+def drop_host(hs: List<&1, String & String>) -> List<&1, String & String>:
+  match hs:
+    case Nil{}:
+      Nil{}
+    case (n, v) <> t:
+      +nn = n
+      +vv = v
+      drop_host.put(nn, vv, drop_host(t), eq_ci(nn, "Host"))
+
 def show_headers.ok(n: String, v: String, hs: Result<&1, &1, U32 & String, String>) ->
   Result<&1, &1, U32 & String, String>:
   match hs:
@@ -1969,6 +1986,8 @@ def fetch(url):
 
 # send_request: any method with headers and body over the same byte
 # exchange; fetch is its GET-and-empty special case at the URL layer.
+# HTTP/1.1 requires Host, so the host used to connect is injected as
+# the Host header (a caller-supplied Host is dropped first).
 
 def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, text: String) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -1998,7 +2017,7 @@ def send_request.fit(+host: String, +port: U32, +path: String, +method: String, 
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
     case True{}:
-      send_request.shown(show_request(method, path, hs, body), host, port)
+      send_request.shown(show_request(method, path, ("Host", host) <> drop_host(hs), body), host, port)
 
 def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):

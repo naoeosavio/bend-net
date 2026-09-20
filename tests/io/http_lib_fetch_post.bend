@@ -1,7 +1,9 @@
 # lib (http_lib_fetch_post): send_request — POST carries method, headers
 # and body through show_request; the echo handler answers with the
-# method glued to the request body, so the roundtrip proves both. A
-# method with a space fails closed with 400 before touching the net.
+# method glued to the request body plus the Host header, so the
+# roundtrip proves all three (HTTP/1.1 needs Host, and send_request must
+# inject it). A method with a space fails closed with 400 before
+# touching the net.
 import Base
 import ../../lib/http.bend as HTTP
 
@@ -50,7 +52,7 @@ law echo.handler:
 
 def echo.handler(req):
   (m, p, hs, b) = req
-  IO.pure(U32 & List<&1, (String & String)> & String, (200, [], m ++ b))
+  IO.pure(U32 & List<&1, (String & String)> & String, (200, [], m ++ b ++ "|" ++ HTTP.get_header("", "Host", hs)))
 
 law server_down:
   for l: Listener
@@ -146,7 +148,7 @@ def case_post(b):
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
     r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "POST", [], "xyz")
-    chk_eq(chan, "POSTxyz", r)
+    chk_eq(chan, "POSTxyz|127.0.0.1", r)
 
 law case_get:
   for b: Listener & U32
@@ -157,7 +159,7 @@ def case_get(b):
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
     r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "GET", [("X-Note", "hi")], "")
-    chk_eq(chan, "GET", r)
+    chk_eq(chan, "GET|127.0.0.1", r)
 
 law case_bad:
   for b: Listener & U32
