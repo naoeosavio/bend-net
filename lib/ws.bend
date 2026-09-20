@@ -361,6 +361,159 @@ def read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool 
         case +b1 <> rest:
           len7.go(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest, True{})
 
+# Incremental framing: total-first split for the recv accumulator.
+# frame_need(bs) is the header read (2 + ext 0/2/8 + mask 0/4 +
+# payload) under the same rules as read_frame (RSV/opcode/control
+# and the 1MB cap); short headers Fail "short ...", invalid ones
+# Fail 400/413. frame_split(bs) never fails soft data: NeedMore
+# with the missing count while the bytes fall short (1 while the
+# header itself is short), FrameGot with the frame plus the exact
+# rest once complete, FrameBad on invalid headers. The unmasked
+# twins serve the client side, like read_frame_unmasked.
+
+type WSFrameSplit is Data:
+  NeedMore{missing: U32}
+  FrameGot{frame: List<&2, U32>, rest: List<&2, U32>}
+  FrameBad{code: U32, msg: String}
+
+def frame_is_short(+e: String) -> Bool:
+  Bool.or(String.eq(e, "short frame"), String.eq(e, "short len"))
+
+def frame_need_done(ok: Bool, code: U32, +total: U32) -> Result<&1, &1, U32 & String, U32>:
+  match ok:
+    case True{}:
+      Done{total}
+    case False{}:
+      Fail{(code, "bad frame")}
+
+def frame_need_len(fin: Bool, rsv_ok: Bool, op: U32, +masked: Bool, +len: U32, ext: U32, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  +mask_len = Bool.pick(U32, masked, 4, 0)
+  +total = (2 + ext + mask_len + len : U32)
+  +cap_ok = U32.is_le(len, 1048576)
+  +mask_ok = Bool.or(masked, unmasked_ok)
+  +ok = Bool.and(mask_ok, payload_ok(rsv_ok, op, fin, len, True{}, cap_ok))
+  +code = Bool.pick(U32, Bool.not(cap_ok), 413, 400)
+  frame_need_done(ok, code, total)
+
+def frame_need_small(fin: Bool, rsv_ok: Bool, op: U32, masked: Bool, len: U32, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  frame_need_len(fin, rsv_ok, op, masked, len, 0, unmasked_ok)
+
+def frame_need_med(fin: Bool, rsv_ok: Bool, op: U32, masked: Bool, b0: U32, b1: U32, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  frame_need_len(fin, rsv_ok, op, masked, (b0 * 256 + b1 : U32), 2, unmasked_ok)
+
+def frame_need_big(fin: Bool, rsv_ok: Bool, op: U32, masked: Bool, lo: U32, is_hi0: Bool, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  match is_hi0:
+    case True{}:
+      frame_need_len(fin, rsv_ok, op, masked, lo, 8, unmasked_ok)
+    case False{}:
+      Fail{(413, "frame too large")}
+
+def frame_need_ext(fin: Bool, rsv_ok: Bool, +op: U32, masked: Bool, len7: U32, rest: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  match len7:
+    case 126:
+      match rest:
+        case Nil{}:
+          Fail{(400, "short len")}
+        case b0 <> r1:
+          match r1:
+            case Nil{}:
+              Fail{(400, "short len")}
+            case b1 <> rest2:
+              frame_need_med(fin, rsv_ok, op, masked, b0, b1, unmasked_ok)
+    case 127:
+      match rest:
+        case Nil{}:
+          Fail{(400, "short len")}
+        case b0 <> r1:
+          match r1:
+            case Nil{}:
+              Fail{(400, "short len")}
+            case b1 <> r2:
+              match r2:
+                case Nil{}:
+                  Fail{(400, "short len")}
+                case b2 <> r3:
+                  match r3:
+                    case Nil{}:
+                      Fail{(400, "short len")}
+                    case b3 <> r4:
+                      match r4:
+                        case Nil{}:
+                          Fail{(400, "short len")}
+                        case b4 <> r5:
+                          match r5:
+                            case Nil{}:
+                              Fail{(400, "short len")}
+                            case b5 <> r6:
+                              match r6:
+                                case Nil{}:
+                                  Fail{(400, "short len")}
+                                case b6 <> r7:
+                                  match r7:
+                                    case Nil{}:
+                                      Fail{(400, "short len")}
+                                    case b7 <> rest2:
+                                      frame_need_big(fin, rsv_ok, op, masked, SHA1.word_of4(b4, b5, b6, b7), U32.is_zero(SHA1.word_of4(b0, b1, b2, b3)), unmasked_ok)
+    case _:
+      frame_need_small(fin, rsv_ok, op, masked, len7, unmasked_ok)
+
+def frame_need_go(bs: List<&2, U32>, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
+  match bs:
+    case Nil{}:
+      Fail{(400, "short frame")}
+    case +b0 <> r1:
+      match r1:
+        case Nil{}:
+          Fail{(400, "short frame")}
+        case +b1 <> rest:
+          frame_need_ext(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest, unmasked_ok)
+
+def frame_need(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, U32>:
+  frame_need_go(bs, False{})
+
+def frame_need_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, U32>:
+  frame_need_go(bs, True{})
+
+def frame_got_go(frame: List<&2, U32>, rest: List<&2, U32>, eq: Bool, missing: U32) -> WSFrameSplit:
+  match eq:
+    case True{}:
+      FrameGot{frame, rest}
+    case False{}:
+      NeedMore{missing}
+
+def frame_split_got(+bs: List<&2, U32>, +total: U32) -> WSFrameSplit:
+  +taken = List.take(&2, U32, bs, U32.to_nat(total))
+  +rest = List.drop(&2, U32, bs, U32.to_nat(total))
+  +got = U32.from_nat(List.length(&2, U32, taken))
+  +missing = U32.sub(total, got)
+  frame_got_go(taken, rest, U32.is_eq(got, total), missing)
+
+def frame_split_bad_go(code: U32, msg: String, is_short: Bool) -> WSFrameSplit:
+  match is_short:
+    case True{}:
+      NeedMore{1}
+    case False{}:
+      FrameBad{code, msg}
+
+def frame_split_bad(code: U32, +msg: String) -> WSFrameSplit:
+  frame_split_bad_go(code, msg, frame_is_short(msg))
+
+def frame_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) -> WSFrameSplit:
+  match need:
+    case Fail{(c, e)}:
+      frame_split_bad(c, e)
+    case Done{total}:
+      frame_split_got(bs, total)
+
+def frame_split_go(+bs: List<&2, U32>, unmasked_ok: Bool) -> WSFrameSplit:
+  frame_split_res(bs, frame_need_go(bs, unmasked_ok))
+
+def frame_split(bs: List<&2, U32>) -> WSFrameSplit:
+  frame_split_go(bs, False{})
+
+def frame_split_unmasked(bs: List<&2, U32>) -> WSFrameSplit:
+  frame_split_go(bs, True{})
+
 def show_b0(fin: Bool, +op: U32) -> U32:
   (Bool.pick(U32, fin, 128, 0) + op : U32)
 
@@ -575,6 +728,121 @@ def recv(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>):
     m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> <- recv_op(sock)
     recv_got(m)
 
+# Framed recv: one TCP.recv_frame call isolates exactly one frame from
+# the byte stream, holding bytes already read (buf) plus the socket
+# until the length prefix completes. The effect only counts the total
+# (2 + ext + mask + payload, capped); the pure codec above still
+# validates the isolated bytes, so every Fail path below stays exact.
+# Each answer carries the rest past the frame: the driver threads it
+# into the next call, and every byte read is consumed exactly once.
+# No user-land loop could do this (a match takes only params and
+# fields, do tails are terms, mutual recursion is out), so the loop
+# lives in the effect: one hop per frame.
+
+def recv_framed_max() -> U32:
+  (1048576 + 14 : U32)
+
+def recv_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
+  TCP.recv_frame(sock, buf, recv_framed_max())
+
+def recv_op_framed_done(s: Socket, p: Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>, rest: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  match p:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>, (s, Done{t}, rest))
+
+def recv_op_framed_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{fr}:
+      (frame, rest) = fr
+      recv_op_framed_done(s, read_frame(frame), rest)
+
+def recv_op_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- recv_framed(sock, buf)
+    recv_op_framed_got(m)
+
+def recv_op_client_framed_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{fr}:
+      (frame, rest) = fr
+      recv_op_framed_done(s, read_frame_unmasked(frame), rest)
+
+def recv_op_client_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- recv_framed(sock, buf)
+    recv_op_client_framed_got(m)
+
+def recv_msg_framed_done(s: Socket, p: Result<&1, &1, U32 & String, WSMessage>, rest: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  match p:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{msg}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Done{msg}, rest))
+
+def recv_msg_framed_got(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  (s, r, rest) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      (fin, op, pay) = t
+      recv_msg_framed_done(s, msg_of_frame(fin, op, pay), rest)
+
+def recv_msg_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- recv_op_framed(sock, buf)
+    recv_msg_framed_got(m)
+
+def recv_msg_client_framed_got(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  (s, r, rest) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      (fin, op, pay) = t
+      recv_msg_framed_done(s, msg_of_frame(fin, op, pay), rest)
+
+def recv_msg_client_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- recv_op_client_framed(sock, buf)
+    recv_msg_client_framed_got(m)
+
+def recv_in_framed_got(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  (s, r, rest) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      (fin, op, pay) = t
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Done{recv_in_of(fin, op, pay)}, rest))
+
+def recv_in_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- recv_op_framed(sock, buf)
+    recv_in_framed_got(m)
+
+def recv_in_client_framed_got(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  (s, r, rest) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      (fin, op, pay) = t
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Done{recv_in_of(fin, op, pay)}, rest))
+
+def recv_in_client_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- recv_op_client_framed(sock, buf)
+    recv_in_client_framed_got(m)
+
 def frame_echo(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>) -> IO(Unit):
   (s, r) = m
   match r:
@@ -584,22 +852,25 @@ def frame_echo(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U3
       (fin, op, pay) = t
       on_op(s, fin, op, pay)
 
-def frame_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+# Echo path, framed: the rest past the frame is dropped on purpose, the
+# echo answers a single frame per connection and closes right after.
+def frame_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) -> IO(Unit):
   (s2, r2) = m
   match r2:
     case Fail{e}:
       Socket.close(s2)
-    case Done{bs}:
-      frame_echo((s2, read_frame(bs)))
+    case Done{fr}:
+      (frame, rest) = fr
+      frame_echo((s2, read_frame(frame)))
 
-def frame_recv(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+def frame_recv(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> IO(Unit):
   (s, r) = m
   match r:
     case Fail{e}:
       Socket.close(s)
     case Done{u}:
       do IO<Unit>:
-        m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv_bytes(s)
+        m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- recv_framed(s, buf)
         frame_got(m2)
 
 def hs_reply(m: Socket & Result<&1, &1, U32 & String, String>) -> IO(Unit):
@@ -610,7 +881,7 @@ def hs_reply(m: Socket & Result<&1, &1, U32 & String, String>) -> IO(Unit):
     case Done{resp}:
       do IO<Unit>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, resp)
-        frame_recv(sent)
+        frame_recv(sent, [])
 
 def hs_recv(m: Socket & Result<&1, &1, U32 & String, String>) -> IO(Unit):
   (s, r) = m
