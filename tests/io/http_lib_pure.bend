@@ -249,10 +249,35 @@ law chk_pack:
 def chk_pack():
   chk_pack.rd(HTTP.from_string("héllo ✓"))
 
+law chk_vr.bad.rd:
+  for r: Result<&1, &1, (U32 & String), String & String & List<&1, (String & String)> & String>
+  U32
+
+def chk_vr.bad.rd(r):
+  match r:
+    case Done{req}:
+      0
+    case Fail{(c, e)}:
+      b2u(U32.is_eq(c, 400))
+
+law chk_vr.reason:
+  for st: U32
+  for want: String
+  U32
+
+def chk_vr.reason(st, want):
+  b2u(String.eq(HTTP.reason(st), want))
+
+law chk_vr:
+  U32
+
+def chk_vr():
+  (chk_vr.bad.rd(HTTP.read_request("GET / HTTP/1.0\r\n\r\n")) + chk_vr.reason(418, "I'm a teapot") + chk_vr.reason(503, "Service Unavailable") + chk_vr.reason(999, "Status") : U32)
+
 law main:
   U32
 
 def main():
-  (chk_url() * 1000000 + chk_parse() * 100000 + chk_roundtrip() * 10000 + chk_response() * 1000 + chk_bad_req() * 100 + chk_keep() * 10 + chk_chunked() + chk_pack() : U32)
+  (chk_vr() * 10000000 + chk_url() * 1000000 + chk_parse() * 100000 + chk_roundtrip() * 10000 + chk_response() * 1000 + chk_bad_req() * 100 + chk_keep() * 10 + chk_chunked() + chk_pack() : U32)
 
-#|441441153
+#|481441153
