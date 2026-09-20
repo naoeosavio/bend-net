@@ -1,0 +1,31 @@
+# Ignore everything by default, then re-include what ships.
+*
+
+# Source
+!lib/
+!lib/**/*
+
+# Docs (CC BY 4.0 — see docs/LICENSE)
+!docs/
+!docs/**/*
+
+# Distribution output and metadata
+!package.json
+!tsconfig*
+!tsup*
+!readme.md
+!README.md
+!CHANGELOG*
+!CONTRIBUTING*
+!AGENTS.md
+!LICENSE*
+
+# Scratch / task tracking
+!tests/
+!tests/**/*
+# !.task/
+# !.task/**/*
+# !task*
+
+# Git
+!.gitignore
