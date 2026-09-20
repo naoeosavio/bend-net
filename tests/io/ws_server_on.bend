@@ -1,6 +1,7 @@
 # lib (ws_server_on): WS.server_on — the generic persistent server.
 # Pure: opcode consts, out_* builders, ping_reply/close_answer policy
-# (explicit OutOp wins, anything else falls back to pong/close echo).
+# (explicit OutOp wins, non-empty OutRaw wins too — it may glue the pong
+# with the next frame; OutRaw{[]} and OutMsg fall back to the auto-pong).
 # Net: one server_on echo handler serves text, ping, a second text and
 # close on the SAME connection (persistence proof); the client speaks
 # masked frames and reads unmasked replies with buf threaded step by
@@ -54,6 +55,18 @@ def is_outop(w, want_op, want):
     case WS.OutRaw{bs}:
       0
 
+law is_outraw:
+  for w: WS.WSOut
+  for +want: List<&2, U32>
+  U32
+
+def is_outraw(w, want):
+  match w:
+    case WS.OutRaw{bs}:
+      b2u(U32.is_eq(eq_list(bs, want), 1))
+    case _:
+      0
+
 law chk_ops:
   U32
 
@@ -70,7 +83,7 @@ law chk_ping:
   U32
 
 def chk_ping():
-  (is_outop(WS.ping_reply([1], WS.OutOp{5, [2]}), 5, [2]) * is_outop(WS.ping_reply([1], WS.OutMsg{WS.WSText{"x"}}), 10, [1]) * is_outop(WS.ping_reply([1], WS.OutRaw{[9]}), 10, [1]) : U32)
+  (is_outop(WS.ping_reply([1], WS.OutOp{5, [2]}), 5, [2]) * is_outop(WS.ping_reply([1], WS.OutMsg{WS.WSText{"x"}}), 10, [1]) * is_outop(WS.ping_reply([1], WS.OutRaw{[]}), 10, [1]) * is_outraw(WS.ping_reply([1], WS.OutRaw{[9]}), [9]) : U32)
 
 law chk_close:
   U32
