@@ -4,6 +4,8 @@
 # Source
 !lib/
 !lib/**/*
+!examples/
+!examples/**/*
 
 # Docs (CC BY 4.0 — see docs/LICENSE)
 !docs/
