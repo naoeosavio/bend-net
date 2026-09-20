@@ -118,10 +118,13 @@ type WSIn is Data:
 # Lifecycle events (server_on API): named open/message/ping/pong/close/
 # error over the frozen wire types. WSMessage/WSIn/WSOut stay byte-exact;
 # the persistent server maps each complete frame to one WSEv and answers
-# the handler's single WSOut per step, always sent verbatim — except ping
-# without an OutOp answer, which falls back to pong, and close, which
-# replies and shuts. Return OutRaw{[]} to continue silently on pong
-# (zero-byte send, no wire effect) or OutOp to override and close.
+# the handler's single WSOut per step, always sent verbatim — except ping,
+# where an OutOp or a non-empty OutRaw wins (OutRaw may glue the pong
+# with the next frame, like the server's echo step) and OutRaw{[]}/OutMsg
+# fall back to pong, and close, which replies and shuts. Return OutRaw{[]}
+# to continue silently on pong (zero-byte send, no wire effect) or OutOp
+# to override and close.
+# client_on mirrors the API over a connect (same WSEv/WSOut, sends masked).
 
 type WSEv is Data:
   EvOpen{}
@@ -155,6 +158,13 @@ def out_pong(+pay: List<&2, U32>) -> WSOut:
 def out_close(+pay: List<&2, U32>) -> WSOut:
   OutOp{op_close(), pay}
 
+def ping_reply.go(+pay: List<&2, U32>, +bs: List<&2, U32>) -> WSOut:
+  match bs:
+    case Nil{}:
+      out_pong(pay)
+    case _ <> _:
+      OutRaw{bs}
+
 def ping_reply(+pay: List<&2, U32>, out: WSOut) -> WSOut:
   match out:
     case OutOp{op, pp}:
@@ -162,7 +172,7 @@ def ping_reply(+pay: List<&2, U32>, out: WSOut) -> WSOut:
     case OutMsg{msg}:
       out_pong(pay)
     case OutRaw{bs}:
-      out_pong(pay)
+      ping_reply.go(pay, bs)
 
 def close_answer(+pay: List<&2, U32>, out: WSOut) -> WSOut:
   match out:
@@ -919,6 +929,8 @@ def recv_in_client_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Resul
 # only pack the next hop). recv_after answers a send before reading on:
 # a failed send short-circuits with no syscall and the dispatcher closes
 # on the Fail. hs_open answers the handshake send the same way.
+# close_done shuts after the close answer, both loops (ws_loop/client_loop):
+# the socket closes on the Fail and on the Done alike.
 
 def recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
   (s, r) = m
@@ -935,6 +947,14 @@ def hs_open(m: Socket & Result<&1, &1, U32 & String, Unit>, out: WSOut) -> IO(So
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
     case Done{u}:
       send_open_bytes((s, out_bytes(out)))
+
+def close_done(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      Socket.close(s)
+    case Done{u}:
+      Socket.close(s)
 
 def frame_echo(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>) -> IO(Unit):
   (s, r) = m
@@ -1081,8 +1101,8 @@ def ws_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & St
           +pp = pay
           do IO<Unit>:
             out : WSOut <- H(EvClose{pp})
-            u : Unit <- send_bytes((s, out_bytes(close_answer(pp, out))))
-            return u
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(close_answer(pp, out))))
+            close_done(m2)
         case EvError{code, msg}:
           do IO<Unit>:
             out : WSOut <- H(EvError{code, msg})
@@ -1304,3 +1324,274 @@ def recv_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>)
   do IO<Socket & Result<&1, &1, U32 & String, WSIn>>:
     m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> <- recv_op_client(sock)
     recv_got(m)
+
+# client_on: the generic persistent WS client, the mirror of server_on.
+# The handler rides the same template (~H: WSEv -> IO(WSOut), baked at
+# the call site as client_on~h). The handshake driver (client_hs, states
+# 0/1/3) connects, sends client_request, accumulates the response head
+# until the blank line under the same 16KB cap, and validates status 101
+# plus Sec-WebSocket-Accept = accept_of(key); anything else emits one
+# EvError and closes (the client must learn WHY it died, unlike the
+# server, whose caller already saw the accept). On success it emits one
+# EvOpen, sends the handler's WSOut masked (fixed key 1,2,3,4, like
+# client_send_op) and enters the frame loop (client_loop, states 1/2):
+# each complete server frame arrives unmasked via recv_in_client_framed
+# with its rest threaded as the next buf, maps to one WSEv, and the
+# handler's single WSOut goes out masked verbatim — EvPing without an
+# OutOp answer falls back to pong, EvClose replies close and shuts,
+# EvPong sends verbatim (OutRaw{[]} continues silently), EvError and a
+# transport Fail report through the handler and close. The loop mirrors
+# ws_loop with the mask sides swapped: the client sends masked and reads
+# unmasked, so the dispatch lives in its own def, not behind a flag.
+
+def client_out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match out:
+    case OutMsg{msg}:
+      +mm = msg
+      show_masked(True{}, msg_to_op(mm), msg_to_bytes(mm), 1, 2, 3, 4)
+    case OutOp{op, pay}:
+      show_masked(True{}, op, pay, 1, 2, 3, 4)
+    case OutRaw{bs}:
+      Done{bs}
+
+def client_recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{u}:
+      recv_in_client_framed(s, buf)
+
+def client_acc.go(hs: List<&1, String & String>, +want: String, got: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      got
+    case (n, v) <> t:
+      +hit = HTTP.eq_ci(n, "Sec-WebSocket-Accept")
+      +acc = String.eq(String.trim(v), want)
+      client_acc.go(t, want, Bool.or(got, Bool.and(hit, acc)))
+
+def client_ok_of(st: U32, hs: List<&1, String & String>, +want: String) -> Bool:
+  Bool.and(U32.is_eq(st, 101), client_acc.go(hs, want, False{}))
+
+@unsafe
+def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, ev: WSEv, +buf: List<&2, U32>) -> IO(Unit):
+  match st:
+    case 1:
+      (s, r, rest) = mf
+      match r:
+        case Fail{(c, m)}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{c, m})
+            x : Unit <- Socket.close(s)
+            return x
+        case Done{inn}:
+          match inn:
+            case InMsg{msg}:
+              client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvMsg{msg}, rest)
+            case InOp{fin, op, pay}:
+              match op:
+                case 8:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvClose{pay}, rest)
+                case 9:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPing{pay}, rest)
+                case 10:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPong{pay}, rest)
+                case 0:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "not data"}, rest)
+                case 1:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                case 2:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                case _:
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "bad frame"}, rest)
+    case 2:
+      (s, r, b) = mf
+      match ev:
+        case EvOpen{}:
+          do IO<Unit>:
+            out : WSOut <- H(EvOpen{})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
+            client_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvMsg{msg}:
+          do IO<Unit>:
+            out : WSOut <- H(EvMsg{msg})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
+            client_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvPing{pay}:
+          +pp = pay
+          do IO<Unit>:
+            out : WSOut <- H(EvPing{pp})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(ping_reply(pp, out))))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
+            client_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvPong{pay}:
+          do IO<Unit>:
+            out : WSOut <- H(EvPong{pay})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
+            client_loop(~H, 1, m3, EvError{0, ""}, [])
+        case EvClose{pay}:
+          +pp = pay
+          do IO<Unit>:
+            out : WSOut <- H(EvClose{pp})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(close_answer(pp, out))))
+            close_done(m2)
+        case EvError{code, msg}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{code, msg})
+            x : Unit <- Socket.close(s)
+            return x
+    case _:
+      IO.pure(Unit, Unit{})
+
+def client_hs.go(~H: WSEv -> IO(WSOut), s: Socket, ok: Bool, +want: String, +buf: List<&2, U32>) -> IO(Unit):
+  match ok:
+    case True{}:
+      do IO<Unit>:
+        out : WSOut <- H(EvOpen{})
+        m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+        m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
+        client_loop(~H, 1, m3, EvError{0, ""}, [])
+    case False{}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{400, "bad handshake"})
+        x : Unit <- Socket.close(s)
+        return x
+
+# The client's response head rides the BYTE lane: the 101 and the
+# server's first frame may coalesce in one segment, and a String recv
+# would swallow the frame bytes (UTF-8 decoding mangles them; the frame
+# loop then starves). client_scan_fit walks the accumulation for the
+# \r\n\r\n window (last three bytes carried, the new byte closes it);
+# client_scan_len answers the head's length including the terminator,
+# so state 1 splits head from rest by index (take/drop) and the rest
+# seeds the frame loop's buf — every byte read is consumed exactly
+# once. The head is ASCII by RFC, so decode rebuilds the String and
+# read_response parses it with the terminator glued back.
+
+def client_scan_fit.go(bs: List<&2, U32>, w0: U32, w1: U32, w2: U32) -> Bool:
+  match bs:
+    case Nil{}:
+      False{}
+    case b <> t:
+      +bb = b
+      +w00 = w0
+      +w11 = w1
+      +w22 = w2
+      +is_end = Bool.and(U32.is_eq(w00, 13), Bool.and(U32.is_eq(w11, 10), Bool.and(U32.is_eq(w22, 13), U32.is_eq(bb, 10))))
+      Bool.pick(Bool, is_end, True{}, client_scan_fit.go(t, w11, w22, bb))
+
+def client_scan_fit(bs: List<&2, U32>) -> Bool:
+  client_scan_fit.go(bs, 0, 0, 0)
+
+def client_scan_len.go(bs: List<&2, U32>, +n: U32, w0: U32, w1: U32, w2: U32) -> U32:
+  match bs:
+    case Nil{}:
+      0
+    case b <> t:
+      +bb = b
+      +w00 = w0
+      +w11 = w1
+      +w22 = w2
+      +is_end = Bool.and(U32.is_eq(w00, 13), Bool.and(U32.is_eq(w11, 10), Bool.and(U32.is_eq(w22, 13), U32.is_eq(bb, 10))))
+      Bool.pick(U32, is_end, (n + 4 : U32), client_scan_len.go(t, (n + 1 : U32), w11, w22, bb))
+
+def client_scan_len(bs: List<&2, U32>) -> U32:
+  client_scan_len.go(bs, 0, 0, 0, 0)
+
+@unsafe
+def client_hs(~H: WSEv -> IO(WSOut), st: U32, mr: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, mp: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, +acc: List<&2, U32>, +fit: Bool, +ok: Bool, +buf: List<&2, U32>, +want: String) -> IO(Unit):
+  match st:
+    case 0:
+      (s, r) = mr
+      match r:
+        case Fail{(c, m)}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{c, m})
+            x : Unit <- Socket.close(s)
+            return x
+        case Done{bs}:
+          +acc2 = List.append(&2, U32, acc, bs)
+          client_hs(~H, 1, (s, Done{Nil{}}), Fail{(0, "")}, acc2, client_scan_fit(acc2), Nat.is_le(List.length(&2, U32, acc2), 16384n), Nil{}, want)
+    case 1:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          +len = client_scan_len(acc)
+          +taken = List.take(&2, U32, acc, U32.to_nat(len))
+          +rest = List.drop(&2, U32, acc, U32.to_nat(len))
+          client_hs(~H, 3, (s, Done{Nil{}}), HTTP.read_response(HTTP.decode(taken) ++ "\r\n\r\n"), acc, fit, ok, rest, want)
+        case False{}:
+          match ok:
+            case True{}:
+              do IO<Unit>:
+                mr2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCP.recv_bytes(s, 8192)
+                client_hs(~H, 0, mr2, Fail{(0, "")}, acc, fit, ok, buf, want)
+            case False{}:
+              do IO<Unit>:
+                out : WSOut <- H(EvError{413, "head too large"})
+                x : Unit <- Socket.close(s)
+                return x
+    case 3:
+      (s, r) = mr
+      match mp:
+        case Fail{(c, m)}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{c, m})
+            x : Unit <- Socket.close(s)
+            return x
+        case Done{parsed}:
+          (st2, hs, body) = parsed
+          client_hs.go(~H, s, client_ok_of(st2, hs, want), want, buf)
+    case _:
+      IO.pure(Unit, Unit{})
+
+def client_start.ship(~H: WSEv -> IO(WSOut), m: Socket & Result<&1, &1, U32 & String, Unit>, +want: String) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{(c, m2)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m2})
+        x : Unit <- Socket.close(s)
+        return x
+    case Done{u}:
+      do IO<Unit>:
+        client_hs(~H, 0, (s, Done{Nil{}}), Fail{(0, "")}, Nil{}, False{}, True{}, Nil{}, want)
+
+def client_start.yes(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +want: String, +req_txt: String) -> IO(Unit):
+  match conn:
+    case Fail{(c, m)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m})
+        return Unit{}
+    case Done{sock}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, req_txt)
+        client_start.ship(~H, sent, want)
+
+def client_start.no(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, c: U32, +m: String) -> IO(Unit):
+  match conn:
+    case Fail{(c2, m2)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c2, m2})
+        return Unit{}
+    case Done{sock}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m})
+        x : Unit <- Socket.close(sock)
+        return x
+
+def client_start(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +want: String, req: Result<&1, &1, U32 & String, String>) -> IO(Unit):
+  match req:
+    case Fail{(c, m)}:
+      client_start.no(~H, conn, c, m)
+    case Done{req_txt}:
+      client_start.yes(~H, conn, want, req_txt)
+
+def client_on(~H: WSEv -> IO(WSOut), +host: String, port: U32, +path: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+    client_start(~H, conn, accept_of(key), client_request(host, path, key))
