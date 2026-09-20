@@ -20,6 +20,7 @@
 # - fetch reads at most 8x8192 bytes (64KB cap), then truncates.
 # - TCP kit has no DNS: use IPs or localhost (see demos/io_http_fetch).
 import Base
+import ./tcp.bend as TCP
 
 # Bytes
 # -----
@@ -1036,9 +1037,13 @@ def read_request.put(m: String, p: String, body: String, hs: Result<&1, &1, U32 
     case True{}:
       read_request.emit(m, p, body, hs)
 
-def read_request.ver(+m: String, +p: String, v: String, rest: List<&2, String>, body: String) ->
+def read_request.is11(m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>, ok: Bool, flag: Bool) ->
   Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.put(m, p, body, parse_headers(rest), valid_req_line(m, p))
+  read_request.put(m, p, body, hs, Bool.and(ok, flag))
+
+def read_request.ver(+m: String, +p: String, +v: String, rest: List<&2, String>, body: String) ->
+  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
+  read_request.is11(m, p, body, parse_headers(rest), valid_req_line(m, p), String.eq(String.trim(v), "HTTP/1.1"))
 
 def read_request.tail(m: String, p: String, v: String, tail: List<&2, String>, rest: List<&2, String>, body: String) ->
   Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
@@ -1110,22 +1115,48 @@ def read_request.capped(+s: String, ok: Bool) ->
 def read_request(+s: String) -> Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
   read_request.capped(s, Nat.is_le(String.length(s), 16384n))
 
-def reason.nf(st: U32, is_nf: Bool) -> String:
-  match is_nf:
-    case True{}:
-      "Not Found"
-    case False{}:
-      "Status"
-
-def reason.go(st: U32, is_ok: Bool, is_nf: Bool) -> String:
-  match is_ok:
-    case True{}:
+def reason(st: U32) -> String:
+  match st:
+    case 200:
       "OK"
-    case False{}:
-      reason.nf(st, is_nf)
-
-def reason(+st: U32) -> String:
-  reason.go(st, U32.is_eq(st, 200), U32.is_eq(st, 404))
+    case 201:
+      "Created"
+    case 204:
+      "No Content"
+    case 301:
+      "Moved Permanently"
+    case 302:
+      "Found"
+    case 304:
+      "Not Modified"
+    case 400:
+      "Bad Request"
+    case 401:
+      "Unauthorized"
+    case 403:
+      "Forbidden"
+    case 404:
+      "Not Found"
+    case 405:
+      "Method Not Allowed"
+    case 413:
+      "Content Too Large"
+    case 418:
+      "I'm a teapot"
+    case 429:
+      "Too Many Requests"
+    case 500:
+      "Internal Server Error"
+    case 501:
+      "Not Implemented"
+    case 502:
+      "Bad Gateway"
+    case 503:
+      "Service Unavailable"
+    case 504:
+      "Gateway Timeout"
+    case _:
+      "Status"
 
 def show_response.tail(+st: U32, +body: String, hs: Result<&1, &1, U32 & String, String>) ->
   Result<&1, &1, U32 & String, String>:
@@ -1255,9 +1286,9 @@ def read_head.chk(is11: Bool, m: String, p: String, rest: List<&2, String>, body
     case True{}:
       read_head.put(is11, m, p, body, parse_headers(rest))
 
-def read_head.ver(+m: String, +p: String, v: String, rest: List<&2, String>, body: String) ->
+def read_head.ver(+m: String, +p: String, +v: String, rest: List<&2, String>, body: String) ->
   Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.chk(String.eq(v, "HTTP/1.1"), m, p, rest, body, valid_req_line(m, p))
+  read_head.chk(String.eq(String.trim(v), "HTTP/1.1"), m, p, rest, body, valid_req_line(m, p))
 
 def read_head.parts4(m: String, p: String, v: String, tail: List<&2, String>, rest: List<&2, String>, body: String) ->
   Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
@@ -1601,6 +1632,54 @@ def dispatch(route: String & String & List<&1, String & String> & String -> IO(U
 
 # IO: fetch and serve
 # -------------------
+# The fetch lane is bytes (TCP.send/recv_bytes): the head/body cut is
+# the "\r\n\r\n" window (218762506) over List<&2, U32>, mirroring
+# body_of over raw bytes; the body decodes at the end.
+
+def bs_body.go(bs: List<&2, U32>, e: Bool, w: U32) -> List<&2, U32>:
+  match bs:
+    case Nil{}:
+      Nil{}
+    case b <> t:
+      match e:
+        case True{}:
+          b <> t
+        case False{}:
+          +w2 = (w * 256 + b : U32)
+          bs_body.go(t, U32.is_eq(w2, 218762506), w2)
+
+def bs_body(bs: List<&2, U32>) -> List<&2, U32>:
+  bs_body.go(bs, False{}, 0)
+
+def bs_head.go(bs: List<&2, U32>, e: Bool, w: U32, acc: List<&2, U32>) -> List<&2, U32>:
+  match bs:
+    case Nil{}:
+      List.reverse(&2, U32, acc)
+    case +b <> t:
+      match e:
+        case True{}:
+          List.reverse(&2, U32, acc)
+        case False{}:
+          +w2 = (w * 256 + b : U32)
+          bs_head.go(t, U32.is_eq(w2, 218762506), w2, b <> acc)
+
+def bs_head(bs: List<&2, U32>) -> List<&2, U32>:
+  bs_head.go(bs, False{}, 0, Nil{})
+
+def bs_take.go(bs: List<&2, U32>, n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
+  match bs:
+    case Nil{}:
+      List.reverse(&2, U32, acc)
+    case b <> t:
+      match n:
+        case 0n:
+          List.reverse(&2, U32, acc)
+        case 1n+k:
+          bs_take.go(t, k, b <> acc)
+
+def bs_take(bs: List<&2, U32>, n: Nat) -> List<&2, U32>:
+  bs_take.go(bs, n, Nil{})
+
 
 law fetch:
   for url: String
@@ -1611,12 +1690,88 @@ def fetch.fail(sock: Socket, e: U32 & String) -> IO(Result<&1, &1, U32 & String,
     x : Unit <- Socket.close(sock)
     return Fail{e}
 
-def fetch.finish(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
+# fetch.body: framing per the response head — chunked decodes via
+# unchunk, Content-Length cuts exactly CL bytes (short of CL is 413,
+# fail-closed: the 64KB cap truncates), no framing reads until EOF.
+
+# fetch.body.frame: one linear fold over the response headers (single
+# def — a per-header helper would cycle back into the fold, and user
+# files forbid forward calls). Content-Length selects arithmetically,
+# Transfer-Encoding: chunked ORs the flag; TE wins at the put.
+
+def fetch.body.frame.u(b: Bool) -> U32:
+  match b:
+    case True{}:
+      1
+    case False{}:
+      0
+
+def fetch.body.unc(r: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{bs}:
+      Done{decode(bs)}
+
+def fetch.body.cl.put(cl: U32, raw: List<&2, U32>, over: Bool) ->
+  Result<&1, &1, U32 & String, String>:
+  match over:
+    case True{}:
+      Fail{(413, "body too large")}
+    case False{}:
+      Done{decode(bs_take(raw, U32.to_nat(cl)))}
+
+def fetch.body.cl.len(+cl: U32, raw: List<&2, U32>, len: Nat) ->
+  Result<&1, &1, U32 & String, String>:
+  fetch.body.cl.put(cl, raw, Bool.and(U32.is_gt(cl, 0), Bool.not(Nat.is_le(U32.to_nat(cl), len))))
+
+def fetch.body.cl(cl: U32, +raw: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
+  fetch.body.cl.len(cl, raw, length_nat(raw))
+
+def fetch.body.frame.go(hs: List<&1, String & String>, +cl: U32, +ch: Bool) -> U32 & Bool:
+  match hs:
+    case Nil{}:
+      (cl, ch)
+    case (n, v) <> t:
+      +nn = n
+      +vv = v
+      +cl_u = fetch.body.frame.u(eq_ci(nn, "Content-Length"))
+      +v_cl = Maybe.default(&2, U32, U32.read(String.trim(vv)), 0)
+      +is_chunk = Bool.and(eq_ci(nn, "Transfer-Encoding"), eq_ci(String.trim(vv), "chunked"))
+      fetch.body.frame.go(t, (cl * (1 - cl_u) + v_cl * cl_u : U32), Bool.or(ch, is_chunk))
+
+def fetch.body.frame.put(raw: List<&2, U32>, fr: U32 & Bool) ->
+  Result<&1, &1, U32 & String, String>:
+  (cl, ch) = fr
+  match ch:
+    case True{}:
+      fetch.body.unc(unchunk(raw))
+    case False{}:
+      fetch.body.cl(cl, raw)
+
+def fetch.body.frame(hs: List<&1, String & String>, raw: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, String>:
+  fetch.body.frame.put(raw, fetch.body.frame.go(hs, 0, False{}))
+
+def fetch.body.head(parsed: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, raw: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, String>:
+  match parsed:
+    case Fail{e}:
+      Fail{e}
+    case Done{r}:
+      (st, hs, b0) = r
+      fetch.body.frame(hs, raw)
+
+def fetch.body(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
+  fetch.body.head(read_response(decode(bs_head(acc))), bs_body(acc))
+
+def fetch.finish(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     x : Unit <- Socket.close(sock)
-    return Done{body_of(acc)}
+    return fetch.body(acc)
 
-def fetch.after8fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after8fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1624,15 +1779,15 @@ def fetch.after8fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.finish(sock2, acc ++ part)
+        case h <> t:
+          fetch.finish(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv8(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after8fn(acc, m))
+def fetch.recv8(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after8fn(acc, m))
 
-def fetch.after7fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after7fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1640,15 +1795,15 @@ def fetch.after7fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv8(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv8(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv7(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after7fn(acc, m))
+def fetch.recv7(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after7fn(acc, m))
 
-def fetch.after6fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after6fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1656,15 +1811,15 @@ def fetch.after6fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv7(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv7(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv6(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after6fn(acc, m))
+def fetch.recv6(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after6fn(acc, m))
 
-def fetch.after5fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after5fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1672,15 +1827,15 @@ def fetch.after5fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv6(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv6(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv5(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after5fn(acc, m))
+def fetch.recv5(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after5fn(acc, m))
 
-def fetch.after4fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after4fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1688,15 +1843,15 @@ def fetch.after4fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv5(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv5(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv4(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after4fn(acc, m))
+def fetch.recv4(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after4fn(acc, m))
 
-def fetch.after3fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after3fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1704,15 +1859,15 @@ def fetch.after3fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv4(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv4(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv3(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after3fn(acc, m))
+def fetch.recv3(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after3fn(acc, m))
 
-def fetch.after2fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after2fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1720,15 +1875,15 @@ def fetch.after2fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv3(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv3(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv2(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after2fn(acc, m))
+def fetch.recv2(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after2fn(acc, m))
 
-def fetch.after1fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>) ->
+def fetch.after1fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1736,27 +1891,30 @@ def fetch.after1fn(acc: String, m: Socket & Result<&1, &1, U32 & String, String>
       fetch.fail(sock2, e)
     case Done{part}:
       match part:
-        case SNil{}:
+        case Nil{}:
           fetch.finish(sock2, acc)
-        case SCon{h, t}:
-          fetch.recv2(sock2, acc ++ part)
+        case h <> t:
+          fetch.recv2(sock2, List.append(&2, U32, acc, part))
 
-def fetch.recv1(sock: Socket, acc: String) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, String>, Result<&1, &1, U32 & String, String>, TCP.recv(sock, 8192), m => fetch.after1fn(acc, m))
+def fetch.recv1(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after1fn(acc, m))
 
-def fetch.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def fetch.exchange.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock, r) = sent
   match r:
     case Fail{e}:
       fetch.fail(sock, e)
     case Done{u}:
-      fetch.recv1(sock, SNil{})
+      fetch.recv1(sock, Nil{})
+
+def fetch.exchange(sock: Socket, text: String) -> IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
+    fetch.exchange.sent(sent)
 
 def fetch.sock(sock: Socket, host: String, path: String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n")
-    fetch.sent(sent)
+  fetch.exchange(sock, "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n")
 
 def fetch.conn(conn: Result<&1, &1, U32 & String, Socket>, host: String, path: String) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -1808,6 +1966,43 @@ def fetch.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U3
 def fetch(url):
   +u = url
   fetch.r(u, read_url(u))
+
+# send_request: any method with headers and body over the same byte
+# exchange; fetch is its GET-and-empty special case at the URL layer.
+
+def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, text: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{sock}:
+      fetch.exchange(sock, text)
+
+def send_request.go(host: String, port: U32, text: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+    send_request.conn(conn, text)
+
+def send_request.shown(shown: Result<&1, &1, U32 & String, String>, +host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match shown:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{text}:
+      send_request.go(host, port, text)
+
+def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String, fit: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match fit:
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
+    case True{}:
+      send_request.shown(show_request(method, path, hs, body), host, port)
+
+def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  send_request.fit(host, port, path, method, hs, body, Bool.and(valid_host(host), valid_port(port)))
 
 # Serve: single-shot with a caller handler, plus a hardcoded echo
 # loop (the loop reuses only top-level defs, never an affine
@@ -1919,5 +2114,166 @@ def echo.serve(l: Listener) -> IO(Unit):
     l2 : Listener <- echo.conn(m)
     echo.serve(l2)
 
+# server_on: the generic keep-alive server. The handler rides a
+# template (~H) — a def name baked at the call site (server_on~h) —
+# because a function value can neither be copied nor thread a loop in
+# affine user-land (no function type is Data). Request headers ride a
+# Data record (Hdr) so the parsed list can enter a + binder: the same
+# list feeds cl_of, keep_of and the handler tuple. The per-connection
+# task is ONE state machine (srv): accumulate head, parse, complete the
+# body at Content-Length, answer, and loop while keep-alive — the
+# states share one def because a helper per state would cycle and
+# forward calls are banned; every decision rides a parameter computed
+# at the caller (arguments, never scrutinees).
+
+type Hdr is Data:
+  Hdr{name: String, value: String}
+
+def to_hdrs(hs: List<&1, String & String>) -> List<&2, Hdr>:
+  match hs:
+    case Nil{}:
+      Nil{}
+    case (n, v) <> t:
+      Hdr{n, v} <> to_hdrs(t)
+
+def get_hdr.put(dflt: String, v: String, rec: String, hit: Bool) -> String:
+  match hit:
+    case True{}:
+      v
+    case False{}:
+      rec
+
+def get_hdr(+dflt: String, +name: String, hd: List<&2, Hdr>) -> String:
+  match hd:
+    case Nil{}:
+      dflt
+    case Hdr{n, v} <> t:
+      +vv = String.trim(v)
+      get_hdr.put(dflt, vv, get_hdr(dflt, name, t), eq_ci(n, name))
+
+def cl_of(hd: List<&2, Hdr>) -> U32:
+  Maybe.default(&2, U32, U32.read(get_hdr("0", "Content-Length", hd)), 0)
+
+def keep_of(is11: Bool, +hd: List<&2, Hdr>) -> Bool:
+  keep_alive.conn(String.to_lower(String.trim(get_hdr("", "Connection", hd))), is11)
+
+def srv.answer.show(keep: Bool, st: U32, hs: List<&1, String & String>, body: String) ->
+  Result<&1, &1, U32 & String, String>:
+  match keep:
+    case True{}:
+      show_response(st, ("Connection", "keep-alive") <> drop_conn(hs), body)
+    case False{}:
+      show_response(st, ("Connection", "close") <> drop_conn(hs), body)
+
+def srv.answer.resp(keep: Bool, resp: U32 & List<&1, String & String> & String) ->
+  Result<&1, &1, U32 & String, String>:
+  (st, hs, body) = resp
+  srv.answer.show(keep, st, hs, body)
+
+def srv.sent_str(m: Socket & Result<&1, &1, U32 & String, Unit>) ->
+  Socket & Result<&1, &1, U32 & String, String>:
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      (s, Fail{e})
+    case Done{u}:
+      (s, Done{SNil{}})
+
+def srv.parse(x: Bool & (String & String & List<&1, String & String> & String)) ->
+  String & String & List<&2, Hdr> & String & U32 & Bool:
+  (is11, req0) = x
+  (m, p, hs, body) = req0
+  +hd = to_hdrs(hs)
+  +cl = cl_of(hd)
+  kp = keep_of(is11, hd)
+  (m, p, hd, body, cl, kp)
+
+@unsafe
+def srv(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), st: U32, mr: Socket & Result<&1, &1, U32 & String, String>, mp: Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>, rq: String & String & List<&2, Hdr> & String & U32 & Bool, +is11: Bool, +hd: List<&2, Hdr>, +m: String, +p: String, +body: String, +cl: U32, +keep: Bool, +fit: Bool, +acc: String) ->
+  IO(Unit):
+  match st:
+    case 0:
+      (s, r) = mr
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{part}:
+          +acc2 = acc ++ part
+          srv(~H, 1, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body, cl, keep, has_blank(acc2), acc2)
+    case 1:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          srv(~H, 3, (s, Done{SNil{}}), read_head(acc), rq, is11, hd, m, p, body, cl, keep, fit, acc)
+        case False{}:
+          do IO<Unit>:
+            mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
+            srv(~H, 0, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
+    case 3:
+      (s, r) = mr
+      match mp:
+        case Fail{e}:
+          serve.ship(s, 400, [], "")
+        case Done{x}:
+          srv(~H, 6, (s, Done{SNil{}}), Fail{(0, SNil{})}, srv.parse(x), is11, hd, m, p, body, cl, keep, fit, acc)
+    case 6:
+      (s, r) = mr
+      (mm, pp, hd2, bd0, cl2, kp2) = rq
+      +bd3 = bd0
+      +cl3 = cl2
+      srv(~H, 2, (s, Done{SNil{}}), mp, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), is11, hd2, mm, pp, bd3, cl3, kp2, Nat.is_le(U32.to_nat(cl3), String.length(bd3)), acc)
+    case 2:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          do IO<Unit>:
+            resp : U32 & List<&1, String & String> & String <- H(m, p, hd, String.take(body, U32.to_nat(cl)))
+            shown : String <- IO.pass(String, srv.answer.resp(keep, resp))
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, shown)
+            mr2 : Socket & Result<&1, &1, U32 & String, String> = srv.sent_str(sent)
+            srv(~H, 4, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
+        case False{}:
+          do IO<Unit>:
+            mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
+            srv(~H, 5, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
+    case 5:
+      (s, r) = mr
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{part}:
+          +body2 = body ++ part
+          srv(~H, 2, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body2, cl, keep, Nat.is_le(U32.to_nat(cl), String.length(body2)), acc)
+    case 4:
+      (s, r) = mr
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{part}:
+          match keep:
+            case True{}:
+              +rest = String.drop(body, U32.to_nat(cl))
+              srv(~H, 0, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body, cl, keep, fit, rest)
+            case False{}:
+              Socket.close(s)
+    case _:
+      IO.pure(Unit, Unit{})
+
+def server.conn(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  (l, r) = m
+  do IO<Listener>:
+    s : Socket <- IO.pass(Socket, r)
+    IO.spawn(Unit, srv(~H, 0, (s, Done{SNil{}}), Fail{(0, SNil{})}, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), False{}, Nil{}, SNil{}, SNil{}, SNil{}, 0, False{}, False{}, SNil{}))
+    return l
+
+@unsafe
+def server_on(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), l: Listener) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    l2 : Listener <- server.conn(~H, m)
+    z : Unit <- server_on(~H, l2)
+    return z
 def ok(+body: String) -> U32 & List<&1, String & String> & String:
   (200, [("Content-Length", body_len.show(body))], body)
