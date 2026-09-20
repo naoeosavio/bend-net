@@ -111,11 +111,15 @@ async function main() {
     check(ev.data.equals(Buffer.from("c1")), "PONG_C1", `payload=${ev.data}`);
 
     ws.send("hello");
+    // The peer may glue echo + ping s2 in a single write (server_on
+    // answers both in one WSOut): hoist the ping waiter before the
+    // message wait, like ping_s1 above, so an early ping is not lost.
+    const ping_s2 = next_event(ws, ["ping"]);
     ev = await next_event(ws, ["message"]);
     const text = ev.data.toString();
     check(text === "hello", "ECHO", `message=${JSON.stringify(text)}`);
 
-    ev = await next_event(ws, ["ping"]);
+    ev = await ping_s2;
     check(ev.data.equals(Buffer.from("s2")), "PING_S2", `payload=${ev.data}`);
     // NOTE: `ws` ponged automatically; the server scores it.
 
