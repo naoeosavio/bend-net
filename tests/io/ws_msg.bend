@@ -4,6 +4,7 @@
 # plus text and binary echo. Scores 1000*pure + 100*raw + 10*text + bin.
 import Base
 import ../../lib/ws.bend as WS
+import ../../lib/tcp.bend as TCP
 
 law b2u:
   for b: Bool
@@ -309,8 +310,8 @@ def text_ok(r):
       b2u(String.eq(s, "Hi"))
 
 law bin_echo_got:
-  for m: Socket & Result<&1, &1, U32 & String, String>
-  for +want: String
+  for m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
+  for +want: List<&2, U32>
   IO(U32)
 
 def bin_echo_got(m, want):
@@ -320,15 +321,15 @@ def bin_echo_got(m, want):
       do IO<U32>:
         x : Unit <- Socket.close(s)
         return 0
-    case Done{txt}:
+    case Done{got}:
       do IO<U32>:
         x : Unit <- Socket.close(s)
-        return b2u(String.eq(txt, want))
+        return b2u(U32.is_eq(eq_list(got, want), 1))
 
 law bin_echo_sent:
   for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for +frame_txt: String
-  for +want: String
+  for +frame_txt: List<&2, U32>
+  for +want: List<&2, U32>
   IO(U32)
 
 def bin_echo_sent(m, frame_txt, want):
@@ -340,13 +341,14 @@ def bin_echo_sent(m, frame_txt, want):
         return 0
     case Done{u}:
       do IO<U32>:
-        got : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
+        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <-
+          TCP.recv_bytes(s, 8192)
         bin_echo_got(got, want)
 
 law bin_hs_got:
   for m: Socket & Result<&1, &1, U32 & String, String>
-  for +frame_txt: String
-  for +want: String
+  for +frame_txt: List<&2, U32>
+  for +want: List<&2, U32>
   IO(U32)
 
 def bin_hs_got(m, frame_txt, want):
@@ -358,13 +360,14 @@ def bin_hs_got(m, frame_txt, want):
         return 0
     case Done{hsresp}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, frame_txt)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <-
+          TCP.send_bytes(s, frame_txt)
         bin_echo_sent(sent, frame_txt, want)
 
 law bin_req_sent:
   for m: Socket & Result<&1, &1, U32 & String, Unit>
-  for +frame_txt: String
-  for +want: String
+  for +frame_txt: List<&2, U32>
+  for +want: List<&2, U32>
   IO(U32)
 
 def bin_req_sent(m, frame_txt, want):
@@ -382,8 +385,8 @@ def bin_req_sent(m, frame_txt, want):
 law bin_conn:
   for conn: Result<&1, &1, U32 & String, Socket>
   for +req_txt: String
-  for +frame_txt: String
-  for +want: String
+  for +frame_txt: List<&2, U32>
+  for +want: List<&2, U32>
   IO(U32)
 
 def bin_conn(conn, req_txt, frame_txt, want):
@@ -398,7 +401,7 @@ def bin_conn(conn, req_txt, frame_txt, want):
 law bin_frames_put:
   for mres: Result<&1, &1, U32 & String, List<&2, U32>>
   for eres: Result<&1, &1, U32 & String, List<&2, U32>>
-  Result<&1, &1, U32 & String, String & String>
+  Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>
 
 def bin_frames_put(mres, eres):
   match mres:
@@ -409,10 +412,10 @@ def bin_frames_put(mres, eres):
         case Fail{e}:
           Fail{e}
         case Done{eby}:
-          Done{(WS.string_of_bytes(mbytes), WS.string_of_bytes(eby))}
+          Done{(mbytes, eby)}
 
 law bin_frames:
-  Result<&1, &1, U32 & String, String & String>
+  Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>
 
 def bin_frames():
   bin_frames_put(WS.show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8), WS.show_frame(True{}, 2, [1, 2, 3, 250]))
@@ -421,7 +424,7 @@ law bin_go:
   for +host: String
   for port: U32
   for +req_txt: String
-  for frames: String & String
+  for frames: List<&2, U32> & List<&2, U32>
   IO(U32)
 
 def bin_go(host, port, req_txt, frames):
@@ -434,7 +437,7 @@ law bin_req_ok:
   for +host: String
   for port: U32
   for req: Result<&1, &1, U32 & String, String>
-  for frames: Result<&1, &1, U32 & String, String & String>
+  for frames: Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>
   IO(U32)
 
 def bin_req_ok(host, port, req, frames):
