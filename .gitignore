@@ -12,9 +12,7 @@
 !docs/**/*
 
 # Distribution output and metadata
-!package.json
-!tsconfig*
-!tsup*
+!package*
 !readme.md
 !README.md
 !CHANGELOG*
