@@ -12,15 +12,17 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { WebSocketServer } = require("ws");
 
+// Refuses Bun's builtin ws reimplementation (BunWebSocket): it loses
+// frames mid-session and crashes terminate() on half-open sockets,
+// which surfaces as harness timeouts. Run under node with the npm
+// ws resolvable (NODE_PATH=/tmp/wsport/node_modules).
+if (String(require("ws").WebSocket).includes("BunWebSocket")) {
+  console.log("FAIL harness: BunWebSocket detected, run under node");
+  process.exit(1);
+}
+
 const PORT = Number(process.argv[2] ?? 19880);
 const STEP_TIMEOUT_MS = 5000;
-
-// Pacing between back-to-back server writes. Bend reads with
-// single-shot TCP.recv and has no framing layer, so two frames in
-// one segment would merge into a single read. 100ms >> localhost
-// RTT: the client always consumes the first frame before the
-// second hits the wire.
-const PACE_MS = 100;
 
 /** @param ms {number} */
 function sleep(ms) {
@@ -82,7 +84,14 @@ let session_taken = false;
 
 wss.on("connection", (ws) => {
   if (session_taken) {
-    ws.terminate();
+    // A second connection (a retry, a probe) is rejected; terminate
+    // can throw on a half-open socket (Bun's ws does), so guard it:
+    // the running session must survive either way.
+    try {
+      ws.terminate();
+    } catch {
+      // half-open socket already gone — nothing to do here
+    }
     return;
   }
   session_taken = true;
@@ -104,7 +113,6 @@ wss.on("connection", (ws) => {
 async function run_session(ws) {
   check(true, "HS", "accepted");
 
-  await sleep(PACE_MS);
   ws.ping("s1");
   let ev = await next_event(ws, ["pong"]);
   check(ev.data.equals(Buffer.from("s1")), "PONG_S1", `payload=${ev.data}`);
@@ -118,7 +126,6 @@ async function run_session(ws) {
   check(text === "hello", "TEXT", `message=${JSON.stringify(text)}`);
   ws.send("hello");
   console.log("SENT echo");
-  await sleep(PACE_MS);
   ws.ping("s2");
 
   ev = await next_event(ws, ["pong"]);

@@ -13,6 +13,14 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const WebSocket = require("ws");
 
+// Refuses Bun's builtin ws reimplementation (BunWebSocket): it loses
+// frames mid-session, which surfaces as harness timeouts. Run under
+// node with the npm ws resolvable (NODE_PATH=/tmp/wsport/node_modules).
+if (String(WebSocket).includes("BunWebSocket")) {
+  console.log("FAIL harness: BunWebSocket detected, run under node");
+  process.exit(1);
+}
+
 const PORT = Number(process.argv[2] ?? 19880);
 const STEP_TIMEOUT_MS = 5000;
 
@@ -71,6 +79,11 @@ function check(cond, name, detail) {
 /** Runs the 6-step script against the server at PORT. */
 async function main() {
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chat`);
+  // The first ping may already be on the wire when open fires (a fast
+  // server sends it right after the handshake), so the listener goes
+  // on before the open wait: otherwise the event is missed and the
+  // step times out. This is harness ordering, not pacing.
+  const ping_s1 = next_event(ws, ["ping"]);
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error("timeout waiting for open"));
@@ -88,7 +101,9 @@ async function main() {
   try {
     // NOTE: `ws` answers pings with a pong automatically, so the
     // client only waits here; the server scores its pong.
-    let ev = await next_event(ws, ["ping"]);
+    // Awaits the hoisted listener: a second once("ping") here could
+    // be removed by the first one's cleanup during emit.
+    let ev = await ping_s1;
     check(ev.data.equals(Buffer.from("s1")), "PING_S1", `payload=${ev.data}`);
 
     ws.ping("c1");
