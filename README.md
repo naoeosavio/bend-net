@@ -1,8 +1,9 @@
 # bend-net
 
 HTTP/1.1 and WebSocket (RFC 6455) for [Bend](https://bend-lang.com),
-written in user-land Bend on top of the `TCP.*` kit. No TLS, no DNS. The
-only native code is the three byte-level socket effects in `lib/effs/`.
+written in user-land Bend on top of the `TCP.*` kit, with package-local
+DNS (no TLS). The only native code is the byte-level socket effects in
+`lib/effs/` plus the A-record resolver.
 
 ## Layout
 
@@ -14,14 +15,18 @@ lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
 lib/b64.bend              # base64, for the handshake accept
 lib/static.bend           # static-file handler on top of HTTP
 lib/tcp.bend              # byte-level socket effects (C + JS twins)
+lib/dns.bend              # DNS resolve: A lookup for name hosts (C + JS twins)
 lib/effs/tcp_send_bytes.* # send List<&2, U32> over a Socket
 lib/effs/tcp_recv_bytes.* # receive bytes from a Socket
 lib/effs/tcp_recv_frame.* # isolate exactly one WS frame, rest preserved
+lib/effs/dns_resolve.*    # resolve a host to one IPv4 (getaddrinfo / UDP query)
 tests/io/http_lib_pure.bend   # pure layer: URL, headers, framing, chunked, UTF-8
 tests/io/http_lib_fetch.bend  # IO: real loopback fetch + fail-closed paths
+tests/io/http_lib_fetch_host.bend # IO: fetch by name over loopback, Host preserved
 tests/io/http_lib_sec.bend    # security: CRLF/NUL injection, oversize, bad status
 tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
 tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
+tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
 examples/                 # runnable interop programs (not published)
 tasks/                    # engineering log (decisions, discoveries, checklists)
 ```
@@ -93,6 +98,25 @@ twin of Base's `TCP.send`/`TCP.recv`, so frames never go through UTF-8:
 
 All three hand the socket back as `Socket & Result<&1, &1, U32 & String, …>`
 on every path.
+
+## DNS
+
+`lib/dns.bend` (import as `DNS`) resolves a host to one IPv4 dotted
+quad, package-locally (`resolve(host) -> IO(Result<&1, &1, U32 & String,
+String>)`). Canonical dotted quads and `localhost` answer without the
+effect; everything else must pass the host checks (printable ASCII,
+253 bytes at most, dot-labels 1–63) or fails with `Fail 601`.
+
+Fail codes are stable numbers, never resolver text: `601` bad host,
+`602` host not found, `603` resolve failed (try again), `604` no IPv4
+address, `605` resolve error. The C twin rides `getaddrinfo` on a
+helper thread; the JS twin writes one A query over UDP to the first
+nameserver of `/etc/resolv.conf`, parking on the socket with a
+deadline (one retry). `fetch` and `send_request` connect by the
+resolved IP but send the ORIGINAL host in `Host` — virtual hosting
+never changes. A dotted quad that fails the canonical check
+(`256.1.1.1`, `01.2.3.4`) is asked as a NAME to the resolver (it fails
+602/603, never connects as if it were an IP).
 
 ## WebSocket
 
@@ -176,8 +200,8 @@ Any server talks to any client (`server.bend <-> client.js`,
 `cliente.bend <-> server.js`, `server_on.bend <-> client_native.js`,
 `cliente_on.bend <-> server_native.js`, ...). `check.sh --checks`
 typechecks the `.bend` files and syntax-checks the `.js` files;
-`http_real.bend` is a manual smoke test (pinned external IPs, no DNS)
-and never runs in the gate.
+`http_real.bend` is a manual smoke test of live sites BY NAME (it
+needs a working resolver) and never runs in the gate.
 
 ## Security policy
 
@@ -185,7 +209,8 @@ and never runs in the gate.
 - `read_*` caps the head at 16 KB; oversize is `Fail 413`.
 - Ports must be 1–65535; hosts reject whitespace, controls and NUL.
 - `fetch` reads at most 8 × 8192 bytes (64 KB cap), then truncates.
-- The TCP kit has no DNS: use IPs or `localhost`.
+- Name hosts resolve via `lib/dns.bend` (fail-closed, `Fail 601`–`605`);
+  the resolved IP is transport-only — `Host` keeps the original name.
 
 ## Publish
 
@@ -213,11 +238,17 @@ pasting the new line.
 ## Tests
 
 ```sh
-bend tests/io/http_lib_pure.bend      # 441441153
+bend tests/io/http_lib_pure.bend      # 481441153
 bend tests/io/http_lib_sec.bend       # 15
 bend tests/io/http_lib_fetch.bend     # 111
+bend tests/io/http_lib_fetch_cl.bend  # 111
+bend tests/io/http_lib_fetch_post.bend  # 111
+bend tests/io/http_lib_fetch_head.bend  # 11111
+bend tests/io/http_lib_fetch_host.bend  # 111
+bend tests/io/http_lib_server_on.bend   # 111
 bend tests/io/tcp_bytes.bend          # 11
 bend tests/io/tcp_bytes_loopback.bend # 1
+bend tests/io/dns_resolve.bend        # 1111111111
 bend tests/io/ws_crypto.bend          # 8
 bend tests/io/ws_handshake.bend       # 4
 bend tests/io/ws_frame.bend           # 6
@@ -238,20 +269,24 @@ bend tests/io/http_lib_pure.bend -o /tmp/pure.js && bun /tmp/pure.js
 bend tests/io/http_lib_pure.bend -o /tmp/purebin && /tmp/purebin
 ```
 
-## Note on the byte effects and `lib/tcp.bend`
+## Note on the byte effects and `lib/tcp.bend` / `lib/dns.bend`
 
 `lib/ws.bend` imports `./tcp.bend as TCP` and calls `TCP.send_bytes` /
-`TCP.recv_bytes` / `TCP.recv_frame`. Keeping the effects in the package
-(rather than in `Base`) is what makes the bundle self-contained: a hub
-consumer with a stock Base can `import 0x<hash>/lib/ws.bend as WS` and
-compile.
+`TCP.recv_bytes` / `TCP.recv_frame`; `lib/http.bend` imports
+`./dns.bend as DNS` and calls `DNS.resolve`. Keeping the effects in the
+package (rather than in `Base`) is what makes the bundle self-contained:
+a hub consumer with a stock Base can `import 0x<hash>/lib/ws.bend as WS`
+and compile.
 
 The effect host symbols are the defs' local names — `send_bytes_run`,
 `recv_bytes_run`, `recv_frame_run`, and the JS functions `send_bytes`,
 `recv_bytes`, `recv_frame` — while the `TCP` in a call site comes from
-the import alias. (A def named `TCP.recv_frame` would instead compile to
-the host `tcp_recv_frame`; that is the shape of the parallel
-`bend2/` Base patch, so the two trees are not interchangeable.)
+the import alias. The same holds for the resolver: the effect def is
+`dns_lookup` (`dns_lookup_run` / `dns_lookup`, `CID_DNS_LOOKUP`) and the
+public `resolve` is a pure wrapper in `lib/dns.bend`. (A def named
+`TCP.recv_frame` would instead compile to the host `tcp_recv_frame`;
+that is the shape of the parallel `bend2/` Base patch, so the two trees
+are not interchangeable.)
 
 The C side targets the Bend 2.0.21 runtime: `io_wait_on(w, fd, evts,
 time, more)` takes the deadline word (pass `0`), and `io_node` takes
@@ -261,4 +296,5 @@ four arguments.
 
 - TLS (`https://`, `wss://`): `fetch` currently refuses `https://` with
   `Fail 501`.
+- IPv6 (AAAA) resolution and connect: `dns.bend` answers A only.
 - Cluster run of the suite (`--gate`) and a first hub `--publish`.
