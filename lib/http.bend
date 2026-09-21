@@ -1,4 +1,5 @@
-# HTTP lib over the existing TCP kit (no TLS, no DNS).
+# HTTP lib over the existing TCP kit (no TLS), with package-local DNS
+# (./dns.bend) for name hosts.
 #
 # Reuses Base (String/List/U32/Nat/TCP/Socket/IO) and the two demos:
 # - io_http_fetch's blank-line cut (window word 218762506 = "\r\n\r\n")
@@ -18,8 +19,12 @@
 # - ports must be 1..65535; hosts reject whitespace and controls.
 # - https:// parses but fetch refuses with 501 (no TLS yet).
 # - fetch reads at most 8x8192 bytes (64KB cap), then truncates.
-# - TCP kit has no DNS: use IPs or localhost (see demos/io_http_fetch).
+# - name hosts resolve via ./dns.bend (A over UDP; Fail 601-605):
+#   fetch/send_request connect by the resolved IPv4 but send the
+#   ORIGINAL host in the Host header, so virtual hosting never
+#   changes; dotted quads and localhost take the pure fast path.
 import Base
+import ./dns.bend as DNS
 import ./tcp.bend as TCP
 
 # Bytes
@@ -1958,6 +1963,25 @@ def fetch.exchange_meth(sock: Socket, meth: String, text: String) -> IO(Result<&
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
     fetch.exchange.sent(meth, sent)
 
+# fetch.dial: resolve-then-connect. DNS.resolve answers the IPv4 the
+# connect rides; the ORIGINAL host keeps riding the caller's text
+# (fetch.sock/send_request build the Host header from it), so virtual
+# hosting never changes. A resolve failure fails with the DNS code
+# (601-605) before any socket exists, so no handle can leak.
+
+def fetch.dial.asked(port: U32, r: Result<&1, &1, U32 & String, String>) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
+    case Done{ip}:
+      TCP.connect(ip, port)
+
+def fetch.dial(+host: String, port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
+  do IO<Result<&1, &1, U32 & String, Socket>>:
+    r : Result<&1, &1, U32 & String, String> <- DNS.resolve(host)
+    fetch.dial.asked(port, r)
+
 def fetch.sock(sock: Socket, host: String, path: String) -> IO(Result<&1, &1, U32 & String, String>):
   fetch.exchange(sock, "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n")
 
@@ -1971,7 +1995,7 @@ def fetch.conn(conn: Result<&1, &1, U32 & String, Socket>, host: String, path: S
 
 def fetch.go(+host: String, port: U32, path: String) -> IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+    conn : Result<&1, &1, U32 & String, Socket> <- fetch.dial(host, port)
     fetch.conn(conn, host, path)
 
 def fetch.port(host: String, port: U32, path: String, ok: Bool) -> IO(Result<&1, &1, U32 & String, String>):
@@ -2014,8 +2038,9 @@ def fetch(url):
 
 # send_request: any method with headers and body over the same byte
 # exchange; fetch is its GET-and-empty special case at the URL layer.
-# HTTP/1.1 requires Host, so the host used to connect is injected as
-# the Host header (a caller-supplied Host is dropped first).
+# HTTP/1.1 requires Host, so the ORIGINAL host is injected as the Host
+# header (a caller-supplied Host is dropped first); the connection
+# itself rides the IPv4 DNS.resolve answered for that host.
 
 def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, meth: String, text: String) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -2028,7 +2053,7 @@ def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, meth: String, 
 def send_request.go(host: String, port: U32, meth: String, text: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+    conn : Result<&1, &1, U32 & String, Socket> <- fetch.dial(host, port)
     send_request.conn(conn, meth, text)
 
 def send_request.shown(shown: Result<&1, &1, U32 & String, String>, +host: String, +port: U32, +meth: String) ->
