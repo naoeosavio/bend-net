@@ -7,7 +7,7 @@ only native code is the three byte-level socket effects in `lib/effs/`.
 ## Layout
 
 ```text
-package.bend              # package entry (publish this file)
+lib/package.bend          # package entry (publish this file)
 lib/http.bend             # HTTP/1.1 library (~1900 lines, imports Base only)
 lib/ws.bend               # WebSocket server + client (text/binary, control)
 lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
@@ -48,7 +48,7 @@ entry only marks the bundle — import the API from its own file:
 
 ```bend
 import Base
-import 0x<hash>/lib/http.bend as HTTP
+import 0x<hash>/http.bend as HTTP
 ```
 
 ## API
@@ -189,20 +189,20 @@ and never runs in the gate.
 
 ## Publish
 
-One command uploads `package.bend` with everything it imports and prints
+One command uploads `lib/package.bend` with everything it imports and prints
 the import lines. No sign-up: proof of work takes its place. No `TODO` or
 open law can land (`law fetch` is filled by `def fetch`; the `@unsafe`
 defs are the HTTP echo and WS accept/event loops; the byte effects carry
 their `.c`/`.js` twins).
 
 ```sh
-bend package.bend --publish
+bend lib/package.bend --publish
 # 0x<hash>
-# import 0x<hash>/lib/http.bend as HTTP
-# import 0x<hash>/lib/ws.bend   as WS
-# import 0x<hash>/lib/sha1.bend as SHA1
-# import 0x<hash>/lib/b64.bend  as B64
-# import 0x<hash>/lib/tcp.bend  as TCP
+# import 0x<hash>/http.bend as HTTP
+# import 0x<hash>/ws.bend   as WS
+# import 0x<hash>/sha1.bend as SHA1
+# import 0x<hash>/b64.bend  as B64
+# import 0x<hash>/tcp.bend  as TCP
 ```
 
 The first run of an importer fetches the package from the hub into
@@ -229,7 +229,7 @@ bend tests/io/ws_framed.bend          # 4
 ```
 
 Each file ends with a `#|` line holding the expected output — that is the
-PASS/FAIL gate. A file with no `main` (like `package.bend`) instead prints
+PASS/FAIL gate. A file with no `main` (like `lib/package.bend`) instead prints
 `All terms check.`; the echo server's `@unsafe` annotation is expected.
 JS and C lanes:
 
