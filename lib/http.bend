@@ -1710,6 +1710,9 @@ def fetch.fail(sock: Socket, e: U32 & String) -> IO(Result<&1, &1, U32 & String,
 # fetch.body: framing per the response head — chunked decodes via
 # unchunk, Content-Length cuts exactly CL bytes (short of CL is 413,
 # fail-closed: the 64KB cap truncates), no framing reads until EOF.
+# Responses with no content by spec (HEAD, 1xx, 204, 304 — RFC 9110
+# 9.3.2, RFC 9112 6.4) short-circuit to an empty body: the head may
+# still carry the GET's Content-Length, so the CL check must not run.
 
 # fetch.body.frame: one linear fold over the response headers (single
 # def — a per-header helper would cycle back into the fold, and user
@@ -1767,28 +1770,48 @@ def fetch.body.frame.put(raw: List<&2, U32>, fr: U32 & Bool) ->
     case False{}:
       fetch.body.cl(cl, raw)
 
-def fetch.body.frame(hs: List<&1, String & String>, raw: List<&2, U32>) ->
-  Result<&1, &1, U32 & String, String>:
-  fetch.body.frame.put(raw, fetch.body.frame.go(hs, 0, False{}))
+def fetch.body.no_body(+meth: String, +st: U32) -> Bool:
+  Bool.or(eq_ci(meth, "HEAD"),
+    Bool.or(U32.is_lt(st, 200),
+      Bool.or(U32.is_eq(st, 204), U32.is_eq(st, 304))))
 
-def fetch.body.head(parsed: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, raw: List<&2, U32>) ->
+def fetch.body.frame(nb: Bool, raw: List<&2, U32>, fr: U32 & Bool) ->
+  Result<&1, &1, U32 & String, String>:
+  match nb:
+    case True{}:
+      Done{SNil{}}
+    case False{}:
+      fetch.body.frame.put(raw, fr)
+
+def fetch.body.head(meth: String, parsed: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, raw: List<&2, U32>) ->
   Result<&1, &1, U32 & String, String>:
   match parsed:
     case Fail{e}:
       Fail{e}
     case Done{r}:
       (st, hs, b0) = r
-      fetch.body.frame(hs, raw)
+      +nb = fetch.body.no_body(meth, st)
+      fr = fetch.body.frame.go(hs, 0, False{})
+      fetch.body.frame(nb, raw, fr)
 
-def fetch.body(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
-  fetch.body.head(read_response(decode(bs_head(acc))), bs_body(acc))
+def fetch.body(meth: String, +acc: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
+  fetch.body.head(meth, read_response(decode(bs_head(acc))), bs_body(acc))
 
-def fetch.finish(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+# The recv loop is unrolled 8x and the index counts DOWN: afterNfn
+# handles the result of the Nth recv and calls recv(N+1) — so the
+# chain runs recv1 → after1fn → recv2 → ... → recv8 → after8fn →
+# finish, at most 8×8192 = 64KB. The defs sit in DESCENDING order so
+# every callee is above its caller (no forward calls). The +1 is the
+# termination budget: afterNfn → recvN would re-check and loop recv1
+# forever (the checker rejects it as a name-scope cycle). Thread the
+# meth param through every hop when touching this chain.
+
+def fetch.finish(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     x : Unit <- Socket.close(sock)
-    return fetch.body(acc)
+    return fetch.body(meth, acc)
 
-def fetch.after8fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after8fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1797,14 +1820,14 @@ def fetch.after8fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.finish(sock2, List.append(&2, U32, acc, part))
+          fetch.finish(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv8(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after8fn(acc, m))
+def fetch.recv8(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after8fn(meth, acc, m))
 
-def fetch.after7fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after7fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1813,14 +1836,14 @@ def fetch.after7fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv8(sock2, List.append(&2, U32, acc, part))
+          fetch.recv8(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv7(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after7fn(acc, m))
+def fetch.recv7(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after7fn(meth, acc, m))
 
-def fetch.after6fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after6fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1829,14 +1852,14 @@ def fetch.after6fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv7(sock2, List.append(&2, U32, acc, part))
+          fetch.recv7(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv6(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after6fn(acc, m))
+def fetch.recv6(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after6fn(meth, acc, m))
 
-def fetch.after5fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after5fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1845,14 +1868,14 @@ def fetch.after5fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv6(sock2, List.append(&2, U32, acc, part))
+          fetch.recv6(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv5(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after5fn(acc, m))
+def fetch.recv5(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after5fn(meth, acc, m))
 
-def fetch.after4fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after4fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1861,14 +1884,14 @@ def fetch.after4fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv5(sock2, List.append(&2, U32, acc, part))
+          fetch.recv5(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv4(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after4fn(acc, m))
+def fetch.recv4(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after4fn(meth, acc, m))
 
-def fetch.after3fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after3fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1877,14 +1900,14 @@ def fetch.after3fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv4(sock2, List.append(&2, U32, acc, part))
+          fetch.recv4(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv3(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after3fn(acc, m))
+def fetch.recv3(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after3fn(meth, acc, m))
 
-def fetch.after2fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after2fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1893,14 +1916,14 @@ def fetch.after2fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv3(sock2, List.append(&2, U32, acc, part))
+          fetch.recv3(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv2(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after2fn(acc, m))
+def fetch.recv2(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after2fn(meth, acc, m))
 
-def fetch.after1fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def fetch.after1fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock2, r) = m
   match r:
@@ -1909,26 +1932,31 @@ def fetch.after1fn(acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, 
     case Done{part}:
       match part:
         case Nil{}:
-          fetch.finish(sock2, acc)
+          fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv2(sock2, List.append(&2, U32, acc, part))
+          fetch.recv2(sock2, meth, List.append(&2, U32, acc, part))
 
-def fetch.recv1(sock: Socket, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after1fn(acc, m))
+def fetch.recv1(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
+  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after1fn(meth, acc, m))
 
-def fetch.exchange.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def fetch.exchange.sent(meth: String, sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Result<&1, &1, U32 & String, String>):
   (sock, r) = sent
   match r:
     case Fail{e}:
       fetch.fail(sock, e)
     case Done{u}:
-      fetch.recv1(sock, Nil{})
+      fetch.recv1(sock, meth, Nil{})
 
 def fetch.exchange(sock: Socket, text: String) -> IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
-    fetch.exchange.sent(sent)
+    fetch.exchange.sent("GET", sent)
+
+def fetch.exchange_meth(sock: Socket, meth: String, text: String) -> IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
+    fetch.exchange.sent(meth, sent)
 
 def fetch.sock(sock: Socket, host: String, path: String) -> IO(Result<&1, &1, U32 & String, String>):
   fetch.exchange(sock, "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n")
@@ -1989,27 +2017,27 @@ def fetch(url):
 # HTTP/1.1 requires Host, so the host used to connect is injected as
 # the Host header (a caller-supplied Host is dropped first).
 
-def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, text: String) ->
+def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, meth: String, text: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
     case Done{sock}:
-      fetch.exchange(sock, text)
+      fetch.exchange_meth(sock, meth, text)
 
-def send_request.go(host: String, port: U32, text: String) ->
+def send_request.go(host: String, port: U32, meth: String, text: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
-    send_request.conn(conn, text)
+    send_request.conn(conn, meth, text)
 
-def send_request.shown(shown: Result<&1, &1, U32 & String, String>, +host: String, +port: U32) ->
+def send_request.shown(shown: Result<&1, &1, U32 & String, String>, +host: String, +port: U32, +meth: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   match shown:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
     case Done{text}:
-      send_request.go(host, port, text)
+      send_request.go(host, port, meth, text)
 
 def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -2017,7 +2045,7 @@ def send_request.fit(+host: String, +port: U32, +path: String, +method: String, 
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
     case True{}:
-      send_request.shown(show_request(method, path, ("Host", host) <> drop_host(hs), body), host, port)
+      send_request.shown(show_request(method, path, ("Host", host) <> drop_host(hs), body), host, port, method)
 
 def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):
