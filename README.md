@@ -2,29 +2,35 @@
 
 HTTP/1.1 and WebSocket (RFC 6455) for [Bend](https://bend-lang.com),
 written in user-land Bend on top of the `TCP.*` kit, with package-local
-DNS (no TLS). The only native code is the byte-level socket effects in
-`lib/effs/` plus the A-record resolver.
+DNS and TLS (client + server, ALPN `h2` for the coming HTTP/2). The
+native code is the byte-level socket effects, the A-record resolver and
+the TLS effects in `lib/effs/` (OpenSSL via dlopen — no link flags).
 
 ## Layout
 
 ```text
 lib/package.bend          # package entry (publish this file)
-lib/http.bend             # HTTP/1.1 library (~1900 lines, imports Base only)
+lib/http.bend             # HTTP/1.1 library (~2350 lines, imports Base only)
 lib/ws.bend               # WebSocket server + client (text/binary, control)
 lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
 lib/b64.bend              # base64, for the handshake accept
 lib/static.bend           # static-file handler on top of HTTP
 lib/tcp.bend              # byte-level socket effects (C + JS twins)
 lib/dns.bend              # DNS resolve: A lookup for name hosts (C + JS twins)
+lib/tls.bend              # TLS client + server effects (C + JS twins, OpenSSL)
+lib/http2.bend            # HTTP/2 codec + client/server over TLS (pure Bend)
 lib/effs/tcp_send_bytes.* # send List<&2, U32> over a Socket
 lib/effs/tcp_recv_bytes.* # receive bytes from a Socket
 lib/effs/tcp_recv_frame.* # isolate exactly one WS frame, rest preserved
 lib/effs/dns_resolve.*    # resolve a host to one IPv4 (getaddrinfo / UDP query)
+lib/effs/tls_*.{c,js}     # TLS connect/accept/send/recv/close (dlopen libssl)
 tests/io/http_lib_pure.bend   # pure layer: URL, headers, framing, chunked, UTF-8
 tests/io/http_lib_fetch.bend  # IO: real loopback fetch + fail-closed paths
 tests/io/http_lib_fetch_host.bend # IO: fetch by name over loopback, Host preserved
 tests/io/http_lib_sec.bend    # security: CRLF/NUL injection, oversize, bad status
 tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
+tests/io/tls_connect_close.bend # IO: TLS loopback echo + fail paths (611/612)
+tests/io/h2_loopback.bend       # IO: HTTP/2 echo over TLS (Bend↔Bend)
 tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
 tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
 examples/                 # runnable interop programs (not published)
@@ -117,6 +123,52 @@ resolved IP but send the ORIGINAL host in `Host` — virtual hosting
 never changes. A dotted quad that fails the canonical check
 (`256.1.1.1`, `01.2.3.4`) is asked as a NAME to the resolver (it fails
 602/603, never connects as if it were an IP).
+
+## TLS
+
+`lib/tls.bend` (import as `TLS`) is a client and server TLS lane over
+the byte effects, riding OpenSSL through `dlopen` (no link flags, both
+the C and JS twins):
+
+| Function | Description |
+|---|---|
+| `tls_connect(host, port)` | Resolve (DNS), connect and handshake with chain verification; SNI is the ORIGINAL host; ALPN `h2` is required |
+| `tls_connect_insecure(host, port)` | Same handshake without chain verification (loopback/self-signed tests) |
+| `tls_accept(listener, cert, key)` | Accept one TCP connection and handshake it with the PEM cert/key files; ALPN `h2` preferred |
+| `tls_send_bytes` / `tls_recv_bytes` | Byte-faithful send/recv (List<&2, U32>) over the TLS socket; WANT_READ/WANT_WRITE parks |
+| `tls_close` | Orderly shutdown, session free, fd close |
+
+Fail codes are stable numbers: `611` bad input (port/host), `612` dial
+failed, `613` handshake failed, `614` verify failed, `615` ALPN
+mismatch, `616` TLS IO error. The TLS handle is opaque (never a raw
+fd): close it with `TLS.tls_close`, not `Socket.close`. DNS failures
+keep the 601-605 codes and happen before any socket exists.
+
+```sh
+bend tests/io/tls_connect_close.bend   # 111
+```
+
+## HTTP/2
+
+`lib/http2.bend` (import as `H2`) is a native HTTP/2 (RFC 7540/7541)
+client and server riding the TLS lane — frames and HPACK are pure
+Bend, no nghttp2/node:http2:
+
+| Function | Description |
+|---|---|
+| `h2_connect(host, port)` / `h2_connect_insecure` | TLS dial, magic preface + SETTINGS |
+| `h2_request(sock, sid, method, path, headers, body)` | One request/response exchange on stream `sid` (1, 3, 5, ...); the socket and next sid thread back |
+| `h2_serve_once(sock, handler)` | Serve one request stream: preface, SETTINGS, HEADERS/DATA → `handler(H2Request) -> IO(H2Response)` → response frames |
+
+HPACK rides literal-without-indexing plus the static table; huffman
+strings and dynamic-table references are refused with `Fail 502`
+(fail-closed), so h2 peers here are Bend↔Bend. Streams are served
+sequentially per connection (the affine handle keeps reads linear);
+interleaved multiplexing, huffman decode and CONTINUATION are backlog.
+
+```sh
+bend tests/io/h2_loopback.bend         # 1
+```
 
 ## WebSocket
 
@@ -249,6 +301,8 @@ bend tests/io/http_lib_server_on.bend   # 111
 bend tests/io/tcp_bytes.bend          # 11
 bend tests/io/tcp_bytes_loopback.bend # 1
 bend tests/io/dns_resolve.bend        # 1111111111
+bend tests/io/tls_connect_close.bend  # 111
+bend tests/io/h2_loopback.bend        # 1
 bend tests/io/ws_crypto.bend          # 8
 bend tests/io/ws_handshake.bend       # 4
 bend tests/io/ws_frame.bend           # 6
@@ -294,7 +348,7 @@ four arguments.
 
 ## Roadmap
 
-- TLS (`https://`, `wss://`): `fetch` currently refuses `https://` with
-  `Fail 501`.
+- HTTP/2 backlog: huffman decode, dynamic table, interleaved
+  multiplexing, CONTINUATION, h2c (cleartext).
 - IPv6 (AAAA) resolution and connect: `dns.bend` answers A only.
 - Cluster run of the suite (`--gate`) and a first hub `--publish`.
