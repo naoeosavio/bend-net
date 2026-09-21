@@ -1,34 +1,58 @@
 // Event-driven WebSocket server for ping/pong interop with Bend.
 // Uses the standard `ws` library: the ON mirror of server_native.js,
-// shaped after WS.server_on (~h.serve) in lib/exemplos/server_on.bend.
+// shaped after WS.server_on (~h.serve) in examples/server_on.bend.
 // Same 6-step script: accept -> ping "s1" -> pong "s1" -> ping "c1"
 // (auto-pong by the lib) -> text "hello" -> echo + ping "s2" ->
 // pong "s2" -> close. Stateless like server_on.bend: every step is
 // identified by (opcode, payload), so no counter threads the handlers.
 // Prints one line per check and DONE 6/6 (grep rule: pass = DONE
 // present with no FAIL); a failed check prints FAIL and closes early.
-// Needs `ws` resolvable: NODE_PATH=/tmp/wsport/node_modules
+// Needs `ws` resolvable under node: NODE_PATH=/tmp/wsport/node_modules
 // Usage: NODE_PATH=/tmp/wsport/node_modules node server_on.js [port]
+//        bun server_on.js [port]
 // (default port 19880)
 
 import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
+// bun provides a global require; node ESM does not, so build one
+// there from the npm ws resolvable via NODE_PATH.
+const require = globalThis.require ?? createRequire(import.meta.url);
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-
-// Refuses Bun's builtin ws reimplementation (BunWebSocket): it loses
-// frames mid-session, which surfaces as harness timeouts. Run under
-// node with the npm ws resolvable (NODE_PATH=/tmp/wsport/node_modules).
-if (String(WebSocket).includes("BunWebSocket")) {
-  console.log("FAIL harness: BunWebSocket detected, run under node");
-  process.exit(1);
-}
 
 const PORT = Number(process.argv[2] ?? 19880);
 const SESSION_TIMEOUT_MS = 15000;
 
 let score = 0;
+// Live session handles for the failure path below. The server takes a
+// single session (see session_taken), so module-level handles are enough.
+let active_ws = null;
+let active_guard = null;
+
+/**
+ * Shuts the session down after a failure without throwing out of
+ * an event-emitter callback (a throw there would be uncaught and
+ * crash the process with a stack on top of the FAIL line).
+ */
+function fail_session(message) {
+  console.log(message);
+  process.exitCode = 1;
+  if (active_guard !== null) {
+    clearTimeout(active_guard);
+  } else {
+    // timer not armed yet — nothing to do here
+  }
+  if (active_ws !== null) {
+    try {
+      active_ws.terminate();
+    } catch {
+      // socket already gone — nothing to do here
+    }
+  } else {
+    // no live socket — nothing to do here
+  }
+  wss.close();
+}
 
 /**
  * Fails the session unless `cond` holds.
@@ -39,19 +63,19 @@ let score = 0;
  */
 function check(cond, name, detail) {
   if (!cond) {
-    console.log(`FAIL ${name}: ${detail}`);
-    process.exitCode = 1;
-    throw new Error(`FAIL ${name}`);
+    fail_session(`FAIL ${name}: ${detail}`);
+  } else {
+    score += 1;
+    console.log(`OK ${name}`);
   }
-  score += 1;
-  console.log(`OK ${name}`);
 }
 
 /** Runs the stateless 6-step script for one connection.
  *
  * @param ws {import("ws").WebSocket} - The peer socket.
+ * @param guard {NodeJS.Timeout} - The per-session timeout to clear on close.
  */
-function run_session(ws) {
+function run_session(ws, guard) {
   check(true, "HS", "accepted");
   ws.ping("s1");
 
@@ -90,6 +114,12 @@ function run_session(ws) {
   });
 
   ws.on("close", () => {
+    clearTimeout(guard);
+    if (process.exitCode === 1) {
+      // a FAIL was already logged — no DONE here
+      wss.close();
+      return;
+    }
     check(true, "CLOSE", "handshake done");
     console.log(`DONE ${score}/6`);
     wss.close();
@@ -126,8 +156,10 @@ wss.on("connection", (ws) => {
     wss.close();
   }, SESSION_TIMEOUT_MS);
   guard.unref();
+  active_ws = ws;
+  active_guard = guard;
   try {
-    run_session(ws);
+    run_session(ws, guard);
   } catch (err) {
     clearTimeout(guard);
     if (process.exitCode !== 1) {

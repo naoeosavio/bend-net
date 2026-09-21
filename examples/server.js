@@ -3,23 +3,17 @@
 // Script (6 checks): accept -> ping "s1" -> pong "s1" ->
 // ping "c1" -> auto-pong -> text "hello" -> echo + ping "s2" ->
 // pong "s2" -> close. Prints one line per check and DONE n/6.
-// Needs `ws` resolvable: NODE_PATH=/tmp/wsport/node_modules
+// Needs `ws` resolvable under node: NODE_PATH=/tmp/wsport/node_modules
 // Usage: NODE_PATH=/tmp/wsport/node_modules node server.js [port]
+//        bun server.js [port]
 // (default port 19880)
 
 import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
+// bun provides a global require; node ESM does not, so build one
+// there from the npm ws resolvable via NODE_PATH.
+const require = globalThis.require ?? createRequire(import.meta.url);
 const { WebSocketServer } = require("ws");
-
-// Refuses Bun's builtin ws reimplementation (BunWebSocket): it loses
-// frames mid-session and crashes terminate() on half-open sockets,
-// which surfaces as harness timeouts. Run under node with the npm
-// ws resolvable (NODE_PATH=/tmp/wsport/node_modules).
-if (String(require("ws").WebSocket).includes("BunWebSocket")) {
-  console.log("FAIL harness: BunWebSocket detected, run under node");
-  process.exit(1);
-}
 
 const PORT = Number(process.argv[2] ?? 19880);
 const STEP_TIMEOUT_MS = 5000;
@@ -131,8 +125,12 @@ async function run_session(ws) {
   ev = await next_event(ws, ["pong"]);
   check(ev.data.equals(Buffer.from("s2")), "PONG_S2", `payload=${ev.data}`);
 
+  // Hoists the close waiter before the close action (like ping_s1 on
+  // the client): some shims emit "close" synchronously on close(),
+  // and a listener attached after would miss it and time out.
+  const closed = next_event(ws, ["close"]);
   ws.close();
-  ev = await next_event(ws, ["close"]);
+  ev = await closed;
   check(true, "CLOSE", `code=${ev.data}`);
 
   console.log(`DONE ${score}/6`);

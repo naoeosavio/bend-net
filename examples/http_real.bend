@@ -8,9 +8,9 @@
 # hand the bytes to HTTP.fetch.exchange (the lib's framer: chunked,
 # Content-Length, UTF-8).
 #
-#   bun bend2/main.ts lib/exemplos/http_real.bend
+#   bend examples/http_real.bend
 import Base
-import ../http.bend as HTTP
+import ../lib/http.bend as HTTP
 
 def emit(label: String, r: Result<&1, &1, U32 & String, String>) -> IO(Unit):
   match r:

@@ -1,10 +1,10 @@
 # Interop client: scripted 6-step ping/pong session against
-# lib/exemplos/server.js (or server.bend) on 127.0.0.1:19880.
+# examples/server.js (or server.bend) on 127.0.0.1:19880.
 # Script: 101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
 # ping s2/pong -> close. Prints the score (6 when all passes).
-# Run: bun bend2/main.ts lib/exemplos/cliente.bend
+# Run: bend examples/cliente.bend
 import Base
-import ../ws.bend as WS
+import ../lib/ws.bend as WS
 
 law b2u:
   for b: Bool

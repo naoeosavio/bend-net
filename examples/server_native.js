@@ -5,6 +5,7 @@
 // text "hello" -> echo + ping "s2" -> pong "s2" -> close.
 // Prints one line per check and DONE n/6.
 // Usage: node server_native.js [port] (default port 19880)
+// (also runs under bun: bun server_native.js [port])
 
 import * as net from "node:net";
 import * as crypto from "node:crypto";

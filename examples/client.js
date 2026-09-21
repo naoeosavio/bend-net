@@ -4,22 +4,28 @@
 // no manual reply) -> ping "c1" -> pong "c1" -> text "hello" ->
 // echo -> ping "s2" (auto-pong) -> server close (auto-reply).
 // Prints one line per check and DONE n/6.
-// Needs `ws` resolvable: NODE_PATH=/tmp/wsport/node_modules
+// Needs `ws` resolvable under node: NODE_PATH=/tmp/wsport/node_modules
+// (under bun, require("ws") answers the builtin — no path needed there).
 // Usage: NODE_PATH=/tmp/wsport/node_modules node client.js [port]
+//        bun client.js [port]
 // (default port 19880)
 
 import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
+// bun provides a global require; node ESM does not, so build one
+// there from the npm ws resolvable via NODE_PATH.
+const require = globalThis.require ?? createRequire(import.meta.url);
 const WebSocket = require("ws");
 
-// Refuses Bun's builtin ws reimplementation (BunWebSocket): it loses
-// frames mid-session, which surfaces as harness timeouts. Run under
-// node with the npm ws resolvable (NODE_PATH=/tmp/wsport/node_modules).
-if (String(WebSocket).includes("BunWebSocket")) {
-  console.log("FAIL harness: BunWebSocket detected, run under node");
-  process.exit(1);
-}
+// Bun's builtin reimplementation differs from npm in two ways (probes
+// x4/x5 each, see task-012): its automatic pong is deferred to the next
+// macrotask, so a synchronous send in the ping handler hits the wire
+// BEFORE the pong (npm queues it before emit); and once() poisons the
+// "ping" event path for re-attached listeners when the first ping
+// listener was a once. next_event() below attaches with on() always,
+// and the user ping is deferred one tick under bun: both together give
+// the same wire order and event behavior as npm (matrix 6/6, task-012).
+const BUN = String(WebSocket).includes("BunWebSocket");
 
 const PORT = Number(process.argv[2] ?? 19880);
 const STEP_TIMEOUT_MS = 5000;
@@ -44,17 +50,25 @@ function next_event(ws, names) {
       cleanup();
       reject(new Error(`timeout waiting for ${names.join("/")}`));
     }, STEP_TIMEOUT_MS);
+    // Bun's builtin poisons the "ping" event path for re-attached
+    // listeners when the FIRST ping listener was attached with once()
+    // (auto-removed after firing): later listeners never fire, while
+    // the auto-pong keeps working (probe x4, task-012). Attaching with
+    // on() and removing surgically is equivalent and works everywhere.
+    const handlers = {};
     const cleanup = () => {
       clearTimeout(timer);
       for (const n of names) {
-        ws.removeAllListeners(n);
+        ws.removeListener(n, handlers[n]);
       }
     };
     for (const n of names) {
-      ws.once(n, (...args) => {
+      const handler = (...args) => {
         cleanup();
         resolve({ name: n, data: args[0], code: args[1] });
-      });
+      };
+      handlers[n] = handler;
+      ws.on(n, handler);
     }
   });
 }
@@ -101,12 +115,18 @@ async function main() {
   try {
     // NOTE: `ws` answers pings with a pong automatically, so the
     // client only waits here; the server scores its pong.
-    // Awaits the hoisted listener: a second once("ping") here could
-    // be removed by the first one's cleanup during emit.
+    // Awaits the hoisted listener: its handler is already registered,
+    // so an early ping is not lost.
     let ev = await ping_s1;
     check(ev.data.equals(Buffer.from("s1")), "PING_S1", `payload=${ev.data}`);
 
-    ws.ping("c1");
+    // Under bun the auto-pong for s1 is deferred (see BUN above): the
+    // send waits one tick so the pong wins the wire, like npm does.
+    if (BUN) {
+      setTimeout(() => ws.ping("c1"), 0);
+    } else {
+      ws.ping("c1");
+    }
     ev = await next_event(ws, ["pong"]);
     check(ev.data.equals(Buffer.from("c1")), "PONG_C1", `payload=${ev.data}`);
 

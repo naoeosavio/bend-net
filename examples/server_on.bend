@@ -1,5 +1,5 @@
 # Mirror of server.bend as a WS.server_on handler: scripted 6-step
-# ping/pong session on 127.0.0.1:19880 for lib/exemplos/cliente.bend
+# ping/pong session on 127.0.0.1:19880 for examples/cliente.bend
 # (or cliente_on.bend).
 # Script: EvOpen(HS) -> pong s1 -> ping c1/pong -> hello/echo+ping s2 ->
 # pong s2 -> close. The script is stateless: every step is identified by
@@ -8,9 +8,9 @@
 # present with no FAIL); a failed check prints FAIL and closes early.
 # The hello step answers echo ++ ping s2 in a single OutRaw (one WSOut
 # per event). Run one server at a time (fixed port).
-# Run: bun bend2/main.ts lib/exemplos/server_on.bend
+# Run: bend examples/server_on.bend
 import Base
-import ../ws.bend as WS
+import ../lib/ws.bend as WS
 
 law b2u:
   for b: Bool

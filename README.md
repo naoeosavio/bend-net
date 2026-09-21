@@ -2,7 +2,7 @@
 
 HTTP/1.1 and WebSocket (RFC 6455) for [Bend](https://bend-lang.com),
 written in user-land Bend on top of the `TCP.*` kit. No TLS, no DNS. The
-only native code is the byte-level socket effect pair in `lib/effs/`.
+only native code is the three byte-level socket effects in `lib/effs/`.
 
 ## Layout
 
@@ -22,6 +22,7 @@ tests/io/http_lib_fetch.bend  # IO: real loopback fetch + fail-closed paths
 tests/io/http_lib_sec.bend    # security: CRLF/NUL injection, oversize, bad status
 tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
 tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
+examples/                 # runnable interop programs (not published)
 tasks/                    # engineering log (decisions, discoveries, checklists)
 ```
 
@@ -93,6 +94,91 @@ twin of Base's `TCP.send`/`TCP.recv`, so frames never go through UTF-8:
 All three hand the socket back as `Socket & Result<&1, &1, U32 & String, …>`
 on every path.
 
+## WebSocket
+
+`lib/ws.bend` (import as `WS`) is an RFC 6455 server and client:
+handshake, frame codec, text/binary messages, ping/pong/close, masked
+clients and unmasked server frames. The codec is pure; IO rides the
+byte effects above. Fragmented frames (`FIN=false`) are refused with
+`Fail 400`.
+
+Handshake (pure):
+
+| Function | Description |
+|---|---|
+| `accept_of` | `Sec-WebSocket-Accept` = base64(SHA1(key ++ GUID)) |
+| `handshake` | Validate a raw request and build the `101` response, or `Fail 400` |
+| `client_request` | Build the client upgrade request for host/path/key |
+
+Frame codec (pure, bytes are `List<&2, U32>`):
+
+| Function | Description |
+|---|---|
+| `read_frame` / `read_frame_unmasked` | Parse one frame into `fin & op & payload`, masked / unmasked |
+| `show_frame` / `show_masked` | Render an unmasked frame / a client-masked frame |
+| `frame_need` / `frame_split` | Length-prefix size, and incremental split into `FrameGot{frame, rest}` / `NeedMore{missing}` / `FrameBad` |
+| `unmask` | XOR a payload with the four mask bytes |
+
+Messages and events: `WSMessage` is `WSText{text}` or `WSBin{data}`;
+`WSOut` is `OutMsg` / `OutOp` / `OutRaw`; `WSIn` is `InMsg` / `InOp`;
+`WSEv` is the lifecycle event (`EvOpen`, `EvMsg`, `EvPing`, `EvPong`,
+`EvClose`, `EvError`).
+
+IO:
+
+| Function | Description |
+|---|---|
+| `send_msg` / `send_op` / `send` | Send a message / an opcode+payload / a `WSOut` |
+| `recv_msg` / `recv_op` / `recv` | Single-shot raw read (one `recv_bytes`); a read may split or glue frames |
+| `recv_msg_framed` / `recv_op_framed` / `recv_in_framed` | One frame per call, the rest threaded back (`*_client_framed` for the client side) |
+| `serve_once` | Server echo of one connection |
+| `ws_serve` | Server accept loop (unsafe) |
+| `server_on(~H, l)` | Event-driven server: `~H` maps `WSEv` to `IO(WSOut)`, one step per frame |
+| `client_on(~H, host, port, path, key)` | Event-driven client, same `WSEv`/`WSOut` API, sends masked |
+| `client_echo(host, port, path, key, msg)` | Connect, handshake, send, read the echo |
+
+## Helpers
+
+| Module | Function | Description |
+|---|---|---|
+| `lib/sha1.bend` (`SHA1`) | `sha1(bytes)` | FIPS 180-4 digest of a byte list |
+| `lib/b64.bend` (`B64`) | `encode(bytes)` / `decode(string)` | base64 over byte lists |
+| `lib/static.bend` (`Static`) | `safe_read(root, path)` | Read a file under `root`, refusing `..`, absolute paths, CRLF and NUL |
+| | `content_type(path)` | Content-Type from the file extension |
+
+## Examples
+
+`examples/` holds runnable programs that are not part of the package:
+`http_real.bend` fetches live pages through `lib/http.bend`;
+`server.bend` / `cliente.bend` are the hand-driven WS session;
+`server_on.bend` / `cliente_on.bend` are the same session over the
+`server_on` / `client_on` event API; the `.js` files are `ws` npm peers
+used for the interop matrix.
+
+Every WS peer runs the same scripted 6-step session on `127.0.0.1:19880`
+(`/chat`): `101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
+ping s2/pong -> close`. Run one server at a time from the repo root;
+each side prints one `OK` line per step and `DONE 6/6`
+(pass = `DONE` present with no `FAIL`).
+
+```sh
+bend examples/server.bend        # then: bend examples/cliente.bend
+bend examples/server_on.bend     # then: bend examples/cliente_on.bend
+# ws peers need `ws` resolvable under node (bun uses its builtin):
+NODE_PATH=/tmp/wsport/node_modules node examples/server.js 19880
+NODE_PATH=/tmp/wsport/node_modules node examples/client.js 19880
+bun examples/server.js 19880      # all four ws peers also run under bun
+node examples/server_native.js 19880   # no dependencies (also runs under bun)
+node examples/client_native.js 19880   # no dependencies (also runs under bun)
+```
+
+Any server talks to any client (`server.bend <-> client.js`,
+`cliente.bend <-> server.js`, `server_on.bend <-> client_native.js`,
+`cliente_on.bend <-> server_native.js`, ...). `check.sh --checks`
+typechecks the `.bend` files and syntax-checks the `.js` files;
+`http_real.bend` is a manual smoke test (pinned external IPs, no DNS)
+and never runs in the gate.
+
 ## Security policy
 
 - `show_*` rejects CRLF in every field with `Fail 400` (injection).
@@ -104,10 +190,10 @@ on every path.
 ## Publish
 
 One command uploads `package.bend` with everything it imports and prints
-the import line. No sign-up: proof of work takes its place. No `TODO` or
-open law can land (`law fetch` is filled by `def fetch`; the single
-`@unsafe` is the echo accept loop, and the byte effects carry their
-`.c`/`.js` twins).
+the import lines. No sign-up: proof of work takes its place. No `TODO` or
+open law can land (`law fetch` is filled by `def fetch`; the `@unsafe`
+defs are the HTTP echo and WS accept/event loops; the byte effects carry
+their `.c`/`.js` twins).
 
 ```sh
 bend package.bend --publish

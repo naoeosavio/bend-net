@@ -6,6 +6,7 @@
 // text "hello" -> echo -> ping "s2" (auto-pong) -> server close
 // (auto-reply). Prints one line per check and DONE n/6.
 // Usage: node client_native.js [port] (default port 19880)
+// (also runs under bun: bun client_native.js [port])
 
 import * as net from "node:net";
 

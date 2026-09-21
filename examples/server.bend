@@ -1,11 +1,11 @@
 # Mirror of server.js in Bend: scripted 6-step ping/pong session on
-# 127.0.0.1:19880 for lib/exemplos/cliente.bend.
+# 127.0.0.1:19880 for examples/cliente.bend.
 # Script: 101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
 # ping s2/pong -> close. Prints the score (6 when all passes).
 # Run one server at a time (fixed port).
-# Run: bun bend2/main.ts lib/exemplos/server.bend
+# Run: bend examples/server.bend
 import Base
-import ../ws.bend as WS
+import ../lib/ws.bend as WS
 
 law b2u:
   for b: Bool

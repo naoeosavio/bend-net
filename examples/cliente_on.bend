@@ -1,5 +1,5 @@
 # Interop client, ON version: scripted 6-step ping/pong session against
-# lib/exemplos/server_on.bend (or server.js, server.bend) on
+# examples/server_on.bend (or server.js, server.bend) on
 # 127.0.0.1:19880, rewritten over WS.client_on — the client is now the
 # event-driven mirror of the server, not a hand-driven socket loop.
 # Script: 101 -> ping s1/pong+ping c1 -> pong c1/hello -> hello/echo ->
@@ -10,9 +10,9 @@
 # server's echo ++ ping s2 glue. Prints one OK line per passed check and
 # DONE 6/6 on close (grep rule: pass = DONE present with no FAIL); a
 # failed check prints FAIL and closes early.
-# Run: bun bend2/main.ts lib/exemplos/cliente_on.bend
+# Run: bend examples/cliente_on.bend
 import Base
-import ../ws.bend as WS
+import ../lib/ws.bend as WS
 
 law b2u:
   for b: Bool
