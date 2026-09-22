@@ -134,7 +134,7 @@ def coll(phase: U32, got: Socket & H2.H2Got, h1: Maybe<&2, H2.H2Head>, h3: Maybe
             got2 : Socket & H2.H2Got <- coll.ack(got)
             coll(0, got2, h1, h3, d1, d3, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
         case 2:
-          coll(4, got, h1, h3, d1, d3, fin, buf, typ, flags, sid2, payload, coll.head_of(H2.h2_head.decode(payload)), coll.hd_ok(H2.h2_head.decode(payload)), U32.and(flags, H2.h2_f_end_stream()))
+          coll(4, got, h1, h3, d1, d3, fin, buf, typ, flags, sid2, payload, coll.head_of(H2.h2_head.of(H2.h2_head.decode(payload, H2.hp_empty()))), coll.hd_ok(H2.h2_head.of(H2.h2_head.decode(payload, H2.hp_empty()))), U32.and(flags, H2.h2_f_end_stream()))
         case _:
           do IO<Socket & U32>:
             got2 : Socket & H2.H2Got <- H2.h2_read_frame(s2, buf)

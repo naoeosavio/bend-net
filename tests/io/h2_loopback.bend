@@ -58,8 +58,8 @@ def server_close(l: Listener, s2: Socket) -> IO(String):
     y : Unit <- Listener.close(l)
     return "up"
 
-def server_served2(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit>) -> IO(String):
-  (s2, r) = got
+def server_served2(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn) -> IO(String):
+  (s2, r, tab) = got
   match r:
     case Fail{e}:
       do IO<String>:
@@ -68,11 +68,11 @@ def server_served2(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Uni
     case Done{u}:
       server_close(l, s2)
 
-def server_serve2(sock: Socket) -> IO(Socket & Result<&1, &1, (U32 & String), Unit>):
-  H2.h2_serve_next(sock, h2_echo)
+def server_serve2(sock: Socket, +tab: H2.HpDyn) -> IO(Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn):
+  H2.h2_serve_next(sock, h2_echo, tab)
 
-def server_served(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit>) -> IO(String):
-  (s2, r) = got
+def server_served(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn) -> IO(String):
+  (s2, r, tab) = got
   match r:
     case Fail{e}:
       do IO<String>:
@@ -80,10 +80,10 @@ def server_served(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit
         server_down(l, e)
     case Done{u}:
       do IO<String>:
-        got2 : Socket & Result<&1, &1, (U32 & String), Unit> <- server_serve2(s2)
+        got2 : Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn <- server_serve2(s2, tab)
         server_served2(l, got2)
 
-def server_serve(sock: Socket) -> IO(Socket & Result<&1, &1, (U32 & String), Unit>):
+def server_serve(sock: Socket) -> IO(Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn):
   H2.h2_serve_once(sock, h2_echo)
 
 law server_talk:
@@ -93,7 +93,7 @@ law server_talk:
 
 def server_talk(l, sock):
   do IO<String>:
-    got : Socket & Result<&1, &1, (U32 & String), Unit> <- server_serve(sock)
+    got : Socket & Result<&1, &1, (U32 & String), Unit> & H2.HpDyn <- server_serve(sock)
     server_served(l, got)
 
 law server_conn:
