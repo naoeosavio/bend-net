@@ -19,16 +19,19 @@
 #
 # Import as: import ./tls.bend as TLS (from lib) or
 # import ../../lib/tls.bend as TLS (from tests/io).
-# Then TLS.tls_connect, TLS.tls_connect_insecure, TLS.tls_accept,
-# TLS.tls_send_bytes, TLS.tls_recv_bytes, TLS.tls_close.
+# Then TLS.tls_connect, TLS.tls_connect_insecure, TLS.tls_connect_noalpn,
+# TLS.tls_connect_noalpn_insecure, TLS.tls_accept, TLS.tls_send_bytes,
+# TLS.tls_recv_bytes, TLS.tls_close.
 import Base
 import ./dns.bend as DNS
 
 # The raw client handshake: connects to the IPv4 ip, SNIs sni, verifies
-# the chain iff verify is 1, negotiates ALPN h2. Answers the TLS socket
-# (SSL*) on Done. Host validation lives above (DNS.resolve); port
-# validation lives above (tls_port).
-def tls_connect_raw(ip: String, sni: String, port: U32, verify: U32) ->
+# the chain iff verify is 1. ALPN mode: alpn=1 offers and requires h2
+# (HTTPS); alpn=0 offers nothing and accepts no protocol negotiation
+# (WSS/HTTP/1.1 Upgrade). Answers the TLS socket (SSL*) on Done. Host
+# validation lives above (DNS.resolve); port validation lives above
+# (tls_port).
+def tls_connect_raw(ip: String, sni: String, port: U32, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   import "./effs/tls_connect.c"
   import "./effs/tls_connect.js"
@@ -68,43 +71,55 @@ def tls_valid_port(+p: U32) -> Bool:
 
 # Resolve-then-handshake. DNS.resolve answers the IPv4 the connect
 # rides; the ORIGINAL host rides SNI. A resolve failure fails with the
-# DNS code (601-605) before any socket exists.
-def tls_dial.asked(port: U32, verify: U32, host: String, r: Result<&1, &1, U32 & String, String>) ->
+# DNS code (601-605) before any socket exists. alpn is the mode above
+# (1 = require h2, 0 = no ALPN).
+def tls_dial.asked(port: U32, verify: U32, alpn: U32, host: String, r: Result<&1, &1, U32 & String, String>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match r:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
     case Done{ip}:
-      tls_connect_raw(ip, host, port, verify)
+      tls_connect_raw(ip, host, port, verify, alpn)
 
-def tls_dial(+host: String, port: U32, verify: U32) ->
+def tls_dial(+host: String, port: U32, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   do IO<Result<&1, &1, U32 & String, Socket>>:
     r : Result<&1, &1, U32 & String, String> <- DNS.resolve(host)
-    tls_dial.asked(port, verify, host, r)
+    tls_dial.asked(port, verify, alpn, host, r)
 
-def tls_go(+host: String, port: U32, verify: U32) ->
+def tls_go(+host: String, port: U32, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
-  tls_dial(host, port, verify)
+  tls_dial(host, port, verify, alpn)
 
-def tls_port(host: String, port: U32, verify: U32, ok: Bool) ->
+def tls_port(host: String, port: U32, verify: U32, alpn: U32, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match ok:
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{(611, "bad port")})
     case True{}:
-      tls_go(host, port, verify)
+      tls_go(host, port, verify, alpn)
 
 # Secure client: verifies the chain, SNIs the original host, ALPN h2.
 def tls_connect(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
-  tls_port(host, port, 1, tls_valid_port(port))
+  tls_port(host, port, 1, 1, tls_valid_port(port))
 
 # Insecure client: same handshake without chain verification (loopback
 # tests with a self-signed cert). Never use it for public hosts.
 def tls_connect_insecure(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
-  tls_port(host, port, 0, tls_valid_port(port))
+  tls_port(host, port, 0, 1, tls_valid_port(port))
+
+# Secure client with no ALPN offer (WSS / HTTP/1.1 Upgrade over TLS):
+# verifies the chain, SNIs the original host, never requires h2.
+def tls_connect_noalpn(+host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  tls_port(host, port, 1, 0, tls_valid_port(port))
+
+# Insecure no-ALPN client (WSS loopback with a self-signed cert).
+def tls_connect_noalpn_insecure(+host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  tls_port(host, port, 0, 0, tls_valid_port(port))
 
 # Server accept: one TLS handshake over the listener with the cert/key
 # at the given paths. The listener is handed back on every path.

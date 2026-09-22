@@ -26,6 +26,7 @@ struct TlsDial {
   u64   sni_len;
   u32   port;
   u32   verify;
+  u32   alpn;
   u32   code;
   void* conn;
 };
@@ -143,8 +144,12 @@ static void tls_call(IoWork* w) {
   } else {
     p_SSL_CTX_set_verify(ctx, 0, NULL);
   }
-  const unsigned char alpn[] = {2, 'h', '2'};
-  p_SSL_CTX_set_alpn_protos(ctx, alpn, 3);
+  // ALPN mode: alpn=1 offers h2 and requires it selected (HTTPS);
+  // alpn=0 offers nothing and accepts no negotiation (WSS/HTTP/1.1).
+  if (d->alpn) {
+    const unsigned char alpn[] = {2, 'h', '2'};
+    p_SSL_CTX_set_alpn_protos(ctx, alpn, 3);
+  }
   void* ssl = p_SSL_new(ctx);
   if (ssl == NULL) {
     p_SSL_CTX_free(ctx);
@@ -176,16 +181,18 @@ static void tls_call(IoWork* w) {
     d->code = 614;
     return;
   }
-  const unsigned char* sel = NULL;
-  unsigned sel_len = 0;
-  p_SSL_get0_alpn_selected(ssl, &sel, &sel_len);
-  if (sel_len != 2 || sel == NULL || sel[0] != 'h' || sel[1] != '2') {
-    p_SSL_shutdown(ssl);
-    p_SSL_free(ssl);
-    p_SSL_CTX_free(ctx);
-    close(fd);
-    d->code = 615;
-    return;
+  if (d->alpn) {
+    const unsigned char* sel = NULL;
+    unsigned sel_len = 0;
+    p_SSL_get0_alpn_selected(ssl, &sel, &sel_len);
+    if (sel_len != 2 || sel == NULL || sel[0] != 'h' || sel[1] != '2') {
+      p_SSL_shutdown(ssl);
+      p_SSL_free(ssl);
+      p_SSL_CTX_free(ctx);
+      close(fd);
+      d->code = 615;
+      return;
+    }
   }
   int fl = fcntl(fd, F_GETFL, 0);
   if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
@@ -224,6 +231,7 @@ Term tls_connect_raw_run(Env e, Term* f, IoWork* w) {
   d->sni    = io_cstr(e, f[1], &d->sni_len);
   d->port   = (u32)f[2];
   d->verify = (u32)f[3];
+  d->alpn   = (u32)f[4];
   d->code   = 0;
   d->conn   = NULL;
   w->data = (char*)d;
