@@ -2535,3 +2535,19 @@ def h2_connect_insecure(host: String, port: U32) -> IO(Result<&1, &1, U32 & Stri
 def h2_request(sock: Socket, +sid: U32, +method: String, +path: String, hs: List<&2, H2Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   h2_request.send(sock, sid, method, path, hs, body)
+
+# h2_serve_next: like h2_serve_once but for an ESTABLISHED connection
+# (preface + SETTINGS already exchanged by a first h2_serve_once).
+# Serves one more request stream and hands the socket back, so a caller
+# threads socket + fuel for sequential keep-alive (sid 1, 3, 5, ... on
+# one TLS connection, no new handshake). Fail codes match serve_once.
+
+def h2_serve_next.got(got: Socket & H2Got, handler: H2Request -> IO(H2Response)) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  h2_srv.pick0(got, H2SrvSt{None{}, Nil{}, 0}, handler)
+
+def h2_serve_next(sock: Socket, handler: H2Request -> IO(H2Response)) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+    got : Socket & H2Got <- h2_read_frame(sock, Nil{})
+    h2_serve_next.got(got, handler)

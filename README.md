@@ -19,6 +19,7 @@ lib/tcp.bend              # byte-level socket effects (C + JS twins)
 lib/dns.bend              # DNS resolve: A lookup for name hosts (C + JS twins)
 lib/tls.bend              # TLS client + server effects (C + JS twins, OpenSSL)
 lib/http2.bend            # HTTP/2 codec + client/server over TLS (pure Bend)
+lib/https.bend            # HTTPS facade: fetch/send_request + server_on over TLS+DNS+H2
 lib/effs/tcp_send_bytes.* # send List<&2, U32> over a Socket
 lib/effs/tcp_recv_bytes.* # receive bytes from a Socket
 lib/effs/tcp_recv_frame.* # isolate exactly one WS frame, rest preserved
@@ -159,6 +160,7 @@ Bend, no nghttp2/node:http2:
 | `h2_connect(host, port)` / `h2_connect_insecure` | TLS dial, magic preface + SETTINGS |
 | `h2_request(sock, sid, method, path, headers, body)` | One request/response exchange on stream `sid` (1, 3, 5, ...); the socket and next sid thread back |
 | `h2_serve_once(sock, handler)` | Serve one request stream: preface, SETTINGS, HEADERS/DATA → `handler(H2Request) -> IO(H2Response)` → response frames |
+| `h2_serve_next(sock, handler)` | Serve one more stream on an established connection (no preface); thread for sequential keep-alive (sid 1, 3, 5, ...) without a new handshake |
 
 HPACK rides literal-without-indexing plus the static table; huffman
 strings and dynamic-table references are refused with `Fail 502`
@@ -168,6 +170,32 @@ interleaved multiplexing, huffman decode and CONTINUATION are backlog.
 
 ```sh
 bend tests/io/h2_loopback.bend         # 1
+```
+
+## HTTPS
+
+`lib/https.bend` (import as `HTTPS`) is the public HTTPS facade over
+TLS + DNS + the HTTP/2 codec — request/response/fetch plus generic
+keep-alive servers, mirroring `lib/http.bend`:
+
+| Function | Description |
+|---|---|
+| `request(host, port, method, path, hs, body)` / `request_insecure` | Single-shot exchange on stream 1 (connect + request + close); answers the full `H2Response` (status + headers + byte body) |
+| `send_request(host, port, path, method, hs, body)` / `send_request_insecure` | Same exchange with a `String` body; answers the response body as `String` |
+| `fetch(url)` / `fetch_insecure` | `https://` GET by URL (via `HTTP.read_url`); `http://` refused with `Fail 400`; answers the body as `String` |
+| `fetch_bytes(url)` / `fetch_bytes_insecure` | Same GET answering raw `List<&2, U32>` bytes |
+| `server_on(~H, l, cert, key, n)` | Generic keep-alive server (like `HTTP.server_on`): TLS accept loop with `IO.spawn` per connection, `n` extra streams per connection via `h2_serve_next`; `~H` is `H2Request -> IO(H2Response)` |
+| `echo.body` / `ok(body)` | Echo handler and `200` response helper |
+
+Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
+`decode_body` wrap `H2.str_bytes` / `H2.bytes_str`); headers are
+`List<H2Hdr>` (`pairs_to_h2` / `h2_to_pairs` convert http-style pairs).
+Fail codes surface unchanged: `400/413/502/503` (codec), `601-605`
+(DNS), `611-616` (TLS).
+
+```sh
+bend tests/io/https_fetch.bend        # 1
+bend tests/io/https_streams.bend      # 1
 ```
 
 ## WebSocket
@@ -303,6 +331,8 @@ bend tests/io/tcp_bytes_loopback.bend # 1
 bend tests/io/dns_resolve.bend        # 1111111111
 bend tests/io/tls_connect_close.bend  # 111
 bend tests/io/h2_loopback.bend        # 1
+tests/io/https_fetch.bend          # 1
+tests/io/https_streams.bend        # 1
 bend tests/io/ws_crypto.bend          # 8
 bend tests/io/ws_handshake.bend       # 4
 bend tests/io/ws_frame.bend           # 6
