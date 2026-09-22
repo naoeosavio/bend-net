@@ -44,8 +44,11 @@ type H2Response is Data:
 type H2Request is Data:
   H2Request{method: String, path: String, headers: List<&2, H2Hdr>, body: List<&2, U32>}
 
+type HpDyn is Data:
+  HpDyn{ents: List<&2, H2Hdr>, size: U32, max: U32}
+
 type H2SrvSt is Data:
-  H2SrvSt{head: Maybe<&2, H2ReqHead>, body: List<&2, U32>, sid: U32}
+  H2SrvSt{head: Maybe<&2, H2ReqHead>, body: List<&2, U32>, sid: U32, hp: HpDyn}
 
 type H2Frame is Data:
   H2Frame{typ: U32, flags: U32, sid: U32, payload: List<&2, U32>}
@@ -56,7 +59,7 @@ type H2FrameOut is Data:
   H2FrameBad{code: U32, msg: String}
 
 type HdrGot is Data:
-  HdrGot{name: String, value: String, rest: List<&2, U32>}
+  HdrGot{name: String, value: String, rest: List<&2, U32>, tab: HpDyn, emit: Bool}
 
 type H2Buf is Data:
   H2BufOk{buf: List<&2, U32>}
@@ -376,27 +379,24 @@ def hpack_int.enc.small(+first: U32, +rest: U32, small: Bool) -> List<&2, U32>:
 def hpack_int.enc(+first: U32, +rest: U32) -> List<&2, U32>:
   hpack_int.enc.small(first, rest, U32.is_lt(rest, 127))
 
-def hpack_int.dec.more(+f: Nat, more: Bool) -> Nat:
-  match more:
-    case True{}:
-      f
-    case False{}:
-      0n
-
-def hpack_int.dec.fin(+fuel: Nat, acc: U32, +rest: List<&2, U32>) -> Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
-  match fuel:
-    case 0n:
-      Done{(acc, rest)}
-    case 1n+f:
-      Fail{(400, "hpack eof")}
-
-def hpack_int.dec.go2(+rest: List<&2, U32>, +fuel: Nat, acc: U32, +m: U32) -> Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
+def hpack_int.dec.go2c(+rest: List<&2, U32>, cont: Bool, +fuel: Nat, acc: U32, +m: U32) -> Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
   match rest:
     case Nil{}:
-      hpack_int.dec.fin(fuel, acc, rest)
+      Fail{(400, "hpack eof")}
     case +b <> rest2:
-      +acc2 = (acc + m * U32.and(b, 127) : U32)
-      hpack_int.dec.go2(rest2, hpack_int.dec.more(fuel, U32.is_eq(U32.and(b, 128), 128)), acc2, (m * 128 : U32))
+      match cont:
+        case False{}:
+          Done{(acc, b <> rest2)}
+        case True{}:
+          match fuel:
+            case 0n:
+              Fail{(502, "hpack int too long")}
+            case 1n+f:
+              +acc2 = (acc + m * U32.and(b, 127) : U32)
+              hpack_int.dec.go2c(rest2, U32.is_eq(U32.and(b, 128), 128), f, acc2, (m * 128 : U32))
+
+def hpack_int.dec.go2(+rest: List<&2, U32>, +fuel: Nat, acc: U32, +m: U32) -> Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
+  hpack_int.dec.go2c(rest, True{}, fuel, acc, m)
 
 def hpack_int.dec.go4(+first: U32, +mask: U32, +rest: List<&2, U32>, short: Bool) ->
   Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
@@ -412,6 +412,285 @@ def hpack_int.dec.go(+first: U32, +mask: U32, +rest: List<&2, U32>) ->
 
 def hpack_int.dec6(first: U32, rest: List<&2, U32>) -> Result<&1, &1, U32 & String, U32 & List<&2, U32>>:
   hpack_int.dec.go(first, 63, rest)
+
+# Huffman strings (RFC 7541 Appendix B, canonical code)
+# -----------------------------------------------------
+# Lengths per symbol 0..256 plus per-length (5..30) counts, first
+# codes and order offsets, generated from the RFC text (no manual
+# transcription). The codes rebuild canonically from the lengths with
+# zero mismatches (257/257), so decode derives everything here.
+# Vectors live in tests/io/hpack_huffman.bend (RFC C.4.1/C.6.1).
+
+def huff_lens() -> List<&2, U32>:
+  [13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+   28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+   6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+   5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+   13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+   7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+   15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+   6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+   20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+   24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+   22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+   21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+   26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+   19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+   20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+   26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+   30]
+def huff_counts() -> List<&2, U32>:
+  [10, 26, 32, 6, 0, 5, 3, 2, 6, 2, 3, 0, 0,
+   0, 3, 8, 13, 26, 29, 12, 4, 15, 19, 29, 0, 4]
+def huff_firsts() -> List<&2, U32>:
+  [0, 20, 92, 248,
+   0, 1016, 2042, 4090,
+   8184, 16380, 32764, 0,
+   0, 0, 524272, 1048550,
+   2097116, 4194258, 8388568, 16777194,
+   33554412, 67108832, 134217694, 268435426,
+   0, 1073741820]
+def huff_starts() -> List<&2, U32>:
+  [0, 10, 36, 68, 74, 74, 79, 82, 84, 90, 92, 95, 95,
+   95, 95, 98, 106, 119, 145, 174, 186, 190, 205, 224, 253, 253]
+def huff_order() -> List<&2, U32>:
+  [48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
+   52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
+   110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+   77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
+   119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
+   43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
+   195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172, 176, 177,
+   179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136, 146, 154, 156, 160,
+   163, 164, 169, 170, 173, 178, 181, 185, 186, 187, 189, 190, 196, 198, 228, 232,
+   233, 1, 135, 137, 138, 139, 140, 141, 143, 147, 149, 150, 151, 152, 155, 157,
+   158, 165, 166, 168, 174, 175, 180, 182, 183, 188, 191, 197, 231, 239, 9, 142,
+   144, 145, 148, 159, 171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193,
+   200, 201, 202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
+   212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252, 253, 254,
+   2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
+   21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22,
+   256]
+
+def huff_nth.go(+xs: List<&2, U32>, +n: Nat) -> U32:
+  match xs:
+    case Nil{}:
+      0
+    case h <> t:
+      match n:
+        case 0n:
+          h
+        case 1n+m:
+          huff_nth.go(t, m)
+
+def huff_nth(+xs: List<&2, U32>, +n: Nat) -> U32:
+  huff_nth.go(xs, n)
+
+def huff_bits.go(+b: U32) -> List<&2, U32>:
+  [U32.and(U32.shrn(b, 7n), 1), U32.and(U32.shrn(b, 6n), 1),
+   U32.and(U32.shrn(b, 5n), 1), U32.and(U32.shrn(b, 4n), 1),
+   U32.and(U32.shrn(b, 3n), 1), U32.and(U32.shrn(b, 2n), 1),
+   U32.and(U32.shrn(b, 1n), 1), U32.and(b, 1)]
+
+def huff_bits(bs: List<&2, U32>) -> List<&2, U32>:
+  match bs:
+    case Nil{}:
+      Nil{}
+    case h <> t:
+      List.append(&2, U32, huff_bits.go(h), huff_bits(t))
+
+def huff_hit(+code: U32, +len: U32) -> Bool:
+  +i = U32.to_nat((len - 5 : U32))
+  +cnt = huff_nth(huff_counts(), i)
+  +fst = huff_nth(huff_firsts(), i)
+  Bool.and(U32.is_ge(code, fst), U32.is_lt((code - fst : U32), cnt))
+
+def huff_at(+code: U32, +len: U32) -> U32:
+  +i = U32.to_nat((len - 5 : U32))
+  +cnt = huff_nth(huff_counts(), i)
+  +fst = huff_nth(huff_firsts(), i)
+  huff_nth(huff_order(), U32.to_nat((huff_nth(huff_starts(), i) + (code - fst : U32) : U32)))
+
+def huff_ones(+bits: List<&2, U32>) -> Bool:
+  match bits:
+    case Nil{}:
+      True{}
+    case b <> t:
+      Bool.and(U32.is_eq(b, 1), huff_ones(t))
+
+def huff_pad(+bits: List<&2, U32>) -> Bool:
+  Bool.and(Nat.is_lt(b_len(bits), 8n), huff_ones(bits))
+
+def huff_empty(+bits: List<&2, U32>) -> Bool:
+  match bits:
+    case Nil{}:
+      True{}
+    case _ <> _:
+      False{}
+
+def huff_emit.big(big: Bool) -> U32:
+  match big:
+    case True{}:
+      31
+    case False{}:
+      0
+
+def huff_emit.go(eos: Bool, big: Bool) -> U32:
+  match eos:
+    case True{}:
+      30
+    case False{}:
+      huff_emit.big(big)
+
+def huff_emit_phase(+sym: U32, +n: U32) -> U32:
+  huff_emit.go(U32.is_eq(sym, 256), U32.is_gt(n, 4096))
+
+def huff_entry.pad(pad: Bool) -> U32:
+  match pad:
+    case True{}:
+      2
+    case False{}:
+      10
+
+def huff_entry.empty(+bits: List<&2, U32>, empty: Bool, pad: Bool) -> U32:
+  match empty:
+    case True{}:
+      1
+    case False{}:
+      huff_entry.pad(pad)
+
+def huff_entry(+bits: List<&2, U32>) -> U32:
+  huff_entry.empty(bits, huff_empty(bits), huff_pad(bits))
+
+# Main huffman loop: one self-recursive phased def (fuel, phase,
+# bits, acc, n, code, len). Phase 0 dispatches (empty/pad/prime),
+# 1/2 finish, 10-14 prime five bits, 20 over-long, 21 emit, 22
+# consume one more bit, 30 EOS, 31 oversize. Fuel bounds total calls
+# (each symbol costs prime 5 + consume 25 at most + emit/dispatch).
+
+def huff_sym_phase.go(hit: Bool) -> U32:
+  match hit:
+    case True{}:
+      21
+    case False{}:
+      22
+
+def huff_sym_phase.hit(+code: U32, +len: U32, hit: Bool, over: Bool) -> U32:
+  match over:
+    case True{}:
+      20
+    case False{}:
+      huff_sym_phase.go(hit)
+
+def huff_sym_phase(+code: U32, +len: U32) -> U32:
+  huff_sym_phase.hit(code, len, huff_hit(code, len), U32.is_gt(len, 30))
+
+def huff_dec.go(+fuel: Nat, +phase: U32, +bits: List<&2, U32>, +acc: List<&2, U32>, +n: U32, +code: U32, +len: U32) ->
+  Result<&1, &1, U32 & String, List<&2, U32>>:
+  match fuel:
+    case 0n:
+      Fail{(502, "huffman fuel")}
+    case 1n+f:
+      match phase:
+        case 0:
+          huff_dec.go(f, huff_entry(bits), bits, acc, n, code, len)
+        case 1:
+          Done{b_cat(acc)}
+        case 2:
+          Done{b_cat(acc)}
+        case 10:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              huff_dec.go(f, 11, t, acc, n, b, len)
+        case 11:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              huff_dec.go(f, 12, t, acc, n, ((code * 2 : U32) + b : U32), len)
+        case 12:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              huff_dec.go(f, 13, t, acc, n, ((code * 2 : U32) + b : U32), len)
+        case 13:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              huff_dec.go(f, 14, t, acc, n, ((code * 2 : U32) + b : U32), len)
+        case 14:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              +cc = ((code * 2 : U32) + b : U32)
+              huff_dec.go(f, huff_sym_phase(cc, 5), t, acc, n, cc, 5)
+        case 20:
+          Fail{(502, "huffman code")}
+        case 21:
+          +sym = huff_at(code, len)
+          +nn = (n + 1 : U32)
+          huff_dec.go(f, huff_emit_phase(sym, nn), bits, sym <> acc, nn, code, len)
+        case 22:
+          match bits:
+            case Nil{}:
+              Fail{(502, "huffman truncated")}
+            case b <> t:
+              +ln = (len + 1 : U32)
+              +cc = ((code * 2 : U32) + b : U32)
+              huff_dec.go(f, huff_sym_phase(cc, ln), t, acc, n, cc, ln)
+        case 30:
+          Fail{(502, "huffman eos")}
+        case 31:
+          Fail{(413, "huffman too large")}
+        case _:
+          Fail{(502, "huffman phase")}
+
+def huff_decode.fuel(+bl: Nat) -> Nat:
+  Nat.add(bl, Nat.add(bl, Nat.add(bl, 1n)))
+
+def huff_decode(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  huff_dec.go(huff_decode.fuel(b_len(huff_bits(bs))), 0, huff_bits(bs), Nil{}, 0, 0, 0)
+
+def hpack_str.dec.huffin(+bs: List<&2, U32>, +rest: List<&2, U32>, whole: Bool) ->
+  Result<&1, &1, U32 & String, String & List<&2, U32>>:
+  match whole:
+    case True{}:
+      Done{(bytes_str(bs), rest)}
+    case False{}:
+      Fail{(400, "hpack eof str")}
+
+def hpack_str.dec.huffed(+n: U32, +rest: List<&2, U32>, r: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, String & List<&2, U32>>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{bs}:
+      hpack_str.dec.huffin(bs, b_drop(U32.to_nat(n), rest), U32.is_eq(n, U32.from_nat(b_len(b_take(U32.to_nat(n), rest)))))
+
+def hpack_str.dec.huf2(+n: U32, +rest: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, String & List<&2, U32>>:
+  hpack_str.dec.huffed(n, rest, huff_decode(b_take(U32.to_nat(n), rest)))
+
+def hpack_str.dec.hufcap(+n: U32, +rest: List<&2, U32>, capped: Bool) ->
+  Result<&1, &1, U32 & String, String & List<&2, U32>>:
+  match capped:
+    case False{}:
+      Fail{(413, "hpack str too large")}
+    case True{}:
+      hpack_str.dec.huf2(n, rest)
+
+def hpack_str.dec.hufin(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, String & List<&2, U32>>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(+n, +rest)}:
+      hpack_str.dec.hufcap(n, rest, U32.is_le(n, 4096))
 
 def hpack_str.enc.cat(a: List<&2, U32>, b: List<&2, U32>) -> List<&2, U32>:
   List.append(&2, U32, a, b)
@@ -451,7 +730,7 @@ def hpack_str.dec.huf(+b0: U32, +rest2: List<&2, U32>, huf: Bool) ->
   Result<&1, &1, U32 & String, String & List<&2, U32>>:
   match huf:
     case True{}:
-      Fail{(502, "huffman refused")}
+      hpack_str.dec.hufin(hpack_int.dec.go(b0, 127, rest2))
     case False{}:
       r = hpack_int.dec.go(b0, 127, rest2)
       hpack_str.dec.str(r)
@@ -604,94 +883,287 @@ def hp_static_name(+idx: U32) -> String:
 def hp_static_pair(+idx: U32) -> String & String:
   hp_static.go(idx)
 
-def hpack_hdr.done(name: String, r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
+# Dynamic table (RFC 7541 section 2.3.2, section 4)
+# ------------------------------------------------
+# Newest entry at the head; size is the sum of entry sizes
+# (len(name) + len(value) + 32); max is the protocol limit 4096.
+# The decoder owns one table per connection, threaded through the
+# header-block loops (Phase 3 wires it; here are the pure ops).
+
+def hp_empty() -> HpDyn:
+  HpDyn{Nil{}, 0, 4096}
+
+def hp_entry_size(+name: String, +value: String) -> U32:
+  (U32.from_nat(String.length(name)) + U32.from_nat(String.length(value)) + 32 : U32)
+
+def hp_len.go(+ents: List<&2, H2Hdr>, +n: Nat) -> Nat:
+  match ents:
+    case Nil{}:
+      n
+    case _ <> t:
+      hp_len.go(t, Nat.add(n, 1n))
+
+def hp_len(+ents: List<&2, H2Hdr>) -> Nat:
+  hp_len.go(ents, 0n)
+
+def hp_fit.go(+fuel: Nat, fit: Bool, +ents: List<&2, H2Hdr>, +size: U32, +max: U32) ->
+  List<&2, H2Hdr> & U32:
+  match fuel:
+    case 0n:
+      (ents, size)
+    case 1n+f:
+      match fit:
+        case True{}:
+          (ents, size)
+        case False{}:
+          match ents:
+            case Nil{}:
+              (Nil{}, 0)
+            case H2Hdr{n, v} <> t:
+              +ns = U32.sub(size, hp_entry_size(n, v))
+              hp_fit.go(f, U32.is_le(ns, max), t, ns, max)
+
+def hp_rev.go(+ents: List<&2, H2Hdr>, acc: List<&2, H2Hdr>) -> List<&2, H2Hdr>:
+  match ents:
+    case Nil{}:
+      acc
+    case h <> t:
+      hp_rev.go(t, h <> acc)
+
+def hp_rev(+ents: List<&2, H2Hdr>) -> List<&2, H2Hdr>:
+  hp_rev.go(ents, Nil{})
+
+def hp_done(p: List<&2, H2Hdr> & U32, +max: U32) -> HpDyn:
+  (kept, sz) = p
+  HpDyn{hp_rev(kept), sz, max}
+
+def hp_insert.trim(+ents: List<&2, H2Hdr>, +size: U32, +max: U32) -> HpDyn:
+  +rev = hp_rev(ents)
+  hp_done(hp_fit.go(hp_len(rev), U32.is_le(size, max), rev, size, max), max)
+
+def hp_insert.do(+ents: List<&2, H2Hdr>, +size: U32, +max: U32, +name: String, +value: String) -> HpDyn:
+  +ns = (size + hp_entry_size(name, value) : U32)
+  hp_insert.trim(H2Hdr{name, value} <> ents, ns, max)
+
+def hp_insert.fit(+ents: List<&2, H2Hdr>, +size: U32, +max: U32, +name: String, +value: String, fits: Bool) -> HpDyn:
+  match fits:
+    case False{}:
+      HpDyn{Nil{}, 0, max}
+    case True{}:
+      hp_insert.do(ents, size, max, name, value)
+
+def hp_insert.go(+tab: HpDyn, +name: String, +value: String) -> HpDyn:
+  match tab:
+    case HpDyn{+ents, +size, +max}:
+      hp_insert.fit(ents, size, max, name, value, U32.is_le(hp_entry_size(name, value), max))
+
+def hp_insert(+tab: HpDyn, +name: String, +value: String) -> HpDyn:
+  hp_insert.go(tab, name, value)
+
+def hp_resize.go(+tab: HpDyn, +max: U32) -> HpDyn:
+  match tab:
+    case HpDyn{+ents, +size, +old}:
+      hp_insert.trim(ents, size, max)
+
+def hp_resize(+tab: HpDyn, +max: U32) -> HpDyn:
+  hp_resize.go(tab, max)
+
+def hp_lookup.at(+ents: List<&2, H2Hdr>, +k: Nat) -> H2Hdr:
+  match ents:
+    case Nil{}:
+      H2Hdr{"", ""}
+    case H2Hdr{n, v} <> t:
+      match k:
+        case 0n:
+          H2Hdr{n, v}
+        case 1n+m:
+          hp_lookup.at(t, m)
+
+def hp_lookup.go(+ents: List<&2, H2Hdr>, +idx: U32, ok: Bool) ->
+  Result<&1, &1, U32 & String, H2Hdr>:
+  match ok:
+    case False{}:
+      Fail{(502, "hpack dyn bounds")}
+    case True{}:
+      Done{hp_lookup.at(ents, U32.to_nat(idx))}
+
+def hp_lookup(+tab: HpDyn, +idx: U32) -> Result<&1, &1, U32 & String, H2Hdr>:
+  match tab:
+    case HpDyn{+ents, +size, +max}:
+      hp_lookup.go(ents, idx, U32.is_lt(idx, U32.from_nat(hp_len(ents))))
+
+def hp_addr.static(sp: String & String) -> H2Hdr:
+  (n, v) = sp
+  H2Hdr{n, v}
+
+def hp_addr.go(+tab: HpDyn, +idx: U32, is_static: Bool) ->
+  Result<&1, &1, U32 & String, H2Hdr>:
+  match is_static:
+    case True{}:
+      Done{hp_addr.static(hp_static_pair(idx))}
+    case False{}:
+      hp_lookup(tab, (idx - 62 : U32))
+
+def hp_addr(+tab: HpDyn, +idx: U32) -> Result<&1, &1, U32 & String, H2Hdr>:
+  hp_addr.go(tab, idx, U32.is_le(idx, 61))
+
+def hpack_hdr.done(+name: String, +tab: HpDyn, r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
   Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(value, rest)}:
-      Done{HdrGot{name, value, rest}}
+      Done{HdrGot{name, value, rest, tab, True{}}}
 
-def hpack_hdr.lit.name(r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
+def hpack_hdr.lit.put(+name: String, +value: String, +rest: List<&2, U32>, +tab: HpDyn, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match is_incr:
+    case False{}:
+      Done{HdrGot{name, value, rest, tab, True{}}}
+    case True{}:
+      Done{HdrGot{name, value, rest, hp_insert(tab, name, value), True{}}}
+
+def hpack_hdr.lit.val(+name: String, +tab: HpDyn, is_incr: Bool, r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(value, rest)}:
+      hpack_hdr.lit.put(name, value, rest, tab, is_incr)
+
+def hpack_hdr.lit.name(r: Result<&1, &1, U32 & String, String & List<&2, U32>>, +tab: HpDyn, is_incr: Bool) ->
   Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(name, rest2)}:
-      r2 = hpack_str.dec.go(rest2)
-      hpack_hdr.done(name, r2)
+      hpack_hdr.lit.val(name, tab, is_incr, hpack_str.dec.go(rest2))
 
-def hpack_hdr.lit.staticname(+idx: U32, +in_static: Bool, +rest: List<&2, U32>) ->
+def hpack_hdr.lit.named(+rest: List<&2, U32>, +tab: HpDyn, is_incr: Bool, r: Result<&1, &1, U32 & String, H2Hdr>) ->
   Result<&1, &1, U32 & String, HdrGot>:
-  match in_static:
-    case True{}:
-      r2 = hpack_str.dec.go(rest)
-      hpack_hdr.done(hp_static_name(idx), r2)
-    case False{}:
-      Fail{(502, "hpack dynamic name refused")}
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{h}:
+      match h:
+        case H2Hdr{+n, +v}:
+          hpack_hdr.lit.val(n, tab, is_incr, hpack_str.dec.go(rest))
 
-def hpack_hdr.lit.idxname(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
+def hpack_hdr.lit.nameat(+idx: U32, +rest: List<&2, U32>, +tab: HpDyn, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  hpack_hdr.lit.named(rest, tab, is_incr, hp_addr(tab, idx))
+
+def hpack_hdr.lit.zero(+rest: List<&2, U32>, +tab: HpDyn, is_incr: Bool, +idx: U32, is_new: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match is_new:
+    case True{}:
+      hpack_hdr.lit.name(hpack_str.dec.go(rest), tab, is_incr)
+    case False{}:
+      hpack_hdr.lit.nameat(idx, rest, tab, is_incr)
+
+def hpack_hdr.lit.go(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(+idx, +rest2)}:
+      hpack_hdr.lit.zero(rest2, tab, is_incr, idx, U32.is_eq(idx, 0))
+
+def hpack_hdr.lit(+b0: U32, +rest: List<&2, U32>, is_incr: Bool, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match is_incr:
+    case True{}:
+      hpack_hdr.lit.go(b0, rest, tab, hpack_int.dec.go(b0, 63, rest), True{})
+    case False{}:
+      hpack_hdr.lit.go(b0, rest, tab, hpack_int.dec.go(b0, 15, rest), False{})
+
+def hpack_hdr.indexed.at(+rest: List<&2, U32>, +tab: HpDyn, r: Result<&1, &1, U32 & String, H2Hdr>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{h}:
+      match h:
+        case H2Hdr{+n, +v}:
+          Done{HdrGot{n, v, rest, tab, True{}}}
+
+def hpack_hdr.indexed.go(+idx: U32, +rest: List<&2, U32>, +tab: HpDyn, ok: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match ok:
+    case False{}:
+      Fail{(502, "hpack bad index")}
+    case True{}:
+      hpack_hdr.indexed.at(rest, tab, hp_addr(tab, idx))
+
+def hpack_hdr.indexed.num(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, +tab: HpDyn) ->
   Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(+idx, +rest)}:
-      hpack_hdr.lit.staticname(idx, U32.is_le(idx, 61), rest)
+      hpack_hdr.indexed.go(idx, rest, tab, U32.is_ge(idx, 1))
 
-def hpack_hdr.lit.go3(b0: U32, rest: List<&2, U32>, low: U32) ->
+def hpack_hdr.indexed.go2(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn) ->
   Result<&1, &1, U32 & String, HdrGot>:
-  match low:
-    case 0:
-      r = hpack_str.dec.go(rest)
-      hpack_hdr.lit.name(r)
-    case _:
-      r = hpack_int.dec6(b0, rest)
-      hpack_hdr.lit.idxname(r)
+  hpack_hdr.indexed.num(hpack_int.dec.go(b0, 127, rest), tab)
 
-def hpack_hdr.lit(+b0: U32, +rest: List<&2, U32>) -> Result<&1, &1, U32 & String, HdrGot>:
-  hpack_hdr.lit.go3(b0, rest, U32.and(b0, 15))
-
-def hpack_hdr.indexed.done(sp: String & String) -> Result<&1, &1, U32 & String, HdrGot>:
-  (n, v) = sp
-  Done{HdrGot{n, v, Nil{}}}
-
-def hpack_hdr.indexed.go(idx: U32, ok: Bool) -> Result<&1, &1, U32 & String, HdrGot>:
+def hpack_hdr.table.sized(+rest: List<&2, U32>, +tab: HpDyn, +ns: U32, ok: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match ok:
     case False{}:
-      Fail{(502, "hpack dynamic ref refused")}
+      Fail{(502, "hpack table too big")}
     case True{}:
-      hpack_hdr.indexed.done(hp_static_pair(idx))
+      Done{HdrGot{"", "", rest, hp_resize(tab, ns), False{}}}
 
-def hpack_hdr.indexed.go2(b0: U32, ok: Bool) -> Result<&1, &1, U32 & String, HdrGot>:
-  hpack_hdr.indexed.go(U32.and(b0, 127), ok)
-
-def hpack_hdr.go3(+b0: U32, +rest: List<&2, U32>, kind: U32) ->
+def hpack_hdr.table.go(+tab: HpDyn, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
   Result<&1, &1, U32 & String, HdrGot>:
-  match kind:
-    case 0:
-      hpack_hdr.lit(b0, rest)
-    case 1:
-      hpack_hdr.lit(b0, rest)
-    case 2:
-      Fail{(502, "hpack table update refused")}
-    case 3:
-      hpack_hdr.indexed.go2(b0, U32.is_le(U32.and(b0, 127), 61))
-    case _:
-      hpack_hdr.lit(b0, rest)
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(+ns, +rest)}:
+      hpack_hdr.table.sized(rest, tab, ns, U32.is_le(ns, 4096))
 
-def hpack_hdr.go2(b0: U32, rest: List<&2, U32>, top: U32) ->
+# RFC 7541 §6 first-byte patterns (top three bits), not (b0>>4)&15:
+# 1xxxxxxx indexed, 01xxxxxx literal incremental, 001xxxxx table size
+# update, 0000/0001 literal without/never indexing. Indexed (0x80-0xFF)
+# used to fall through to lit and eat the next header as a value string
+# (node's :status 200 = 0x88 → "hpack eof str").
+
+def hpack_hdr.after_table(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn, is_table: Bool) ->
   Result<&1, &1, U32 & String, HdrGot>:
-  hpack_hdr.go3(b0, rest, top)
+  match is_table:
+    case True{}:
+      hpack_hdr.table.go(tab, hpack_int.dec.go(b0, 31, rest))
+    case False{}:
+      hpack_hdr.lit(b0, rest, False{}, tab)
 
-def hpack_hdr.go(+b0: U32, +rest: List<&2, U32>) -> Result<&1, &1, U32 & String, HdrGot>:
-  hpack_hdr.go2(b0, rest, U32.and(U32.shrn(b0, 4n), 15))
+def hpack_hdr.after_incr(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match is_incr:
+    case True{}:
+      hpack_hdr.lit(b0, rest, True{}, tab)
+    case False{}:
+      hpack_hdr.after_table(b0, rest, tab, U32.is_ge(b0, 32))
 
-def hpack_hdr.dec(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, HdrGot>:
+def hpack_hdr.after_idx(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn, is_idx: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  match is_idx:
+    case True{}:
+      hpack_hdr.indexed.go2(b0, rest, tab)
+    case False{}:
+      hpack_hdr.after_incr(b0, rest, tab, U32.is_ge(b0, 64))
+
+def hpack_hdr.go(+b0: U32, +rest: List<&2, U32>, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, HdrGot>:
+  hpack_hdr.after_idx(b0, rest, tab, U32.is_ge(b0, 128))
+
+def hpack_hdr.dec(+bs: List<&2, U32>, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match bs:
     case Nil{}:
       Fail{(400, "hpack eof")}
     case +b0 <> rest:
-      hpack_hdr.go(b0, rest)
+      hpack_hdr.go(b0, rest, tab)
 
 def hpack_lit.enc(+name: String, +value: String) -> List<&2, U32>:
   b_append([0], b_append(hpack_str.enc(name), hpack_str.enc(value)))
@@ -870,8 +1342,15 @@ def h2_head.apply(+st: H2Head, +name: String, +value: String, is_status: Bool) -
     case H2Head{+status, +headers}:
       h2_head.apply2(status, headers, name, value, is_status)
 
-@unsafe def h2_head.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: H2Head) ->
-  Result<&1, &1, U32 & String, H2Head>:
+def h2_head.phase(emit: Bool) -> U32:
+  match emit:
+    case True{}:
+      2
+    case False{}:
+      3
+
+@unsafe def h2_head.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: H2Head, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, H2Head & HpDyn>:
   match fuel:
     case 0n:
       Fail{(502, "too many headers")}
@@ -880,21 +1359,32 @@ def h2_head.apply(+st: H2Head, +name: String, +value: String, is_status: Bool) -
         case 0:
           match bs:
             case Nil{}:
-              Done{st}
+              Done{(st, tab)}
             case _:
-              h2_head.go(f, 1, bs, hpack_hdr.dec(bs), "", "", st)
+              h2_head.go(f, 1, bs, hpack_hdr.dec(bs, tab), "", "", st, tab)
         case 1:
           match r:
             case Fail{e}:
               Fail{e}
-            case Done{HdrGot{+name, +value, rrest}}:
-              h2_head.go(f, 2, rrest, Fail{(0, "")}, name, value, st)
-        case _:
+            case Done{HdrGot{+name, +value, +rrest, +tab2, +emit2}}:
+              h2_head.go(f, h2_head.phase(emit2), rrest, Fail{(0, "")}, name, value, st, tab2)
+        case 2:
           +st2 = h2_head.apply(st, name, value, String.eq(name, ":status"))
-          h2_head.go(f, 0, bs, r, "", "", st2)
+          h2_head.go(f, 0, bs, r, "", "", st2, tab)
+        case _:
+          h2_head.go(f, 0, bs, r, "", "", st, tab)
 
-def h2_head.decode(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, H2Head>:
-  h2_head.go(64n, 0, bs, Fail{(0, "")}, "", "", H2Head{0, Nil{}})
+def h2_head.decode(+bs: List<&2, U32>, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, H2Head & HpDyn>:
+  h2_head.go(64n, 0, bs, Fail{(0, "")}, "", "", H2Head{0, Nil{}}, tab)
+
+def h2_head.of(r: Result<&1, &1, U32 & String, H2Head & HpDyn>) ->
+  Result<&1, &1, U32 & String, H2Head>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(h, t)}:
+      Done{h}
 
 def h2_reqhead.pick2(+method: String, +path: String, +headers: List<&2, H2Hdr>, +name: String, +value: String, +is_path: Bool) -> H2ReqHead:
   match is_path:
@@ -925,8 +1415,15 @@ def h2_reqhead.apply(+st: H2ReqHead, +name: String, +value: String, is_meth: Boo
     case H2ReqHead{+method, +path, +headers}:
       h2_reqhead.apply2(method, path, headers, name, value, is_meth, is_path)
 
-@unsafe def h2_reqhead.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: H2ReqHead) ->
-  Result<&1, &1, U32 & String, H2ReqHead>:
+def h2_reqhead.phase(emit: Bool) -> U32:
+  match emit:
+    case True{}:
+      2
+    case False{}:
+      3
+
+@unsafe def h2_reqhead.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: H2ReqHead, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, H2ReqHead & HpDyn>:
   match fuel:
     case 0n:
       Fail{(502, "too many headers")}
@@ -935,21 +1432,39 @@ def h2_reqhead.apply(+st: H2ReqHead, +name: String, +value: String, is_meth: Boo
         case 0:
           match bs:
             case Nil{}:
-              Done{st}
+              Done{(st, tab)}
             case _:
-              h2_reqhead.go(f, 1, bs, hpack_hdr.dec(bs), "", "", st)
+              h2_reqhead.go(f, 1, bs, hpack_hdr.dec(bs, tab), "", "", st, tab)
         case 1:
           match r:
             case Fail{e}:
               Fail{e}
-            case Done{HdrGot{+name, +value, rrest}}:
-              h2_reqhead.go(f, 2, rrest, Fail{(0, "")}, name, value, st)
-        case _:
+            case Done{HdrGot{+name, +value, +rrest, +tab2, +emit2}}:
+              h2_reqhead.go(f, h2_reqhead.phase(emit2), rrest, Fail{(0, "")}, name, value, st, tab2)
+        case 2:
           +st2 = h2_reqhead.apply(st, name, value, String.eq(name, ":method"), String.eq(name, ":path"))
-          h2_reqhead.go(f, 0, bs, r, "", "", st2)
+          h2_reqhead.go(f, 0, bs, r, "", "", st2, tab)
+        case _:
+          h2_reqhead.go(f, 0, bs, r, "", "", st, tab)
 
-def h2_reqhead.decode(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, H2ReqHead>:
-  h2_reqhead.go(64n, 0, bs, Fail{(0, "")}, "", "", H2ReqHead{"", "", Nil{}})
+def h2_reqhead.decode(+bs: List<&2, U32>, +tab: HpDyn) ->
+  Result<&1, &1, U32 & String, H2ReqHead & HpDyn>:
+  h2_reqhead.go(64n, 0, bs, Fail{(0, "")}, "", "", H2ReqHead{"", "", Nil{}}, tab)
+
+def h2_reqhead.of(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  Result<&1, &1, U32 & String, H2ReqHead>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{(h, t)}:
+      Done{h}
+
+def h2_reqhead.tab_of(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) -> HpDyn:
+  match r:
+    case Fail{e}:
+      hp_empty()
+    case Done{(h, t)}:
+      t
 
 def h2_next_sid(+sid: U32) -> U32:
   (sid + 2 : U32)
@@ -1147,7 +1662,7 @@ def h2_resp.head7.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head7(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head7.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.acked7(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2RespSt, +sid: U32, +buf: List<&2, U32>) ->
@@ -1243,7 +1758,7 @@ def h2_resp.head6.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head6(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head6.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.acked6(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2RespSt, +sid: U32, +buf: List<&2, U32>) ->
@@ -1311,7 +1826,7 @@ def h2_resp.head5.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head5(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head5.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.acked5(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2RespSt, +sid: U32, +buf: List<&2, U32>) ->
@@ -1393,7 +1908,7 @@ def h2_resp.head4.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head4(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head4.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.acked4(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2RespSt, +sid: U32, +buf: List<&2, U32>) ->
@@ -1484,7 +1999,7 @@ def h2_resp.head3.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head3(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head3.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.data3.fin(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U32>, +end: U32, is_end: Bool) ->
@@ -1580,7 +2095,7 @@ def h2_resp.head2.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head2(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head2.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.next2(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf: List<&2, U32>, cls: U32) ->
@@ -1662,7 +2177,7 @@ def h2_resp.head1.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head1(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head1.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.next1(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf: List<&2, U32>, cls: U32) ->
@@ -1744,7 +2259,7 @@ def h2_resp.head0.done(sock: Socket, +st: H2RespSt, +sid: U32, +buf: List<&2, U3
 def h2_resp.head0(sock: Socket, +st: H2RespSt, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.decode(payload)
+    hd : Result<&1, &1, U32 & String, H2Head> = h2_head.of(h2_head.decode(payload, hp_empty()))
     h2_resp.head0.done(sock, st, sid, buf, end, hd)
 
 def h2_resp.next0(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf: List<&2, U32>, cls: U32) ->
@@ -1857,15 +2372,20 @@ def h2_srv.send_resp(sock: Socket, +sid: U32, +resp: H2Response) ->
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_headers(), flags, sid, hpack_block(hs))
         h2_srv.resp_body(sent, sid, body, Nat.is_eq(b_len(body), 0n))
 
+def h2_srv.st_hp(+st: H2SrvSt) -> HpDyn:
+  match st:
+    case H2SrvSt{head, body, sid, hp}:
+      hp
+
 def h2_srv.st_add_head(+st: H2SrvSt, +head: H2ReqHead) -> H2SrvSt:
   match st:
-    case H2SrvSt{old_head, +body, +sid}:
-      H2SrvSt{Some{head}, body, sid}
+    case H2SrvSt{old_head, +body, +sid, +hp}:
+      H2SrvSt{Some{head}, body, sid, hp}
 
 def h2_srv.st_add_body(+st: H2SrvSt, +pay: List<&2, U32>) -> H2SrvSt:
   match st:
-    case H2SrvSt{+head, +body, +sid}:
-      H2SrvSt{head, List.append(&2, U32, body, pay), sid}
+    case H2SrvSt{+head, +body, +sid, +hp}:
+      H2SrvSt{head, List.append(&2, U32, body, pay), sid, hp}
 
 def h2_srv.cls3(+typ: U32) -> U32:
   match typ:
@@ -1899,52 +2419,67 @@ def h2_srv.classify(+frame: H2Frame) -> U32:
       h2_srv.cls(typ, sid2)
 
 def h2_srv.round6(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "request too long")}))
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "request too long")}, hp_empty()))
 
-def h2_srv.answer3(sock: Socket, +rh: H2ReqHead, +body: List<&2, U32>, +sid: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.answer3.wrap(m: Socket & Result<&1, &1, U32 & String, Unit>, +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s, Fail{e}, tab))
+    case Done{u}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s, Done{u}, tab))
+
+def h2_srv.answer3.send(sock: Socket, +sid: U32, +resp: H2Response, +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_srv.send_resp(sock, sid, resp)
+    h2_srv.answer3.wrap(sent, tab)
+
+def h2_srv.answer3(sock: Socket, +rh: H2ReqHead, +body: List<&2, U32>, +sid: U32, handler: H2Request -> IO(H2Response), +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match rh:
     case H2ReqHead{+method, +path, +headers}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
         req : H2Request = H2Request{method, path, headers, body}
         resp : H2Response <- handler(req)
-        h2_srv.send_resp(sock, sid, resp)
+        h2_srv.answer3.send(sock, sid, resp, tab)
 
 
-def h2_srv.answer2(sock: Socket, head: Maybe<&2, H2ReqHead>, +body: List<&2, U32>, +sid: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.answer2(sock: Socket, head: Maybe<&2, H2ReqHead>, +body: List<&2, U32>, +sid: U32, handler: H2Request -> IO(H2Response), +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match head:
     case None{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "no request head")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "no request head")}, hp_empty()))
     case Some{+rh}:
-      h2_srv.answer3(sock, rh, body, sid, handler)
+      h2_srv.answer3(sock, rh, body, sid, handler, tab)
 
 
 def h2_srv.answer(sock: Socket, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match st:
-    case H2SrvSt{+head, +body, +sid}:
-      h2_srv.answer2(sock, head, body, sid, handler)
+    case H2SrvSt{+head, +body, +sid, +hp}:
+      h2_srv.answer2(sock, head, body, sid, handler, hp)
 
 def h2_srv.head5.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round6(sock, st, buf, handler)
 
-def h2_srv.head5.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head5.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head5.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head5.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.data5.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -1952,7 +2487,7 @@ def h2_srv.data5.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round6(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data5.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data5.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -1960,72 +2495,72 @@ def h2_srv.data5.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round6(sock, st, buf, handler)
 
 def h2_srv.stream5.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head5.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data5.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream5(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream5.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.acked5(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round6(sock, st, buf, handler)
 
 def h2_srv.next5(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round6(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked5(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream5(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round6(sock, st, buf, handler)
 
 def h2_srv.pick5(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next5(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
 def h2_srv.round5(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick5(got, st, handler)
 
 def h2_srv.acked4(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round5(sock, st, buf, handler)
 
 def h2_srv.data4.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -2033,7 +2568,7 @@ def h2_srv.data4.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round5(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data4.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data4.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -2041,86 +2576,86 @@ def h2_srv.data4.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round5(sock, st, buf, handler)
 
 def h2_srv.head4.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round5(sock, st, buf, handler)
 
-def h2_srv.head4.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head4.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head4.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head4.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.stream4.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head4.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data4.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream4(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream4.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.next4(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round5(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked4(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream4(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round5(sock, st, buf, handler)
 
 def h2_srv.pick4(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next4(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
 def h2_srv.round4(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick4(got, st, handler)
 
 def h2_srv.head3.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round4(sock, st, buf, handler)
 
-def h2_srv.head3.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head3.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head3.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head3.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.data3.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -2128,7 +2663,7 @@ def h2_srv.data3.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round4(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data3.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data3.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -2136,63 +2671,63 @@ def h2_srv.data3.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round4(sock, st, buf, handler)
 
 def h2_srv.stream3.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head3.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data3.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream3(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream3.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.acked3(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round4(sock, st, buf, handler)
 
 def h2_srv.next3(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round4(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked3(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream3(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round4(sock, st, buf, handler)
 
 def h2_srv.pick3(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next3(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
 def h2_srv.round3(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick3(got, st, handler)
 
 def h2_srv.data2.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -2200,7 +2735,7 @@ def h2_srv.data2.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round3(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data2.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data2.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -2208,95 +2743,95 @@ def h2_srv.data2.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round3(sock, st, buf, handler)
 
 def h2_srv.head2.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round3(sock, st, buf, handler)
 
-def h2_srv.head2.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head2.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head2.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head2.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.stream2.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head2.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data2.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream2(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream2.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.acked2(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round3(sock, st, buf, handler)
 
 def h2_srv.next2(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round3(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked2(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream2(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round3(sock, st, buf, handler)
 
 def h2_srv.pick2(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next2(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
 def h2_srv.round2(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick2(got, st, handler)
 
 def h2_srv.head1.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round2(sock, st, buf, handler)
 
-def h2_srv.head1.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head1.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head1.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head1.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.data1.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -2304,7 +2839,7 @@ def h2_srv.data1.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round2(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data1.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data1.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -2312,63 +2847,63 @@ def h2_srv.data1.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round2(sock, st, buf, handler)
 
 def h2_srv.stream1.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head1.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data1.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream1(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream1.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.acked1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round2(sock, st, buf, handler)
 
 def h2_srv.next1(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round2(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked1(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream1(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round2(sock, st, buf, handler)
 
 def h2_srv.pick1(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next1(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
 def h2_srv.round1(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick1(got, st, handler)
 
 def h2_srv.data0.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, h2_srv.st_add_body(st, payload), handler)
@@ -2376,7 +2911,7 @@ def h2_srv.data0.fin(sock: Socket, +st: H2SrvSt, +sid2: U32, +payload: List<&2, 
       h2_srv.round1(sock, h2_srv.st_add_body(st, payload), buf, handler)
 
 def h2_srv.data0.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_data: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_data:
     case True{}:
       h2_srv.data0.fin(sock, st, sid2, payload, buf, handler, end, U32.is_eq(end, 1))
@@ -2384,68 +2919,68 @@ def h2_srv.data0.done(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +payloa
       h2_srv.round1(sock, st, buf, handler)
 
 def h2_srv.head0.fin(sock: Socket, +st: H2SrvSt, +typ: U32, +sid2: U32, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_end: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_end:
     case True{}:
       h2_srv.answer(sock, st, handler)
     case False{}:
       h2_srv.round1(sock, st, buf, handler)
 
-def h2_srv.head0.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def h2_srv.head0.done(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, hd: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match hd:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
-    case Done{+rh}:
-      h2_srv.head0.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
+    case Done{(+rh, +tab2)}:
+      h2_srv.head0.fin(sock, H2SrvSt{Some{rh}, Nil{}, sid2, tab2}, typ, sid2, buf, handler, end, U32.is_eq(end, 1))
 
 def h2_srv.stream0.go(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32, is_head: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match is_head:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        hd : Result<&1, &1, U32 & String, H2ReqHead> = h2_reqhead.decode(payload)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+        hd : Result<&1, &1, U32 & String, H2ReqHead & HpDyn> = h2_reqhead.decode(payload, h2_srv.st_hp(st))
         h2_srv.head0.done(sock, st, typ, flags, sid2, payload, buf, handler, end, hd)
     case False{}:
       h2_srv.data0.done(sock, st, typ, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_data()))
 
 def h2_srv.stream0(sock: Socket, +st: H2SrvSt, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.stream0.go(sock, st, typ, flags, sid2, payload, buf, handler, end, U32.is_eq(typ, h2_t_headers()))
 
 def h2_srv.acked0(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{(c, m)}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(c, m)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(c, m)}, hp_empty()))
     case Done{u}:
       h2_srv.round1(sock, st, buf, handler)
 
 def h2_srv.next0(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32>, cls: U32, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
       match cls:
         case 0:
           h2_srv.round1(sock, st, buf, handler)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
             h2_srv.acked0(sent, st, buf, handler)
         case 5:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(502, "goaway")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "goaway")}, hp_empty()))
         case 6:
           h2_srv.stream0(sock, st, typ, flags, sid2, payload, buf, handler, U32.and(flags, h2_f_end_stream()))
         case _:
           h2_srv.round1(sock, st, buf, handler)
 
 def h2_srv.pick0(got: Socket & H2Got, +st: H2SrvSt, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, g) = got
   match g:
     case H2GotErr{code, msg}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code, msg)}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{(code, msg)}, hp_empty()))
     case H2GotOk{+frame, buf}:
       h2_srv.next0(s2, st, frame, buf, h2_srv.classify(frame), handler)
 
@@ -2455,72 +2990,72 @@ def h2_srv.build(+rh: H2ReqHead, +body: List<&2, U32>) -> H2Request:
       H2Request{method, path, headers, body}
 
 def h2_srv.round0(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_srv.pick0(got, st, handler)
 
 def h2_srv.preface4(sent: Socket & Result<&1, &1, U32 & String, Unit>, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{e}, hp_empty()))
     case Done{u}:
-      h2_srv.round0(sock, H2SrvSt{None{}, Nil{}, 0}, b_drop(24n, buf), handler)
+      h2_srv.round0(sock, H2SrvSt{None{}, Nil{}, 0, hp_empty()}, b_drop(24n, buf), handler)
 
 def h2_srv.preface3b(sock: Socket, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), ok: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match ok:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), 0, 0, Nil{})
         h2_srv.preface4(sent, buf, handler)
     case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{(503, "bad preface")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(503, "bad preface")}, hp_empty()))
 
 def h2_srv.preface3(sock: Socket, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response), magic: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   h2_srv.preface3b(sock, buf, handler, U32.is_eq(magic, 1))
 
 def h2_srv.preface2(sock: Socket, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     magic : U32 = h2_srv.preface_ok(buf)
     h2_srv.preface3(sock, buf, handler, magic)
 
 def h2_serve_once.got2(r2: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +chunk: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, r) = r2
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{e}, hp_empty()))
     case Done{chunk2}:
       h2_srv.preface2(s2, List.append(&2, U32, chunk, chunk2), handler)
 
 
 def h2_serve_once.short(sock: Socket, +chunk: List<&2, U32>, handler: H2Request -> IO(H2Response), short: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   match short:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
         r2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
         h2_serve_once.got2(r2, chunk, handler)
     case False{}:
       h2_srv.preface2(sock, chunk, handler)
 
 def h2_serve_once.got1(r1: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
   (s2, r) = r1
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s2, Fail{e}, hp_empty()))
     case Done{+chunk}:
       h2_serve_once.short(s2, chunk, handler, Nat.is_lt(b_len(chunk), 24n))
 
 def h2_serve_once(sock: Socket, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
     h2_serve_once.got1(r1, handler)
 
@@ -2542,12 +3077,12 @@ def h2_request(sock: Socket, +sid: U32, +method: String, +path: String, hs: List
 # threads socket + fuel for sequential keep-alive (sid 1, 3, 5, ... on
 # one TLS connection, no new handshake). Fail codes match serve_once.
 
-def h2_serve_next.got(got: Socket & H2Got, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  h2_srv.pick0(got, H2SrvSt{None{}, Nil{}, 0}, handler)
+def h2_serve_next.got(got: Socket & H2Got, handler: H2Request -> IO(H2Response), +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  h2_srv.pick0(got, H2SrvSt{None{}, Nil{}, 0, tab}, handler)
 
-def h2_serve_next(sock: Socket, handler: H2Request -> IO(H2Response)) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+def h2_serve_next(sock: Socket, handler: H2Request -> IO(H2Response), +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
     got : Socket & H2Got <- h2_read_frame(sock, Nil{})
-    h2_serve_next.got(got, handler)
+    h2_serve_next.got(got, handler, tab)

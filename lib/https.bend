@@ -66,6 +66,31 @@ def dispatch(route: H2.H2Request -> IO(H2.H2Response), req: H2.H2Request) ->
   IO(H2.H2Response):
   route(req)
 
+# RFC 9113 requires :authority on every request; node:http2 closes the
+# session without a stream when it is missing. Build it from the dial
+# target (host:port) and drop any caller-supplied copy first.
+
+def drop_authority.go(+n: String, +v: String, rec: List<&2, H2.H2Hdr>, is_auth: Bool) ->
+  List<&2, H2.H2Hdr>:
+  match is_auth:
+    case True{}:
+      rec
+    case False{}:
+      H2.H2Hdr{n, v} <> rec
+
+def drop_authority(hs: List<&2, H2.H2Hdr>) -> List<&2, H2.H2Hdr>:
+  match hs:
+    case Nil{}:
+      Nil{}
+    case H2.H2Hdr{n, v} <> t:
+      +nn = n
+      +vv = v
+      drop_authority.go(nn, vv, drop_authority(t), String.eq(nn, ":authority"))
+
+def with_authority(+host: String, +port: U32, hs: List<&2, H2.H2Hdr>) ->
+  List<&2, H2.H2Hdr>:
+  H2.H2Hdr{":authority", host ++ ":" ++ U32.show(port)} <> drop_authority(hs)
+
 # Single-shot request (RFC core)
 # ------------------------------
 # Connect, one exchange on stream 1, close. Returns the full H2Response
@@ -103,17 +128,27 @@ def request.conn(conn: Result<&1, &1, U32 & String, Socket>, +method: String, +p
     case Done{sock}:
       request.exch(sock, method, path, hs, body)
 
-def request.go(+host: String, port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>, verify: Bool) ->
+def request.secure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, H2.H2Response>):
+  +hs2 = with_authority(host, port, hs)
+  do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect(host, port)
+    request.conn(conn, method, path, hs2, body)
+
+def request.insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, H2.H2Response>):
+  +hs2 = with_authority(host, port, hs)
+  do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect_insecure(host, port)
+    request.conn(conn, method, path, hs2, body)
+
+def request.go(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>, verify: Bool) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
   match verify:
     case True{}:
-      do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect(host, port)
-        request.conn(conn, method, path, hs, body)
+      request.secure(host, port, method, path, hs, body)
     case False{}:
-      do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect_insecure(host, port)
-        request.conn(conn, method, path, hs, body)
+      request.insecure(host, port, method, path, hs, body)
 
 def request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>, verify: Bool, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
@@ -312,25 +347,25 @@ def apply_wrap(~H: H2.H2Request -> IO(H2.H2Response), req: H2.H2Request) -> IO(H
 # H2.h2_serve_next (established connection, no preface). Fuel n bounds
 # the extra streams (self-recursion on Nat, socket threaded whole).
 
-def serve_loop(~H: H2.H2Request -> IO(H2.H2Response), fuel: Nat, got: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def serve_loop(~H: H2.H2Request -> IO(H2.H2Response), fuel: Nat, got: Socket & Result<&1, &1, U32 & String, Unit> & H2.HpDyn) ->
   IO(Unit):
   match fuel:
     case 0n:
-      (s0, r0) = got
+      (s0, r0, tab0) = got
       TLS.tls_close(s0)
     case 1n+t:
-      (s2, r) = got
+      (s2, r, tab) = got
       match r:
         case Fail{e}:
           TLS.tls_close(s2)
         case Done{u}:
           do IO<Unit>:
-            got2 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_serve_next(s2, apply_wrap(~H))
+            got2 : Socket & Result<&1, &1, U32 & String, Unit> & H2.HpDyn <- H2.h2_serve_next(s2, apply_wrap(~H), tab)
             serve_loop(~H, t, got2)
 
 def serve_start(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket, n: Nat) -> IO(Unit):
   do IO<Unit>:
-    got : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_serve_once(sock, apply_wrap(~H))
+    got : Socket & Result<&1, &1, U32 & String, Unit> & H2.HpDyn <- H2.h2_serve_once(sock, apply_wrap(~H))
     serve_loop(~H, n, got)
 
 def server.spawn(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket, l: Listener, n: Nat) ->
@@ -372,7 +407,7 @@ def server_on(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String,
 
 def mux.sid_of(st: H2.H2SrvSt) -> U32:
   match st:
-    case H2.H2SrvSt{head, body, +sid}:
+    case H2.H2SrvSt{head, body, +sid, hp}:
       sid
 
 # SETTINGS classification fix: ack only a fresh (non-ACK) SETTINGS.
@@ -447,7 +482,7 @@ def mux.decide4(ok: Bool, a: Bool, b: Bool, +end: U32) -> U32:
 
 def mux.some_of(st: H2.H2SrvSt) -> Bool:
   match st:
-    case H2.H2SrvSt{head, body, sid}:
+    case H2.H2SrvSt{head, body, sid, hp}:
       match head:
         case None{}:
           False{}
@@ -456,7 +491,7 @@ def mux.some_of(st: H2.H2SrvSt) -> Bool:
 
 def mux.rh_of(st: H2.H2SrvSt) -> H2.H2ReqHead:
   match st:
-    case H2.H2SrvSt{head, body, sid}:
+    case H2.H2SrvSt{head, body, sid, hp}:
       match head:
         case None{}:
           H2.H2ReqHead{"", "", Nil{}}
@@ -465,7 +500,7 @@ def mux.rh_of(st: H2.H2SrvSt) -> H2.H2ReqHead:
 
 def mux.body_of(st: H2.H2SrvSt) -> List<&2, U32>:
   match st:
-    case H2.H2SrvSt{head, +body, sid}:
+    case H2.H2SrvSt{head, +body, sid, hp}:
       body
 
 def mux.req_of(+rh: H2.H2ReqHead, +body: List<&2, U32>) -> H2.H2Request:
@@ -498,7 +533,7 @@ def mux.decide5(ha: Bool, sa: Bool, hb: Bool, sb: Bool, +end: U32) -> U32:
 # decisions as Bool params). Answers inline.
 
 @unsafe
-def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Got, +stA: H2.H2SrvSt, +stB: H2.H2SrvSt, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +a_free: Bool, +a_hit: Bool, +b_free: Bool, +b_hit: Bool, +rh: H2.H2ReqHead, act: U32, +rhA: H2.H2ReqHead, +bodyA: List<&2, U32>, +sidA: U32, +rhB: H2.H2ReqHead, +bodyB: List<&2, U32>, +sidB: U32) ->
+def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Got, +stA: H2.H2SrvSt, +stB: H2.H2SrvSt, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +a_free: Bool, +a_hit: Bool, +b_free: Bool, +b_hit: Bool, +rh: H2.H2ReqHead, act: U32, +rhA: H2.H2ReqHead, +bodyA: List<&2, U32>, +sidA: U32, +rhB: H2.H2ReqHead, +bodyB: List<&2, U32>, +sidB: U32, +tab: H2.HpDyn) ->
   IO(Unit):
   match phase:
     case 0:
@@ -509,11 +544,11 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
             case 0:
               do IO<Unit>:
                 got2 : Socket & H2.H2Got <- H2.h2_read_frame(s0, buf)
-                mux(~H, 1, got2, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+                mux(~H, 1, got2, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
             case _:
               TLS.tls_close(s0)
         case H2.H2GotOk{frame0, buf0}:
-          mux(~H, 1, got, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 1, got, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
     case 1:
       (s1, g1) = got
       match g1:
@@ -522,49 +557,50 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
         case H2.H2GotOk{+frame, +buf2}:
           match frame:
             case H2.H2Frame{+typ2, +flags2, +sid22, +payload2}:
-              mux(~H, 2, (s1, H2.H2GotOk{frame, buf2}), stA, stB, buf2, typ2, flags2, sid22, payload2, mux.cls_fix(H2.h2_srv.classify(frame), flags2), U32.and(flags2, H2.h2_f_end_stream()), U32.is_eq(mux.sid_of(stA), 0), U32.is_eq(mux.sid_of(stA), sid22), U32.is_eq(mux.sid_of(stB), 0), U32.is_eq(mux.sid_of(stB), sid22), H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+              mux(~H, 2, (s1, H2.H2GotOk{frame, buf2}), stA, stB, buf2, typ2, flags2, sid22, payload2, mux.cls_fix(H2.h2_srv.classify(frame), flags2), U32.and(flags2, H2.h2_f_end_stream()), U32.is_eq(mux.sid_of(stA), 0), U32.is_eq(mux.sid_of(stA), sid22), U32.is_eq(mux.sid_of(stB), 0), U32.is_eq(mux.sid_of(stB), sid22), H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
             got2 : Socket & H2.H2Got <- mux.ack(got)
-            mux(~H, 0, got2, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, got2, stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 5:
           mux.close_got(got)
         case 6:
-          mux(~H, 3, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 3, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 0:
-          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case _:
-          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
     case 3:
       match typ:
         case 1:
-          +dec : Result<&1, &1, U32 & String, H2.H2ReqHead> = H2.h2_reqhead.decode(payload)
-          mux(~H, 4, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, mux.rh_or(dec), mux.decide4(mux.ok_of(dec), a_free, b_free, end), H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          +pr : Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn> = H2.h2_reqhead.decode(payload, tab)
+          +dec : Result<&1, &1, U32 & String, H2.H2ReqHead> = H2.h2_reqhead.of(pr)
+          mux(~H, 4, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, mux.rh_or(dec), mux.decide4(mux.ok_of(dec), a_free, b_free, end), H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.h2_reqhead.tab_of(pr))
         case 0:
-          mux(~H, 5, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, H2.H2ReqHead{"", "", Nil{}}, mux.decide5(a_hit, mux.some_of(stA), b_hit, mux.some_of(stB), end), mux.rh_of(stA), mux.body_of(stA), mux.sid_of(stA), mux.rh_of(stB), mux.body_of(stB), mux.sid_of(stB))
+          mux(~H, 5, got, stA, stB, buf, typ, flags, sid2, payload, cls, end, a_free, a_hit, b_free, b_hit, H2.H2ReqHead{"", "", Nil{}}, mux.decide5(a_hit, mux.some_of(stA), b_hit, mux.some_of(stB), end), mux.rh_of(stA), mux.body_of(stA), mux.sid_of(stA), mux.rh_of(stB), mux.body_of(stB), mux.sid_of(stB), tab)
         case _:
-          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          mux(~H, 0, mux.read_got(got), H2.H2SrvSt{Some{rh}, Nil{}, sid2}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), H2.H2SrvSt{Some{rh}, Nil{}, sid2, H2.hp_empty()}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 1:
           do IO<Unit>:
             req : H2.H2Request = mux.req_of(rh, Nil{})
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(s4, sid2, resp)
-            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 2:
-          mux(~H, 0, mux.read_got(got), stA, H2.H2SrvSt{Some{rh}, Nil{}, sid2}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, H2.H2SrvSt{Some{rh}, Nil{}, sid2, H2.hp_empty()}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 3:
           do IO<Unit>:
             req : H2.H2Request = mux.req_of(rh, Nil{})
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(s4, sid2, resp)
-            mux(~H, 0, mux.sent_got(sent), stA, H2.H2SrvSt{None{}, Nil{}, 0}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, mux.sent_got(sent), stA, H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 4:
           TLS.tls_close(s4)
         case 5:
@@ -576,34 +612,34 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       match act:
         case 0:
           +bA0 : List<&2, U32> = List.append(&2, U32, bodyA, payload)
-          mux(~H, 0, mux.read_got(got), H2.H2SrvSt{Some{rhA}, bA0, sidA}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), H2.H2SrvSt{Some{rhA}, bA0, sidA, H2.hp_empty()}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 1:
           do IO<Unit>:
             +bA1 : List<&2, U32> = List.append(&2, U32, bodyA, payload)
             req : H2.H2Request = mux.req_of(rhA, bA1)
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(sm, sidA, resp)
-            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 2:
           +bB0 : List<&2, U32> = List.append(&2, U32, bodyB, payload)
-          mux(~H, 0, mux.read_got(got), stA, H2.H2SrvSt{Some{rhB}, bB0, sidB}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, H2.H2SrvSt{Some{rhB}, bB0, sidB, H2.hp_empty()}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 3:
           do IO<Unit>:
             +bB1 : List<&2, U32> = List.append(&2, U32, bodyB, payload)
             req : H2.H2Request = mux.req_of(rhB, bB1)
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(sm, sidB, resp)
-            mux(~H, 0, mux.sent_got(sent), stA, H2.H2SrvSt{None{}, Nil{}, 0}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, mux.sent_got(sent), stA, H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 4:
-          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
         case 5:
           TLS.tls_close(sm)
         case 6:
           TLS.tls_close(sm)
         case _:
-          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+          mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
     case _:
-      mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+      mux(~H, 0, mux.read_got(got), stA, stB, buf, 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, tab)
 
 # Preface entry for the mux (owns the byte buffer end-to-end, so pipelined
 # frames are never dropped between streams). Below mux: calls upward.
@@ -635,7 +671,7 @@ def mux_pre(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, rs: Socket & Resu
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_settings(), 0, 0, Nil{})
-            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0}, H2.H2SrvSt{None{}, Nil{}, 0}, H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0)
+            mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.hp_empty())
         case _:
           TLS.tls_close(s2)
     case _:
