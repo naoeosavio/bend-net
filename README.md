@@ -166,11 +166,21 @@ Bend, no nghttp2/node:http2:
 | `h2_serve_once(sock, handler)` | Serve one request stream: preface, SETTINGS, HEADERS/DATA → `handler(H2Request) -> IO(H2Response)` → response frames |
 | `h2_serve_next(sock, handler)` | Serve one more stream on an established connection (no preface); thread for sequential keep-alive (sid 1, 3, 5, ...) without a new handshake |
 
-HPACK rides literal-without-indexing plus the static table; huffman
-strings and dynamic-table references are refused with `Fail 502`
-(fail-closed), so h2 peers here are Bend↔Bend. Streams are served
-sequentially per connection (the affine handle keeps reads linear);
-interleaved multiplexing, huffman decode and CONTINUATION are backlog.
+HPACK decodes the full RFC 7541 subset: literal (all three modes),
+static-table indexed (1–61) and dynamic-table indexed references,
+huffman strings (canonical Appendix B code), dynamic-table inserts
+with eviction (entry = len + len + 32, max 4096) and table-size
+updates. Integer continuations past 5 bytes fail closed with `502`
+(RFC 7541 §7.4 implementation limit). The encoder stays literal
+without huffman — valid HPACK every peer decodes, so Bend→Node needs
+no huffman encoder. Header blocks split across CONTINUATION and
+frames over 16384 still fail closed (`400`/`413`, backlog).
+`examples/https_real.bend` is a manual smoke against live hosts
+(observed: `400`/`413` on example.com, cloudflare.com, info.cern.ch);
+it is never part of the gate. Multi-stream keep-alive clients against
+huffman peers stay on single-shot `request` (fresh table per
+connection, always correct); per-connection decode state threads
+through the server loops and the concurrent mux.
 
 ```sh
 bend tests/io/h2_loopback.bend         # 1
@@ -199,11 +209,19 @@ Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
 Fail codes surface unchanged: `400/413/502/503` (codec), `601-605`
 (DNS), `611-616` (TLS).
 
+**Scope:** the client speaks HTTP/2 over verified TLS (ALPN `h2`).
+HPACK decode is full (see `## HTTP/2`): real-world `https://` hosts
+fail closed only on CONTINUATION splits (`400`) or frames > 16384
+(`413`); huffman/dynamic-table peers (node:http2, public sites)
+decode fine. Loopback and Bend↔Bend remain the golden-tested path;
+`examples/https_real.bend` documents the live smoke manually.
+
 ```sh
 bend tests/io/https_fetch.bend        # 1
 bend tests/io/https_streams.bend      # 1
 bend tests/io/https_server_on.bend    # 1
 bend tests/io/https_mux.bend          # 1
+bend examples/https_real.bend         # manual; FAIL 400/413/502 (HPACK subset)
 ```
 
 ## WebSocket
@@ -287,10 +305,15 @@ bend tests/io/wss_client_on.bend   # 1111
 
 `examples/` holds runnable programs that are not part of the package:
 `http_real.bend` fetches live pages through `lib/http.bend`;
-`server.bend` / `cliente.bend` are the hand-driven WS session;
+`https_real.bend` is the HTTPS smoke (manual, may `Fail 400`/`413`/`502`
+— HPACK subset / CONTINUATION); `server.bend` / `cliente.bend` are the
+hand-driven WS session;
 `server_on.bend` / `cliente_on.bend` are the same session over the
 `server_on` / `client_on` event API; the `.js` files are `ws` npm peers
-used for the interop matrix.
+used for the interop matrix (WSS/HTTPS peers live alongside them).
+`saturate_https_wss.bend` is the manual load driver (20 parallel
+clients per lane over ephemeral ports; prints `SAT`/`BENCH` lines) —
+never runs in the gate.
 
 Every WS peer runs the same scripted 6-step session on `127.0.0.1:19880`
 (`/chat`): `101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
@@ -315,6 +338,16 @@ Any server talks to any client (`server.bend <-> client.js`,
 typechecks the `.bend` files and syntax-checks the `.js` files;
 `http_real.bend` is a manual smoke test of live sites BY NAME (it
 needs a working resolver) and never runs in the gate.
+
+Interop matrix (loopback, test PEMs):
+
+| Pair | Result |
+|---|---|
+| WSS node ↔ node / bun ↔ bun / node ↔ bun / bun → node | **4/4 PASS** |
+| Bend `https_echo_client` → Node `https_server.js` | **PASS** (`DONE 3/3` / `DONE 1/1`) |
+| Node `https_client.js` → Bend `https_echo_server.bend` | **PASS** (`DONE 4/4`; was `502 huffman refused` before HPACK-full) |
+| Bend ↔ Bend HTTPS | **PASS** (golden `tests/io/https_*`, 4/4) |
+| HPACK vectors (RFC C.4.1/C.6.1) + dynamic-table unit | **PASS** (`tests/io/hpack_huffman.bend` 11111111, `hpack_dyntab.bend` 11111111) |
 
 ## Security policy
 
@@ -413,7 +446,18 @@ four arguments.
 
 ## Roadmap
 
-- HTTP/2 backlog: huffman decode, dynamic table, interleaved
-  multiplexing, CONTINUATION, h2c (cleartext).
+- HTTPS/WSS validation (done 2026-09-22, see `tasks/task-018-validate-https-wss.md`):
+  interop WSS 4/4 + Bend→Node HTTPS PASS (Node→Bend FAIL documented:
+  HPACK huffman), saturation 20/20 per lane
+  (`examples/saturate_https_wss.bend`), bench 40 exchanges in ~15.2s
+  interp / ~2.3s C (~2.6 vs ~17.8 ex/s).
+- HPACK full (done 2026-09-22, see `tasks/task-019-hpack-huffman-dyntab.md`):
+  huffman decode + dynamic table + table-size updates; interop HTTPS
+  bidirecional PASS; saturation 20/20 per lane (interp ~16.3s / C
+  ~2.2s for 40 exchanges — see `tasks/task-020-perf.md`).
+- HTTP/2 backlog: interleaved multiplexing (sequential + 2-slot mux
+  today), CONTINUATION, h2c (cleartext). Live smoke already fails
+  closed on CONTINUATION splits (`400 hpack eof*`) and frames
+  > 16384 (`413`).
 - IPv6 (AAAA) resolution and connect: `dns.bend` answers A only.
 - Cluster run of the suite (`--gate`) and a first hub `--publish`.
