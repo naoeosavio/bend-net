@@ -12,6 +12,7 @@ the TLS effects in `lib/effs/` (OpenSSL via dlopen — no link flags).
 lib/package.bend          # package entry (publish this file)
 lib/http.bend             # HTTP/1.1 library (~2350 lines, imports Base only)
 lib/ws.bend               # WebSocket server + client (text/binary, control)
+lib/wss.bend              # WebSocket Secure: WS over TLS (client + server)
 lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
 lib/b64.bend              # base64, for the handshake accept
 lib/static.bend           # static-file handler on top of HTTP
@@ -32,7 +33,9 @@ tests/io/http_lib_sec.bend    # security: CRLF/NUL injection, oversize, bad stat
 tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
 tests/io/tls_connect_close.bend # IO: TLS loopback echo + fail paths (611/612)
 tests/io/h2_loopback.bend       # IO: HTTP/2 echo over TLS (Bend↔Bend)
+tests/io/https_*.bend         # HTTPS facade: fetch, streams, server_on, mux
 tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
+tests/io/wss_*.bend           # WSS loopback, server_on, client_on over TLS
 tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
 examples/                 # runnable interop programs (not published)
 tasks/                    # engineering log (decisions, discoveries, checklists)
@@ -135,7 +138,8 @@ the C and JS twins):
 |---|---|
 | `tls_connect(host, port)` | Resolve (DNS), connect and handshake with chain verification; SNI is the ORIGINAL host; ALPN `h2` is required |
 | `tls_connect_insecure(host, port)` | Same handshake without chain verification (loopback/self-signed tests) |
-| `tls_accept(listener, cert, key)` | Accept one TCP connection and handshake it with the PEM cert/key files; ALPN `h2` preferred |
+| `tls_connect_noalpn(host, port)` / `tls_connect_noalpn_insecure` | Same without offering ALPN (WSS / HTTP/1.1 Upgrade over TLS) |
+| `tls_accept(listener, cert, key)` | Accept one TCP connection and handshake it with the PEM cert/key files; ALPN `h2` preferred (NOACK when the client offers none) |
 | `tls_send_bytes` / `tls_recv_bytes` | Byte-faithful send/recv (List<&2, U32>) over the TLS socket; WANT_READ/WANT_WRITE parks |
 | `tls_close` | Orderly shutdown, session free, fd close |
 
@@ -185,6 +189,8 @@ keep-alive servers, mirroring `lib/http.bend`:
 | `fetch(url)` / `fetch_insecure` | `https://` GET by URL (via `HTTP.read_url`); `http://` refused with `Fail 400`; answers the body as `String` |
 | `fetch_bytes(url)` / `fetch_bytes_insecure` | Same GET answering raw `List<&2, U32>` bytes |
 | `server_on(~H, l, cert, key, n)` | Generic keep-alive server (like `HTTP.server_on`): TLS accept loop with `IO.spawn` per connection, `n` extra streams per connection via `h2_serve_next`; `~H` is `H2Request -> IO(H2Response)` |
+| `server_on_concurrent(~H, l, cert, key)` | Same accept loop; per connection a 2-slot interleaved mux (pipelined HEADERS/DATA of two open streams answered by sid; a third simultaneous stream fails the connection fail-closed) |
+| `mux_start(~H, sock)` | One-shot concurrent serve on an established TLS socket (the test entry of the mux) |
 | `echo.body` / `ok(body)` | Echo handler and `200` response helper |
 
 Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
@@ -196,6 +202,8 @@ Fail codes surface unchanged: `400/413/502/503` (codec), `601-605`
 ```sh
 bend tests/io/https_fetch.bend        # 1
 bend tests/io/https_streams.bend      # 1
+bend tests/io/https_server_on.bend    # 1
+bend tests/io/https_mux.bend          # 1
 ```
 
 ## WebSocket
@@ -240,6 +248,31 @@ IO:
 | `server_on(~H, l)` | Event-driven server: `~H` maps `WSEv` to `IO(WSOut)`, one step per frame |
 | `client_on(~H, host, port, path, key)` | Event-driven client, same `WSEv`/`WSOut` API, sends masked |
 | `client_echo(host, port, path, key, msg)` | Connect, handshake, send, read the echo |
+
+## WSS
+
+`lib/wss.bend` (import as `WSS`) is WebSocket Secure: the same RFC 6455
+API as `lib/ws.bend`, riding `lib/tls.bend`. Types (`WSEv`, `WSOut`,
+`WSMessage`) come from `WS` — import both. The client dials with
+`tls_connect_noalpn[_insecure]` (ALPN none: WSS is HTTP/1.1 Upgrade,
+not h2); the server accepts with `tls_accept`. Every path closes via
+`TLS.tls_close` (never `Socket.close`).
+
+| Function | Description |
+|---|---|
+| `serve_once(sock)` | Single-shot server echo over one TLS socket |
+| `server_on(~H, l, cert, key)` | Event-driven server: TLS accept loop, `IO.spawn` per connection, same `~H` as `WS.server_on` |
+| `client_on(~H, host, port, path, key)` / `client_on_insecure` | Event-driven client over no-ALPN TLS, masked sends |
+| `client_echo(...)` / `client_echo_insecure(...)` | Single-shot connect + handshake + one frame + echo |
+
+Fail codes surface unchanged: WS `400`/`413`, DNS `601-605`, TLS
+`611-616`.
+
+```sh
+bend tests/io/wss_loopback.bend    # 111
+bend tests/io/wss_server_on.bend   # 1
+bend tests/io/wss_client_on.bend   # 1111
+```
 
 ## Helpers
 
@@ -331,8 +364,10 @@ bend tests/io/tcp_bytes_loopback.bend # 1
 bend tests/io/dns_resolve.bend        # 1111111111
 bend tests/io/tls_connect_close.bend  # 111
 bend tests/io/h2_loopback.bend        # 1
-tests/io/https_fetch.bend          # 1
-tests/io/https_streams.bend        # 1
+bend tests/io/https_fetch.bend        # 1
+bend tests/io/https_streams.bend      # 1
+bend tests/io/https_server_on.bend    # 1
+bend tests/io/https_mux.bend          # 1
 bend tests/io/ws_crypto.bend          # 8
 bend tests/io/ws_handshake.bend       # 4
 bend tests/io/ws_frame.bend           # 6

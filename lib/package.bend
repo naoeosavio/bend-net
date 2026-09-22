@@ -21,7 +21,9 @@
 #
 #   import 0x<hash>/http.bend as HTTP
 #   import 0x<hash>/http2.bend as HTTP2
+#   import 0x<hash>/https.bend as HTTPS
 #   import 0x<hash>/ws.bend   as WS
+#   import 0x<hash>/wss.bend  as WSS
 #   import 0x<hash>/sha1.bend as SHA1
 #   import 0x<hash>/b64.bend  as B64
 #   import 0x<hash>/tcp.bend  as TCP
@@ -34,15 +36,17 @@ import ./b64.bend as B64
 import ./dns.bend as DNS
 import ./http.bend as HTTP
 import ./http2.bend as HTTP2
+import ./https.bend as HTTPS
 import ./sha1.bend as SHA1
 import ./tcp.bend as TCP
 import ./tls.bend as TLS
 import ./ws.bend as WS
+import ./wss.bend as WSS
 
 # Marks the bundle ready; the API lives in http.bend, ws.bend
-# (with sha1.bend and b64.bend for the handshake), tcp.bend, whose
-# byte effects WS frames ride, dns.bend, whose resolve feeds the
-# HTTP fetch lane, and tls.bend, whose handshake lane feeds the
-# coming HTTP/2.
+# (with sha1.bend and b64.bend for the handshake), wss.bend (WS
+# over TLS), tcp.bend, whose byte effects WS frames ride,
+# dns.bend, whose resolve feeds the HTTP fetch lane, and
+# tls.bend, whose handshake lane feeds HTTPS and WSS.
 def Package.ready() -> Unit:
   Unit{}
