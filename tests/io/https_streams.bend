@@ -1,12 +1,23 @@
-# lib (lib_h2_loopback): HTTP/2 over TLS on loopback. The server
-# accepts one TLS connection, serves one h2 request stream with the
-# echo handler; the client connects insecurely (self-signed test
-# cert), POSTs a body on stream 1 and checks the echo. A second
-# request rides the same connection on stream 3 (sequential
-# multiplexing). Status and both bodies must match.
+# lib (lib_https_streams): two sequential streams on one HTTPS
+# connection. The server serves via HTTPS.serve_start (multi-stream
+# sequential loop); the client connects once and POSTs body1 on sid 1
+# then body2 on sid 3 over the same TLS connection, checking both
+# echoes and statuses. Golden 1.
 import Base
 import ../../lib/tls.bend as TLS
+import ../../lib/https.bend as HTTPS
 import ../../lib/http2.bend as H2
+
+def body1() -> List<&2, U32>:
+  [104, 101, 108, 108, 111]
+
+def body2() -> List<&2, U32>:
+  [119, 111, 114, 108, 100, 33]
+
+def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
+  match req:
+    case H2.H2Request{+method, +path, +headers, +body}:
+      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -14,12 +25,6 @@ def b2u(b: Bool) -> U32:
       1
     case False{}:
       0
-
-def body1() -> List<&2, U32>:
-  [104, 101, 108, 108, 111]
-
-def body2() -> List<&2, U32>:
-  [119, 111, 114, 108, 100, 33]
 
 def mul_eq(+acc: U32, same: Bool) -> U32:
   match same:
@@ -37,11 +42,6 @@ def bytes_eq(a: List<&2, U32>, b: List<&2, U32>) -> U32:
     case _ _:
       0
 
-def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
-  match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
-
 law server_down:
   for l: Listener
   for e: U32 & String
@@ -52,61 +52,23 @@ def server_down(l, e):
     x : Unit <- Listener.close(l)
     return "down"
 
-def server_close(l: Listener, s2: Socket) -> IO(String):
+def server_close(l: Listener) -> IO(String):
   do IO<String>:
-    x : Unit <- TLS.tls_close(s2)
     y : Unit <- Listener.close(l)
     return "up"
 
-def server_served2(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit>) -> IO(String):
-  (s2, r) = got
-  match r:
-    case Fail{e}:
-      do IO<String>:
-        x : Unit <- TLS.tls_close(s2)
-        server_down(l, e)
-    case Done{u}:
-      server_close(l, s2)
-
-def server_serve2(sock: Socket) -> IO(Socket & Result<&1, &1, (U32 & String), Unit>):
-  H2.h2_serve_next(sock, h2_echo)
-
-def server_served(l: Listener, got: Socket & Result<&1, &1, (U32 & String), Unit>) -> IO(String):
-  (s2, r) = got
-  match r:
-    case Fail{e}:
-      do IO<String>:
-        x : Unit <- TLS.tls_close(s2)
-        server_down(l, e)
-    case Done{u}:
-      do IO<String>:
-        got2 : Socket & Result<&1, &1, (U32 & String), Unit> <- server_serve2(s2)
-        server_served2(l, got2)
-
-def server_serve(sock: Socket) -> IO(Socket & Result<&1, &1, (U32 & String), Unit>):
-  H2.h2_serve_once(sock, h2_echo)
-
-law server_talk:
-  for l: Listener
-  for sock: Socket
-  IO(String)
-
-def server_talk(l, sock):
+def server_served(l: Listener, sock: Socket) -> IO(String):
   do IO<String>:
-    got : Socket & Result<&1, &1, (U32 & String), Unit> <- server_serve(sock)
-    server_served(l, got)
+    x : Unit <- HTTPS.serve_start(~h2_echo, sock, 8n)
+    server_close(l)
 
-law server_conn:
-  for m: Listener & Result<&1, &1, (U32 & String), Socket>
-  IO(String)
-
-def server_conn(m):
+def server_conn(m: Listener & Result<&1, &1, (U32 & String), Socket>) -> IO(String):
   (l, r) = m
   match r:
     case Fail{e}:
       server_down(l, e)
     case Done{sock}:
-      server_talk(l, sock)
+      server_served(l, sock)
 
 law server_side:
   for l: Listener
@@ -117,32 +79,11 @@ def server_side(l):
     m : Listener & Result<&1, &1, (U32 & String), Socket> <- TLS.tls_accept(l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     server_conn(m)
 
-
-def client_score(sock: Socket, body: List<&2, U32>, st_ok: U32) -> IO(U32):
-  do IO<U32>:
-    x : Unit <- TLS.tls_close(sock)
-    +eq : U32 = bytes_eq(body, body1())
-    return (st_ok * eq : U32)
-
-
-def client_done(got: Socket & Result<&1, &1, (U32 & String), H2.H2Response>) -> IO(U32):
-  (s2, r) = got
-  match r:
-    case Fail{e}:
-      do IO<U32>:
-        x : Unit <- TLS.tls_close(s2)
-        return 0
-    case Done{+resp}:
-      match resp:
-        case H2.H2Response{+status, +headers, +body}:
-          client_score(s2, body, b2u(U32.is_eq(status, 200)))
-
 def client_score2(sock: Socket, body: List<&2, U32>, st_ok: U32, acc: U32) -> IO(U32):
   do IO<U32>:
     x : Unit <- TLS.tls_close(sock)
     +eq : U32 = bytes_eq(body, body2())
     return (st_ok * eq * acc : U32)
-
 
 def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), H2.H2Response>) -> IO(U32):
   (s2, r) = got
