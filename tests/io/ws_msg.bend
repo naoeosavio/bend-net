@@ -1,5 +1,6 @@
 # lib (ws_msg): WSMessage send/recv generics over loopback.
-# Pure: text/binary roundtrips, fragmented/control rejects, ping as
+# Pure: text/binary roundtrips, fragment reassembly (a leading FIN=0
+# frame now stitches instead of failing), control rejects, ping as
 # InOp. Net (one listener, three accepts): raw send_bytes/recv_bytes
 # plus text and binary echo. Scores 1000*pure + 100*raw + 10*text + bin.
 import Base
@@ -159,11 +160,24 @@ law chk_bin:
 def chk_bin():
   msg_bin_ok(msg_of_res(read_of(WS.show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8))))
 
+law is_frag:
+  for s: WS.WsStep
+  U32
+
+def is_frag(s):
+  match s:
+    case WS.StepFrag{acc}:
+      1
+    case WS.StepEv{ev}:
+      0
+    case WS.StepOut{out}:
+      0
+
 law chk_frag:
   U32
 
 def chk_frag():
-  is_fail400m(msg_of_res(WS.read_frame([1, 130, 1, 2, 3, 4, 73, 107])))
+  is_frag(WS.frag_ev(WS.FragIdle{}, False{}, 1, [72, 105]))
 
 law chk_ping:
   U32

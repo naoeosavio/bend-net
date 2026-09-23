@@ -143,7 +143,7 @@ law chk_cap:
   U32
 
 def chk_cap():
-  is_fail413f(WS.read_frame([130, 255, 0, 0, 0, 0, 0, 16, 0, 1, 1, 2, 3, 4, 5]))
+  is_fail413f(WS.read_frame([130, 255, 0, 0, 0, 0, 1, 0, 0, 1, 1, 2, 3, 4, 5]))
 
 law main:
   U32
