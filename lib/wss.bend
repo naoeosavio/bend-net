@@ -417,11 +417,27 @@ def wss_hs_scan_done(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32
       (head, rest) = pair
       wss_hs_reply(~H, s, WS.handshake(HTTP.decode(head)), rest)
 
+def wss_hs_scan_done_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, +wanted: List<&2, String>) ->
+  IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      wss_close(s)
+    case Done{pair}:
+      (head, rest) = pair
+      wss_hs_reply(~H, s, WS.handshake_sub(HTTP.decode(head), wanted), rest)
+
 def wss_serve(~H: WS.WSEv -> IO(WS.WSOut), sock: Socket, cert: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(sock, Nil{}, False{}, True{})
     wss_hs_scan_done(~H, m)
+
+def wss_serve_sub(~H: WS.WSEv -> IO(WS.WSOut), sock: Socket, +wanted: List<&2, String>) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(sock, Nil{}, False{}, True{})
+    wss_hs_scan_done_sub(~H, m, wanted)
 
 def wss_conn(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +cert: String, +key: String) ->
   IO(Listener):
@@ -431,6 +447,14 @@ def wss_conn(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & Str
     IO.spawn(Unit, wss_serve(~H, s, cert))
     return l
 
+def wss_conn_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +cert: String, +key: String, +wanted: List<&2, String>) ->
+  IO(Listener):
+  (l, r) = m
+  do IO<Listener>:
+    s : Socket <- IO.pass(Socket, r)
+    IO.spawn(Unit, wss_serve_sub(~H, s, wanted))
+    return l
+
 @unsafe
 def server_on(~H: WS.WSEv -> IO(WS.WSOut), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
@@ -438,6 +462,15 @@ def server_on(~H: WS.WSEv -> IO(WS.WSOut), l: Listener, +cert: String, +key: Str
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
     l2 : Listener <- wss_conn(~H, m, cert, key)
     z : Unit <- server_on(~H, l2, cert, key)
+    return z
+
+@unsafe
+def server_on_sub(~H: WS.WSEv -> IO(WS.WSOut), l: Listener, +cert: String, +key: String, +wanted: List<&2, String>) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
+    l2 : Listener <- wss_conn_sub(~H, m, cert, key, wanted)
+    z : Unit <- server_on_sub(~H, l2, cert, key, wanted)
     return z
 
 # client_on: event-driven persistent client over TLS, the mirror of
@@ -565,6 +598,17 @@ def wss_client_hs_parsed(~H: WS.WSEv -> IO(WS.WSOut), s: Socket, parsed: Result<
       (st, hs, body) = pr
       wss_client_hs_go(~H, s, WS.client_ok_of(st, hs, accept), rest)
 
+def wss_client_hs_parsed_sub(~H: WS.WSEv -> IO(WS.WSOut), s: Socket, parsed: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, +rest: List<&2, U32>, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  match parsed:
+    case Fail{(c, m)}:
+      do IO<Unit>:
+        out : WS.WSOut <- H(WS.EvError{c, m})
+        wss_close(s)
+    case Done{pr}:
+      (st, hs, body) = pr
+      wss_client_hs_go(~H, s, WS.client_ok_of_sub(st, hs, accept, offered), rest)
+
 def wss_client_hs(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, +accept: String) ->
   IO(Unit):
   (s, r) = m
@@ -576,6 +620,18 @@ def wss_client_hs(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & 
     case Done{pair}:
       (head, rest) = pair
       wss_client_hs_parsed(~H, s, HTTP.read_response(HTTP.decode(head) ++ "\r\n\r\n"), rest, accept)
+
+def wss_client_hs_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{(c, msg)}:
+      do IO<Unit>:
+        out : WS.WSOut <- H(WS.EvError{c, msg})
+        wss_close(s)
+    case Done{pair}:
+      (head, rest) = pair
+      wss_client_hs_parsed_sub(~H, s, HTTP.read_response(HTTP.decode(head) ++ "\r\n\r\n"), rest, accept, offered)
 
 def wss_client_req_sent(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & String, Unit>, +accept: String) ->
   IO(Unit):
@@ -590,6 +646,19 @@ def wss_client_req_sent(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, 
         m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(s, Nil{}, False{}, True{})
         wss_client_hs(~H, m2, accept)
 
+def wss_client_req_sent_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & String, Unit>, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{(c, msg)}:
+      do IO<Unit>:
+        out : WS.WSOut <- H(WS.EvError{c, msg})
+        wss_close(s)
+    case Done{u}:
+      do IO<Unit>:
+        m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(s, Nil{}, False{}, True{})
+        wss_client_hs_sub(~H, m2, accept, offered)
+
 def wss_client_dial(~H: WS.WSEv -> IO(WS.WSOut), conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String, +accept: String) ->
   IO(Unit):
   match conn:
@@ -601,6 +670,18 @@ def wss_client_dial(~H: WS.WSEv -> IO(WS.WSOut), conn: Result<&1, &1, U32 & Stri
       do IO<Unit>:
         m : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_str(sock, req_txt)
         wss_client_req_sent(~H, m, accept)
+
+def wss_client_dial_sub(~H: WS.WSEv -> IO(WS.WSOut), conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  match conn:
+    case Fail{(c, m)}:
+      do IO<Unit>:
+        out : WS.WSOut <- H(WS.EvError{c, m})
+        return Unit{}
+    case Done{sock}:
+      do IO<Unit>:
+        m : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_str(sock, req_txt)
+        wss_client_req_sent_sub(~H, m, accept, offered)
 
 def wss_on_go(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port: U32, +req_txt: String, +accept: String) ->
   IO(Unit):
@@ -614,6 +695,18 @@ def wss_on_go(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port: U32
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn(host, port)
         wss_client_dial(~H, conn, req_txt, accept)
 
+def wss_on_go_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, +port: U32, +req_txt: String, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  match verify:
+    case 0:
+      do IO<Unit>:
+        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
+        wss_client_dial_sub(~H, conn, req_txt, accept, offered)
+    case _:
+      do IO<Unit>:
+        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn(host, port)
+        wss_client_dial_sub(~H, conn, req_txt, accept, offered)
+
 def wss_client_req(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port: U32, +accept: String, req: Result<&1, &1, U32 & String, String>) ->
   IO(Unit):
   match req:
@@ -624,6 +717,16 @@ def wss_client_req(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port
     case Done{req_txt}:
       wss_on_go(~H, verify, host, port, req_txt, accept)
 
+def wss_client_req_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, +port: U32, +accept: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, String>) ->
+  IO(Unit):
+  match req:
+    case Fail{(c, m)}:
+      do IO<Unit>:
+        out : WS.WSOut <- H(WS.EvError{c, m})
+        return Unit{}
+    case Done{req_txt}:
+      wss_on_go_sub(~H, verify, host, port, req_txt, accept, offered)
+
 def client_on(~H: WS.WSEv -> IO(WS.WSOut), +host: String, port: U32, +path: String, +key: String) ->
   IO(Unit):
   wss_client_req(~H, 1, host, port, WS.accept_of(key), WS.client_request(host, path, key))
@@ -631,6 +734,14 @@ def client_on(~H: WS.WSEv -> IO(WS.WSOut), +host: String, port: U32, +path: Stri
 def client_on_insecure(~H: WS.WSEv -> IO(WS.WSOut), +host: String, port: U32, +path: String, +key: String) ->
   IO(Unit):
   wss_client_req(~H, 0, host, port, WS.accept_of(key), WS.client_request(host, path, key))
+
+def client_on_sub(~H: WS.WSEv -> IO(WS.WSOut), +host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) ->
+  IO(Unit):
+  wss_client_req_sub(~H, 1, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
+
+def client_on_sub_insecure(~H: WS.WSEv -> IO(WS.WSOut), +host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) ->
+  IO(Unit):
+  wss_client_req_sub(~H, 0, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
 
 # Client echo (single-shot, fixed mask) for loopback tests.
 # Mirrors WS.client_echo: dial noalpn, handshake, send masked frame,
