@@ -29,19 +29,138 @@ import ./tcp.bend as TCP
 def guid() -> String:
   "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# Phase 2 helpers: strict handshake validation plus subprotocol picks.
+# All comments in English; callees stay above callers.
+
+def ws_is_b64(+code: U32) -> Bool:
+  Bool.or(Bool.and(U32.is_ge(code, 65), U32.is_le(code, 90)), Bool.or(Bool.and(U32.is_ge(code, 97), U32.is_le(code, 122)), Bool.or(Bool.and(U32.is_ge(code, 48), U32.is_le(code, 57)), Bool.or(U32.is_eq(code, 43), U32.is_eq(code, 47)))))
+
+def ws_b64_char_ok(c: Char) -> Bool:
+  match c:
+    case Chr{code}:
+      ws_is_b64(code)
+
+def ws_b64_list_ok(cs: List<&2, Char>) -> Bool:
+  match cs:
+    case Nil{}:
+      True{}
+    case h <> t:
+      Bool.and(ws_b64_char_ok(h), ws_b64_list_ok(t))
+
+def ws_key_ok(+key: String) -> Bool:
+  +trimmed = String.trim(key)
+  +head22 = String.take(trimmed, 22n)
+  Bool.and(Nat.is_eq(String.length(trimmed), 24n), Bool.and(String.ends_with(trimmed, "=="), ws_b64_list_ok(String.to_list(head22))))
+
+def ws_conn_tok_ok(+tok: String) -> Bool:
+  String.eq(String.to_lower(String.trim(tok)), "upgrade")
+
+def ws_conn_list_ok(toks: List<&2, String>) -> Bool:
+  match toks:
+    case Nil{}:
+      False{}
+    case h <> t:
+      +hh = h
+      Bool.or(ws_conn_tok_ok(hh), ws_conn_list_ok(t))
+
+def ws_conn_has_upgrade(+val: String) -> Bool:
+  ws_conn_list_ok(String.split(val, ','))
+
+def ws_trim_nonempty(+tok: String) -> Bool:
+  Bool.not(String.is_empty(String.trim(tok)))
+
+def ws_proto_cons(+trimmed: String, +rest: List<&2, String>, keep: Bool) -> List<&2, String>:
+  match keep:
+    case True{}:
+      trimmed <> rest
+    case False{}:
+      rest
+
+def ws_trim_protos(toks: List<&2, String>) -> List<&2, String>:
+  match toks:
+    case Nil{}:
+      Nil{}
+    case h <> t:
+      +hh = h
+      +trimmed = String.trim(hh)
+      ws_proto_cons(trimmed, ws_trim_protos(t), ws_trim_nonempty(hh))
+
+def ws_protos_of(+val: String) -> List<&2, String>:
+  ws_trim_protos(String.split(val, ','))
+
+def ws_list_contains(xs: List<&2, String>, +item: String) -> Bool:
+  match xs:
+    case Nil{}:
+      False{}
+    case h <> t:
+      +hh = h
+      +it = item
+      Bool.or(String.eq(hh, it), ws_list_contains(t, it))
+
+def ws_pick_go(+served: List<&2, String>, +client: List<&2, String>) -> Maybe<&2, String>:
+  match served:
+    case Nil{}:
+      None{}
+    case h <> t:
+      +hh = h
+      +tt = t
+      +cc = client
+      +hh2 = hh
+      +cc2 = cc
+      Bool.pick(Maybe<&2, String>, ws_list_contains(cc, hh), Some{hh2}, ws_pick_go(tt, cc2))
+
+def ws_pick_sub(+client: List<&2, String>, +served: List<&2, String>) -> Maybe<&2, String>:
+  ws_pick_go(served, client)
+
+def ws_host_port_go(+host: String, +port: U32, is_def: Bool) -> String:
+  match is_def:
+    case True{}:
+      host
+    case False{}:
+      host ++ ":" ++ U32.show(port)
+
+def ws_host_port(+host: String, +port: U32) -> String:
+  ws_host_port_go(host, port, Bool.or(U32.is_eq(port, 80), U32.is_eq(port, 443)))
+
+def scan_proto_add(+acc: List<&2, String>, +val: String, is_proto: Bool) -> List<&2, String>:
+  match is_proto:
+    case True{}:
+      List.append(&2, String, acc, ws_protos_of(val))
+    case False{}:
+      acc
+
 def scan_go(hs: List<&1, String & String>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool) -> String & Bool:
   match hs:
     case Nil{}:
-      (key_acc, Bool.and(up_ok, Bool.and(ver_ok, Bool.and(conn_ok, Bool.not(String.is_empty(String.trim(key_acc)))))))
+      (key_acc, Bool.and(up_ok, Bool.and(ver_ok, Bool.and(conn_ok, ws_key_ok(key_acc)))))
     case (n, v) <> t:
       +nn = n
       +vv = v
       +tv = String.trim(vv)
       +low = String.to_lower(String.trim(vv))
-      scan_go(t, Bool.pick(String, HTTP.eq_ci(nn, "Sec-WebSocket-Key"), tv, key_acc), Bool.or(up_ok, Bool.and(HTTP.eq_ci(nn, "Upgrade"), String.eq(low, "websocket"))), Bool.or(ver_ok, Bool.and(HTTP.eq_ci(nn, "Sec-WebSocket-Version"), String.eq(tv, "13"))), Bool.or(conn_ok, Bool.and(HTTP.eq_ci(nn, "Connection"), String.contains(low, "upgrade"))))
+      scan_go(t, Bool.pick(String, HTTP.eq_ci(nn, "Sec-WebSocket-Key"), tv, key_acc), Bool.or(up_ok, Bool.and(HTTP.eq_ci(nn, "Upgrade"), String.eq(low, "websocket"))), Bool.or(ver_ok, Bool.and(HTTP.eq_ci(nn, "Sec-WebSocket-Version"), String.eq(tv, "13"))), Bool.or(conn_ok, Bool.and(HTTP.eq_ci(nn, "Connection"), ws_conn_has_upgrade(vv))))
 
 def scan(hs: List<&1, String & String>) -> String & Bool:
   scan_go(hs, "", False{}, False{}, False{})
+
+def scan_full_go(hs: List<&1, String & String>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool, +proto_acc: List<&2, String>) -> String & Bool & List<&2, String>:
+  match hs:
+    case Nil{}:
+      (key_acc, Bool.and(up_ok, Bool.and(ver_ok, Bool.and(conn_ok, ws_key_ok(key_acc)))), proto_acc)
+    case (n, v) <> t:
+      +nn = n
+      +vv = v
+      +tv = String.trim(vv)
+      +low = String.to_lower(String.trim(vv))
+      +nn2 = nn
+      +nn3 = nn
+      +nn4 = nn
+      +vv2 = vv
+      +vv3 = vv
+      scan_full_go(t, Bool.pick(String, HTTP.eq_ci(nn, "Sec-WebSocket-Key"), tv, key_acc), Bool.or(up_ok, Bool.and(HTTP.eq_ci(nn2, "Upgrade"), String.eq(low, "websocket"))), Bool.or(ver_ok, Bool.and(HTTP.eq_ci(nn3, "Sec-WebSocket-Version"), String.eq(tv, "13"))), Bool.or(conn_ok, Bool.and(HTTP.eq_ci(nn4, "Connection"), ws_conn_has_upgrade(vv2))), scan_proto_add(proto_acc, vv3, HTTP.eq_ci(nn, "Sec-WebSocket-Protocol")))
+
+def scan_full(hs: List<&1, String & String>) -> String & Bool & List<&2, String>:
+  scan_full_go(hs, "", False{}, False{}, False{}, Nil{})
 
 def accept_of(+key: String) -> String:
   +trimmed = String.trim(key)
@@ -57,6 +176,55 @@ def show_101.go(+accept: String, bad: Bool) -> Result<&1, &1, U32 & String, Stri
 
 def show_101(+accept: String) -> Result<&1, &1, U32 & String, String>:
   show_101.go(accept, HTTP.has_crlf(accept))
+
+def show_101_sub_go(+accept: String, +proto: String, bad: Bool) -> Result<&1, &1, U32 & String, String>:
+  match bad:
+    case True{}:
+      Fail{(400, "bad accept")}
+    case False{}:
+      Done{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " ++ accept ++ "\r\nSec-WebSocket-Protocol: " ++ proto ++ "\r\n\r\n"}
+
+def show_101_with(+accept: String, +proto: String) -> Result<&1, &1, U32 & String, String>:
+  show_101_sub_go(accept, proto, Bool.or(HTTP.has_crlf(accept), HTTP.has_crlf(proto)))
+
+def show_101_sub(+accept: String, proto: Maybe<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  match proto:
+    case None{}:
+      show_101(accept)
+    case Some{p}:
+      show_101_with(accept, p)
+
+def chk_headers_sub(+key: String, ok: Bool, proto: Maybe<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  match ok:
+    case True{}:
+      show_101_sub(accept_of(key), proto)
+    case False{}:
+      Fail{(400, "bad headers")}
+
+def chk_method_sub(+key: String, headers_ok: Bool, is_get: Bool, proto: Maybe<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  match is_get:
+    case True{}:
+      chk_headers_sub(key, headers_ok, proto)
+    case False{}:
+      Fail{(400, "bad method")}
+
+def handshake_keys_sub(m: String, trio: String & Bool & List<&2, String>, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  (key, ok, cprotos) = trio
+  chk_method_sub(key, ok, String.eq(m, "GET"), ws_pick_sub(cprotos, wanted))
+
+def handshake_req_sub(req: String & String & List<&1, String & String> & String, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  (m, p, hs, body) = req
+  handshake_keys_sub(m, scan_full(hs), wanted)
+
+def handshake_parsed_sub(parsed: Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  match parsed:
+    case Fail{e}:
+      Fail{e}
+    case Done{req}:
+      handshake_req_sub(req, wanted)
+
+def handshake_sub(+s: String, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  handshake_parsed_sub(HTTP.read_request(s), wanted)
 
 def chk_headers(+key: String, ok: Bool) -> Result<&1, &1, U32 & String, String>:
   match ok:
@@ -969,6 +1137,32 @@ def show_frame(+fin: Bool, +op: U32, +payload: List<&2, U32>) -> Result<&1, &1, 
 # ------
 # Builds the opening request and masked frames (fixed key in tests).
 
+def ws_has_proto(protos: List<&2, String>) -> Bool:
+  match protos:
+    case Nil{}:
+      False{}
+    case _ <> _:
+      True{}
+
+def ws_proto_line_go(+joined: String, has_any: Bool) -> String:
+  match has_any:
+    case True{}:
+      "\r\nSec-WebSocket-Protocol: " ++ joined
+    case False{}:
+      ""
+
+def ws_proto_line(+protos: List<&2, String>) -> String:
+  +pp = protos
+  ws_proto_line_go(String.join(pp, ", "), ws_has_proto(pp))
+
+def ws_protos_bad(protos: List<&2, String>) -> Bool:
+  match protos:
+    case Nil{}:
+      False{}
+    case h <> t:
+      +hh = h
+      Bool.or(HTTP.has_crlf(hh), ws_protos_bad(t))
+
 def client_req.go(+host: String, +path: String, +key: String, bad: Bool) -> Result<&1, &1, U32 & String, String>:
   match bad:
     case True{}:
@@ -978,6 +1172,18 @@ def client_req.go(+host: String, +path: String, +key: String, bad: Bool) -> Resu
 
 def client_request(+host: String, +path: String, +key: String) -> Result<&1, &1, U32 & String, String>:
   client_req.go(host, path, key, HTTP.has_crlf3(host, path, key))
+
+def client_req_sub_go(+hostport: String, +path: String, +key: String, +protoline: String, bad: Bool) -> Result<&1, &1, U32 & String, String>:
+  match bad:
+    case True{}:
+      Fail{(400, "bad request")}
+    case False{}:
+      Done{"GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ hostport ++ "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " ++ key ++ protoline ++ "\r\nSec-WebSocket-Version: 13\r\n\r\n"}
+
+def client_request_sub(+host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  +hp = ws_host_port(host, port)
+  +pl = ws_proto_line(protos)
+  client_req_sub_go(hp, path, key, pl, Bool.or(HTTP.has_crlf3(host, path, key), ws_protos_bad(protos)))
 
 def show_masked_small(+fin: Bool, +op: U32, +len: U32, +masked: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32) -> List<&2, U32>:
   List.append(&2, U32, [show_b0(fin, op), (len + 128 : U32), k0, k1, k2, k3], masked)
@@ -1529,6 +1735,70 @@ def server_on(~H: WSEv -> IO(WSOut), l: Listener) -> IO(Unit):
     z : Unit <- server_on(~H, l2)
     return z
 
+# server_on_sub: same persistent server but negotiates Sec-WebSocket-Protocol.
+# wanted lists the protocols the application supports; the handshake echoes
+# the first overlap with the client's offer (or none when disjoint, per RFC
+# the server may ignore). Plain server_on stays a Nil-wanted wrapper so old
+# goldens never regress.
+
+@unsafe
+def ws_hs_sub(~H: WSEv -> IO(WSOut), st: U32, mr: Socket & Result<&1, &1, U32 & String, String>, mp: Result<&1, &1, U32 & String, String>, +acc: String, +fit: Bool, +ok: Bool, +wanted: List<&2, String>) -> IO(Unit):
+  match st:
+    case 0:
+      (s, r) = mr
+      match r:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{part}:
+          +acc2 = acc ++ part
+          +w = wanted
+          ws_hs_sub(~H, 1, (s, Done{""}), Fail{(0, "")}, acc2, HTTP.has_blank(acc2), Nat.is_le(String.length(acc2), 16384n), w)
+    case 1:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          +a = acc
+          +w = wanted
+          ws_hs_sub(~H, 3, (s, Done{""}), handshake_sub(a, w), acc, fit, ok, wanted)
+        case False{}:
+          match ok:
+            case True{}:
+              +w = wanted
+              do IO<Unit>:
+                mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
+                ws_hs_sub(~H, 0, mr2, Fail{(0, "")}, acc, fit, ok, w)
+            case False{}:
+              Socket.close(s)
+    case 3:
+      (s, r) = mr
+      match mp:
+        case Fail{e}:
+          Socket.close(s)
+        case Done{resp}:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, resp)
+            out : WSOut <- H(EvOpen{})
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- hs_open(sent, out)
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, [])
+            ws_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], FragIdle{}, False{})
+    case _:
+      IO.pure(Unit, Unit{})
+
+def server_conn_sub(~H: WSEv -> IO(WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +wanted: List<&2, String>) -> IO(Listener):
+  (l, r) = m
+  do IO<Listener>:
+    s : Socket <- IO.pass(Socket, r)
+    IO.spawn(Unit, ws_hs_sub(~H, 0, (s, Done{""}), Fail{(0, "")}, "", False{}, True{}, wanted))
+    return l
+
+@unsafe
+def server_on_sub(~H: WSEv -> IO(WSOut), l: Listener, +wanted: List<&2, String>) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    l2 : Listener <- server_conn_sub(~H, m, wanted)
+    z : Unit <- server_on_sub(~H, l2, wanted)
+    return z
+
 # Client echo (single Hi, fixed mask) for loopback tests.
 # Returns Done{"Hi"} on exact echo, Fail otherwise. Closes always.
 # Frames ride the byte lane; only the handshake request stays String.
@@ -1727,6 +1997,57 @@ def client_recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<
       IO.pure(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, (s, Fail{e}, []))
     case Done{u}:
       recv_in_client_framed(s, buf)
+
+def client_proto_go(hs: List<&1, String & String>, +found: String, got: Bool) -> String & Bool:
+  match hs:
+    case Nil{}:
+      (found, got)
+    case (n, v) <> t:
+      +is_p = HTTP.eq_ci(n, "Sec-WebSocket-Protocol")
+      +vv = v
+      client_proto_go(t, Bool.pick(String, is_p, String.trim(vv), found), Bool.or(got, is_p))
+
+def client_proto_found(pair: String & Bool) -> Maybe<&2, String>:
+  (found, got) = pair
+  match got:
+    case True{}:
+      Some{found}
+    case False{}:
+      None{}
+
+def client_proto_of(hs: List<&1, String & String>) -> Maybe<&2, String>:
+  client_proto_found(client_proto_go(hs, "", False{}))
+
+def client_proto_ok(proto: Maybe<&2, String>, +offered: List<&2, String>) -> Bool:
+  match proto:
+    case None{}:
+      True{}
+    case Some{p}:
+      ws_list_contains(offered, p)
+
+def client_check_end(+offered: List<&2, String>, +found: String, acc_ok: Bool, got: Bool) -> Bool:
+  match got:
+    case True{}:
+      Bool.and(acc_ok, ws_list_contains(offered, found))
+    case False{}:
+      acc_ok
+
+def client_check_go(hs: List<&1, String & String>, +want: String, +offered: List<&2, String>, acc_ok: Bool, +found: String, got: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      client_check_end(offered, found, acc_ok, got)
+    case (n, v) <> t:
+      +nn = n
+      +vv = v
+      +nn2 = nn
+      +vv2 = vv
+      +want2 = want
+      +off2 = offered
+      +found2 = found
+      client_check_go(t, want2, off2, Bool.or(acc_ok, Bool.and(HTTP.eq_ci(nn, "Sec-WebSocket-Accept"), String.eq(String.trim(vv), want))), Bool.pick(String, HTTP.eq_ci(nn2, "Sec-WebSocket-Protocol"), String.trim(vv2), found2), Bool.or(got, HTTP.eq_ci(nn, "Sec-WebSocket-Protocol")))
+
+def client_ok_of_sub(st: U32, hs: List<&1, String & String>, +want: String, +offered: List<&2, String>) -> Bool:
+  Bool.and(U32.is_eq(st, 101), client_check_go(hs, want, offered, False{}, "", False{}))
 
 def client_acc.go(hs: List<&1, String & String>, +want: String, got: Bool) -> Bool:
   match hs:
@@ -1975,3 +2296,102 @@ def client_on(~H: WSEv -> IO(WSOut), +host: String, port: U32, +path: String, +k
   do IO<Unit>:
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
     client_start(~H, conn, accept_of(key), client_request(host, path, key))
+
+# client_on_sub: same persistent client but offers Sec-WebSocket-Protocol.
+# protos lists the protocols the client offers; the server's choice is
+# validated to be one of them (absent choice always ok). Plain client_on
+# stays a Nil-offer wrapper.
+
+@unsafe
+def client_hs_sub(~H: WSEv -> IO(WSOut), st: U32, mr: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, mp: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, +acc: List<&2, U32>, +fit: Bool, +ok: Bool, +buf: List<&2, U32>, +want: String, +offered: List<&2, String>) -> IO(Unit):
+  match st:
+    case 0:
+      (s, r) = mr
+      match r:
+        case Fail{(c, m)}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{c, m})
+            x : Unit <- Socket.close(s)
+            return x
+        case Done{bs}:
+          +acc2 = List.append(&2, U32, acc, bs)
+          client_hs_sub(~H, 1, (s, Done{Nil{}}), Fail{(0, "")}, acc2, client_scan_fit(acc2), Nat.is_le(List.length(&2, U32, acc2), 16384n), Nil{}, want, offered)
+    case 1:
+      (s, r) = mr
+      match fit:
+        case True{}:
+          +len = client_scan_len(acc)
+          +taken = List.take(&2, U32, acc, U32.to_nat(len))
+          +rest = List.drop(&2, U32, acc, U32.to_nat(len))
+          client_hs_sub(~H, 3, (s, Done{Nil{}}), HTTP.read_response(HTTP.decode(taken) ++ "\r\n\r\n"), acc, fit, ok, rest, want, offered)
+        case False{}:
+          match ok:
+            case True{}:
+              do IO<Unit>:
+                mr2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCP.recv_bytes(s, 8192)
+                client_hs_sub(~H, 0, mr2, Fail{(0, "")}, acc, fit, ok, buf, want, offered)
+            case False{}:
+              do IO<Unit>:
+                out : WSOut <- H(EvError{413, "head too large"})
+                x : Unit <- Socket.close(s)
+                return x
+    case 3:
+      (s, r) = mr
+      match mp:
+        case Fail{(c, m)}:
+          do IO<Unit>:
+            out : WSOut <- H(EvError{c, m})
+            x : Unit <- Socket.close(s)
+            return x
+        case Done{parsed}:
+          (st2, hs, body) = parsed
+          client_hs.go(~H, s, client_ok_of_sub(st2, hs, want, offered), want, buf)
+    case _:
+      IO.pure(Unit, Unit{})
+
+def client_start_sub.ship(~H: WSEv -> IO(WSOut), m: Socket & Result<&1, &1, U32 & String, Unit>, +want: String, +offered: List<&2, String>) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{(c, m2)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m2})
+        x : Unit <- Socket.close(s)
+        return x
+    case Done{u}:
+      do IO<Unit>:
+        client_hs_sub(~H, 0, (s, Done{Nil{}}), Fail{(0, "")}, Nil{}, False{}, True{}, Nil{}, want, offered)
+
+def client_start_sub.yes(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +want: String, +offered: List<&2, String>, +req_txt: String) -> IO(Unit):
+  match conn:
+    case Fail{(c, m)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m})
+        return Unit{}
+    case Done{sock}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, req_txt)
+        client_start_sub.ship(~H, sent, want, offered)
+
+def client_start_sub.no(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, c: U32, +m: String) -> IO(Unit):
+  match conn:
+    case Fail{(c2, m2)}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c2, m2})
+        return Unit{}
+    case Done{sock}:
+      do IO<Unit>:
+        out : WSOut <- H(EvError{c, m})
+        x : Unit <- Socket.close(sock)
+        return x
+
+def client_start_sub(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +want: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, String>) -> IO(Unit):
+  match req:
+    case Fail{(c, m)}:
+      client_start_sub.no(~H, conn, c, m)
+    case Done{req_txt}:
+      client_start_sub.yes(~H, conn, want, offered, req_txt)
+
+def client_on_sub(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) -> IO(Unit):
+  do IO<Unit>:
+    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+    client_start_sub(~H, conn, accept_of(key), protos, client_request_sub(host, port, path, key, protos))
