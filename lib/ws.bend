@@ -95,7 +95,7 @@ def handshake(+s: String) -> Result<&1, &1, U32 & String, String>:
 # Pure codec on byte lists. Server reads masked client frames with
 # read_frame; server writes unmasked frames with show_frame.
 # Fail-closed: unmasked client frames, control >125 or fragmented,
-# reserved opcodes or RSV, and payloads over 1MB all Fail.
+# reserved opcodes or RSV, and payloads over 16MB all Fail.
 #
 # Messages (generic API): WSText is UTF-8 String on the wire via
 # HTTP.encode/decode; WSBin is raw bytes. Controls (0/8/9/10) and
@@ -126,6 +126,14 @@ type WSIn is Data:
 # to override and close.
 # client_on mirrors the API over a connect (same WSEv/WSOut, sends masked).
 
+# Fragment reassembly state (RFC 6455 section 5.4). FragIdle means no
+# open fragment; FragOpen holds the leading opcode (1 text, 2 binary)
+# plus the bytes stitched so far.
+
+type MsgAcc is Data:
+  FragIdle{}
+  FragOpen{op: U32, buf: List<&2, U32>}
+
 type WSEv is Data:
   EvOpen{}
   EvMsg{msg: WSMessage}
@@ -133,6 +141,18 @@ type WSEv is Data:
   EvPong{pay: List<&2, U32>}
   EvClose{pay: List<&2, U32>}
   EvError{code: U32, msg: String}
+
+# Loop-internal step carrier: the session loops fold each frame into
+# one of these before dispatching. StepEv carries a handler-bound
+# event; StepFrag means a fragment was stitched and the loop must keep
+# reading silently; StepOut carries a handler answer still to send
+# (the send edge also learns whether the answer closes). Handlers
+# never see this type, so WSEv above stays a stable public contract.
+
+type WsStep is Data:
+  StepEv{ev: WSEv}
+  StepFrag{acc: MsgAcc}
+  StepOut{out: WSOut}
 
 def op_text() -> U32:
   1
@@ -174,14 +194,59 @@ def ping_reply(+pay: List<&2, U32>, out: WSOut) -> WSOut:
     case OutRaw{bs}:
       ping_reply.go(pay, bs)
 
+# Wire denormalization for close echoes: our normalized empty (1005)
+# must never reach the wire (RFC 6455 forbids 1005/1006/1015 on the
+# wire), so answers to it go out empty; every other code echoes.
+
+def close_is_1005(+pay: List<&2, U32>) -> Bool:
+  match pay:
+    case Nil{}:
+      True{}
+    case hi <> t:
+      match t:
+        case Nil{}:
+          False{}
+        case lo <> rest:
+          match rest:
+            case Nil{}:
+              Bool.and(U32.is_eq(hi, 3), U32.is_eq(lo, 237))
+            case _ <> _:
+              False{}
+
+def close_wire_of.go(+pay: List<&2, U32>, deny: Bool) -> List<&2, U32>:
+  match deny:
+    case True{}:
+      []
+    case False{}:
+      pay
+
+def close_wire_of(+pay: List<&2, U32>) -> List<&2, U32>:
+  close_wire_of.go(pay, close_is_1005(pay))
+
+# Send-side guard: a handler echoing a normalized empty close would
+# otherwise put 1005 on the wire through the verbatim OutOp path, and
+# the peer would fail the close with 1006. Only close frames carrying
+# our internal 1005 marker are rewritten to empty; every other opcode
+# and payload rides untouched.
+
+def out_op_pay.go(+pay: List<&2, U32>, keep: Bool) -> List<&2, U32>:
+  match keep:
+    case True{}:
+      pay
+    case False{}:
+      []
+
+def out_op_pay(+op: U32, +pay: List<&2, U32>) -> List<&2, U32>:
+  out_op_pay.go(pay, Bool.or(Bool.not(U32.is_eq(op, 8)), Bool.not(close_is_1005(pay))))
+
 def close_answer(+pay: List<&2, U32>, out: WSOut) -> WSOut:
   match out:
     case OutOp{op, pp}:
       OutOp{op, pp}
     case OutMsg{msg}:
-      out_close(pay)
+      out_close(close_wire_of(pay))
     case OutRaw{bs}:
-      out_close(pay)
+      out_close(close_wire_of(pay))
 
 def msg_to_op(msg: WSMessage) -> U32:
   match msg:
@@ -196,6 +261,13 @@ def msg_to_bytes(msg: WSMessage) -> List<&2, U32>:
       HTTP.encode(text)
     case WSBin{data}:
       data
+
+# Largest single-frame payload accepted on the wire (16MB). Both the
+# masked and unmasked splits and both show paths enforce it; the
+# reassembly accumulator enforces the same bound on the stitched
+# message (see frag_acc below).
+def ws_max_payload() -> U32:
+  16777216
 
 def msg_of_frame.go2(is_text: Bool, is_bin: Bool, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, WSMessage>:
   match is_text is_bin:
@@ -217,6 +289,281 @@ def msg_of_frame.go(fin: Bool, is_text: Bool, is_bin: Bool, +pay: List<&2, U32>)
 
 def msg_of_frame(fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, WSMessage>:
   msg_of_frame.go(fin, U32.is_eq(op, 1), U32.is_eq(op, 2), pay)
+
+# Strict UTF-8 validation over byte lists (RFC 6455 section 5.6: text
+# frames and close reasons must be valid UTF-8, else 1007). One
+# self-recursive walker carries the open sequence length (need: 0 for
+# a fresh lead byte, 1-3 for open continuations, 9 for poisoned), its
+# minimum code point (min, rejects overlongs) and the running value
+# (code); the last continuation validates the code point (no
+# surrogates, nothing past U+10FFFF) back into need 0 or 9, so every
+# branch stays inside this single def.
+
+def utf8_is_cont(+b: U32) -> Bool:
+  Bool.and(U32.is_ge(b, 128), U32.is_le(b, 191))
+
+def utf8_need(+b: U32) -> U32:
+  Bool.pick(U32, U32.is_lt(b, 128), 0, Bool.pick(U32, U32.is_lt(b, 194), 9, Bool.pick(U32, U32.is_lt(b, 224), 1, Bool.pick(U32, U32.is_lt(b, 240), 2, Bool.pick(U32, U32.is_le(b, 244), 3, 9)))))
+
+def utf8_min(+need: U32) -> U32:
+  match need:
+    case 1:
+      128
+    case 2:
+      2048
+    case 3:
+      65536
+    case _:
+      0
+
+def utf8_mask(+need: U32) -> U32:
+  match need:
+    case 1:
+      31
+    case 2:
+      15
+    case 3:
+      7
+    case _:
+      0
+
+def utf8_code_ok(+code: U32, +min: U32) -> Bool:
+  Bool.and(U32.is_ge(code, min), Bool.and(Bool.not(Bool.and(U32.is_ge(code, 55296), U32.is_le(code, 57343))), U32.is_le(code, 1114111)))
+
+def utf8_fin2(+code2: U32, +min: U32) -> U32:
+  Bool.pick(U32, utf8_code_ok(code2, min), 0, 9)
+
+def utf8_fin(+code: U32, +min: U32, +b: U32) -> U32:
+  Bool.pick(U32, utf8_is_cont(b), utf8_fin2((code * 64 + U32.and(b, 63) : U32), min), 9)
+
+def utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
+  match bs:
+    case Nil{}:
+      U32.is_zero(need)
+    case b <> t:
+      match need:
+        case 0:
+          utf8_go(t, utf8_need(b), utf8_min(utf8_need(b)), U32.and(b, utf8_mask(utf8_need(b))))
+        case 1:
+          utf8_go(t, utf8_fin(code, min, b), 0, 0)
+        case 2:
+          utf8_go(t, Bool.pick(U32, utf8_is_cont(b), 1, 9), min, (code * 64 + U32.and(b, 63) : U32))
+        case 3:
+          utf8_go(t, Bool.pick(U32, utf8_is_cont(b), 2, 9), min, (code * 64 + U32.and(b, 63) : U32))
+        case _:
+          False{}
+
+def utf8_ok(bs: List<&2, U32>) -> Bool:
+  utf8_go(bs, 0, 0, 0)
+
+# Close payload validation (RFC 6455 section 5.5.1): empty or a 2-byte
+# big-endian status code plus a UTF-8 reason. Empty normalizes to the
+# 1005 wire form so the application always sees a code; reserved codes
+# (under 1000, 1004-1006, 1015, 1016-2999, past 4999) fail 1002 and a
+# non-UTF-8 reason fails 1007.
+
+def close_in1000(+code: U32) -> Bool:
+  Bool.or(Bool.and(U32.is_ge(code, 1000), U32.is_le(code, 1011)), Bool.and(U32.is_ge(code, 3000), U32.is_le(code, 4999)))
+
+def close_reserved(+code: U32) -> Bool:
+  Bool.or(Bool.or(U32.is_eq(code, 1004), U32.is_eq(code, 1005)), Bool.or(U32.is_eq(code, 1006), U32.is_eq(code, 1015)))
+
+def close_code_ok(+code: U32) -> Bool:
+  Bool.and(close_in1000(code), Bool.not(close_reserved(code)))
+
+def close_reason.go(+pay: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match ok:
+    case True{}:
+      Done{pay}
+    case False{}:
+      Fail{(1007, "bad close reason")}
+
+def close_reason(+pay: List<&2, U32>, +reason: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  close_reason.go(pay, utf8_ok(reason))
+
+def close_code.go(+pay: List<&2, U32>, +reason: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match ok:
+    case True{}:
+      close_reason(pay, reason)
+    case False{}:
+      Fail{(1002, "bad close code")}
+
+def close_code(+pay: List<&2, U32>, +code: U32, +reason: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  close_code.go(pay, reason, close_code_ok(code))
+
+def close_hi(+pay: List<&2, U32>, +hi: U32, +t: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match t:
+    case Nil{}:
+      Fail{(1002, "short close")}
+    case lo <> reason:
+      close_code(pay, (hi * 256 + lo : U32), reason)
+
+def close_norm(+pay: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  match pay:
+    case Nil{}:
+      Done{[3, 237]}
+    case hi <> t:
+      close_hi(pay, hi, t)
+
+def close_ev.go(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> WSEv:
+  match r:
+    case Fail{(c, m)}:
+      EvError{c, m}
+    case Done{norm}:
+      EvClose{norm}
+
+def close_ev(+pay: List<&2, U32>) -> WSEv:
+  close_ev.go(close_norm(pay))
+
+# Fragment reassembly (RFC 6455 section 5.4): frag_step folds one data
+# frame (op 1/2 to open, 0 to continue) into the accumulator. A leading
+# frame with FIN set emits at once; otherwise bytes stitch until FIN
+# and only the stitched message emits (text validated as UTF-8 at
+# completion, since a code point may straddle fragments). An orphan
+# continuation or a new data frame mid-reassembly fails 400; anything
+# past ws_max_payload fails 413 so the loops can answer close 1009.
+# Control frames never reach this fold; the loops emit them at once.
+
+def frag_capped(+buf: List<&2, U32>) -> Bool:
+  U32.is_le(U32.from_nat(List.length(&2, U32, buf)), ws_max_payload())
+
+def frag_text.go(+buf: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, WSMessage>:
+  match ok:
+    case True{}:
+      Done{WSText{HTTP.decode(buf)}}
+    case False{}:
+      Fail{(1007, "bad utf8")}
+
+def frag_text(+buf: List<&2, U32>) -> Result<&1, &1, U32 & String, WSMessage>:
+  frag_text.go(buf, utf8_ok(buf))
+
+def frag_msg.go(+op: U32, +buf: List<&2, U32>, is_text: Bool) -> Result<&1, &1, U32 & String, WSMessage>:
+  match is_text:
+    case True{}:
+      frag_text(buf)
+    case False{}:
+      Done{WSBin{buf}}
+
+def frag_msg(+op: U32, +buf: List<&2, U32>) -> Result<&1, &1, U32 & String, WSMessage>:
+  frag_msg.go(op, buf, U32.is_eq(op, 1))
+
+def frag_msg_done(r: Result<&1, &1, U32 & String, WSMessage>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{msg}:
+      Done{(FragIdle{}, Some{msg})}
+
+def frag_single_msg(+op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_msg_done(frag_msg(op, pay))
+
+def frag_single.go(+op: U32, +pay: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match ok:
+    case True{}:
+      frag_single_msg(op, pay)
+    case False{}:
+      Fail{(413, "message too large")}
+
+def frag_single(+op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_single.go(op, pay, frag_capped(pay))
+
+def frag_begin.go(+op: U32, +pay: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match ok:
+    case True{}:
+      Done{(FragOpen{op, pay}, None{})}
+    case False{}:
+      Fail{(413, "fragment too large")}
+
+def frag_begin(+op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_begin.go(op, pay, frag_capped(pay))
+
+def frag_first(fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match fin:
+    case True{}:
+      frag_single(op, pay)
+    case False{}:
+      frag_begin(op, pay)
+
+def frag_open.go(fin: Bool, +op: U32, +pay: List<&2, U32>, is_data: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match is_data:
+    case True{}:
+      frag_first(fin, op, pay)
+    case False{}:
+      Fail{(400, "not data")}
+
+def frag_open(fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_open.go(fin, op, pay, Bool.or(U32.is_eq(op, 1), U32.is_eq(op, 2)))
+
+def frag_last(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match fin:
+    case True{}:
+      frag_single_msg(op0, grown)
+    case False{}:
+      Done{(FragOpen{op0, grown}, None{})}
+
+def frag_cont2(fin: Bool, +op0: U32, +grown: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match ok:
+    case True{}:
+      frag_last(fin, op0, grown)
+    case False{}:
+      Fail{(413, "message too large")}
+
+def frag_cont.go(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_cont2(fin, op0, grown, frag_capped(grown))
+
+def frag_cont(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_cont.go(fin, op0, List.append(&2, U32, buf, pay))
+
+def frag_got.go(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>, is_cont: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match is_cont:
+    case True{}:
+      frag_cont(fin, op0, buf, pay)
+    case False{}:
+      Fail{(400, "mixed fragment")}
+
+def frag_got(fin: Bool, +op: U32, +op0: U32, +pay: List<&2, U32>, +buf: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  frag_got.go(fin, op0, buf, pay, U32.is_eq(op, 0))
+
+def frag_step(+acc: MsgAcc, fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
+  match acc:
+    case FragIdle{}:
+      frag_open(fin, op, pay)
+    case FragOpen{op0, buf}:
+      frag_got(fin, op, op0, pay, buf)
+
+def frag_done(+acc2: MsgAcc, maybe: Maybe<&2, WSMessage>) -> WsStep:
+  match maybe:
+    case None{}:
+      StepFrag{acc2}
+    case Some{msg}:
+      StepEv{EvMsg{msg}}
+
+def frag_ev.go(r: Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>) -> WsStep:
+  match r:
+    case Fail{(c, m)}:
+      StepEv{EvError{c, m}}
+    case Done{pr}:
+      (acc2, maybe) = pr
+      frag_done(acc2, maybe)
+
+def frag_ev(+acc: MsgAcc, fin: Bool, +op: U32, +pay: List<&2, U32>) -> WsStep:
+  frag_ev.go(frag_step(acc, fin, op, pay))
+
+# Loop helpers: the 1009 close answered on Fail 413, and the opcode
+# carried by a handler answer (255 when the answer is no opcode frame,
+# so the loops can tell a handler-initiated close apart).
+
+def cap_close_out() -> WSOut:
+  out_close([3, 249])
+
+def out_op_of(out: WSOut) -> U32:
+  match out:
+    case OutOp{op, pay}:
+      op
+    case OutMsg{msg}:
+      255
+    case OutRaw{bs}:
+      255
 
 def unmask_byte(+b: U32, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32) -> U32:
   match pos:
@@ -307,7 +654,7 @@ def frame_payload(+fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, +k0: U32, +k1: 
   +taken = List.take(&2, U32, rest, U32.to_nat(len))
   +dropped = List.drop(&2, U32, rest, U32.to_nat(len))
   +len_ok = Bool.and(ws_is_nil(dropped), Nat.is_eq(List.length(&2, U32, taken), U32.to_nat(len)))
-  +cap_ok = U32.is_le(len, 1048576)
+  +cap_ok = U32.is_le(len, ws_max_payload())
   +unmasked = unmask(taken, k0, k1, k2, k3, 0)
   +ok = payload_ok(rsv_ok, op, fin, len, len_ok, cap_ok)
   +code = Bool.pick(U32, Bool.not(cap_ok), 413, 400)
@@ -416,7 +763,7 @@ def read_frame(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & L
           len7.go(U32.is_ge(b0, 128), U32.is_zero(U32.and(U32.shrn(b0, 4n), 7)), U32.and(b0, 15), U32.is_ge(b1, 128), U32.and(b1, 127), rest, False{})
 
 # Client parse: server frames arrive unmasked (RFC 6455 server-to-client).
-# Same caps as read_frame (1MB, control rules); masked frames still parse.
+# Same caps as read_frame (16MB, control rules); masked frames still parse.
 
 def read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
   match bs:
@@ -432,7 +779,7 @@ def read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool 
 # Incremental framing: total-first split for the recv accumulator.
 # frame_need(bs) is the header read (2 + ext 0/2/8 + mask 0/4 +
 # payload) under the same rules as read_frame (RSV/opcode/control
-# and the 1MB cap); short headers Fail "short ...", invalid ones
+# and the 16MB cap); short headers Fail "short ...", invalid ones
 # Fail 400/413. frame_split(bs) never fails soft data: NeedMore
 # with the missing count while the bytes fall short (1 while the
 # header itself is short), FrameGot with the frame plus the exact
@@ -457,7 +804,7 @@ def frame_need_done(ok: Bool, code: U32, +total: U32) -> Result<&1, &1, U32 & St
 def frame_need_len(fin: Bool, rsv_ok: Bool, op: U32, +masked: Bool, +len: U32, ext: U32, unmasked_ok: Bool) -> Result<&1, &1, U32 & String, U32>:
   +mask_len = Bool.pick(U32, masked, 4, 0)
   +total = (2 + ext + mask_len + len : U32)
-  +cap_ok = U32.is_le(len, 1048576)
+  +cap_ok = U32.is_le(len, ws_max_payload())
   +mask_ok = Bool.or(masked, unmasked_ok)
   +ok = Bool.and(mask_ok, payload_ok(rsv_ok, op, fin, len, True{}, cap_ok))
   +code = Bool.pick(U32, Bool.not(cap_ok), 413, 400)
@@ -614,8 +961,8 @@ def show_go(ok: Bool, code: U32, fin: Bool, +op: U32, +payload: List<&2, U32>, +
 
 def show_frame(+fin: Bool, +op: U32, +payload: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   +len = U32.from_nat(List.length(&2, U32, payload))
-  +ok = Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, 1048576)))
-  +code = Bool.pick(U32, Bool.not(U32.is_le(len, 1048576)), 413, 400)
+  +ok = Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, ws_max_payload())))
+  +code = Bool.pick(U32, Bool.not(U32.is_le(len, ws_max_payload())), 413, 400)
   show_go(ok, code, fin, op, payload, len)
 
 # Client
@@ -662,7 +1009,7 @@ def show_masked.go(fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: 
 
 def show_masked(+fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   +len = U32.from_nat(List.length(&2, U32, payload))
-  show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, 1048576))))
+  show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, ws_max_payload()))))
 
 # IO: single-shot echo plus parallel accept loop (mold HTTP.echo).
 # Frames ride TCP.send_bytes/TCP.recv_bytes (byte-faithful 0..255);
@@ -727,7 +1074,9 @@ def out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
       +mm = msg
       show_frame(True{}, msg_to_op(mm), msg_to_bytes(mm))
     case OutOp{op, pay}:
-      show_frame(True{}, op, pay)
+      +oo = op
+      +pp = pay
+      show_frame(True{}, oo, out_op_pay(oo, pp))
     case OutRaw{bs}:
       Done{bs}
 
@@ -822,7 +1171,8 @@ def recv(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>):
 # lives in the effect: one hop per frame.
 
 def recv_framed_max() -> U32:
-  (1048576 + 14 : U32)
+  +cap = ws_max_payload()
+  (cap + 14 : U32)
 
 def recv_framed(sock: Socket, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   TCP.recv_frame(sock, buf, recv_framed_max())
@@ -1042,72 +1392,86 @@ def ws_serve(l: Listener) -> IO(Unit):
 # the template threaded through both.
 
 @unsafe
-def ws_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, ev: WSEv, +buf: List<&2, U32>) -> IO(Unit):
+def ws_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, step: WsStep, +buf: List<&2, U32>, acc: MsgAcc, shut: Bool) -> IO(Unit):
   match st:
     case 1:
       (s, r, rest) = mf
       match r:
-        case Fail{e}:
-          Socket.close(s)
+        case Fail{(c, m)}:
+          match c:
+            case 413:
+              do IO<Unit>:
+                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(cap_close_out())))
+                close_done(m2)
+            case _:
+              Socket.close(s)
         case Done{inn}:
           match inn:
             case InMsg{msg}:
-              ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvMsg{msg}, rest)
+              ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvMsg{msg}}, rest, FragIdle{}, shut)
             case InOp{fin, op, pay}:
               match op:
                 case 8:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvClose{pay}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{close_ev(pay)}, rest, FragIdle{}, shut)
                 case 9:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPing{pay}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPing{pay}}, rest, FragIdle{}, shut)
                 case 10:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPong{pay}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPong{pay}}, rest, FragIdle{}, shut)
                 case 0:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "not data"}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case 1:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case 2:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case _:
-                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "bad frame"}, rest)
+                  ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvError{400, "bad frame"}}, rest, FragIdle{}, shut)
     case 2:
       (s, r, b) = mf
-      match ev:
-        case EvOpen{}:
+      match step:
+        case StepEv{ev}:
+          match ev:
+            case EvOpen{}:
+              do IO<Unit>:
+                out : WSOut <- H(EvOpen{})
+                ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvMsg{msg}:
+              do IO<Unit>:
+                out : WSOut <- H(EvMsg{msg})
+                ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvPing{pay}:
+              +pp = pay
+              do IO<Unit>:
+                out : WSOut <- H(EvPing{pp})
+                ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{ping_reply(pp, out)}, buf, acc, shut)
+            case EvPong{pay}:
+              do IO<Unit>:
+                out : WSOut <- H(EvPong{pay})
+                ws_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvClose{pay}:
+              match shut:
+                case True{}:
+                  Socket.close(s)
+                case False{}:
+                  +pp = pay
+                  do IO<Unit>:
+                    out : WSOut <- H(EvClose{pp})
+                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(close_answer(pp, out))))
+                    close_done(m2)
+            case EvError{code, msg}:
+              do IO<Unit>:
+                out : WSOut <- H(EvError{code, msg})
+                x : Unit <- Socket.close(s)
+                return x
+        case StepFrag{acc2}:
           do IO<Unit>:
-            out : WSOut <- H(EvOpen{})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_in_framed(s, b)
+            ws_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], acc2, shut)
+        case StepOut{out2}:
+          +o2 = out2
+          do IO<Unit>:
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(o2)))
             m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
-            ws_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvMsg{msg}:
-          do IO<Unit>:
-            out : WSOut <- H(EvMsg{msg})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
-            ws_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvPing{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WSOut <- H(EvPing{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(ping_reply(pp, out))))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
-            ws_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvPong{pay}:
-          do IO<Unit>:
-            out : WSOut <- H(EvPong{pay})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(out)))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, buf)
-            ws_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvClose{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WSOut <- H(EvClose{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- send_open_bytes((s, out_bytes(close_answer(pp, out))))
-            close_done(m2)
-        case EvError{code, msg}:
-          do IO<Unit>:
-            out : WSOut <- H(EvError{code, msg})
-            x : Unit <- Socket.close(s)
-            return x
+            ws_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], acc, Bool.or(shut, U32.is_eq(out_op_of(o2), 8)))
     case _:
       IO.pure(Unit, Unit{})
 
@@ -1146,7 +1510,7 @@ def ws_hs(~H: WSEv -> IO(WSOut), st: U32, mr: Socket & Result<&1, &1, U32 & Stri
             out : WSOut <- H(EvOpen{})
             m2 : Socket & Result<&1, &1, U32 & String, Unit> <- hs_open(sent, out)
             m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_after(m2, [])
-            ws_loop(~H, 1, m3, EvError{0, ""}, [])
+            ws_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], FragIdle{}, False{})
     case _:
       IO.pure(Unit, Unit{})
 
@@ -1350,7 +1714,9 @@ def client_out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
       +mm = msg
       show_masked(True{}, msg_to_op(mm), msg_to_bytes(mm), 1, 2, 3, 4)
     case OutOp{op, pay}:
-      show_masked(True{}, op, pay, 1, 2, 3, 4)
+      +oo = op
+      +pp = pay
+      show_masked(True{}, oo, out_op_pay(oo, pp), 1, 2, 3, 4)
     case OutRaw{bs}:
       Done{bs}
 
@@ -1375,75 +1741,89 @@ def client_ok_of(st: U32, hs: List<&1, String & String>, +want: String) -> Bool:
   Bool.and(U32.is_eq(st, 101), client_acc.go(hs, want, False{}))
 
 @unsafe
-def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, ev: WSEv, +buf: List<&2, U32>) -> IO(Unit):
+def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>, step: WsStep, +buf: List<&2, U32>, acc: MsgAcc, shut: Bool) -> IO(Unit):
   match st:
     case 1:
       (s, r, rest) = mf
       match r:
         case Fail{(c, m)}:
-          do IO<Unit>:
-            out : WSOut <- H(EvError{c, m})
-            x : Unit <- Socket.close(s)
-            return x
+          match c:
+            case 413:
+              do IO<Unit>:
+                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(cap_close_out())))
+                close_done(m2)
+            case _:
+              do IO<Unit>:
+                out : WSOut <- H(EvError{c, m})
+                x : Unit <- Socket.close(s)
+                return x
         case Done{inn}:
           match inn:
             case InMsg{msg}:
-              client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvMsg{msg}, rest)
+              client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvMsg{msg}}, rest, FragIdle{}, shut)
             case InOp{fin, op, pay}:
               match op:
                 case 8:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvClose{pay}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{close_ev(pay)}, rest, FragIdle{}, shut)
                 case 9:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPing{pay}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPing{pay}}, rest, FragIdle{}, shut)
                 case 10:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvPong{pay}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPong{pay}}, rest, FragIdle{}, shut)
                 case 0:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "not data"}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case 1:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case 2:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "fragmented"}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case _:
-                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), EvError{400, "bad frame"}, rest)
+                  client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvError{400, "bad frame"}}, rest, FragIdle{}, shut)
     case 2:
       (s, r, b) = mf
-      match ev:
-        case EvOpen{}:
+      match step:
+        case StepEv{ev}:
+          match ev:
+            case EvOpen{}:
+              do IO<Unit>:
+                out : WSOut <- H(EvOpen{})
+                client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvMsg{msg}:
+              do IO<Unit>:
+                out : WSOut <- H(EvMsg{msg})
+                client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvPing{pay}:
+              +pp = pay
+              do IO<Unit>:
+                out : WSOut <- H(EvPing{pp})
+                client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{ping_reply(pp, out)}, buf, acc, shut)
+            case EvPong{pay}:
+              do IO<Unit>:
+                out : WSOut <- H(EvPong{pay})
+                client_loop(~H, 2, (s, Done{InOp{False{}, 0, []}}, []), StepOut{out}, buf, acc, shut)
+            case EvClose{pay}:
+              match shut:
+                case True{}:
+                  Socket.close(s)
+                case False{}:
+                  +pp = pay
+                  do IO<Unit>:
+                    out : WSOut <- H(EvClose{pp})
+                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(close_answer(pp, out))))
+                    close_done(m2)
+            case EvError{code, msg}:
+              do IO<Unit>:
+                out : WSOut <- H(EvError{code, msg})
+                x : Unit <- Socket.close(s)
+                return x
+        case StepFrag{acc2}:
           do IO<Unit>:
-            out : WSOut <- H(EvOpen{})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- recv_in_client_framed(s, b)
+            client_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], acc2, shut)
+        case StepOut{out2}:
+          +o2 = out2
+          do IO<Unit>:
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(o2)))
             m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
-            client_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvMsg{msg}:
-          do IO<Unit>:
-            out : WSOut <- H(EvMsg{msg})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
-            client_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvPing{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WSOut <- H(EvPing{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(ping_reply(pp, out))))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
-            client_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvPong{pay}:
-          do IO<Unit>:
-            out : WSOut <- H(EvPong{pay})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
-            client_loop(~H, 1, m3, EvError{0, ""}, [])
-        case EvClose{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WSOut <- H(EvClose{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(close_answer(pp, out))))
-            close_done(m2)
-        case EvError{code, msg}:
-          do IO<Unit>:
-            out : WSOut <- H(EvError{code, msg})
-            x : Unit <- Socket.close(s)
-            return x
+            client_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], acc, Bool.or(shut, U32.is_eq(out_op_of(o2), 8)))
     case _:
       IO.pure(Unit, Unit{})
 
@@ -1454,7 +1834,7 @@ def client_hs.go(~H: WSEv -> IO(WSOut), s: Socket, ok: Bool, +want: String, +buf
         out : WSOut <- H(EvOpen{})
         m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
         m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
-        client_loop(~H, 1, m3, EvError{0, ""}, [])
+        client_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], FragIdle{}, False{})
     case False{}:
       do IO<Unit>:
         out : WSOut <- H(EvError{400, "bad handshake"})
@@ -1497,7 +1877,7 @@ def client_scan_len.go(bs: List<&2, U32>, +n: U32, w0: U32, w1: U32, w2: U32) ->
       +w11 = w1
       +w22 = w2
       +is_end = Bool.and(U32.is_eq(w00, 13), Bool.and(U32.is_eq(w11, 10), Bool.and(U32.is_eq(w22, 13), U32.is_eq(bb, 10))))
-      Bool.pick(U32, is_end, (n + 4 : U32), client_scan_len.go(t, (n + 1 : U32), w11, w22, bb))
+      Bool.pick(U32, is_end, (n + 1 : U32), client_scan_len.go(t, (n + 1 : U32), w11, w22, bb))
 
 def client_scan_len(bs: List<&2, U32>) -> U32:
   client_scan_len.go(bs, 0, 0, 0, 0)
