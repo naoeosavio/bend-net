@@ -150,7 +150,9 @@ def client_out_bytes(out: WS.WSOut) -> Result<&1, &1, U32 & String, List<&2, U32
       +mm = msg
       WS.show_masked(True{}, WS.msg_to_op(mm), WS.msg_to_bytes(mm), 1, 2, 3, 4)
     case WS.OutOp{op, pay}:
-      WS.show_masked(True{}, op, pay, 1, 2, 3, 4)
+      +oo = op
+      +pp = pay
+      WS.show_masked(True{}, oo, WS.out_op_pay(oo, pp), 1, 2, 3, 4)
     case WS.OutRaw{bs}:
       Done{bs}
 
@@ -295,72 +297,86 @@ def wss_close_snd(m: Socket & Result<&1, &1, U32 & String, Unit>) ->
   wss_close(s)
 
 @unsafe
-def wss_loop(~H: WS.WSEv -> IO(WS.WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32>, ev: WS.WSEv, +buf: List<&2, U32>) ->
+def wss_loop(~H: WS.WSEv -> IO(WS.WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32>, step: WS.WsStep, +buf: List<&2, U32>, acc: WS.MsgAcc, shut: Bool) ->
   IO(Unit):
   match st:
     case 1:
       (s, r, rest) = mf
       match r:
-        case Fail{e}:
-          wss_close(s)
+        case Fail{(c, m)}:
+          match c:
+            case 413:
+              do IO<Unit>:
+                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, WS.cap_close_out())
+                wss_close_snd(m2)
+            case _:
+              wss_close(s)
         case Done{inn}:
           match inn:
             case WS.InMsg{msg}:
-              wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvMsg{msg}, rest)
+              wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvMsg{msg}}, rest, WS.FragIdle{}, shut)
             case WS.InOp{fin, op, pay}:
               match op:
                 case 8:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvClose{pay}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.close_ev(pay)}, rest, WS.FragIdle{}, shut)
                 case 9:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvPing{pay}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvPing{pay}}, rest, WS.FragIdle{}, shut)
                 case 10:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvPong{pay}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvPong{pay}}, rest, WS.FragIdle{}, shut)
                 case 0:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "not data"}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case 1:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "fragmented"}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case 2:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "fragmented"}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case _:
-                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "bad frame"}, rest)
+                  wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvError{400, "bad frame"}}, rest, WS.FragIdle{}, shut)
     case 2:
       (s, r, b) = mf
-      match ev:
-        case WS.EvOpen{}:
+      match step:
+        case WS.StepEv{ev}:
+          match ev:
+            case WS.EvOpen{}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvOpen{})
+                wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvMsg{msg}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvMsg{msg})
+                wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvPing{pay}:
+              +pp = pay
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvPing{pp})
+                wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{WS.ping_reply(pp, out)}, buf, acc, shut)
+            case WS.EvPong{pay}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvPong{pay})
+                wss_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvClose{pay}:
+              match shut:
+                case True{}:
+                  wss_close(s)
+                case False{}:
+                  +pp = pay
+                  do IO<Unit>:
+                    out : WS.WSOut <- H(WS.EvClose{pp})
+                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, WS.close_answer(pp, out))
+                    wss_close_snd(m2)
+            case WS.EvError{code, msg}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvError{code, msg})
+                wss_close(s)
+        case WS.StepFrag{acc2}:
           do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvOpen{})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, out)
+            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_in(s, b, False{})
+            wss_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], acc2, shut)
+        case WS.StepOut{out2}:
+          +o2 = out2
+          do IO<Unit>:
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, o2)
             m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_after(m2, buf)
-            wss_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvMsg{msg}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvMsg{msg})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, out)
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_after(m2, buf)
-            wss_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvPing{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvPing{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, WS.ping_reply(pp, out))
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_after(m2, buf)
-            wss_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvPong{pay}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvPong{pay})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, out)
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_after(m2, buf)
-            wss_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvClose{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvClose{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, WS.close_answer(pp, out))
-            wss_close_snd(m2)
-        case WS.EvError{code, msg}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvError{code, msg})
-            wss_close(s)
+            wss_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], acc, Bool.or(shut, U32.is_eq(WS.out_op_of(o2), 8)))
     case _:
       IO.pure(Unit, Unit{})
 
@@ -375,7 +391,7 @@ def wss_hs_open(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1, U32 & St
         out : WS.WSOut <- H(WS.EvOpen{})
         m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open(s, out)
         m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_after(m2, rest)
-        wss_loop(~H, 1, m3, WS.EvError{0, ""}, [])
+        wss_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], WS.FragIdle{}, False{})
 
 def wss_hs_send(~H: WS.WSEv -> IO(WS.WSOut), s: Socket, +resp: String, +rest: List<&2, U32>) ->
   IO(Unit):
@@ -439,74 +455,88 @@ def wss_client_recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, +buf: 
       wss_recv_in(s, buf, True{})
 
 @unsafe
-def wss_client_loop(~H: WS.WSEv -> IO(WS.WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32>, ev: WS.WSEv, +buf: List<&2, U32>) ->
+def wss_client_loop(~H: WS.WSEv -> IO(WS.WSOut), st: U32, mf: Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32>, step: WS.WsStep, +buf: List<&2, U32>, acc: WS.MsgAcc, shut: Bool) ->
   IO(Unit):
   match st:
     case 1:
       (s, r, rest) = mf
       match r:
         case Fail{(c, m)}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvError{c, m})
-            wss_close(s)
+          match c:
+            case 413:
+              do IO<Unit>:
+                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, WS.cap_close_out())
+                wss_close_snd(m2)
+            case _:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvError{c, m})
+                wss_close(s)
         case Done{inn}:
           match inn:
             case WS.InMsg{msg}:
-              wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvMsg{msg}, rest)
+              wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvMsg{msg}}, rest, WS.FragIdle{}, shut)
             case WS.InOp{fin, op, pay}:
               match op:
                 case 8:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvClose{pay}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.close_ev(pay)}, rest, WS.FragIdle{}, shut)
                 case 9:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvPing{pay}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvPing{pay}}, rest, WS.FragIdle{}, shut)
                 case 10:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvPong{pay}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvPong{pay}}, rest, WS.FragIdle{}, shut)
                 case 0:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "not data"}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case 1:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "fragmented"}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case 2:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "fragmented"}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.frag_ev(acc, fin, op, pay), rest, WS.FragIdle{}, shut)
                 case _:
-                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.EvError{400, "bad frame"}, rest)
+                  wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepEv{WS.EvError{400, "bad frame"}}, rest, WS.FragIdle{}, shut)
     case 2:
       (s, r, b) = mf
-      match ev:
-        case WS.EvOpen{}:
+      match step:
+        case WS.StepEv{ev}:
+          match ev:
+            case WS.EvOpen{}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvOpen{})
+                wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvMsg{msg}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvMsg{msg})
+                wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvPing{pay}:
+              +pp = pay
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvPing{pp})
+                wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{WS.ping_reply(pp, out)}, buf, acc, shut)
+            case WS.EvPong{pay}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvPong{pay})
+                wss_client_loop(~H, 2, (s, Done{WS.InOp{False{}, 0, []}}, []), WS.StepOut{out}, buf, acc, shut)
+            case WS.EvClose{pay}:
+              match shut:
+                case True{}:
+                  wss_close(s)
+                case False{}:
+                  +pp = pay
+                  do IO<Unit>:
+                    out : WS.WSOut <- H(WS.EvClose{pp})
+                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, WS.close_answer(pp, out))
+                    wss_close_snd(m2)
+            case WS.EvError{code, msg}:
+              do IO<Unit>:
+                out : WS.WSOut <- H(WS.EvError{code, msg})
+                wss_close(s)
+        case WS.StepFrag{acc2}:
           do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvOpen{})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, out)
+            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_recv_in(s, b, True{})
+            wss_client_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], acc2, shut)
+        case WS.StepOut{out2}:
+          +o2 = out2
+          do IO<Unit>:
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, o2)
             m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_client_recv_after(m2, buf)
-            wss_client_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvMsg{msg}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvMsg{msg})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, out)
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_client_recv_after(m2, buf)
-            wss_client_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvPing{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvPing{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, WS.ping_reply(pp, out))
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_client_recv_after(m2, buf)
-            wss_client_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvPong{pay}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvPong{pay})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, out)
-            m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_client_recv_after(m2, buf)
-            wss_client_loop(~H, 1, m3, WS.EvError{0, ""}, [])
-        case WS.EvClose{pay}:
-          +pp = pay
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvClose{pp})
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, WS.close_answer(pp, out))
-            wss_close_snd(m2)
-        case WS.EvError{code, msg}:
-          do IO<Unit>:
-            out : WS.WSOut <- H(WS.EvError{code, msg})
-            wss_close(s)
+            wss_client_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], acc, Bool.or(shut, U32.is_eq(WS.out_op_of(o2), 8)))
     case _:
       IO.pure(Unit, Unit{})
 
@@ -518,7 +548,7 @@ def wss_client_hs_go(~H: WS.WSEv -> IO(WS.WSOut), s: Socket, ok: Bool, +rest: Li
         out : WS.WSOut <- H(WS.EvOpen{})
         m2 : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_open_masked(s, out)
         m3 : Socket & Result<&1, &1, U32 & String, WS.WSIn> & List<&2, U32> <- wss_client_recv_after(m2, rest)
-        wss_client_loop(~H, 1, m3, WS.EvError{0, ""}, [])
+        wss_client_loop(~H, 1, m3, WS.StepEv{WS.EvError{0, ""}}, [], WS.FragIdle{}, False{})
     case False{}:
       do IO<Unit>:
         out : WS.WSOut <- H(WS.EvError{400, "bad handshake"})

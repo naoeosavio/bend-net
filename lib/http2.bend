@@ -267,7 +267,7 @@ def h2_frame.mid6(+len24: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +s2: 
   match rest6:
     case +s3 <> rest7:
       +sid = u32_of4(s0, s1, s2, U32.and(s3, 127))
-      h2_frame.go2(typ, flags, sid, rest7, len24, U32.is_le(len24, 16384))
+      h2_frame.go2(typ, flags, sid, rest7, len24, U32.is_le(len24, 65535))
     case Nil{}:
       H2NeedMore{1n}
 
@@ -1376,7 +1376,7 @@ def h2_head.phase(emit: Bool) -> U32:
 
 def h2_head.decode(+bs: List<&2, U32>, +tab: HpDyn) ->
   Result<&1, &1, U32 & String, H2Head & HpDyn>:
-  h2_head.go(64n, 0, bs, Fail{(0, "")}, "", "", H2Head{0, Nil{}}, tab)
+  h2_head.go(512n, 0, bs, Fail{(0, "")}, "", "", H2Head{0, Nil{}}, tab)
 
 def h2_head.of(r: Result<&1, &1, U32 & String, H2Head & HpDyn>) ->
   Result<&1, &1, U32 & String, H2Head>:
@@ -1449,7 +1449,7 @@ def h2_reqhead.phase(emit: Bool) -> U32:
 
 def h2_reqhead.decode(+bs: List<&2, U32>, +tab: HpDyn) ->
   Result<&1, &1, U32 & String, H2ReqHead & HpDyn>:
-  h2_reqhead.go(64n, 0, bs, Fail{(0, "")}, "", "", H2ReqHead{"", "", Nil{}}, tab)
+  h2_reqhead.go(512n, 0, bs, Fail{(0, "")}, "", "", H2ReqHead{"", "", Nil{}}, tab)
 
 def h2_reqhead.of(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
   Result<&1, &1, U32 & String, H2ReqHead>:
