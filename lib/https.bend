@@ -670,7 +670,7 @@ def mux_pre(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, rs: Socket & Resu
       match ok:
         case 1:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_settings(), 0, 0, Nil{})
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_settings(), 0, 0, H2.h2_settings_initial_pay())
             mux(~H, 0, mux.sent_got(sent), H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}, H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, False{}, False{}, False{}, False{}, H2.H2ReqHead{"", "", Nil{}}, 4, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.H2ReqHead{"", "", Nil{}}, Nil{}, 0, H2.hp_empty())
         case _:
           TLS.tls_close(s2)

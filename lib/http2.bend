@@ -41,6 +41,9 @@ type H2RespSt is Data:
 type H2Response is Data:
   H2Response{status: U32, headers: List<&2, H2Hdr>, body: List<&2, U32>}
 
+type H2Settings is Data:
+  H2Settings{max_frame: U32, init_window: U32, max_headers: U32, max_streams: U32, table_size: U32}
+
 type H2Request is Data:
   H2Request{method: String, path: String, headers: List<&2, H2Hdr>, body: List<&2, U32>}
 
@@ -228,6 +231,77 @@ def h2_f_end_headers() -> U32:
 def h2_f_padded() -> U32:
   8
 
+def h2_f_priority() -> U32:
+  32
+
+# Phase 3 flow/frame tuning: we always slice outbound DATA to 16384
+# (safe under any peer: RFC 9113 section 6.5.2 minimum), announce a
+# 6 MB inbound window plus 65535 max frame, and accept HPACK strings
+# up to 65535 bytes.
+def h2_max_send() -> U32:
+  16384
+
+def h2_init_window() -> U32:
+  6291456
+
+def h2_max_hpack() -> U32:
+  65535
+
+def h2_be16.go(+v: U32) -> List<&2, U32>:
+  [U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
+
+def h2_be16(+v: U32) -> List<&2, U32>:
+  h2_be16.go(v)
+
+def h2_be32.go(+v: U32) -> List<&2, U32>:
+  [U32.and(U32.shrn(v, 24n), 255), U32.and(U32.shrn(v, 16n), 255), U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
+
+def h2_be32(+v: U32) -> List<&2, U32>:
+  h2_be32.go(v)
+
+def h2_settings_initial_pay() -> List<&2, U32>:
+  b_append(b_append(h2_be16(4), h2_be32(h2_init_window())), b_append(h2_be16(5), h2_be32(65535)))
+
+# Strip PADDED / PRIORITY framing before HPACK decode (RFC 9113
+# sections 6.1/6.2): PADDED prefix is pad-length byte plus that many
+# trailing pad bytes; PRIORITY adds a 5-byte exclusive+dependency
+# field. Only HEADERS (1) and DATA (0) carry these flags here.
+def h2_strip_pad_take(+rest: List<&2, U32>, +total: Nat, +pad: U32) -> List<&2, U32>:
+  b_take((total - U32.to_nat(pad) : Nat), rest)
+
+def h2_strip_pad_cut(+rest: List<&2, U32>, +pad: U32) -> List<&2, U32>:
+  h2_strip_pad_take(rest, b_len(rest), pad)
+
+def h2_strip_pad_dec(+rest: List<&2, U32>, +pad: U32, has_pad: Bool) -> List<&2, U32>:
+  match has_pad:
+    case False{}:
+      pad <> rest
+    case True{}:
+      h2_strip_pad_cut(rest, pad)
+
+def h2_strip_pad_go(+pay: List<&2, U32>, has_pad: Bool) -> List<&2, U32>:
+  match pay:
+    case Nil{}:
+      Nil{}
+    case +p0 <> rest:
+      h2_strip_pad_dec(rest, p0, has_pad)
+
+def h2_strip_prio_go(+pay: List<&2, U32>, has_prio: Bool) -> List<&2, U32>:
+  match has_prio:
+    case False{}:
+      pay
+    case True{}:
+      b_drop(5n, pay)
+
+def h2_frame_payload(+pay: List<&2, U32>, +flags: U32, +typ: U32) -> List<&2, U32>:
+  match typ:
+    case 0:
+      h2_strip_prio_go(h2_strip_pad_go(pay, U32.is_eq(U32.and(flags, 8), 8)), U32.is_eq(U32.and(flags, 32), 32))
+    case 1:
+      h2_strip_prio_go(h2_strip_pad_go(pay, U32.is_eq(U32.and(flags, 8), 8)), U32.is_eq(U32.and(flags, 32), 32))
+    case _:
+      pay
+
 def u32_of4.go(b3: U32, b2: U32, b1: U32, b0: U32) -> U32:
   (((b3 * 16777216 + b2 * 65536 + b1 * 256 + b0 : U32)))
 
@@ -238,10 +312,10 @@ def h2_frame.fin4(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, len: U32
   +n = U32.to_nat(len)
   H2NeedMore{(n - b_len(b_take(n, rest)) : Nat)}
 
-def h2_frame.fin3(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, len: U32) -> H2FrameOut:
+def h2_frame.fin3(+typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, len: U32) -> H2FrameOut:
   +n = U32.to_nat(len)
   +taken = b_take(n, rest)
-  H2FrameOk{H2Frame{typ, flags, sid, taken}, b_drop(n, rest)}
+  H2FrameOk{H2Frame{typ, flags, sid, h2_frame_payload(taken, flags, typ)}, b_drop(n, rest)}
 
 def h2_frame.fin2(typ: U32, flags: U32, sid: U32, rest: List<&2, U32>, len: U32, ok: Bool) ->
   H2FrameOut:
@@ -353,6 +427,96 @@ def h2_frame_write.hdr(+len: U32, +typ: U32, +flags: U32, +sid: U32) -> List<&2,
 def h2_frame_write(+typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) -> List<&2, U32>:
   +len = U32.from_nat(b_len(pay))
   h2_frame_write.cat(h2_frame_write.hdr(len, typ, flags, sid), pay)
+
+def h2_settings_initial() -> List<&2, U32>:
+  h2_frame_write(h2_t_settings(), 0, 0, h2_settings_initial_pay())
+
+def h2_window_update_pay(+inc: U32) -> List<&2, U32>:
+  h2_be32(U32.and(inc, 2147483647))
+
+# Peer SETTINGS ledger (RFC 9113 section 6.5): unknown ids are
+# ignored; 0 means unlimited for max_headers / max_streams.
+def h2_settings_default() -> H2Settings:
+  H2Settings{16384, 65535, 0, 0, 4096}
+
+def h2_settings_one.done(+mf: U32, +iw: U32, +mhl: U32, +mcc: U32, +hts: U32, +id: U32, +val: U32) -> H2Settings:
+  match id:
+    case 1:
+      H2Settings{mf, iw, mhl, mcc, val}
+    case 3:
+      H2Settings{mf, iw, mhl, val, hts}
+    case 4:
+      H2Settings{mf, val, mhl, mcc, hts}
+    case 5:
+      H2Settings{val, iw, mhl, mcc, hts}
+    case 6:
+      H2Settings{mf, iw, val, mcc, hts}
+    case _:
+      H2Settings{mf, iw, mhl, mcc, hts}
+
+def h2_settings_one.go(+st: H2Settings, +id: U32, +val: U32) -> H2Settings:
+  match st:
+    case H2Settings{+mf, +iw, +mhl, +mcc, +hts}:
+      h2_settings_one.done(mf, iw, mhl, mcc, hts, id, val)
+
+def h2_settings_one(+st: H2Settings, +id: U32, +val: U32) -> H2Settings:
+  h2_settings_one.go(st, id, val)
+
+def h2_settings_apply_go(+fuel: Nat, +pay: List<&2, U32>, +st: H2Settings) -> H2Settings:
+  match fuel:
+    case 0n:
+      st
+    case 1n+f:
+      match pay:
+        case Nil{}:
+          st
+        case +b0 <> r0:
+          match r0:
+            case Nil{}:
+              st
+            case +b1 <> r1:
+              match r1:
+                case Nil{}:
+                  st
+                case +b2 <> r2:
+                  match r2:
+                    case Nil{}:
+                      st
+                    case +b3 <> r3:
+                      match r3:
+                        case Nil{}:
+                          st
+                        case +b4 <> r4:
+                          match r4:
+                            case Nil{}:
+                              st
+                            case +b5 <> rest:
+                              h2_settings_apply_go(f, rest, h2_settings_one(st, (b0 * 256 + b1 : U32), u32_of4(b2, b3, b4, b5)))
+
+def h2_settings_apply(+pay: List<&2, U32>, +st: H2Settings) -> H2Settings:
+  h2_settings_apply_go(b_len(pay), pay, st)
+
+def h2_window_update_val(+v: U32) -> Bool:
+  Bool.and(U32.is_gt(v, 0), U32.is_lt(v, 2147483648))
+
+def h2_window_update_ok(+pay: List<&2, U32>) -> Bool:
+  match pay:
+    case Nil{}:
+      False{}
+    case +b0 <> r0:
+      match r0:
+        case Nil{}:
+          False{}
+        case +b1 <> r1:
+          match r1:
+            case Nil{}:
+              False{}
+            case +b2 <> r2:
+              match r2:
+                case Nil{}:
+                  False{}
+                case +b3 <> r3:
+                  h2_window_update_val(u32_of4(b0, b1, b2, b3))
 
 def hpack_int.enc.go(+fuel: Nat, +rest: U32, acc: List<&2, U32>, big: Bool) -> List<&2, U32>:
   match fuel:
@@ -543,7 +707,7 @@ def huff_emit.go(eos: Bool, big: Bool) -> U32:
       huff_emit.big(big)
 
 def huff_emit_phase(+sym: U32, +n: U32) -> U32:
-  huff_emit.go(U32.is_eq(sym, 256), U32.is_gt(n, 4096))
+  huff_emit.go(U32.is_eq(sym, 256), U32.is_gt(n, h2_max_hpack()))
 
 def huff_entry.pad(pad: Bool) -> U32:
   match pad:
@@ -690,7 +854,7 @@ def hpack_str.dec.hufin(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
     case Fail{e}:
       Fail{e}
     case Done{(+n, +rest)}:
-      hpack_str.dec.hufcap(n, rest, U32.is_le(n, 4096))
+      hpack_str.dec.hufcap(n, rest, U32.is_le(n, h2_max_hpack()))
 
 def hpack_str.enc.cat(a: List<&2, U32>, b: List<&2, U32>) -> List<&2, U32>:
   List.append(&2, U32, a, b)
@@ -724,7 +888,7 @@ def hpack_str.dec.str(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
     case Fail{e}:
       Fail{e}
     case Done{(+n, +rest)}:
-      hpack_str.dec.len(n, rest, U32.is_le(n, 4096))
+      hpack_str.dec.len(n, rest, U32.is_le(n, h2_max_hpack()))
 
 def hpack_str.dec.huf(+b0: U32, +rest2: List<&2, U32>, huf: Bool) ->
   Result<&1, &1, U32 & String, String & List<&2, U32>>:
@@ -1187,10 +1351,65 @@ def h2_settings_empty() -> List<&2, U32>:
 def h2_settings_ack() -> List<&2, U32>:
   h2_frame_write(h2_t_settings(), h2_f_ack(), 0, Nil{})
 
+def h2_send_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  TLS.tls_send_bytes(sock, h2_frame_write(typ, flags, sid, pay))
+
+def h2_send_window_update(sock: Socket, +sid: U32, +inc: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  h2_send_frame(sock, h2_t_window_update(), 0, sid, h2_window_update_pay(inc))
+
+def h2_send_wu2.next(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +inc: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  (s2, r) = sent
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{e}))
+    case Done{u}:
+      h2_send_window_update(s2, sid, inc)
+
+# Replenish both ledgers after inbound DATA (RFC 9113 section 6.9):
+# connection window first, then the stream window. Empty DATA needs
+# no credit (increment 0 would be a connection error).
+def h2_send_wu_len.go(sock: Socket, +sid: U32, +inc: U32, empty: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  match empty:
+    case True{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+    case False{}:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_window_update(sock, 0, inc)
+        h2_send_wu2.next(sent, sid, inc)
+
+def h2_send_wu_len(sock: Socket, +sid: U32, +inc: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  h2_send_wu_len.go(sock, sid, inc, U32.is_eq(inc, 0))
+
+# Narrow carrier leaves for the flow sender: best-effort credit
+# mapping plus fresh-only SETTINGS ack (shared with the DATA runs).
+def h2_round.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +rest: List<&2, U32>) -> Socket & H2Got:
+  (s, r) = sent
+  (s, H2GotOk{H2Frame{typ, flags, sid2, payload}, rest})
+
+def h2_round.wu_typ(sock: Socket, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +rest: List<&2, U32>) -> IO(Socket & H2Got):
+  match typ:
+    case 0:
+      do IO<Socket & H2Got>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_wu_len(sock, sid2, U32.from_nat(b_len(payload)))
+        IO.pure(Socket & H2Got, h2_round.wu_kept(sent, typ, flags, sid2, payload, rest))
+    case _:
+      IO.pure(Socket & H2Got, (sock, H2GotOk{H2Frame{typ, flags, sid2, payload}, rest}))
+
+def h2_round.wu_data(sock: Socket, +frame: H2Frame, +rest: List<&2, U32>) -> IO(Socket & H2Got):
+  match frame:
+    case H2Frame{+typ, +flags, +sid2, +payload}:
+      h2_round.wu_typ(sock, typ, flags, sid2, payload, rest)
+
+
 def h2_round.done4(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
   match out:
     case H2FrameOk{frame, rest}:
-      IO.pure(Socket & H2Got, (sock, H2GotOk{frame, rest}))
+      h2_round.wu_data(sock, frame, rest)
     case H2FrameBad{code, msg}:
       IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
     case _:
@@ -1219,7 +1438,7 @@ def h2_round.after3(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +
 def h2_round.done3(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
   match out:
     case H2FrameOk{frame, rest}:
-      IO.pure(Socket & H2Got, (sock, H2GotOk{frame, rest}))
+      h2_round.wu_data(sock, frame, rest)
     case H2FrameBad{code, msg}:
       IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
     case H2NeedMore{missing}:
@@ -1250,7 +1469,7 @@ def h2_round.after2(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +
 def h2_round.done2(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
   match out:
     case H2FrameOk{frame, rest}:
-      IO.pure(Socket & H2Got, (sock, H2GotOk{frame, rest}))
+      h2_round.wu_data(sock, frame, rest)
     case H2FrameBad{code, msg}:
       IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
     case H2NeedMore{missing}:
@@ -1281,7 +1500,7 @@ def h2_round.after1(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +
 def h2_round.done1(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
   match out:
     case H2FrameOk{frame, rest}:
-      IO.pure(Socket & H2Got, (sock, H2GotOk{frame, rest}))
+      h2_round.wu_data(sock, frame, rest)
     case H2FrameBad{code, msg}:
       IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
     case H2NeedMore{missing}:
@@ -1312,7 +1531,7 @@ def h2_round.after0(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +
 def h2_round.done0(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
   match out:
     case H2FrameOk{frame, rest}:
-      IO.pure(Socket & H2Got, (sock, H2GotOk{frame, rest}))
+      h2_round.wu_data(sock, frame, rest)
     case H2FrameBad{code, msg}:
       IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
     case H2NeedMore{missing}:
@@ -1326,9 +1545,182 @@ def h2_round0(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
 def h2_read_frame(sock: Socket, buf: List<&2, U32>) -> IO(Socket & H2Got):
   h2_round0(sock, buf)
 
-def h2_send_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
+def h2_wu_best_effort(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2Got:
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      (s, H2GotErr{0, "next"})
+    case Done{u}:
+      (s, H2GotErr{0, "next"})
+
+def h2_tail_ack.go(sock: Socket, g: H2Got, +flags: U32, fresh: Bool) -> IO(Socket & H2Got):
+  match fresh:
+    case True{}:
+      do IO<Socket & H2Got>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
+        IO.pure(Socket & H2Got, h2_wu_best_effort(sent))
+    case False{}:
+      IO.pure(Socket & H2Got, (sock, g))
+
+def h2_tail_ack(prev: Socket & H2Got, +flags: U32) -> IO(Socket & H2Got):
+  (s, g) = prev
+  h2_tail_ack.go(s, g, flags, U32.is_eq(U32.and(flags, h2_f_ack()), 0))
+
+# Flow-aware DATA sender (Phase 3 flow): slices to 16 KB and honors
+# the peer's connection + stream windows (RFC 9113 section 6.9),
+# waiting for WINDOW_UPDATE credit when exhausted. Initial windows
+# are the RFC defaults (65535); the peer SETTINGS INITIAL_WINDOW_SIZE
+# is picked up on the fly (delta edge vs already-open streams is
+# ignored: the announcement always precedes our first DATA here).
+def h2_u32_min.pick(+a: U32, +b: U32, pick_a: Bool) -> U32:
+  match pick_a:
+    case True{}:
+      a
+    case False{}:
+      b
+
+def h2_u32_min(+a: U32, +b: U32) -> U32:
+  h2_u32_min.pick(a, b, U32.is_le(a, b))
+
+def h2_settings.iw(+st: H2Settings) -> U32:
+  match st:
+    case H2Settings{mf, iw, mhl, mcc, hts}:
+      iw
+
+def h2_flow_wu_inc(+pay: List<&2, U32>) -> U32:
+  match pay:
+    case Nil{}:
+      0
+    case +b0 <> r0:
+      match r0:
+        case Nil{}:
+          0
+        case +b1 <> r1:
+          match r1:
+            case Nil{}:
+              0
+            case +b2 <> r2:
+              match r2:
+                case Nil{}:
+                  0
+                case +b3 <> r3:
+                  u32_of4(b0, b1, b2, b3)
+
+def h2_flow_credit.mine(+cw: U32, +sw: U32, +inc: U32, is_mine: Bool) -> U32 & U32:
+  match is_mine:
+    case True{}:
+      (cw, (sw + inc : U32))
+    case False{}:
+      (cw, sw)
+
+def h2_flow_credit.conn(+cw: U32, +sw: U32, +inc: U32, is_conn: Bool, is_mine: Bool) -> U32 & U32:
+  match is_conn:
+    case True{}:
+      ((cw + inc : U32), sw)
+    case False{}:
+      h2_flow_credit.mine(cw, sw, inc, is_mine)
+
+def h2_flow_credit.add(+cw: U32, +sw: U32, +sid: U32, +sid2: U32, +inc: U32) -> U32 & U32:
+  h2_flow_credit.conn(cw, sw, inc, U32.is_eq(sid2, 0), U32.is_eq(sid2, sid))
+
+def h2_flow_credit.go(+cw: U32, +sw: U32, +sid: U32, +sid2: U32, +inc: U32, valid: Bool) -> U32 & U32:
+  match valid:
+    case False{}:
+      (cw, sw)
+    case True{}:
+      h2_flow_credit.add(cw, sw, sid, sid2, inc)
+
+def h2_flow_cw(p: U32 & U32) -> U32:
+  (a, b) = p
+  a
+
+def h2_flow_sw(p: U32 & U32) -> U32:
+  (a, b) = p
+  b
+
+def h2_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2Got:
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      (s, H2GotErr{616, "tls io"})
+    case Done{u}:
+      (s, H2GotErr{0, "next"})
+
+@unsafe
+def h2_send_data_flow(+phase: U32, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +ps: H2Settings, prev: Socket & H2Got, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +chunk: U32, +need_read: Bool, +buf: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  TLS.tls_send_bytes(sock, h2_frame_write(typ, flags, sid, pay))
+  match phase:
+    case 0:
+      match body:
+        case Nil{}:
+          (se, ge) = prev
+          h2_send_frame(se, h2_t_data(), h2_f_end_stream(), sid, Nil{})
+        case +b <> r:
+          h2_send_data_flow(1, sid, body, cw, sw, ps, prev, 0, 0, 0, Nil{}, h2_u32_min(h2_u32_min(h2_u32_min(cw, sw), 16384), U32.from_nat(b_len(body))), U32.is_eq(h2_u32_min(h2_u32_min(h2_u32_min(cw, sw), 16384), U32.from_nat(b_len(body))), 0), buf)
+    case 1:
+      (s1, g1) = prev
+      match need_read:
+        case True{}:
+          h2_send_data_flow(3, sid, body, cw, sw, ps, (s1, g1), typ, flags, sid2, payload, chunk, need_read, buf)
+        case False{}:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(s1, h2_t_data(), 0, sid, b_take(U32.to_nat(chunk), body))
+            h2_send_data_flow(2, sid, b_drop(U32.to_nat(chunk), body), (cw - chunk : U32), (sw - chunk : U32), ps, h2_flow_sent(sent), 0, 0, 0, Nil{}, 0, False{}, buf)
+    case 2:
+      (s2, g2) = prev
+      match g2:
+        case H2GotErr{code2, msg2}:
+          match code2:
+            case 0:
+              h2_send_data_flow(0, sid, body, cw, sw, ps, (s2, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
+            case _:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code2, msg2)}))
+        case H2GotOk{frame2, buf2}:
+          h2_send_data_flow(0, sid, body, cw, sw, ps, (s2, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
+    case 3:
+      (s3, g3) = prev
+      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+        got2 : Socket & H2Got <- h2_read_frame(s3, buf)
+        h2_send_data_flow(4, sid, body, cw, sw, ps, got2, 0, 0, 0, Nil{}, 0, False{}, buf)
+    case 4:
+      (s4, g4) = prev
+      match g4:
+        case H2GotErr{code4, msg4}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s4, Fail{(code4, msg4)}))
+        case H2GotOk{+frame4, +buf4}:
+          match frame4:
+            case H2Frame{+typ4, +flags4, +sid42, +payload4}:
+              h2_send_data_flow(5, sid, body, cw, sw, ps, (s4, H2GotOk{H2Frame{typ4, flags4, sid42, payload4}, buf4}), typ4, flags4, sid42, payload4, 0, False{}, buf4)
+    case _:
+      (s5, g5) = prev
+      match typ:
+        case 8:
+          h2_send_data_flow(0, sid, body, h2_flow_cw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), h2_flow_sw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), ps, (s5, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
+        case 4:
+          +ps2 = h2_settings_apply(payload, ps)
+          +sw2 = h2_settings.iw(ps2)
+          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+            c4 : Socket & H2Got <- h2_tail_ack((s5, g5), flags)
+            h2_send_data_flow(3, sid, body, cw, sw2, ps2, c4, 0, 0, 0, Nil{}, 0, False{}, buf)
+        case 6:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(s5, h2_t_ping(), h2_f_ack(), 0, payload)
+            h2_send_data_flow(3, sid, body, cw, sw, ps, h2_wu_best_effort(sent), 0, 0, 0, Nil{}, 0, False{}, buf)
+        case _:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s5, Fail{(502, "flow blocked")}))
+
+def h2_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  h2_send_data_flow(0, sid, body, 65535, 65535, h2_settings_default(), (sock, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, Nil{})
+
+# Receive-side flow credit, centralized at the single frame-read
+# choke point every loop (chain, tails, flow sender, mux) funnels
+# through. INITIAL_WINDOW_SIZE only raises per-STREAM windows; the
+# CONNECTION window always starts at 65535 and stalls any peer past
+# it (nghttp2 stops at exactly 65535) unless we replenish. So every
+# inbound DATA earns connection + stream WINDOW_UPDATE immediately
+# (best-effort: a failed credit still delivers the frame; a dead
+# connection fails at the next read; empty DATA needs no credit).
 
 def h2_head.apply2(+status: U32, +headers: List<&2, H2Hdr>, +name: String, +value: String, is_status: Bool) -> H2Head:
   match is_status:
@@ -1485,7 +1877,7 @@ def h2_connect.go(conn: Result<&1, &1, U32 & String, Socket>) ->
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
     case Done{sock}:
       do IO<Result<&1, &1, U32 & String, Socket>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, b_append(h2_preface(), h2_settings_empty()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, b_append(h2_preface(), h2_settings_initial()))
         h2_connect.sent(sent)
 
 def h2_connect(host: String, port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
@@ -1511,10 +1903,24 @@ def h2_resp.cls3(+typ: U32) -> U32:
     case _:
       0
 
+def h2_resp.cls_wu_ok(ok: Bool) -> U32:
+  match ok:
+    case False{}:
+      9
+    case True{}:
+      6
+
+def h2_resp.cls_wu(+typ: U32, +payload: List<&2, U32>) -> U32:
+  match typ:
+    case 8:
+      h2_resp.cls_wu_ok(h2_window_update_ok(payload))
+    case _:
+      h2_resp.cls3(typ)
+
 def h2_resp.cls2(+typ: U32, +flags: U32, +payload: List<&2, U32>, mine: Bool) -> U32:
   match mine:
     case True{}:
-      h2_resp.cls3(typ)
+      h2_resp.cls_wu(typ, payload)
     case False{}:
       0
 
@@ -1637,9 +2043,58 @@ def h2_resp.cls(+typ: U32) -> U32:
 
 
 
+# Unbounded DATA run: takes over where round8 fails so a long
+# response body (many DATA frames) never hits "response too long".
+# Narrow single-@unsafe phased loop: phase 0 reads or decomposes one
+# frame, phase 1 dispatches on cls (DATA appends, valid WINDOW_UPDATE
+# skips, anything else keeps the old overflow error), phase 2 settles
+# END_STREAM or fires best-effort WINDOW_UPDATE credit first.
+@unsafe
+def h2_resp.data_run(+phase: U32, +st: H2RespSt, +buf: List<&2, U32>, +sid: U32, prev: Socket & H2Got, +cls: U32, +is_end: Bool, +dlen: U32, +payload: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, H2Response>):
+  match phase:
+    case 0:
+      (s0, g0) = prev
+      match g0:
+        case H2GotErr{code, msg}:
+          match code:
+            case 0:
+              do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
+                got2 : Socket & H2Got <- h2_read_frame(s0, buf)
+                h2_resp.data_run(0, st, buf, sid, got2, 0, False{}, 0, Nil{})
+            case _:
+              IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (s0, Fail{(code, msg)}))
+        case H2GotOk{+frame, +buf2}:
+          match frame:
+            case H2Frame{+typ, +flags, +sid2, +payload2}:
+              h2_resp.data_run(1, st, buf2, sid, (s0, H2GotOk{H2Frame{typ, flags, sid2, payload2}, buf2}), h2_resp.cls2(typ, flags, payload2, Bool.and(U32.is_eq(sid2, sid), U32.is_gt(sid2, 0))), U32.is_eq(U32.and(flags, h2_f_end_stream()), h2_f_end_stream()), U32.from_nat(b_len(payload2)), payload2)
+    case 1:
+      (s1, g1) = prev
+      match cls:
+        case 3:
+          h2_resp.data_run(2, h2_resp.st_add(st, payload), buf, sid, (s1, g1), cls, is_end, dlen, Nil{})
+        case 0:
+          h2_resp.data_run(0, st, buf, sid, (s1, H2GotErr{0, "next"}), 0, False{}, 0, Nil{})
+        case 6:
+          h2_resp.data_run(0, st, buf, sid, (s1, H2GotErr{0, "next"}), 0, False{}, 0, Nil{})
+        case _:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (s1, Fail{(502, "response too long")}))
+    case 2:
+      (s2, g2) = prev
+      match is_end:
+        case True{}:
+          h2_resp.finish(s2, st)
+        case False{}:
+          do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_wu_len(s2, sid, dlen)
+            h2_resp.data_run(0, st, buf, sid, h2_wu_best_effort(sent), 0, False{}, 0, Nil{})
+    case _:
+      (sx, gx) = prev
+      IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sx, Fail{(502, "bad phase")}))
+
 def h2_resp.round8(sock: Socket, +st: H2RespSt, +buf: List<&2, U32>, +sid: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
-  IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "response too long")}))
+  h2_resp.data_run(0, st, buf, sid, (sock, H2GotErr{0, "next"}), 0, False{}, 0, Nil{})
 
 
 
@@ -1695,6 +2150,10 @@ def h2_resp.next7(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round8(sock, st, buf, sid)
+        case 6:
+          h2_resp.round8(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -1777,6 +2236,10 @@ def h2_resp.next6(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round7(sock, st, buf, sid)
+        case 6:
+          h2_resp.round7(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -1859,6 +2322,10 @@ def h2_resp.next5(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round6(sock, st, buf, sid)
+        case 6:
+          h2_resp.round6(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -1941,6 +2408,10 @@ def h2_resp.next4(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round5(sock, st, buf, sid)
+        case 6:
+          h2_resp.round5(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2023,6 +2494,10 @@ def h2_resp.next3(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round4(sock, st, buf, sid)
+        case 6:
+          h2_resp.round4(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2105,6 +2580,10 @@ def h2_resp.next2(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round3(sock, st, buf, sid)
+        case 6:
+          h2_resp.round3(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2187,6 +2666,10 @@ def h2_resp.next1(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round2(sock, st, buf, sid)
+        case 6:
+          h2_resp.round2(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2269,6 +2752,10 @@ def h2_resp.next0(sock: Socket, +st: H2RespSt, +sid: U32, +frame: H2Frame, +buf:
       match cls:
         case 0:
           h2_resp.round1(sock, st, buf, sid)
+        case 6:
+          h2_resp.round1(sock, st, buf, sid)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{(502, "bad window_update")}))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2299,6 +2786,49 @@ def h2_resp.round0(sock: Socket, +st: H2RespSt, +buf: List<&2, U32>, +sid: U32) 
     got : Socket & H2Got <- h2_read_frame(sock, buf)
     h2_resp.pick0(got, st, sid)
 
+# Response entry drain: skips unbounded housekeeping (leftover
+# WINDOW_UPDATEs from our own upload, late SETTINGS ACKs, PINGs)
+# before the chain starts, so a late HEADERS never overflows the
+# finite round budget. Returns the carrier holding the first stream
+# HEADERS/DATA. Skips never ack (Bend never acks; Node never blocks
+# on a missing ack mid-exchange); GOAWAY and bad WINDOW_UPDATE fail.
+# Narrow single-@unsafe loop (5 params): phase 0 reads or
+# decomposes one frame, phase 1 dispatches on cls.
+@unsafe
+def h2_resp.drain(+phase: U32, +sid: U32, prev: Socket & H2Got, +buf: List<&2, U32>, +cls: U32) ->
+  IO(Socket & H2Got):
+  match phase:
+    case 0:
+      (s0, g0) = prev
+      match g0:
+        case H2GotErr{code, msg}:
+          match code:
+            case 0:
+              do IO<Socket & H2Got>:
+                got2 : Socket & H2Got <- h2_read_frame(s0, buf)
+                h2_resp.drain(0, sid, got2, buf, 0)
+            case _:
+              IO.pure(Socket & H2Got, (s0, H2GotErr{code, msg}))
+        case H2GotOk{+frame, +buf2}:
+          h2_resp.drain(1, sid, (s0, H2GotOk{frame, buf2}), buf2, h2_resp.classify(frame, sid))
+    case _:
+      (s1, g1) = prev
+      match cls:
+        case 2:
+          IO.pure(Socket & H2Got, (s1, g1))
+        case 3:
+          IO.pure(Socket & H2Got, (s1, g1))
+        case 5:
+          IO.pure(Socket & H2Got, (s1, H2GotErr{502, "goaway"}))
+        case 9:
+          IO.pure(Socket & H2Got, (s1, H2GotErr{502, "bad window_update"}))
+        case _:
+          h2_resp.drain(0, sid, (s1, H2GotErr{0, "next"}), buf, 0)
+
+def h2_resp.drain_done(got: Socket & H2Got, +sid: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, H2Response>):
+  h2_resp.pick0(got, H2RespSt{None{}, Nil{}}, sid)
+
 def h2_request.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
   (sock, r) = sent
@@ -2306,7 +2836,9 @@ def h2_request.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, H2Response>, (sock, Fail{e}))
     case Done{u}:
-      h2_resp.round0(sock, H2RespSt{None{}, Nil{}}, Nil{}, sid)
+      do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
+        got : Socket & H2Got <- h2_resp.drain(0, sid, (sock, H2GotErr{0, "next"}), Nil{}, 0)
+        h2_resp.drain_done(got, sid)
 
 def h2_request.data(sock: Socket, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, H2Response>):
@@ -2317,7 +2849,7 @@ def h2_request.data(sock: Socket, +sid: U32, +body: List<&2, U32>, is_empty: Boo
         h2_request.sent(sent, sid)
     case False{}:
       do IO<Socket & Result<&1, &1, U32 & String, H2Response>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_data(), h2_f_end_stream(), sid, body)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_data_start(sock, sid, body)
         h2_request.sent(sent, sid)
 
 def h2_request.body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>) ->
@@ -2351,7 +2883,7 @@ def h2_srv.resp_data(sock: Socket, +sid: U32, +body: List<&2, U32>, is_empty: Bo
     case True{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
     case False{}:
-      h2_send_frame(sock, h2_t_data(), h2_f_end_stream(), sid, body)
+      h2_send_data_start(sock, sid, body)
 
 def h2_srv.resp_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
@@ -2400,27 +2932,127 @@ def h2_srv.cls3(+typ: U32) -> U32:
     case _:
       0
 
-def h2_srv.cls2(+typ: U32, +odd: U32, is_odd: Bool) -> U32:
+def h2_srv.cls_wu_ok(ok: Bool) -> U32:
+  match ok:
+    case False{}:
+      9
+    case True{}:
+      7
+
+def h2_srv.cls_wu(+typ: U32, +payload: List<&2, U32>) -> U32:
+  match typ:
+    case 8:
+      h2_srv.cls_wu_ok(h2_window_update_ok(payload))
+    case _:
+      h2_srv.cls3(typ)
+
+def h2_srv.cls2(+typ: U32, +odd: U32, +payload: List<&2, U32>, is_odd: Bool) -> U32:
   match is_odd:
     case True{}:
-      h2_srv.cls3(typ)
+      h2_srv.cls_wu(typ, payload)
     case False{}:
       0
 
-def h2_srv.cls_odd(+typ: U32, +odd: U32) -> U32:
-  h2_srv.cls2(typ, odd, U32.is_eq(odd, 1))
+def h2_srv.cls_odd(+typ: U32, +odd: U32, +payload: List<&2, U32>) -> U32:
+  h2_srv.cls2(typ, odd, payload, U32.is_eq(odd, 1))
 
-def h2_srv.cls(+typ: U32, +sid2: U32) -> U32:
-  h2_srv.cls_odd(typ, U32.and(sid2, 1))
+def h2_srv.cls(+typ: U32, +sid2: U32, +payload: List<&2, U32>) -> U32:
+  h2_srv.cls_odd(typ, U32.and(sid2, 1), payload)
 
 def h2_srv.classify(+frame: H2Frame) -> U32:
   match frame:
     case H2Frame{+typ, +flags, +sid2, +payload}:
-      h2_srv.cls(typ, sid2)
+      h2_srv.cls(typ, sid2, payload)
+
+# Server DATA-run leaves: request projection (pure) and
+# send-receipt wrap, mirroring answer2/answer3.wrap without looping.
+def h2_srv.tail_req(+rh: H2ReqHead, +body: List<&2, U32>) -> H2Request:
+  match rh:
+    case H2ReqHead{+method, +path, +headers}:
+      H2Request{method, path, headers, body}
+
+def h2_srv.tail_req_head(head: Maybe<&2, H2ReqHead>, +body: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, H2Request>:
+  match head:
+    case None{}:
+      Fail{(502, "no request head")}
+    case Some{+rh}:
+      Done{h2_srv.tail_req(rh, body)}
+
+def h2_srv.tail_req_st(+st: H2SrvSt) -> Result<&1, &1, U32 & String, H2Request>:
+  match st:
+    case H2SrvSt{head, body, sid, hp}:
+      h2_srv.tail_req_head(head, body)
+
+def h2_srv.tail_wrapped(sent: Socket & Result<&1, &1, U32 & String, Unit>, +tab: HpDyn) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s, Fail{e}, tab))
+    case Done{u}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s, Done{u}, tab))
+
+# Unbounded server DATA run: takes over where round6 fails so a long
+# request body never hits "request too long". Same narrow shape as
+# h2_resp.data_run, plus the handler, the HPACK table ledger and an
+# answer phase. PING is skipped, never acked (Phase 4 item).
+@unsafe
+def h2_srv.data_run(+phase: U32, +st: H2SrvSt, +buf: List<&2, U32>, prev: Socket & H2Got, +cls: U32, +is_end: Bool, +dlen: U32, +payload: List<&2, U32>, +sid2: U32, hreq: Result<&1, &1, U32 & String, H2Request>, +tab: HpDyn, handler: H2Request -> IO(H2Response)) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
+  match phase:
+    case 0:
+      (s0, g0) = prev
+      match g0:
+        case H2GotErr{code, msg}:
+          match code:
+            case 0:
+              do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+                got2 : Socket & H2Got <- h2_read_frame(s0, buf)
+                h2_srv.data_run(0, st, buf, got2, 0, False{}, 0, Nil{}, 0, Fail{(0, "")}, tab, handler)
+            case _:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s0, Fail{(code, msg)}, hp_empty()))
+        case H2GotOk{+frame, +buf2}:
+          match frame:
+            case H2Frame{+typ, +flags, +sid22, +payload2}:
+              h2_srv.data_run(1, st, buf2, (s0, H2GotOk{H2Frame{typ, flags, sid22, payload2}, buf2}), h2_srv.cls(typ, sid22, payload2), U32.is_eq(U32.and(flags, h2_f_end_stream()), h2_f_end_stream()), U32.from_nat(b_len(payload2)), payload2, sid22, Fail{(0, "")}, tab, handler)
+    case 1:
+      (s1, g1) = prev
+      match cls:
+        case 6:
+          h2_srv.data_run(2, h2_srv.st_add_body(st, payload), buf, (s1, g1), cls, is_end, dlen, Nil{}, sid2, Fail{(0, "")}, tab, handler)
+        case 0:
+          h2_srv.data_run(0, st, buf, (s1, H2GotErr{0, "next"}), 0, False{}, 0, Nil{}, 0, Fail{(0, "")}, tab, handler)
+        case 7:
+          h2_srv.data_run(0, st, buf, (s1, H2GotErr{0, "next"}), 0, False{}, 0, Nil{}, 0, Fail{(0, "")}, tab, handler)
+        case _:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s1, Fail{(502, "request too long")}, hp_empty()))
+    case 2:
+      (s2, g2) = prev
+      match is_end:
+        case True{}:
+          h2_srv.data_run(4, H2SrvSt{None{}, Nil{}, 0, hp_empty()}, buf, (s2, g2), cls, is_end, dlen, Nil{}, sid2, h2_srv.tail_req_st(st), tab, handler)
+        case False{}:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_wu_len(s2, sid2, dlen)
+            h2_srv.data_run(0, st, buf, h2_wu_best_effort(sent), 0, False{}, 0, Nil{}, 0, Fail{(0, "")}, tab, handler)
+    case 3:
+      (sx, gx) = prev
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sx, Fail{(502, "bad phase")}, hp_empty()))
+    case _:
+      (s4, g4) = prev
+      match hreq:
+        case Fail{e}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (s4, Fail{e}, hp_empty()))
+        case Done{+req}:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
+            resp : H2Response <- handler(req)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_srv.send_resp(s4, sid2, resp)
+            h2_srv.tail_wrapped(sent, tab)
 
 def h2_srv.round6(sock: Socket, +st: H2SrvSt, +buf: List<&2, U32>, handler: H2Request -> IO(H2Response)) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
-  IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "request too long")}, hp_empty()))
+  h2_srv.data_run(0, st, buf, (sock, H2GotErr{0, "next"}), 0, False{}, 0, Nil{}, 0, Fail{(0, "")}, h2_srv.st_hp(st), handler)
 
 def h2_srv.answer3.wrap(m: Socket & Result<&1, &1, U32 & String, Unit>, +tab: HpDyn) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn):
@@ -2524,6 +3156,10 @@ def h2_srv.next5(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round6(sock, st, buf, handler)
+        case 7:
+          h2_srv.round6(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2612,6 +3248,10 @@ def h2_srv.next4(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round5(sock, st, buf, handler)
+        case 7:
+          h2_srv.round5(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2700,6 +3340,10 @@ def h2_srv.next3(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round4(sock, st, buf, handler)
+        case 7:
+          h2_srv.round4(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2788,6 +3432,10 @@ def h2_srv.next2(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round3(sock, st, buf, handler)
+        case 7:
+          h2_srv.round3(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2876,6 +3524,10 @@ def h2_srv.next1(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round2(sock, st, buf, handler)
+        case 7:
+          h2_srv.round2(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -2964,6 +3616,10 @@ def h2_srv.next0(sock: Socket, +st: H2SrvSt, +frame: H2Frame, +buf: List<&2, U32
       match cls:
         case 0:
           h2_srv.round1(sock, st, buf, handler)
+        case 7:
+          h2_srv.round1(sock, st, buf, handler)
+        case 9:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(502, "bad window_update")}, hp_empty()))
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), h2_f_ack(), 0, Nil{})
@@ -3009,7 +3665,7 @@ def h2_srv.preface3b(sock: Socket, +buf: List<&2, U32>, handler: H2Request -> IO
   match ok:
     case True{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & HpDyn>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), 0, 0, Nil{})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(sock, h2_t_settings(), 0, 0, h2_settings_initial_pay())
         h2_srv.preface4(sent, buf, handler)
     case False{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & HpDyn, (sock, Fail{(503, "bad preface")}, hp_empty()))
