@@ -11,7 +11,9 @@ import ../lib/http2.bend as H2
 def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
   match req:
     case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
+      do IO<H2.H2Response>:
+        x : Unit <- IO.print("SRV got " ++ U32.show(U32.from_nat(H2.b_len(body))))
+        IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
 
 law server_side:
   for l: Listener
