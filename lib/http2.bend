@@ -1582,11 +1582,6 @@ def h2_u32_min.pick(+a: U32, +b: U32, pick_a: Bool) -> U32:
 def h2_u32_min(+a: U32, +b: U32) -> U32:
   h2_u32_min.pick(a, b, U32.is_le(a, b))
 
-def h2_settings.iw(+st: H2Settings) -> U32:
-  match st:
-    case H2Settings{mf, iw, mhl, mcc, hts}:
-      iw
-
 def h2_flow_wu_inc(+pay: List<&2, U32>) -> U32:
   match pay:
     case Nil{}:
@@ -1646,72 +1641,106 @@ def h2_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & 
     case Done{u}:
       (s, H2GotErr{0, "next"})
 
+def h2_chunk_of(+cw: U32, +sw: U32, +blen: Nat) -> U32:
+  h2_u32_min(h2_u32_min(h2_u32_min(cw, sw), 16384), U32.from_nat(blen))
+
+def h2_settings.iw_found(+cur: U32, +val: U32, is_four: Bool) -> U32:
+  match is_four:
+    case True{}:
+      val
+    case False{}:
+      cur
+
+def h2_settings.iw_of.go(+fuel: Nat, +pay: List<&2, U32>, +cur: U32) -> U32:
+  match fuel:
+    case 0n:
+      cur
+    case 1n+f:
+      match pay:
+        case Nil{}:
+          cur
+        case +b0 <> r0:
+          match r0:
+            case Nil{}:
+              cur
+            case +b1 <> r1:
+              match r1:
+                case Nil{}:
+                  cur
+                case +b2 <> r2:
+                  match r2:
+                    case Nil{}:
+                      cur
+                    case +b3 <> r3:
+                      match r3:
+                        case Nil{}:
+                          cur
+                        case +b4 <> r4:
+                          match r4:
+                            case Nil{}:
+                              cur
+                            case +b5 <> rest:
+                              h2_settings.iw_of.go(f, rest, h2_settings.iw_found(cur, u32_of4(b2, b3, b4, b5), U32.is_eq((b0 * 256 + b1 : U32), 4)))
+
+def h2_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
+  h2_settings.iw_of.go(b_len(pay), pay, cur)
+
 @unsafe
-def h2_send_data_flow(+phase: U32, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +ps: H2Settings, prev: Socket & H2Got, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +chunk: U32, +need_read: Bool, +buf: List<&2, U32>) ->
+def h2_send_data_flow(+phase: U32, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, prev: Socket & H2Got, +buf: List<&2, U32>, +need_read: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   match phase:
     case 0:
       match body:
         case Nil{}:
           (se, ge) = prev
-          h2_send_frame(se, h2_t_data(), h2_f_end_stream(), sid, Nil{})
+          match ge:
+            case H2GotErr{code, msg}:
+              match code:
+                case 0:
+                  h2_send_frame(se, h2_t_data(), h2_f_end_stream(), sid, Nil{})
+                case _:
+                  IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (se, Fail{(code, msg)}))
+            case H2GotOk{frame0, buf0}:
+              h2_send_data_flow(0, sid, body, cw, sw, (se, H2GotErr{0, "next"}), buf0, False{})
         case +b <> r:
-          h2_send_data_flow(1, sid, body, cw, sw, ps, prev, 0, 0, 0, Nil{}, h2_u32_min(h2_u32_min(h2_u32_min(cw, sw), 16384), U32.from_nat(b_len(body))), U32.is_eq(h2_u32_min(h2_u32_min(h2_u32_min(cw, sw), 16384), U32.from_nat(b_len(body))), 0), buf)
+          h2_send_data_flow(1, sid, body, cw, sw, prev, buf, U32.is_eq(h2_chunk_of(cw, sw, b_len(body)), 0))
     case 1:
       (s1, g1) = prev
       match need_read:
         case True{}:
-          h2_send_data_flow(3, sid, body, cw, sw, ps, (s1, g1), typ, flags, sid2, payload, chunk, need_read, buf)
+          h2_send_data_flow(2, sid, body, cw, sw, (s1, g1), buf, need_read)
         case False{}:
           do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(s1, h2_t_data(), 0, sid, b_take(U32.to_nat(chunk), body))
-            h2_send_data_flow(2, sid, b_drop(U32.to_nat(chunk), body), (cw - chunk : U32), (sw - chunk : U32), ps, h2_flow_sent(sent), 0, 0, 0, Nil{}, 0, False{}, buf)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(s1, h2_t_data(), 0, sid, b_take(U32.to_nat(h2_chunk_of(cw, sw, b_len(body))), body))
+            h2_send_data_flow(0, sid, b_drop(U32.to_nat(h2_chunk_of(cw, sw, b_len(body))), body), (cw - h2_chunk_of(cw, sw, b_len(body)) : U32), (sw - h2_chunk_of(cw, sw, b_len(body)) : U32), h2_flow_sent(sent), buf, False{})
     case 2:
       (s2, g2) = prev
-      match g2:
-        case H2GotErr{code2, msg2}:
-          match code2:
-            case 0:
-              h2_send_data_flow(0, sid, body, cw, sw, ps, (s2, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
-            case _:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s2, Fail{(code2, msg2)}))
-        case H2GotOk{frame2, buf2}:
-          h2_send_data_flow(0, sid, body, cw, sw, ps, (s2, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
-    case 3:
-      (s3, g3) = prev
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        got2 : Socket & H2Got <- h2_read_frame(s3, buf)
-        h2_send_data_flow(4, sid, body, cw, sw, ps, got2, 0, 0, 0, Nil{}, 0, False{}, buf)
-    case 4:
-      (s4, g4) = prev
-      match g4:
-        case H2GotErr{code4, msg4}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s4, Fail{(code4, msg4)}))
-        case H2GotOk{+frame4, +buf4}:
-          match frame4:
-            case H2Frame{+typ4, +flags4, +sid42, +payload4}:
-              h2_send_data_flow(5, sid, body, cw, sw, ps, (s4, H2GotOk{H2Frame{typ4, flags4, sid42, payload4}, buf4}), typ4, flags4, sid42, payload4, 0, False{}, buf4)
+        got2 : Socket & H2Got <- h2_read_frame(s2, buf)
+        h2_send_data_flow(3, sid, body, cw, sw, got2, buf, False{})
     case _:
-      (s5, g5) = prev
-      match typ:
-        case 8:
-          h2_send_data_flow(0, sid, body, h2_flow_cw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), h2_flow_sw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), ps, (s5, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, buf)
-        case 4:
-          +ps2 = h2_settings_apply(payload, ps)
-          +sw2 = h2_settings.iw(ps2)
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-            c4 : Socket & H2Got <- h2_tail_ack((s5, g5), flags)
-            h2_send_data_flow(3, sid, body, cw, sw2, ps2, c4, 0, 0, 0, Nil{}, 0, False{}, buf)
-        case 6:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- h2_send_frame(s5, h2_t_ping(), h2_f_ack(), 0, payload)
-            h2_send_data_flow(3, sid, body, cw, sw, ps, h2_wu_best_effort(sent), 0, 0, 0, Nil{}, 0, False{}, buf)
-        case _:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s5, Fail{(502, "flow blocked")}))
+      (s3, g3) = prev
+      match g3:
+        case H2GotErr{code3, msg3}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s3, Fail{(code3, msg3)}))
+        case H2GotOk{+frame3, +buf3}:
+          match frame3:
+            case H2Frame{+typ, +flags, +sid2, +payload}:
+              match typ:
+                case 8:
+                  h2_send_data_flow(0, sid, body, h2_flow_cw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), h2_flow_sw(h2_flow_credit.go(cw, sw, sid, sid2, h2_flow_wu_inc(payload), h2_window_update_ok(payload))), (s3, H2GotErr{0, "next"}), buf3, False{})
+                case 4:
+                  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+                    c4 : Socket & H2Got <- h2_tail_ack((s3, g3), flags)
+                    h2_send_data_flow(2, sid, body, cw, h2_settings.iw_of(payload, sw), c4, buf3, False{})
+                case 6:
+                  h2_send_data_flow(2, sid, body, cw, sw, (s3, H2GotErr{0, "next"}), buf3, False{})
+                case _:
+                  IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s3, Fail{(502, "flow blocked")}))
 
 def h2_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  h2_send_data_flow(0, sid, body, 65535, 65535, h2_settings_default(), (sock, H2GotErr{0, "next"}), 0, 0, 0, Nil{}, 0, False{}, Nil{})
+  h2_send_data_flow(0, sid, body, 65535, 65535, (sock, H2GotErr{0, "next"}), Nil{}, False{})
 
 # Receive-side flow credit, centralized at the single frame-read
 # choke point every loop (chain, tails, flow sender, mux) funnels
