@@ -1,7 +1,7 @@
-// HTTP/2 secure echo server (node:http2) for interop with Bend
-// HTTPS clients (HTTPS.send_request_insecure / fetch_insecure). Uses
-// the test PEMs (tests/io/tls_test_*), ALPN h2. Echoes the request
-// body on any path. Prints LISTEN then DONE n/n after the first
+// Secure echo server (node:http2) for interop with Bend HTTPS clients
+// (HTTPS.send_request_insecure / fetch_insecure). Uses the test PEMs
+// (tests/io/tls_test_*), negotiates h2 or http/1.1, and echoes the
+// request body on any path. Prints LISTEN then DONE n/n after the first
 // exchange (manual only — not in check.sh). The Node HPACK encoder
 // uses huffman + dynamic table + multi-byte ints — Bend decodes all
 // of that since task-019 (HPACK full); if the Bend client fails, that
@@ -21,11 +21,31 @@ const DONE_AFTER = Number(process.argv[3] ?? 1);
 let exchanges = 0;
 let score = 0;
 
-const server = createSecureServer({ key: KEY, cert: CERT, allowHTTP1: false });
+const server = createSecureServer({ key: KEY, cert: CERT, allowHTTP1: true });
 
 server.on("error", (err) => {
   console.log(`FAIL server: ${err.message}`);
   process.exitCode = 1;
+});
+
+server.on("request", (request, response) => {
+  const chunks = [];
+  request.on("data", (chunk) => chunks.push(chunk));
+  request.on("end", () => {
+    const body = Buffer.concat(chunks);
+    response.writeHead(200, {
+      "content-type": "text/plain",
+      "content-length": String(body.length),
+    });
+    response.end(body);
+    console.log(`OK ECHO path=${request.url} len=${body.length}`);
+    score += 1;
+    exchanges += 1;
+    if (exchanges >= DONE_AFTER) {
+      console.log(`DONE ${score}/${DONE_AFTER}`);
+      server.close();
+    }
+  });
 });
 
 server.on("stream", (stream, headers) => {
