@@ -72,7 +72,7 @@ law https_server:
 
 def https_server(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem", 8n)
+    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law wss_server:

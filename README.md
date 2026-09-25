@@ -198,8 +198,8 @@ keep-alive servers, mirroring `lib/http.bend`:
 | `send_request(host, port, path, method, hs, body)` / `send_request_insecure` | Same exchange with a `String` body; answers the response body as `String` |
 | `fetch(url)` / `fetch_insecure` | `https://` GET by URL (via `HTTP.read_url`); `http://` refused with `Fail 400`; answers the body as `String` |
 | `fetch_bytes(url)` / `fetch_bytes_insecure` | Same GET answering raw `List<&2, U32>` bytes |
-| `server_on(~H, l, cert, key, n)` | Generic keep-alive server (like `HTTP.server_on`): TLS accept loop with `IO.spawn` per connection, `n` extra streams per connection via `h2_serve_next`; `~H` is `H2Request -> IO(H2Response)` |
-| `server_on_concurrent(~H, l, cert, key)` | Same accept loop; per connection a 2-slot interleaved mux (pipelined HEADERS/DATA of two open streams answered by sid; a third simultaneous stream fails the connection fail-closed) |
+| `server_on(~H, l, cert, key)` | Generic keep-alive server (like `HTTP.server_on`): unbounded TLS accept loop with `IO.spawn` per connection, unlimited sequential streams per connection until GOAWAY/EOF; `~H` is `H2Request -> IO(H2Response)` |
+| `server_on_concurrent(~H, l, cert, key)` | Same accept loop; per connection an unbounded interleaved mux (open streams tracked in a `List<H2SrvSt>` by sid, answered in any completion order; header fragments parked until CONTINUATION completes the block) |
 | `mux_start(~H, sock)` | One-shot concurrent serve on an established TLS socket (the test entry of the mux) |
 | `echo.body` / `ok(body)` | Echo handler and `200` response helper |
 

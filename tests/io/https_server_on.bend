@@ -19,7 +19,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem", 8n)
+    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 def client_two(r1: U32, r2: U32) -> U32:
