@@ -4,6 +4,7 @@
 // (TlsConn*), never a raw fd. OpenSSL rides dlopen, no link flags.
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string.h>
@@ -17,6 +18,10 @@ struct TlsConn {
 };
 #endif
 
+#define TLS_ALPN_H2 1
+#define TLS_ALPN_BOTH 2
+#define TLS_ALPN_HTTP1 3
+
 struct TlsServe {
   char* cert;
   u64   cert_len;
@@ -25,6 +30,9 @@ struct TlsServe {
   int   fd;
   u32   code;
   void* conn;
+  char  proto[256];
+  u64   proto_len;
+  u32   offer;
 };
 
 static void*          tls_s_h = NULL;
@@ -91,20 +99,33 @@ static const char* tls_s_msg(u32 code) {
   }
 }
 
-// ALPN select: prefer h2 when the client offers it.
+// ALPN select: preserve the client's protocol order.
 static int tls_alpn_cb(void* ssl, const unsigned char** out,
   unsigned char* outlen, const unsigned char* in, unsigned inlen, void* arg) {
   (void)ssl;
-  (void)arg;
+  u32 offer = (u32)(uintptr_t)arg;
   unsigned i = 0;
   while (i + 1 < inlen) {
     unsigned l = in[i];
-    if (i + 1 + l > inlen) {
+    if (l == 0 || i + 1 + l > inlen) {
       break;
     }
-    if (l == 2 && in[i + 1] == 'h' && in[i + 2] == '2') {
+    if (offer == TLS_ALPN_H2 && l == 2
+      && in[i + 1] == 'h' && in[i + 2] == '2') {
       *out = in + i + 1;
       *outlen = 2;
+      return 0;
+    }
+    if (offer == TLS_ALPN_BOTH && l == 2
+      && in[i + 1] == 'h' && in[i + 2] == '2') {
+      *out = in + i + 1;
+      *outlen = 2;
+      return 0;
+    }
+    if ((offer == TLS_ALPN_BOTH || offer == TLS_ALPN_HTTP1) && l == 8
+      && memcmp(in + i + 1, "http/1.1", 8) == 0) {
+      *out = in + i + 1;
+      *outlen = 8;
       return 0;
     }
     i += 1 + l;
@@ -116,6 +137,8 @@ static void tls_serve_call(IoWork* w) {
   struct TlsServe* s = (struct TlsServe*)w->data;
   s->code = 0;
   s->conn = NULL;
+  s->proto[0] = 0;
+  s->proto_len = 0;
   u32 q = tls_s_init();
   if (q != 0) {
     s->code = q;
@@ -146,7 +169,8 @@ static void tls_serve_call(IoWork* w) {
     s->code = 613;
     return;
   }
-  s_SSL_CTX_set_alpn_select_cb(ctx, (void*)tls_alpn_cb, NULL);
+  s_SSL_CTX_set_alpn_select_cb(ctx, (void*)tls_alpn_cb,
+    (void*)(uintptr_t)s->offer);
   void* ssl = s_SSL_new(ctx);
   if (ssl == NULL) {
     s_SSL_CTX_free(ctx);
@@ -169,6 +193,21 @@ static void tls_serve_call(IoWork* w) {
     s->code = 613;
     return;
   }
+  const unsigned char* selected = NULL;
+  unsigned selected_len = 0;
+  s_SSL_get0_alpn_selected(ssl, &selected, &selected_len);
+  if (selected_len > sizeof(s->proto)) {
+    s_SSL_shutdown(ssl);
+    s_SSL_free(ssl);
+    s_SSL_CTX_free(ctx);
+    close(s->fd);
+    s->code = 616;
+    return;
+  }
+  if (selected_len > 0 && selected != NULL) {
+    memcpy(s->proto, selected, selected_len);
+  }
+  s->proto_len = selected_len;
   struct TlsConn* c = io_mem(malloc(sizeof(*c)));
   c->ssl = ssl;
   c->ctx = ctx;
@@ -182,7 +221,8 @@ static Term tls_serve_pack(Env e, IoWork* w) {
   struct TlsServe* s = (struct TlsServe*)w->data;
   Term r;
   if (s->code == 0) {
-    r = io_done(e, io_hand((intptr_t)s->conn));
+    r = io_done(e, io_tup(e, io_hand((intptr_t)s->conn),
+      io_str(e, s->proto, s->proto_len)));
   } else {
     r = io_fail(e, s->code, tls_s_msg(s->code));
   }
@@ -208,9 +248,18 @@ Term tls_accept_raw_run(Env e, Term* f, IoWork* w) {
   s->fd = -1;
   s->code = 0;
   s->conn = NULL;
+  s->proto[0] = 0;
+  s->proto_len = 0;
+  s->offer = (u32)f[3];
   w->data = (char*)s;
-  // Custom entry: try accept now; on EAGAIN park; on fd, reuse s.
   int lfd = (int)w->hand;
+  if (s->offer != TLS_ALPN_H2 && s->offer != TLS_ALPN_BOTH
+    && s->offer != TLS_ALPN_HTTP1) {
+    free(s->cert);
+    free(s->key);
+    free(s);
+    return io_tup(e, io_hand(lfd), io_fail(e, 611, "bad input"));
+  }
   int got = accept(lfd, NULL, NULL);
   if (got >= 0 && fcntl(got, F_SETFL, fcntl(got, F_GETFL) | O_NONBLOCK) < 0) {
     close(got);
