@@ -1,8 +1,9 @@
 # HTTPS facade over TLS + DNS + HTTP/2 codec (RFC 7540/7541).
 #
-# Stack: TCP -> TLS (SNI, cert verify, ALPN h2) -> HTTP/2 frames/HPACK.
-# This file is the public API; the codec lives in ./http2.bend (H2),
-# the handshake in ./tls.bend (TLS), URL validation in ./http.bend (HTTP).
+# Stack: TCP -> TLS (SNI, cert verify, ALPN h2/http1.1) -> HTTP/2 frames
+# or the HTTP/1.1 module. This file is the public API; the codec lives in
+# ./http2.bend (H2), the handshake in ./tls.bend (TLS), and URL validation
+# in ./http.bend (HTTP).
 #
 # RFC pattern (the core): headers are List<H2Hdr> byte pairs (lowercase,
 # pseudo-headers :method/:path/:scheme/:authority handled by the codec);
@@ -23,6 +24,10 @@ import Base
 import ./http.bend as HTTP
 import ./http2.bend as H2
 import ./tls.bend as TLS
+import ./https_http1.bend as HTTP1
+
+type HTTPSCall is Data:
+  HTTPSCall{host: String, port: U32, method: String, path: String, headers: List<&2, H2.H2Hdr>, body: List<&2, U32>}
 
 # Bodies
 # ------
@@ -91,7 +96,47 @@ def with_authority(+host: String, +port: U32, hs: List<&2, H2.H2Hdr>) ->
   List<&2, H2.H2Hdr>:
   H2.H2Hdr{":authority", host ++ ":" ++ U32.show(port)} <> drop_authority(hs)
 
-# Single-shot request (RFC core)
+
+def h1_headers.put(n: String, v: String,
+  rec: List<&2, HTTP.Hdr>, drop: Bool) -> List<&2, HTTP.Hdr>:
+  match drop:
+    case True{}:
+      rec
+    case False{}:
+      HTTP.Hdr{n, v} <> rec
+
+def h1_headers(hs: List<&2, H2.H2Hdr>) -> List<&2, HTTP.Hdr>:
+  match hs:
+    case Nil{}:
+      Nil{}
+    case H2.H2Hdr{n, v} <> tail:
+      +nn = n
+      +vv = v
+      h1_headers.put(nn, vv, h1_headers(tail),
+        HTTP1.http1_forbidden(nn))
+
+def h1_to_h2(headers: List<&2, HTTP.Hdr>) ->
+  List<&2, H2.H2Hdr>:
+  match headers:
+    case Nil{}:
+      Nil{}
+    case HTTP.Hdr{name, value} <> tail:
+      H2.H2Hdr{name, value} <> h1_to_h2(tail)
+
+def request.http1_convert(
+  got: Socket & Result<&1, &1, U32 & String, HTTP1.HTTP1Response>) ->
+  IO(Socket & Result<&1, &1, U32 & String, H2.H2Response>):
+  (sock, result) = got
+  match result:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, H2.H2Response>,
+        (sock, Fail{e}))
+    case Done{response}:
+      match response:
+        case HTTP1.HTTP1Response{status, headers, body}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, H2.H2Response>,
+            (sock, Done{H2.H2Response{status, h1_to_h2(headers), body}}))
+
 # ------------------------------
 # Connect, one exchange on stream 1, close. Returns the full H2Response
 # (status + headers + byte body). Multi-stream keep-alive callers use
@@ -128,19 +173,56 @@ def request.conn(conn: Result<&1, &1, U32 & String, Socket>, +method: String, +p
     case Done{sock}:
       request.exch(sock, method, path, hs, body)
 
+def request.alpn.go(is_h2: Bool, sock: Socket,
+  h2_call: HTTPSCall, h1_call: HTTP1.HTTPSCall) ->
+  IO(Result<&1, &1, U32 & String, H2.H2Response>):
+  match is_h2:
+    case True{}:
+      match h2_call:
+        case HTTPSCall{host, port, +method, path, headers, body}:
+          do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
+            conn : Result<&1, &1, U32 & String, Socket> <-
+              H2.h2_connect.go(Done{sock})
+            request.conn(conn, method, path, headers, body)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
+        got : Socket & Result<&1, &1, U32 & String, HTTP1.HTTP1Response> <-
+          HTTP1.http1_exch(sock, h1_call)
+        converted : Socket & Result<&1, &1, U32 & String, H2.H2Response> <-
+          request.http1_convert(got)
+        request.body(converted)
+
+def request.alpn.conn(
+  conn: Result<&1, &1, U32 & String, Socket & String>,
+  h2_call: HTTPSCall, h1_call: HTTP1.HTTPSCall) ->
+  IO(Result<&1, &1, U32 & String, H2.H2Response>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, H2.H2Response>, Fail{e})
+    case Done{value}:
+      (sock, protocol) = value
+      request.alpn.go(TLS.tls_alpn_is_h2(protocol), sock,
+        h2_call, h1_call)
+
 def request.secure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
   +hs2 = with_authority(host, port, hs)
+  +hs1 = h1_headers(hs2)
   do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect(host, port)
-    request.conn(conn, method, path, hs2, body)
+    conn : Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_connect_any(host, port)
+    request.alpn.conn(conn, HTTPSCall{host, port, method, path, hs2, body},
+      HTTP1.HTTPSCall{host, port, method, path, hs1, body})
 
 def request.insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
   +hs2 = with_authority(host, port, hs)
+  +hs1 = h1_headers(hs2)
   do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- H2.h2_connect_insecure(host, port)
-    request.conn(conn, method, path, hs2, body)
+    conn : Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_connect_any_insecure(host, port)
+    request.alpn.conn(conn, HTTPSCall{host, port, method, path, hs2, body},
+      HTTP1.HTTPSCall{host, port, method, path, hs1, body})
 
 def request.go(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>, verify: Bool) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
@@ -389,7 +471,46 @@ def server_on(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String,
     z : Unit <- server_on(~H, l2, cert, key)
     return z
 
-# Concurrent streams (interleaved, unbounded slots per connection)
+@unsafe
+def server_on_http1(
+  ~H: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  listener: Listener, +cert: String, +key: String) -> IO(Unit):
+  HTTP1.server_on_http1(~H, listener, cert, key)
+
+def server.alpn_conn.go(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+  match is_h2:
+    case True{}:
+      server.spawn(~H2, sock, listener)
+    case False{}:
+      HTTP1.http1_spawn(~H1, sock, listener)
+
+def server.alpn_conn(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
+  (listener, result) = accepted
+  match result:
+    case Fail{e}:
+      IO.pure(Listener, listener)
+    case Done{value}:
+      (sock, protocol) = value
+      server.alpn_conn.go(~H2, ~H1, TLS.tls_alpn_is_h2(protocol),
+        listener, sock)
+
+@unsafe
+def server_on_alpn(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  listener: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_accept_alpn(listener, cert, key)
+    next : Listener <- server.alpn_conn(~H2, ~H1, accepted)
+    server_on_alpn(~H2, ~H1, next, cert, key)
+
 # -------------------------------------------------------
 # Sequential serve_next tracks ONE H2SrvSt, so pipelined frames of two
 # open streams (HEADERS 1, HEADERS 3, DATA 1, DATA 3) would mix into one
@@ -878,6 +999,40 @@ def server_on_concurrent(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +ce
     l2 : Listener <- mux.conn(~H, m)
     z : Unit <- server_on_concurrent(~H, l2, cert, key)
     return z
+
+def mux.alpn_conn.go(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+  match is_h2:
+    case True{}:
+      mux.spawn(~H2, sock, listener)
+    case False{}:
+      HTTP1.http1_spawn(~H1, sock, listener)
+
+def mux.alpn_conn(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
+  (listener, result) = accepted
+  match result:
+    case Fail{e}:
+      IO.pure(Listener, listener)
+    case Done{value}:
+      (sock, protocol) = value
+      mux.alpn_conn.go(~H2, ~H1, TLS.tls_alpn_is_h2(protocol),
+        listener, sock)
+
+@unsafe
+def server_on_concurrent_alpn(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  listener: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_accept_alpn(listener, cert, key)
+    next : Listener <- mux.alpn_conn(~H2, ~H1, accepted)
+    server_on_concurrent_alpn(~H2, ~H1, next, cert, key)
 
 def echo.body(req: H2.H2Request) -> IO(H2.H2Response):
   match req:

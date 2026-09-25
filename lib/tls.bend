@@ -26,23 +26,72 @@ import Base
 import ./dns.bend as DNS
 
 # The raw client handshake: connects to the IPv4 ip, SNIs sni, verifies
-# the chain iff verify is 1. ALPN mode: alpn=1 offers and requires h2
-# (HTTPS); alpn=0 offers nothing and accepts no protocol negotiation
-# (WSS/HTTP/1.1 Upgrade). Answers the TLS socket (SSL*) on Done. Host
-# validation lives above (DNS.resolve); port validation lives above
-# (tls_port).
+# the chain iff verify is 1. ALPN mode: alpn=1 offers and requires h2,
+# alpn=2 offers h2/http/1.1, alpn=3 offers only http/1.1, and
+# alpn=0 offers nothing. Answers the TLS socket (SSL*) on Done.
 def tls_connect_raw(ip: String, sni: String, port: U32, verify: U32, alpn: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket>):
+  IO(Result<&1, &1, U32 & String, Socket & String>):
   import "./effs/tls_connect.c"
   import "./effs/tls_connect.js"
 
-# The raw server handshake: accepts one TCP connection on listener,
-# handshakes it with cert/key at the given file paths, negotiates ALPN
-# h2. Hands the listener back beside the TLS socket, like TCP.accept.
-def tls_accept_raw(listener: Listener, cert: String, key: String) ->
-  IO(Listener & Result<&1, &1, U32 & String, Socket>):
+# The raw server handshake returns the selected ALPN protocol beside the
+# socket. offer=1 requires h2; offer=2 accepts h2/http1.1; offer=3
+# accepts only http/1.1.
+def tls_accept_raw(listener: Listener, cert: String, key: String, offer: U32) ->
+  IO(Listener & Result<&1, &1, U32 & String, Socket & String>):
   import "./effs/tls_accept.c"
   import "./effs/tls_accept.js"
+
+def tls_valid_port(+p: U32) -> Bool:
+  Bool.and(U32.is_ge(p, 1), U32.is_le(p, 65535))
+
+def tls_connect.without_alpn(
+  r: Result<&1, &1, U32 & String, Socket & String>) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
+    case Done{value}:
+      (sock, protocol) = value
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
+
+def tls_dial_any.asked(+port: U32, +verify: U32, +host: String,
+  r: Result<&1, &1, U32 & String, String>) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & String>, Fail{e})
+    case Done{ip}:
+      tls_connect_raw(ip, host, port, verify, 2)
+
+def tls_dial_any(+host: String, port: U32, verify: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  do IO<Result<&1, &1, U32 & String, Socket & String>>:
+    r : Result<&1, &1, U32 & String, String> <- DNS.resolve(host)
+    tls_dial_any.asked(port, verify, host, r)
+
+def tls_port_any(+host: String, port: U32, verify: U32, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  match ok:
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & String>,
+        Fail{(611, "bad port")})
+    case True{}:
+      tls_dial_any(host, port, verify)
+
+def tls_connect_any(+host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  tls_port_any(host, port, 1, tls_valid_port(port))
+
+def tls_connect_any_insecure(+host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  tls_port_any(host, port, 0, tls_valid_port(port))
+
+def tls_alpn_is_h2(protocol: String) -> Bool:
+  String.eq(protocol, "h2")
+
+def tls_alpn_is_http1(protocol: String) -> Bool:
+  String.eq(protocol, "http/1.1")
 
 # Sends every byte of the list over the TLS socket, handing it back. A
 # value past 255 fails with EINVAL before any byte leaves; WANT_READ /
@@ -65,10 +114,6 @@ def tls_close(sock: Socket) -> IO(Unit):
   import "./effs/tls_close.c"
   import "./effs/tls_close.js"
 
-# Ports must be 1..65535, like HTTP valid_port.
-def tls_valid_port(+p: U32) -> Bool:
-  Bool.and(U32.is_ge(p, 1), U32.is_le(p, 65535))
-
 # Resolve-then-handshake. DNS.resolve answers the IPv4 the connect
 # rides; the ORIGINAL host rides SNI. A resolve failure fails with the
 # DNS code (601-605) before any socket exists. alpn is the mode above
@@ -79,7 +124,10 @@ def tls_dial.asked(port: U32, verify: U32, alpn: U32, host: String, r: Result<&1
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
     case Done{ip}:
-      tls_connect_raw(ip, host, port, verify, alpn)
+      do IO<Result<&1, &1, U32 & String, Socket>>:
+        conn : Result<&1, &1, U32 & String, Socket & String> <-
+          tls_connect_raw(ip, host, port, verify, alpn)
+        tls_connect.without_alpn(conn)
 
 def tls_dial(+host: String, port: U32, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
@@ -123,6 +171,33 @@ def tls_connect_noalpn_insecure(+host: String, +port: U32) ->
 
 # Server accept: one TLS handshake over the listener with the cert/key
 # at the given paths. The listener is handed back on every path.
+def tls_accept.without_alpn(
+  m: Listener & Result<&1, &1, U32 & String, Socket & String>) ->
+  IO(Listener & Result<&1, &1, U32 & String, Socket>):
+  (l, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Listener & Result<&1, &1, U32 & String, Socket>,
+        (l, Fail{e}))
+    case Done{value}:
+      (sock, protocol) = value
+      IO.pure(Listener & Result<&1, &1, U32 & String, Socket>,
+        (l, Done{sock}))
+
+def tls_accept_alpn(listener: Listener, cert: String, key: String) ->
+  IO(Listener & Result<&1, &1, U32 & String, Socket & String>):
+  tls_accept_raw(listener, cert, key, 2)
+
+def tls_accept_http1(listener: Listener, cert: String, key: String) ->
+  IO(Listener & Result<&1, &1, U32 & String, Socket>):
+  do IO<Listener & Result<&1, &1, U32 & String, Socket>>:
+    m : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      tls_accept_raw(listener, cert, key, 3)
+    tls_accept.without_alpn(m)
+
 def tls_accept(listener: Listener, cert: String, key: String) ->
   IO(Listener & Result<&1, &1, U32 & String, Socket>):
-  tls_accept_raw(listener, cert, key)
+  do IO<Listener & Result<&1, &1, U32 & String, Socket>>:
+    m : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      tls_accept_raw(listener, cert, key, 1)
+    tls_accept.without_alpn(m)
