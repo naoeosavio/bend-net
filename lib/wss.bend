@@ -144,17 +144,23 @@ def wss_recv_in(s: Socket, +buf: List<&2, U32>, +unmasked_ok: Bool) ->
 
 # Open sends (stay open; the session driver closes).
 
-def client_out_bytes(out: WS.WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+def client_out_bytes(out: WS.WSOut, +key: WS.WSMask) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   match out:
     case WS.OutMsg{msg}:
       +mm = msg
-      WS.show_masked(True{}, WS.msg_to_op(mm), WS.msg_to_bytes(mm), 1, 2, 3, 4)
+      WS.show_masked_key(True{}, WS.msg_to_op(mm), WS.msg_to_bytes(mm), key)
     case WS.OutOp{op, pay}:
       +oo = op
       +pp = pay
-      WS.show_masked(True{}, oo, WS.out_op_pay(oo, pp), 1, 2, 3, 4)
+      WS.show_masked_key(True{}, oo, WS.out_op_pay(oo, pp), key)
     case WS.OutRaw{bs}:
       Done{bs}
+
+def client_out_bytes_random(out: WS.WSOut) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+    +key : WS.WSMask <- WS.mask_key()
+    IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, client_out_bytes(out, key))
 
 def wss_send_open(s: Socket, out: WS.WSOut) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
@@ -162,7 +168,9 @@ def wss_send_open(s: Socket, out: WS.WSOut) ->
 
 def wss_send_open_masked(s: Socket, out: WS.WSOut) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  wss_send_bytes((s, client_out_bytes(out)))
+  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+    fr : Result<&1, &1, U32 & String, List<&2, U32>> <- client_out_bytes_random(out)
+    wss_send_bytes((s, fr))
 
 # Handshake over TLS (byte lane)
 # ------------------------------
@@ -270,6 +278,9 @@ def wss_after_hs(m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&
       (head, rest) = pair
       wss_serve_go(s, WS.handshake(HTTP.decode(head)), rest)
 
+# TEST-ONLY: one-shot echo server. Real interop uses server_on (the
+# event-driven session below); this single-frame helper exists for the
+# loopback tests and the hand-written clients in examples/.
 def serve_once(sock: Socket) -> IO(Unit):
   do IO<Unit>:
     m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(sock, Nil{}, False{}, True{})
@@ -427,7 +438,7 @@ def wss_hs_scan_done_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Socket & Result<&1, &1,
       (head, rest) = pair
       wss_hs_reply(~H, s, WS.handshake_sub(HTTP.decode(head), wanted), rest)
 
-def wss_serve(~H: WS.WSEv -> IO(WS.WSOut), sock: Socket, cert: String) ->
+def wss_serve(~H: WS.WSEv -> IO(WS.WSOut), sock: Socket) ->
   IO(Unit):
   do IO<Unit>:
     m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(sock, Nil{}, False{}, True{})
@@ -439,28 +450,36 @@ def wss_serve_sub(~H: WS.WSEv -> IO(WS.WSOut), sock: Socket, +wanted: List<&2, S
     m : Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>> <- wss_hs_start(sock, Nil{}, False{}, True{})
     wss_hs_scan_done_sub(~H, m, wanted)
 
-def wss_conn(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +cert: String, +key: String) ->
+# A failed tls_accept hands the listener back instead of aborting the
+# accept loop (same shape as HTTPS.serve.conn).
+def wss_conn(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
-  do IO<Listener>:
-    s : Socket <- IO.pass(Socket, r)
-    IO.spawn(Unit, wss_serve(~H, s, cert))
-    return l
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      do IO<Listener>:
+        x : Unit <- IO.spawn(Unit, wss_serve(~H, sock))
+        return l
 
-def wss_conn_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +cert: String, +key: String, +wanted: List<&2, String>) ->
+def wss_conn_sub(~H: WS.WSEv -> IO(WS.WSOut), m: Listener & Result<&1, &1, U32 & String, Socket>, +wanted: List<&2, String>) ->
   IO(Listener):
   (l, r) = m
-  do IO<Listener>:
-    s : Socket <- IO.pass(Socket, r)
-    IO.spawn(Unit, wss_serve_sub(~H, s, wanted))
-    return l
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      do IO<Listener>:
+        x : Unit <- IO.spawn(Unit, wss_serve_sub(~H, sock, wanted))
+        return l
 
 @unsafe
 def server_on(~H: WS.WSEv -> IO(WS.WSOut), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
-    l2 : Listener <- wss_conn(~H, m, cert, key)
+    l2 : Listener <- wss_conn(~H, m)
     z : Unit <- server_on(~H, l2, cert, key)
     return z
 
@@ -469,7 +488,7 @@ def server_on_sub(~H: WS.WSEv -> IO(WS.WSOut), l: Listener, +cert: String, +key:
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
-    l2 : Listener <- wss_conn_sub(~H, m, cert, key, wanted)
+    l2 : Listener <- wss_conn_sub(~H, m, wanted)
     z : Unit <- server_on_sub(~H, l2, cert, key, wanted)
     return z
 
@@ -683,31 +702,31 @@ def wss_client_dial_sub(~H: WS.WSEv -> IO(WS.WSOut), conn: Result<&1, &1, U32 & 
         m : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_str(sock, req_txt)
         wss_client_req_sent_sub(~H, m, accept, offered)
 
-def wss_on_go(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port: U32, +req_txt: String, +accept: String) ->
+def wss_on_go(~H: WS.WSEv -> IO(WS.WSOut), verify: Bool, +host: String, port: U32, +req_txt: String, +accept: String) ->
   IO(Unit):
   match verify:
-    case 0:
-      do IO<Unit>:
-        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
-        wss_client_dial(~H, conn, req_txt, accept)
-    case _:
+    case True{}:
       do IO<Unit>:
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn(host, port)
         wss_client_dial(~H, conn, req_txt, accept)
-
-def wss_on_go_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, +port: U32, +req_txt: String, +accept: String, +offered: List<&2, String>) ->
-  IO(Unit):
-  match verify:
-    case 0:
+    case False{}:
       do IO<Unit>:
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
-        wss_client_dial_sub(~H, conn, req_txt, accept, offered)
-    case _:
+        wss_client_dial(~H, conn, req_txt, accept)
+
+def wss_on_go_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: Bool, +host: String, +port: U32, +req_txt: String, +accept: String, +offered: List<&2, String>) ->
+  IO(Unit):
+  match verify:
+    case True{}:
       do IO<Unit>:
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn(host, port)
         wss_client_dial_sub(~H, conn, req_txt, accept, offered)
+    case False{}:
+      do IO<Unit>:
+        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
+        wss_client_dial_sub(~H, conn, req_txt, accept, offered)
 
-def wss_client_req(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port: U32, +accept: String, req: Result<&1, &1, U32 & String, String>) ->
+def wss_client_req(~H: WS.WSEv -> IO(WS.WSOut), verify: Bool, +host: String, port: U32, +accept: String, req: Result<&1, &1, U32 & String, String>) ->
   IO(Unit):
   match req:
     case Fail{(c, m)}:
@@ -717,7 +736,7 @@ def wss_client_req(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, port
     case Done{req_txt}:
       wss_on_go(~H, verify, host, port, req_txt, accept)
 
-def wss_client_req_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, +port: U32, +accept: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, String>) ->
+def wss_client_req_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: Bool, +host: String, +port: U32, +accept: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, String>) ->
   IO(Unit):
   match req:
     case Fail{(c, m)}:
@@ -729,38 +748,24 @@ def wss_client_req_sub(~H: WS.WSEv -> IO(WS.WSOut), verify: U32, +host: String, 
 
 def client_on(~H: WS.WSEv -> IO(WS.WSOut), +host: String, port: U32, +path: String, +key: String) ->
   IO(Unit):
-  wss_client_req(~H, 1, host, port, WS.accept_of(key), WS.client_request(host, path, key))
+  wss_client_req(~H, True{}, host, port, WS.accept_of(key), WS.client_request(host, path, key))
 
 def client_on_insecure(~H: WS.WSEv -> IO(WS.WSOut), +host: String, port: U32, +path: String, +key: String) ->
   IO(Unit):
-  wss_client_req(~H, 0, host, port, WS.accept_of(key), WS.client_request(host, path, key))
+  wss_client_req(~H, False{}, host, port, WS.accept_of(key), WS.client_request(host, path, key))
 
 def client_on_sub(~H: WS.WSEv -> IO(WS.WSOut), +host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) ->
   IO(Unit):
-  wss_client_req_sub(~H, 1, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
+  wss_client_req_sub(~H, True{}, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
 
 def client_on_sub_insecure(~H: WS.WSEv -> IO(WS.WSOut), +host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) ->
   IO(Unit):
-  wss_client_req_sub(~H, 0, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
+  wss_client_req_sub(~H, False{}, host, port, WS.accept_of(key), protos, WS.client_request_sub(host, port, path, key, protos))
 
-# Client echo (single-shot, fixed mask) for loopback tests.
-# Mirrors WS.client_echo: dial noalpn, handshake, send masked frame,
-# read unmasked echo, tls_close. Done{"Hi"} on exact echo.
-
-def wss_eq_bytes(xs: List<&2, U32>, ys: List<&2, U32>) -> Bool:
-  match xs:
-    case Nil{}:
-      match ys:
-        case Nil{}:
-          True{}
-        case _ <> _:
-          False{}
-    case h1 <> t1:
-      match ys:
-        case Nil{}:
-          False{}
-        case h2 <> t2:
-          Bool.and(U32.is_eq(h1, h2), wss_eq_bytes(t1, t2))
+# TEST-ONLY: single-shot echo client (loopback tests and examples).
+# Mirrors WS.client_echo: dial noalpn, handshake, send one masked frame
+# with a random key, read the unmasked echo, tls_close. Done{"Hi"} on an
+# exact echo. Real interop uses client_on / client_on_sub.
 
 def wss_echo_score(ok: Bool) -> IO(Result<&1, &1, U32 & String, String>):
   match ok:
@@ -773,7 +778,7 @@ def wss_echo_ok(s: Socket, bs: List<&2, U32>, +want: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     x : Unit <- wss_close(s)
-    wss_echo_score(wss_eq_bytes(bs, want))
+    wss_echo_score(WS.eq_bytes(bs, want))
 
 def wss_echo_got(m: Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, +want: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -858,19 +863,19 @@ def wss_client_conn(conn: Result<&1, &1, U32 & String, Socket>, +req_txt: String
         m : Socket & Result<&1, &1, U32 & String, Unit> <- wss_send_str(sock, req_txt)
         wss_client_hs_start(m, framed, want, key)
 
-def wss_client_go(+host: String, port: U32, verify: U32, +req_txt: String, +framed: List<&2, U32>, +want: List<&2, U32>, +key: String) ->
+def wss_client_go(+host: String, port: U32, verify: Bool, +req_txt: String, +framed: List<&2, U32>, +want: List<&2, U32>, +key: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   match verify:
-    case 0:
-      do IO<Result<&1, &1, U32 & String, String>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
-        wss_client_conn(conn, req_txt, framed, want, key)
-    case _:
+    case True{}:
       do IO<Result<&1, &1, U32 & String, String>>:
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn(host, port)
         wss_client_conn(conn, req_txt, framed, want, key)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, String>>:
+        conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
+        wss_client_conn(conn, req_txt, framed, want, key)
 
-def wss_client_want(+host: String, port: U32, verify: U32, +req_txt: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>, +key: String) ->
+def wss_client_want(+host: String, port: U32, verify: Bool, +req_txt: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>, +key: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   match want:
     case Fail{e}:
@@ -878,22 +883,30 @@ def wss_client_want(+host: String, port: U32, verify: U32, +req_txt: String, +fr
     case Done{wb}:
       wss_client_go(host, port, verify, req_txt, framed, wb, key)
 
-def wss_client_start(+host: String, port: U32, verify: U32, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, framed: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wss_client_start.framed(host: String, port: U32, verify: Bool, +req_txt: String, +msg: String, +key: String, fb: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match fb:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{fb2}:
+      wss_client_want(host, port, verify, req_txt, fb2, WS.show_frame(True{}, 1, HTTP.encode(msg)), key)
+
+def wss_client_start(+host: String, port: U32, verify: Bool, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, framed: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match req:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
     case Done{req_txt}:
-      match framed:
-        case Fail{e}:
-          IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-        case Done{fb}:
-          wss_client_want(host, port, verify, req_txt, fb, WS.show_frame(True{}, 1, HTTP.encode(msg)), key)
+      wss_client_start.framed(host, port, verify, req_txt, msg, key, framed)
 
 def client_echo(+host: String, port: U32, +path: String, +key: String, +msg: String) ->
   IO(Result<&1, &1, U32 & String, String>):
-  wss_client_start(host, port, 1, path, key, msg, WS.client_request(host, path, key), WS.show_masked(True{}, 1, HTTP.encode(msg), 1, 2, 3, 4))
+  do IO<Result<&1, &1, U32 & String, String>>:
+    fr : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.show_masked_random(True{}, 1, HTTP.encode(msg))
+    wss_client_start(host, port, True{}, path, key, msg, WS.client_request(host, path, key), fr)
 
 def client_echo_insecure(+host: String, port: U32, +path: String, +key: String, +msg: String) ->
   IO(Result<&1, &1, U32 & String, String>):
-  wss_client_start(host, port, 0, path, key, msg, WS.client_request(host, path, key), WS.show_masked(True{}, 1, HTTP.encode(msg), 1, 2, 3, 4))
+  do IO<Result<&1, &1, U32 & String, String>>:
+    fr : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.show_masked_random(True{}, 1, HTTP.encode(msg))
+    wss_client_start(host, port, False{}, path, key, msg, WS.client_request(host, path, key), fr)

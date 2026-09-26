@@ -1217,6 +1217,41 @@ def show_masked(+fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U3
   +len = U32.from_nat(List.length(&2, U32, payload))
   show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(is_op_ok(op), Bool.and(ctrl_ok(op, fin, len), U32.is_le(len, ws_max_payload()))))
 
+# Client masking key (RFC 6455 section 5.3): every client frame needs a
+# fresh unpredictable key, never a constant. IO.random_u32 reads the
+# host entropy pool (getrandom on Linux, arc4random on Apple), so two
+# draws give 64 bits for the 32-bit field the RFC asks to be
+# unpredictable. show_masked above stays public for tests that want a
+# fixed key on purpose.
+type WSMask is Data:
+  WSMask{k0: U32, k1: U32, k2: U32, k3: U32}
+
+def mask_key.go(a: Result<&1, &1, U32 & String, U32>, b: Result<&1, &1, U32 & String, U32>) ->
+  WSMask:
+  match a b:
+    case Done{+hi} Done{+lo}:
+      WSMask{U32.and(hi, 255), U32.and(U32.shrn(hi, 8n), 255), U32.and(U32.shrn(hi, 16n), 255), U32.and(lo, 255)}
+    case _ _:
+      WSMask{1, 2, 3, 4}
+
+def mask_key() -> IO(WSMask):
+  do IO<WSMask>:
+    a : Result<&1, &1, U32 & String, U32> <- IO.random_u32()
+    b : Result<&1, &1, U32 & String, U32> <- IO.random_u32()
+    IO.pure(WSMask, mask_key.go(a, b))
+
+def show_masked_key(+fin: Bool, +op: U32, +payload: List<&2, U32>, +key: WSMask) ->
+  Result<&1, &1, U32 & String, List<&2, U32>>:
+  match key:
+    case WSMask{k0, k1, k2, k3}:
+      show_masked(fin, op, payload, k0, k1, k2, k3)
+
+def show_masked_random(+fin: Bool, +op: U32, +payload: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+    +key : WSMask <- mask_key()
+    IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, show_masked_key(fin, op, payload, key))
+
 # IO: single-shot echo plus parallel accept loop (mold HTTP.echo).
 # Frames ride TCP.send_bytes/TCP.recv_bytes (byte-faithful 0..255);
 # only the HTTP handshake stays on TCP.send/recv (ASCII text).
@@ -1286,22 +1321,45 @@ def out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
     case OutRaw{bs}:
       Done{bs}
 
-def on_op(s: Socket, fin: Bool, op: U32, +pay: List<&2, U32>) -> IO(Unit):
+# One-shot echo policy (serve_once / client_echo only; a persistent
+# session runs ws_loop, which reassembles fragments and answers ping via
+# ping_reply). Codes: 1 echo the same op, 2 answer a ping with a pong,
+# 0 close. A fragment (fin=false) means a message this path cannot
+# answer whole, and control frames may not be fragmented at all, so
+# both close instead of echoing a truncated frame. A continuation means
+# the same thing one step later, and an unsolicited pong has nothing to
+# answer: those close too (they used to put op 0 / op 10 on the wire).
+def echo_op_fin(op: U32) -> U32:
   match op:
-    case 0:
-      send_op(s, 0, pay)
     case 1:
-      send_op(s, 1, pay)
+      1
     case 2:
-      send_op(s, 2, pay)
+      1
     case 8:
-      send_op(s, 8, pay)
+      1
     case 9:
+      2
+    case _:
+      0
+
+def echo_op(fin: Bool, op: U32) -> U32:
+  match fin:
+    case True{}:
+      echo_op_fin(op)
+    case False{}:
+      0
+
+def on_op.go(act: U32, s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Unit):
+  match act:
+    case 1:
+      send_op(s, op, pay)
+    case 2:
       send_op(s, 10, pay)
-    case 10:
-      Socket.close(s)
     case _:
       Socket.close(s)
+
+def on_op(s: Socket, fin: Bool, +op: U32, +pay: List<&2, U32>) -> IO(Unit):
+  on_op.go(echo_op(fin, op), s, op, pay)
 
 # Recv (generic API): raw wire bytes as List, no parse, no close.
 # The server side reads masked frames, the client side the unmasked
@@ -1896,8 +1954,10 @@ def client_frames_put(mres: Result<&1, &1, U32 & String, List<&2, U32>>, eres: R
         case Done{eby}:
           Done{(mbytes, eby)}
 
-def client_frames(+msg: String) -> Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>:
-  client_frames_put(show_masked(True{}, 1, HTTP.encode(msg), 1, 2, 3, 4), show_frame(True{}, 1, HTTP.encode(msg)))
+# The masked frame of the one-shot echo client: a fresh key per frame.
+def client_frames(+msg: String) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  show_masked_random(True{}, 1, HTTP.encode(msg))
 
 def client_go(+host: String, port: U32, +path: String, +key: String, +msg: String, req: String, frames: List<&2, U32> & List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   (frame_txt, want) = frames
@@ -1905,7 +1965,19 @@ def client_go(+host: String, port: U32, +path: String, +key: String, +msg: Strin
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
     client_conn(conn, req, frame_txt, want)
 
-def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, frames: Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) -> IO(Result<&1, &1, U32 & String, String>):
+def client_echo_go(+host: String, port: U32, +path: String, +key: String, +msg: String, +req_txt: String, frames: Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match frames:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{fr}:
+      client_go(host, port, path, key, msg, req_txt, fr)
+
+def client_echo_frame(+host: String, port: U32, +path: String, +key: String, +msg: String, +req_txt: String, +fb: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  client_echo_go(host, port, path, key, msg, req_txt, client_frames_put(Done{fb}, show_frame(True{}, 1, HTTP.encode(msg))))
+
+def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: String, req: Result<&1, &1, U32 & String, String>, frames: Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Result<&1, &1, U32 & String, String>):
   match req:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
@@ -1913,14 +1985,18 @@ def client_req_ok(+host: String, port: U32, +path: String, +key: String, +msg: S
       match frames:
         case Fail{e}:
           IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-        case Done{fr}:
-          client_go(host, port, path, key, msg, req_txt, fr)
+        case Done{fb}:
+          client_echo_frame(host, port, path, key, msg, req_txt, fb)
 
-def client_echo(+host: String, port: U32, +path: String, +key: String, +msg: String) -> IO(Result<&1, &1, U32 & String, String>):
-  client_req_ok(host, port, path, key, msg, client_request(host, path, key), client_frames(msg))
+def client_echo(+host: String, port: U32, +path: String, +key: String, +msg: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    fr : Result<&1, &1, U32 & String, List<&2, U32>> <- client_frames(msg)
+    client_req_ok(host, port, path, key, msg, client_request(host, path, key), fr)
 
-# Client session (interop): masked sends with a fixed key, unmasked recvs.
-# The socket stays open across calls; the session driver closes it.
+# Client session (interop): masked sends with a fresh random key
+# (WS.mask_key), unmasked recvs. The socket stays open across calls;
+# the session driver closes it.
 
 def client_send_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
   (s, r) = m
@@ -1931,7 +2007,9 @@ def client_send_bytes(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -
       TCP.send_bytes(s, bs)
 
 def client_send_op(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  client_send_bytes((s, show_masked(True{}, op, pay, 1, 2, 3, 4)))
+  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+    fr : Result<&1, &1, U32 & String, List<&2, U32>> <- show_masked_random(True{}, op, pay)
+    client_send_bytes((s, fr))
 
 def client_send_msg(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
   client_send_op(s, msg_to_op(msg), msg_to_bytes(msg))
@@ -1967,7 +2045,7 @@ def recv_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>)
 # plus Sec-WebSocket-Accept = accept_of(key); anything else emits one
 # EvError and closes (the client must learn WHY it died, unlike the
 # server, whose caller already saw the accept). On success it emits one
-# EvOpen, sends the handler's WSOut masked (fixed key 1,2,3,4, like
+# EvOpen, sends the handler's WSOut masked (a fresh random key, like
 # client_send_op) and enters the frame loop (client_loop, states 1/2):
 # each complete server frame arrives unmasked via recv_in_client_framed
 # with its rest threaded as the next buf, maps to one WSEv, and the
@@ -1978,17 +2056,23 @@ def recv_client(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, WSIn>)
 # ws_loop with the mask sides swapped: the client sends masked and reads
 # unmasked, so the dispatch lives in its own def, not behind a flag.
 
-def client_out_bytes(out: WSOut) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+def client_out_bytes(out: WSOut, +key: WSMask) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   match out:
     case OutMsg{msg}:
       +mm = msg
-      show_masked(True{}, msg_to_op(mm), msg_to_bytes(mm), 1, 2, 3, 4)
+      show_masked_key(True{}, msg_to_op(mm), msg_to_bytes(mm), key)
     case OutOp{op, pay}:
       +oo = op
       +pp = pay
-      show_masked(True{}, oo, out_op_pay(oo, pp), 1, 2, 3, 4)
+      show_masked_key(True{}, oo, out_op_pay(oo, pp), key)
     case OutRaw{bs}:
       Done{bs}
+
+def client_out_bytes_random(out: WSOut) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+    key : WSMask <- mask_key()
+    IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, client_out_bytes(out, key))
 
 def client_recv_after(m: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
   (s, r) = m
@@ -2071,7 +2155,8 @@ def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 
           match c:
             case 413:
               do IO<Unit>:
-                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(cap_close_out())))
+                f1 : Result<&1, &1, U32 & String, List<&2, U32>> <- client_out_bytes_random(cap_close_out())
+                m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, f1))
                 close_done(m2)
             case _:
               do IO<Unit>:
@@ -2128,7 +2213,8 @@ def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 
                   +pp = pay
                   do IO<Unit>:
                     out : WSOut <- H(EvClose{pp})
-                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(close_answer(pp, out))))
+                    f2 : Result<&1, &1, U32 & String, List<&2, U32>> <- client_out_bytes_random(close_answer(pp, out))
+                    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, f2))
                     close_done(m2)
             case EvError{code, msg}:
               do IO<Unit>:
@@ -2142,7 +2228,8 @@ def client_loop(~H: WSEv -> IO(WSOut), st: U32, mf: Socket & Result<&1, &1, U32 
         case StepOut{out2}:
           +o2 = out2
           do IO<Unit>:
-            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(o2)))
+            f3 : Result<&1, &1, U32 & String, List<&2, U32>> <- client_out_bytes_random(o2)
+            m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, f3))
             m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
             client_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], acc, Bool.or(shut, U32.is_eq(out_op_of(o2), 8)))
     case _:
@@ -2153,7 +2240,8 @@ def client_hs.go(~H: WSEv -> IO(WSOut), s: Socket, ok: Bool, +want: String, +buf
     case True{}:
       do IO<Unit>:
         out : WSOut <- H(EvOpen{})
-        m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, client_out_bytes(out)))
+        f4 : Result<&1, &1, U32 & String, List<&2, U32>> <- client_out_bytes_random(out)
+        m2 : Socket & Result<&1, &1, U32 & String, Unit> <- client_send_bytes((s, f4))
         m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- client_recv_after(m2, buf)
         client_loop(~H, 1, m3, StepEv{EvError{0, ""}}, [], FragIdle{}, False{})
     case False{}:

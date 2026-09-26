@@ -5,7 +5,7 @@
 # ./http2.bend (H2), the handshake in ./tls.bend (TLS), and URL validation
 # in ./http.bend (HTTP).
 #
-# RFC pattern (the core): headers are List<H2Hdr> byte pairs (lowercase,
+# RFC pattern (the core): headers are List<H2Hdr> String pairs (lowercase,
 # pseudo-headers :method/:path/:scheme/:authority handled by the codec);
 # bodies are byte-faithful List<&2, U32>. Textual wrappers (fetch,
 # send_request) encode/decode via H2.str_bytes / H2.bytes_str, mirroring
@@ -57,19 +57,6 @@ def h2_to_pairs(hs: List<&2, H2.H2Hdr>) -> List<&1, String & String>:
       Nil{}
     case H2.H2Hdr{n, v} <> t:
       (n, v) <> h2_to_pairs(t)
-
-# Response
-# --------
-# Status projection and handler dispatch (mirror HTTP.route_status).
-
-def route_status(resp: H2.H2Response) -> U32:
-  match resp:
-    case H2.H2Response{+status, +headers, +body}:
-      status
-
-def dispatch(route: H2.H2Request -> IO(H2.H2Response), req: H2.H2Request) ->
-  IO(H2.H2Response):
-  route(req)
 
 # RFC 9113 requires :authority on every request; node:http2 closes the
 # session without a stream when it is missing. Build it from the dial
@@ -142,10 +129,6 @@ def request.http1_convert(
 # (status + headers + byte body). Multi-stream keep-alive callers use
 # H2.h2_connect + H2.h2_request directly and thread the socket + sid.
 
-def request.closed(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
-  IO(Result<&1, &1, U32 & String, H2.H2Response>):
-  IO.pure(Result<&1, &1, U32 & String, H2.H2Response>, r)
-
 def request.body(got: Socket & Result<&1, &1, U32 & String, H2.H2Response>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
   (s2, r) = got
@@ -153,11 +136,11 @@ def request.body(got: Socket & Result<&1, &1, U32 & String, H2.H2Response>) ->
     case Fail{e}:
       do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
         x : Unit <- TLS.tls_close(s2)
-        request.closed(Fail{e})
+        IO.pure(Result<&1, &1, U32 & String, H2.H2Response>, Fail{e})
     case Done{+resp}:
       do IO<Result<&1, &1, U32 & String, H2.H2Response>>:
         x : Unit <- TLS.tls_close(s2)
-        request.closed(Done{resp})
+        IO.pure(Result<&1, &1, U32 & String, H2.H2Response>, Done{resp})
 
 def request.exch(sock: Socket, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
@@ -232,6 +215,11 @@ def request.go(+host: String, +port: U32, +method: String, +path: String, hs: Li
     case False{}:
       request.insecure(host, port, method, path, hs, body)
 
+# One validation predicate for every public entry point (the mirror of
+# HTTP.valid_host/valid_port/valid_path triple).
+def valid.go(+host: String, +port: U32, +path: String) -> Bool:
+  Bool.and(HTTP.valid_host(host), Bool.and(HTTP.valid_port(port), HTTP.valid_path(path)))
+
 def request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>, verify: Bool, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
   match fit:
@@ -242,17 +230,18 @@ def request.fit(+host: String, +port: U32, +path: String, +method: String, hs: L
 
 def request(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
-  request.fit(host, port, path, method, hs, body, True{}, Bool.and(HTTP.valid_host(host), Bool.and(HTTP.valid_port(port), HTTP.valid_path(path))))
+  request.fit(host, port, path, method, hs, body, True{}, valid.go(host, port, path))
 
 def request_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, H2.H2Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, H2.H2Response>):
-  request.fit(host, port, path, method, hs, body, False{}, Bool.and(HTTP.valid_host(host), Bool.and(HTTP.valid_port(port), HTTP.valid_path(path))))
+  request.fit(host, port, path, method, hs, body, False{}, valid.go(host, port, path))
 
-# Textual send_request (mirror HTTP.send_request)
-# -----------------------------------------------
-# Same exchange with a String body; answers the response body as String.
+# Response body projections
+# -------------------------
+# The textual entry points share one projection: the body of a Done
+# response decodes as String, a Fail passes through untouched.
 
-def send_request.text(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
+def body_text(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match r:
     case Fail{e}:
@@ -262,11 +251,15 @@ def send_request.text(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
         case H2.H2Response{+status, +headers, +body}:
           IO.pure(Result<&1, &1, U32 & String, String>, Done{decode_body(body)})
 
+# Textual send_request (mirror HTTP.send_request)
+# -----------------------------------------------
+# Same exchange with a String body; answers the response body as String.
+
 def send_request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: String, verify: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     r : Result<&1, &1, U32 & String, H2.H2Response> <- request.go(host, port, method, path, hs, encode_body(body), verify)
-    send_request.text(r)
+    body_text(r)
 
 def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: String, verify: Bool, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -278,27 +271,17 @@ def send_request.fit(+host: String, +port: U32, +path: String, +method: String, 
 
 def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):
-  send_request.fit(host, port, path, method, hs, body, True{}, Bool.and(HTTP.valid_host(host), Bool.and(HTTP.valid_port(port), HTTP.valid_path(path))))
+  send_request.fit(host, port, path, method, hs, body, True{}, valid.go(host, port, path))
 
 def send_request_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, H2.H2Hdr>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):
-  send_request.fit(host, port, path, method, hs, body, False{}, Bool.and(HTTP.valid_host(host), Bool.and(HTTP.valid_port(port), HTTP.valid_path(path))))
+  send_request.fit(host, port, path, method, hs, body, False{}, valid.go(host, port, path))
 
 # fetch: GET by URL (mirror HTTP.fetch, https only)
 # -------------------------------------------------
 # Parses https://host[:port]/path via HTTP.read_url; http:// is refused
 # with 400 (use HTTP.fetch for cleartext). Answers the body as String;
 # fetch_bytes answers raw bytes.
-
-def fetch.text(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match r:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{+resp}:
-      match resp:
-        case H2.H2Response{+status, +headers, +body}:
-          IO.pure(Result<&1, &1, U32 & String, String>, Done{decode_body(body)})
 
 def fetch.raw(r: Result<&1, &1, U32 & String, H2.H2Response>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
@@ -314,7 +297,7 @@ def fetch.get(+host: String, port: U32, path: String, verify: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     r : Result<&1, &1, U32 & String, H2.H2Response> <- request.go(host, port, "GET", path, Nil{}, Nil{}, verify)
-    fetch.text(r)
+    body_text(r)
 
 def fetch_bytes.get(+host: String, port: U32, path: String, verify: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
@@ -447,69 +430,11 @@ def serve_start(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket) -> IO(Unit)
     got : Socket & Result<&1, &1, U32 & String, Unit> & H2.HpDyn <- H2.h2_serve_once(sock, apply_wrap(~H))
     serve_loop(~H, got)
 
-def server.spawn(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket, l: Listener) ->
-  IO(Listener):
-  do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, serve_start(~H, sock))
-    return l
-
-def server.conn(~H: H2.H2Request -> IO(H2.H2Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
-  IO(Listener):
-  (l, r) = m
-  match r:
-    case Fail{e}:
-      IO.pure(Listener, l)
-    case Done{sock}:
-      server.spawn(~H, sock, l)
-
-@unsafe
-def server_on(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String, +key: String) ->
-  IO(Unit):
-  do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
-    l2 : Listener <- server.conn(~H, m)
-    z : Unit <- server_on(~H, l2, cert, key)
-    return z
-
 @unsafe
 def server_on_http1(
   ~H: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
   listener: Listener, +cert: String, +key: String) -> IO(Unit):
   HTTP1.server_on_http1(~H, listener, cert, key)
-
-def server.alpn_conn.go(
-  ~H2: H2.H2Request -> IO(H2.H2Response),
-  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
-  is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
-  match is_h2:
-    case True{}:
-      server.spawn(~H2, sock, listener)
-    case False{}:
-      HTTP1.http1_spawn(~H1, sock, listener)
-
-def server.alpn_conn(
-  ~H2: H2.H2Request -> IO(H2.H2Response),
-  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
-  accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
-  (listener, result) = accepted
-  match result:
-    case Fail{e}:
-      IO.pure(Listener, listener)
-    case Done{value}:
-      (sock, protocol) = value
-      server.alpn_conn.go(~H2, ~H1, TLS.tls_alpn_is_h2(protocol),
-        listener, sock)
-
-@unsafe
-def server_on_alpn(
-  ~H2: H2.H2Request -> IO(H2.H2Response),
-  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
-  listener: Listener, +cert: String, +key: String) -> IO(Unit):
-  do IO<Unit>:
-    accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
-      TLS.tls_accept_alpn(listener, cert, key)
-    next : Listener <- server.alpn_conn(~H2, ~H1, accepted)
-    server_on_alpn(~H2, ~H1, next, cert, key)
 
 # -------------------------------------------------------
 # Sequential serve_next tracks ONE H2SrvSt, so pipelined frames of two
@@ -530,9 +455,10 @@ def mux.sid_of(st: H2.H2SrvSt) -> U32:
       sid
 
 # SETTINGS classification fix: ack only a fresh (non-ACK) SETTINGS.
-# An ACK already answers one; acking it back would ping-pong forever
-# between two unbounded read loops (bounded single-shot readers never
-# notice). base rides H2.h2_srv.classify.
+# An ACK already answers one, and acking it back would make the two
+# unbounded read loops (this mux and the client chain) answer each other
+# forever; a bounded single-shot reader would never notice. base rides
+# H2.h2_srv.classify.
 
 def mux.cls_fix(base: U32, +flags: U32) -> U32:
   match base flags:
@@ -541,33 +467,36 @@ def mux.cls_fix(base: U32, +flags: U32) -> U32:
     case _ _:
       base
 
-def mux.sent_got(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2.H2Got:
-  (s2, r) = sent
-  match r:
-    case Fail{e}:
-      (s2, H2.H2GotErr{616, "tls io"})
-    case Done{u}:
-      (s2, H2.H2GotErr{0, "next"})
-
-def mux.read_got(got: Socket & H2.H2Got) -> Socket & H2.H2Got:
-  (s, g) = got
-  (s, H2.H2GotErr{0, "next"})
+# The loop below reads on every turn, so the carrier only has to carry the
+# socket: the H2Got slot is parked on a frame-less value while no frame is
+# in hand. The socket is affine and Bend recovers it only by matching the
+# carrier, so this parking value is the honest minimum here (a new H2Got
+# variant would break every match on the type, and a magic error code is
+# worse).
+def mux.again(s: Socket) -> Socket & H2.H2Got:
+  (s, H2.H2GotOk{H2.H2Frame{0, 0, 0, Nil{}}, Nil{}})
 
 def mux.close_got(got: Socket & H2.H2Got) -> IO(Unit):
   (s, g) = got
   TLS.tls_close(s)
 
+# Housekeeping sends keep the connection alive even if the write fails:
+# the next read answers the dead socket and closes the connection.
+def mux.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2.H2Got:
+  (s2, r) = sent
+  mux.again(s2)
+
 def mux.ack(got: Socket & H2.H2Got) -> IO(Socket & H2.H2Got):
   (s, g) = got
   do IO<Socket & H2.H2Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s, H2.h2_t_settings(), H2.h2_f_ack(), 0, Nil{})
-    IO.pure(Socket & H2.H2Got, mux.sent_got(sent))
+    IO.pure(Socket & H2.H2Got, mux.sent(sent))
 
 def mux.ack_ping(got: Socket & H2.H2Got, +payload: List<&2, U32>) -> IO(Socket & H2.H2Got):
   (s, g) = got
   do IO<Socket & H2.H2Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s, H2.h2_t_ping(), H2.h2_f_ack(), 0, payload)
-    IO.pure(Socket & H2.H2Got, mux.sent_got(sent))
+    IO.pure(Socket & H2.H2Got, mux.sent(sent))
 
 # Slot decision leafs (plain defs, top-level matches only). HEADERS codes:
 # 0 claim A, 1 answer A, 2 claim B, 3 answer B, 4 busy fail-closed,
@@ -816,7 +745,8 @@ def muxn.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Un
 # forward-call into mux). Single Socket carrier threaded whole, slot
 # decisions as Bool/U32 params computed in caller arg position, open
 # streams as List<H2SrvSt> + fragment END_STREAM ledger fends).
-# Phases: 0 expect frame, 1 decompose, 2 connection dispatch (cls),
+# Phases: 0 read the next frame (the carrier only carries the socket),
+# 1 decompose, 2 connection dispatch (cls),
 # 3 stream dispatch (typ), 4 HEADERS-complete, 5 DATA, 6 CONTINUATION.
 # Answers inline via H2.h2_srv.send_resp; inbound DATA flow credit
 # rides H2.h2_read_frame (best-effort WINDOW_UPDATE, Phase 3).
@@ -827,17 +757,9 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
   match phase:
     case 0:
       (s0, g0) = got
-      match g0:
-        case H2.H2GotErr{code, msg}:
-          match code:
-            case 0:
-              do IO<Unit>:
-                got2 : Socket & H2.H2Got <- H2.h2_read_frame(s0, buf)
-                mux(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
-            case _:
-              TLS.tls_close(s0)
-        case H2.H2GotOk{frame0, buf0}:
-          mux(~H, 1, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+      do IO<Unit>:
+        got2 : Socket & H2.H2Got <- H2.h2_read_frame(s0, buf)
+        mux(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
     case 1:
       (s1, g1) = got
       match g1:
@@ -860,9 +782,9 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
         case 5:
           mux.close_got(got)
         case 2:
-          mux(~H, 0, mux.read_got(got), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 7:
-          mux(~H, 0, mux.read_got(got), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 9:
           mux.close_got(got)
         case 8:
@@ -870,9 +792,9 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
         case 6:
           mux(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 0:
-          mux(~H, 0, mux.read_got(got), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case _:
-          mux(~H, 0, mux.read_got(got), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
     case 3:
       match typ:
         case 1:
@@ -882,20 +804,20 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
         case 0:
           mux(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, H2.H2ReqHead{"", "", Nil{}}, muxn.decide_data(muxn.has(slots, sid2), end), tab)
         case _:
-          mux(~H, 0, mux.read_got(got), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          mux(~H, 0, mux.read_got(got), muxn.put(slots, H2.H2SrvSt{Some{rh}, Nil{}, sid2, H2.hp_empty()}), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{Some{rh}, Nil{}, sid2, H2.hp_empty()}), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           do IO<Unit>:
             req : H2.H2Request = mux.req_of(rh, Nil{})
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(s4, sid2, resp)
-            mux(~H, 0, mux.sent_got(sent), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+            mux(~H, 0, mux.sent(sent), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 6:
-          mux(~H, 0, mux.read_got(got), muxn.put(slots, H2.H2SrvSt{None{}, payload, sid2, H2.hp_empty()}), muxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{None{}, payload, sid2, H2.hp_empty()}), muxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 5:
           TLS.tls_close(s4)
         case _:
@@ -904,7 +826,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       (sm, gm) = got
       match act:
         case 0:
-          mux(~H, 0, mux.read_got(got), muxn.put(slots, H2.H2SrvSt{Some{muxn.slot_rh(slots, sid2)}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{Some{muxn.slot_rh(slots, sid2)}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           do IO<Unit>:
             +oldb : List<&2, U32> = muxn.slot_body(slots, sid2)
@@ -912,7 +834,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
             req : H2.H2Request = mux.req_of(muxn.slot_rh(slots, sid2), b1)
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(sm, sid2, resp)
-            mux(~H, 0, mux.sent_got(sent), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+            mux(~H, 0, mux.sent(sent), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 4:
           mux.close_got(got)
         case _:
@@ -921,7 +843,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       (s6, g6) = got
       match act:
         case 0:
-          mux(~H, 0, mux.read_got(got), muxn.put(slots, H2.H2SrvSt{None{}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{None{}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           +full : List<&2, U32> = List.append(&2, U32, muxn.slot_body(slots, sid2), payload)
           +pr6 : Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn> = H2.h2_reqhead.decode(full, tab)
@@ -932,7 +854,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_goaway(s6, 0, 1)
             muxn.cont_failed(sent)
     case _:
-      mux(~H, 0, mux.read_got(got), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+      mux(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
 
 # Preface entry for the mux (owns the byte buffer end-to-end, so pipelined
 # frames are never dropped between streams). Below mux: calls upward.
@@ -964,7 +886,7 @@ def mux_pre(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, rs: Socket & Resu
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_settings(), 0, 0, H2.h2_settings_initial_pay())
-            mux(~H, 0, mux.sent_got(sent), muxn.no_slots(), muxn.no_fends(), H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, H2.hp_empty())
+            mux(~H, 0, mux.sent(sent), muxn.no_slots(), muxn.no_fends(), H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, H2.hp_empty())
         case _:
           TLS.tls_close(s2)
     case _:
@@ -976,43 +898,53 @@ def mux_start(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket) -> IO(Unit):
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
     mux_pre(~H, 0, r1, Nil{}, 0, False{})
 
-def mux.spawn(~H: H2.H2Request -> IO(H2.H2Response), sock: Socket, l: Listener) ->
+# Accept plumbing shared by both servers: one stream at a time
+# (is_mux = False) or the unbounded-slot mux (is_mux = True). The two
+# differ only in the per-connection start (serve_start vs mux_start), so
+# one pair serves both and lives here, below the two starts. HTTP/1.1
+# connections never reach it: the ALPN split hands them to
+# HTTP1.http1_spawn.
+
+def serve.spawn.go(~H: H2.H2Request -> IO(H2.H2Response), is_mux: Bool, sock: Socket) ->
+  IO(Unit):
+  match is_mux:
+    case True{}:
+      mux_start(~H, sock)
+    case False{}:
+      serve_start(~H, sock)
+
+def serve.spawn(~H: H2.H2Request -> IO(H2.H2Response), is_mux: Bool, sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, mux_start(~H, sock))
+    x : Unit <- IO.spawn(Unit, serve.spawn.go(~H, is_mux, sock))
     return l
 
-def mux.conn(~H: H2.H2Request -> IO(H2.H2Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def serve.conn(~H: H2.H2Request -> IO(H2.H2Response), is_mux: Bool, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
     case Fail{e}:
       IO.pure(Listener, l)
     case Done{sock}:
-      mux.spawn(~H, sock, l)
+      serve.spawn(~H, is_mux, sock, l)
 
-@unsafe
-def server_on_concurrent(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String, +key: String) ->
-  IO(Unit):
-  do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
-    l2 : Listener <- mux.conn(~H, m)
-    z : Unit <- server_on_concurrent(~H, l2, cert, key)
-    return z
+# ALPN split: h2 connections go to the H2 codec, http/1.1 (or no ALPN)
+# to the HTTP/1.1 module, on the same port.
 
-def mux.alpn_conn.go(
+def serve.alpn_conn.go(
   ~H2: H2.H2Request -> IO(H2.H2Response),
   ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
-  is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+  is_mux: Bool, is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
   match is_h2:
     case True{}:
-      mux.spawn(~H2, sock, listener)
+      serve.spawn(~H2, is_mux, sock, listener)
     case False{}:
       HTTP1.http1_spawn(~H1, sock, listener)
 
-def mux.alpn_conn(
+def serve.alpn_conn(
   ~H2: H2.H2Request -> IO(H2.H2Response),
   ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  is_mux: Bool,
   accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
   match result:
@@ -1020,8 +952,41 @@ def mux.alpn_conn(
       IO.pure(Listener, listener)
     case Done{value}:
       (sock, protocol) = value
-      mux.alpn_conn.go(~H2, ~H1, TLS.tls_alpn_is_h2(protocol),
+      serve.alpn_conn.go(~H2, ~H1, is_mux, TLS.tls_alpn_is_h2(protocol),
         listener, sock)
+
+# Public servers. The plain pair keeps the legacy H2-only contract
+# (strict h2 ALPN); the _alpn pair accepts HTTP/1.1 on the same port.
+
+@unsafe
+def server_on(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
+    l2 : Listener <- serve.conn(~H, False{}, m)
+    z : Unit <- server_on(~H, l2, cert, key)
+    return z
+
+@unsafe
+def server_on_concurrent(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
+    l2 : Listener <- serve.conn(~H, True{}, m)
+    z : Unit <- server_on_concurrent(~H, l2, cert, key)
+    return z
+
+@unsafe
+def server_on_alpn(
+  ~H2: H2.H2Request -> IO(H2.H2Response),
+  ~H1: String -> String -> List<&2, HTTP.Hdr> -> String -> IO(U32 & List<&1, String & String> & String),
+  listener: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_accept_alpn(listener, cert, key)
+    next : Listener <- serve.alpn_conn(~H2, ~H1, False{}, accepted)
+    z : Unit <- server_on_alpn(~H2, ~H1, next, cert, key)
+    return z
 
 @unsafe
 def server_on_concurrent_alpn(
@@ -1031,13 +996,6 @@ def server_on_concurrent_alpn(
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
       TLS.tls_accept_alpn(listener, cert, key)
-    next : Listener <- mux.alpn_conn(~H2, ~H1, accepted)
-    server_on_concurrent_alpn(~H2, ~H1, next, cert, key)
-
-def echo.body(req: H2.H2Request) -> IO(H2.H2Response):
-  match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
-
-def ok(+body: List<&2, U32>) -> H2.H2Response:
-  H2.H2Response{200, Nil{}, body}
+    next : Listener <- serve.alpn_conn(~H2, ~H1, True{}, accepted)
+    z : Unit <- server_on_concurrent_alpn(~H2, ~H1, next, cert, key)
+    return z

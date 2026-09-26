@@ -1410,144 +1410,53 @@ def h2_round.wu_data(sock: Socket, +frame: H2Frame, +rest: List<&2, U32>) -> IO(
       h2_round.wu_typ(sock, typ, flags, sid2, payload, rest)
 
 
-def h2_round.done4(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
-  match out:
-    case H2FrameOk{frame, rest}:
-      h2_round.wu_data(sock, frame, rest)
-    case H2FrameBad{code, msg}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
-    case _:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{400, "eof"}))
+# Frame reader: parse the buffer and, while the frame is still
+# incomplete, read one more chunk. The read budget is unbounded on
+# purpose — a peer may split a frame across any number of TLS records
+# (Cloudflare delivers ~1.4KB per record, so its 3.6KB HEADERS block
+# alone needs 3 reads and the 8KB DATA behind it 6 more) and a frame may
+# carry up to 65535 bytes, which is more reads than any fixed budget
+# allowed (the old 4-read chain turned a real response into `400 eof`).
+# Only a real EOF (an empty chunk) ends the wait, and then only while the
+# frame is still incomplete.
+#
+# The parse result rides the state tuple whole: Bend only takes a param
+# or a pattern-bound var as a match scrutinee, and the buffer may not
+# travel twice.
 
-def h2_round4(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round.done4(sock, buf, h2_frame_read(buf))
-
-def h2_round.eof3(sock: Socket, +buf: List<&2, U32>, +chunk: List<&2, U32>, +missing: Nat, is_eof: Bool) ->
-  IO(Socket & H2Got):
+def h2_read.loop.done(s: Socket, +chunk: List<&2, U32>, +buf: List<&2, U32>, is_eof: Bool) ->
+  Socket & H2FrameOut & List<&2, U32>:
   match is_eof:
     case True{}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{400, "eof"}))
+      (s, H2FrameBad{400, "eof"}, buf)
     case False{}:
-      h2_round4(sock, b_append(buf, chunk))
+      +buf2 = b_append(buf, chunk)
+      (s, h2_frame_read(buf2), buf2)
 
-def h2_round.after3(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +missing: Nat) ->
-  IO(Socket & H2Got):
-  (s2, r) = got
-  match r:
-    case Fail{(c, m)}:
-      IO.pure(Socket & H2Got, (s2, H2GotErr{c, m}))
+def h2_read.loop.grow(r: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>) ->
+  Socket & H2FrameOut & List<&2, U32>:
+  (s, res) = r
+  match res:
+    case Fail{(code, msg)}:
+      (s, H2FrameBad{code, msg}, buf)
     case Done{+chunk}:
-      h2_round.eof3(s2, buf, chunk, missing, Nat.is_eq(b_len(chunk), 0n))
+      h2_read.loop.done(s, chunk, buf, Nat.is_eq(b_len(chunk), 0n))
 
-def h2_round.done3(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
+@unsafe
+def h2_read_loop(state: Socket & H2FrameOut & List<&2, U32>) -> IO(Socket & H2Got):
+  (s0, out, buf) = state
   match out:
     case H2FrameOk{frame, rest}:
-      h2_round.wu_data(sock, frame, rest)
+      h2_round.wu_data(s0, frame, rest)
     case H2FrameBad{code, msg}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
+      IO.pure(Socket & H2Got, (s0, H2GotErr{code, msg}))
     case H2NeedMore{missing}:
       do IO<Socket & H2Got>:
-        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-        h2_round.after3(got, buf, missing)
+        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
+        h2_read_loop(h2_read.loop.grow(r1, buf))
 
-def h2_round3(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round.done3(sock, buf, h2_frame_read(buf))
-
-def h2_round.eof2(sock: Socket, +buf: List<&2, U32>, +chunk: List<&2, U32>, +missing: Nat, is_eof: Bool) ->
-  IO(Socket & H2Got):
-  match is_eof:
-    case True{}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{400, "eof"}))
-    case False{}:
-      h2_round3(sock, b_append(buf, chunk))
-
-def h2_round.after2(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +missing: Nat) ->
-  IO(Socket & H2Got):
-  (s2, r) = got
-  match r:
-    case Fail{(c, m)}:
-      IO.pure(Socket & H2Got, (s2, H2GotErr{c, m}))
-    case Done{+chunk}:
-      h2_round.eof2(s2, buf, chunk, missing, Nat.is_eq(b_len(chunk), 0n))
-
-def h2_round.done2(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
-  match out:
-    case H2FrameOk{frame, rest}:
-      h2_round.wu_data(sock, frame, rest)
-    case H2FrameBad{code, msg}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
-    case H2NeedMore{missing}:
-      do IO<Socket & H2Got>:
-        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-        h2_round.after2(got, buf, missing)
-
-def h2_round2(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round.done2(sock, buf, h2_frame_read(buf))
-
-def h2_round.eof1(sock: Socket, +buf: List<&2, U32>, +chunk: List<&2, U32>, +missing: Nat, is_eof: Bool) ->
-  IO(Socket & H2Got):
-  match is_eof:
-    case True{}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{400, "eof"}))
-    case False{}:
-      h2_round2(sock, b_append(buf, chunk))
-
-def h2_round.after1(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +missing: Nat) ->
-  IO(Socket & H2Got):
-  (s2, r) = got
-  match r:
-    case Fail{(c, m)}:
-      IO.pure(Socket & H2Got, (s2, H2GotErr{c, m}))
-    case Done{+chunk}:
-      h2_round.eof1(s2, buf, chunk, missing, Nat.is_eq(b_len(chunk), 0n))
-
-def h2_round.done1(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
-  match out:
-    case H2FrameOk{frame, rest}:
-      h2_round.wu_data(sock, frame, rest)
-    case H2FrameBad{code, msg}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
-    case H2NeedMore{missing}:
-      do IO<Socket & H2Got>:
-        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-        h2_round.after1(got, buf, missing)
-
-def h2_round1(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round.done1(sock, buf, h2_frame_read(buf))
-
-def h2_round.eof0(sock: Socket, +buf: List<&2, U32>, +chunk: List<&2, U32>, +missing: Nat, is_eof: Bool) ->
-  IO(Socket & H2Got):
-  match is_eof:
-    case True{}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{400, "eof"}))
-    case False{}:
-      h2_round1(sock, b_append(buf, chunk))
-
-def h2_round.after0(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +missing: Nat) ->
-  IO(Socket & H2Got):
-  (s2, r) = got
-  match r:
-    case Fail{(c, m)}:
-      IO.pure(Socket & H2Got, (s2, H2GotErr{c, m}))
-    case Done{+chunk}:
-      h2_round.eof0(s2, buf, chunk, missing, Nat.is_eq(b_len(chunk), 0n))
-
-def h2_round.done0(sock: Socket, +buf: List<&2, U32>, out: H2FrameOut) -> IO(Socket & H2Got):
-  match out:
-    case H2FrameOk{frame, rest}:
-      h2_round.wu_data(sock, frame, rest)
-    case H2FrameBad{code, msg}:
-      IO.pure(Socket & H2Got, (sock, H2GotErr{code, msg}))
-    case H2NeedMore{missing}:
-      do IO<Socket & H2Got>:
-        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-        h2_round.after0(got, buf, missing)
-
-def h2_round0(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round.done0(sock, buf, h2_frame_read(buf))
-
-def h2_read_frame(sock: Socket, buf: List<&2, U32>) -> IO(Socket & H2Got):
-  h2_round0(sock, buf)
+def h2_read_frame(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & H2Got):
+  h2_read_loop((sock, h2_frame_read(buf), buf))
 
 def h2_wu_best_effort(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2Got:
   (s, r) = sent

@@ -1,16 +1,17 @@
 # bend-net: package entry for BendHub.
 # Source: https://github.com/naoeosavio/bend-net.git
 #
-# HTTP/1.1 and WebSocket (RFC 6455) over TCP for Bend, with
-# package-local DNS and TLS (client + server, ALPN h2). Pure Bend on
-# top of the Base TCP.* kit; the native code is the byte-level socket
-# effects in ./effs/ (C + JS twins: send_bytes, recv_bytes, recv_frame),
-# the A-record resolver (dns_resolve) and the TLS lane (tls_*: OpenSSL
-# via dlopen). No compiler change.
-# Boundaries: fetch reads at most 8 x 8192 bytes (64 KB cap); https://
-# rides lib/tls.bend (fetch still returns Fail 501 until wired); TLS
-# fails closed with 611-616; resolution fails closed with 601-605 and
-# never touches the Host header.
+# HTTP/1.1, HTTP/2 over TLS and WebSocket (RFC 6455) for Bend, with
+# package-local DNS and TLS (client + server, ALPN h2 / http/1.1 /
+# noalpn). Pure Bend on top of the Base TCP.* kit; the native code is
+# the byte-level socket effects in ./effs/ (C + JS twins: send_bytes,
+# recv_bytes, recv_frame), the A-record resolver (dns_resolve) and the
+# TLS lane (tls_*: OpenSSL via dlopen). No compiler change.
+# Boundaries: HTTP/1.1 fetch reads at most 8 x 8192 bytes (64 KB cap);
+# HTTPS rides lib/tls.bend and speaks HTTP/2 (lib/http2.bend) with the
+# HTTP/1.1 module (lib/https_http1.bend) behind ALPN; TLS fails closed
+# with 611-616; resolution fails closed with 601-605 and never touches
+# the Host header.
 #
 # Package entry point. Publish with:
 #
@@ -43,10 +44,10 @@ import ./tls.bend as TLS
 import ./ws.bend as WS
 import ./wss.bend as WSS
 
-# Marks the bundle ready; the API lives in http.bend, ws.bend
-# (with sha1.bend and b64.bend for the handshake), wss.bend (WS
-# over TLS), tcp.bend, whose byte effects WS frames ride,
-# dns.bend, whose resolve feeds the HTTP fetch lane, and
-# tls.bend, whose handshake lane feeds HTTPS and WSS.
+# Marks the bundle ready; the API lives in http.bend, http2.bend,
+# https.bend (+ https_http1.bend), ws.bend (with sha1.bend and b64.bend
+# for the handshake), wss.bend (WS over TLS), tcp.bend, whose byte
+# effects WS frames ride, dns.bend, whose resolve feeds the HTTP fetch
+# lane, and tls.bend, whose handshake lane feeds HTTPS and WSS.
 def Package.ready() -> Unit:
   Unit{}
