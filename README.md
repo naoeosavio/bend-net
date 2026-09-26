@@ -200,8 +200,10 @@ keep-alive servers, mirroring `lib/http.bend`:
 | `fetch_bytes(url)` / `fetch_bytes_insecure` | Same GET answering raw `List<&2, U32>` bytes |
 | `server_on(~H, l, cert, key)` | Generic keep-alive server (like `HTTP.server_on`): unbounded TLS accept loop with `IO.spawn` per connection, unlimited sequential streams per connection until GOAWAY/EOF; `~H` is `H2Request -> IO(H2Response)` |
 | `server_on_concurrent(~H, l, cert, key)` | Same accept loop; per connection an unbounded interleaved mux (open streams tracked in a `List<H2SrvSt>` by sid, answered in any completion order; header fragments parked until CONTINUATION completes the block) |
+| `server_on_alpn(~H2, ~H1, l, cert, key)` | Same, but ALPN splits the port: `h2` to the H2 codec, `http/1.1` to `lib/https_http1.bend` (same `IO.spawn` per connection) |
+| `server_on_concurrent_alpn(~H2, ~H1, l, cert, key)` | ALPN split + unbounded interleaved mux |
 | `mux_start(~H, sock)` | One-shot concurrent serve on an established TLS socket (the test entry of the mux) |
-| `echo.body` / `ok(body)` | Echo handler and `200` response helper |
+| `server_on_http1(~H, l, cert, key)` | HTTP/1.1-only server (the module of `lib/https_http1.bend`, ALPN `http/1.1` only) |
 
 Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
 `decode_body` wrap `H2.str_bytes` / `H2.bytes_str`); headers are
@@ -209,19 +211,42 @@ Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
 Fail codes surface unchanged: `400/413/502/503` (codec), `601-605`
 (DNS), `611-616` (TLS).
 
-**Scope:** the client speaks HTTP/2 over verified TLS (ALPN `h2`).
-HPACK decode is full (see `## HTTP/2`): real-world `https://` hosts
-fail closed only on CONTINUATION splits (`400`) or frames > 16384
-(`413`); huffman/dynamic-table peers (node:http2, public sites)
-decode fine. Loopback and Bend↔Bend remain the golden-tested path;
-`examples/https_real.bend` documents the live smoke manually.
+**Contract (2026-09-25, task-020):**
+
+- `server_on` has **no fuel**: one accept loop serves streams until
+  GOAWAY/EOF, the same contract `node:http2` expects.
+- The client offers `h2` **and** `http/1.1` (ALPN mode 2) and speaks
+  whichever the server picks; a peer without ALPN gets HTTP/1.1. The
+  H1 lane lives in `lib/https_http1.bend`, reusing the pure codec of
+  `lib/http.bend` with TLS as the only transport change, and answers
+  byte-faithful (chunked and binary included).
+- The server side splits on ALPN too: `tls_accept` is strict `h2`
+  (legacy contract), `tls_accept_alpn` is dual, `tls_accept_http1` is
+  H1-only.
+- Flow control: the codec announces `INITIAL_WINDOW_SIZE=6 MB` and
+  `MAX_FRAME_SIZE=65535`, replenishes the connection and stream
+  windows on every inbound DATA, and slices uploads into
+  `WINDOW_UPDATE`-paced frames. Bodies are not capped at 64 KB.
+- Header blocks survive `CONTINUATION` in both directions, carry a
+  per-response HPACK dynamic table on the client, and the 64-header
+  fuel cap is gone (`512` fields, `512` HPACK tokens).
+- `RST_STREAM`, `GOAWAY`, `PING` and `WINDOW_UPDATE` are handled as
+  protocol events, not as skips; housekeeping frames are answered with
+  a fresh-only `ACK` (never an ACK-of-an-ACK, which would ping-pong
+  between two unbounded read loops).
+- The frame reader has no read budget: it reads until a whole frame
+  lands, so a peer that splits a frame over many TLS records (public
+  sites deliver ~1.4 KB per record) no longer answers `400 eof`.
 
 ```sh
 bend tests/io/https_fetch.bend        # 1
 bend tests/io/https_streams.bend      # 1
 bend tests/io/https_server_on.bend    # 1
 bend tests/io/https_mux.bend          # 1
-bend examples/https_real.bend         # manual; FAIL 400/413/502 (HPACK subset)
+bend tests/io/https_http1_module.bend # 1
+bend tests/io/tls_alpn_dual.bend      # 1
+bend tests/io/h2_frame_read.bend      # 8
+bend examples/https_real.bend         # manual live smoke
 ```
 
 ## WebSocket
@@ -229,8 +254,11 @@ bend examples/https_real.bend         # manual; FAIL 400/413/502 (HPACK subset)
 `lib/ws.bend` (import as `WS`) is an RFC 6455 server and client:
 handshake, frame codec, text/binary messages, ping/pong/close, masked
 clients and unmasked server frames. The codec is pure; IO rides the
-byte effects above. Fragmented frames (`FIN=false`) are refused with
-`Fail 400`.
+byte effects above. Fragmented messages (`1/2` then `0*` until `FIN=1`)
+are reassembled in both directions; a close payload, a close reason and
+a text payload are validated (see `## WSS` for the close state). Client
+frames are masked with a key drawn from the host entropy pool
+(`IO.random_u32`), never a constant.
 
 Handshake (pure):
 
@@ -261,11 +289,13 @@ IO:
 | `send_msg` / `send_op` / `send` | Send a message / an opcode+payload / a `WSOut` |
 | `recv_msg` / `recv_op` / `recv` | Single-shot raw read (one `recv_bytes`); a read may split or glue frames |
 | `recv_msg_framed` / `recv_op_framed` / `recv_in_framed` | One frame per call, the rest threaded back (`*_client_framed` for the client side) |
-| `serve_once` | Server echo of one connection |
+| `serve_once` | **test-only**: server echo of one connection |
 | `ws_serve` | Server accept loop (unsafe) |
 | `server_on(~H, l)` | Event-driven server: `~H` maps `WSEv` to `IO(WSOut)`, one step per frame |
 | `client_on(~H, host, port, path, key)` | Event-driven client, same `WSEv`/`WSOut` API, sends masked |
-| `client_echo(host, port, path, key, msg)` | Connect, handshake, send, read the echo |
+| `client_echo(host, port, path, key, msg)` | **test-only**: connect, handshake, send, read the echo |
+| `mask_key()` | `IO` draw of a fresh 32-bit masking key (2 × `IO.random_u32`); `show_masked_random` / `client_out_bytes_random` are the IO wrappers |
+| `show_masked(fin, op, payload, k0, k1, k2, k3)` | Masked frame with an explicit key (tests pin a fixed key on purpose) |
 
 ## WSS
 
@@ -278,10 +308,26 @@ not h2); the server accepts with `tls_accept`. Every path closes via
 
 | Function | Description |
 |---|---|
-| `serve_once(sock)` | Single-shot server echo over one TLS socket |
+| `serve_once(sock)` | **test-only**: single-shot server echo over one TLS socket |
 | `server_on(~H, l, cert, key)` | Event-driven server: TLS accept loop, `IO.spawn` per connection, same `~H` as `WS.server_on` |
+| `server_on_sub(~H, l, cert, key, protos)` | Same, negotiating `Sec-WebSocket-Protocol` (selects the first of the client's offer that the server lists) |
 | `client_on(~H, host, port, path, key)` / `client_on_insecure` | Event-driven client over no-ALPN TLS, masked sends |
-| `client_echo(...)` / `client_echo_insecure(...)` | Single-shot connect + handshake + one frame + echo |
+| `client_on_sub(~H, host, port, path, key, protos)` / `client_on_sub_insecure` | Same, offering subprotocols and requiring the echoed one |
+| `client_echo(...)` / `client_echo_insecure(...)` | **test-only**: single-shot connect + handshake + one frame + echo |
+
+`verify` is a `Bool` on every `client_on*` entry, like the rest of the
+API. A failed `tls_accept` hands the listener back instead of aborting
+the accept loop.
+
+**Close state (2026-09-25, task-020):** the close handshake is
+complete. An empty close payload reports `1005` to the application but
+never puts `1005` on the wire (the echo of an empty close used to make
+Node answer `1002`); a 2-byte payload is validated (2 bytes, known
+code, UTF-8 reason, `1005/1006/1015` refused); text frames and close
+reasons are validated as UTF-8, so a peer answers `1007` instead of
+silently accepting replacement characters. Fragments are reassembled
+(`1/2` then `0*` until `FIN=1`) in both directions, and the payload cap
+(`16 MB`) answers `close 1009` instead of a bare TCP close.
 
 Fail codes surface unchanged: WS `400`/`413`, DNS `601-605`, TLS
 `611-616`.
@@ -290,6 +336,9 @@ Fail codes surface unchanged: WS `400`/`413`, DNS `601-605`, TLS
 bend tests/io/wss_loopback.bend    # 111
 bend tests/io/wss_server_on.bend   # 1
 bend tests/io/wss_client_on.bend   # 1111
+bend tests/io/ws_close.bend        # 10
+bend tests/io/ws_fragments.bend    # 9
+bend tests/io/ws_handshake_sub.bend # 12
 ```
 
 ## Helpers
@@ -339,7 +388,8 @@ typechecks the `.bend` files and syntax-checks the `.js` files;
 `http_real.bend` is a manual smoke test of live sites BY NAME (it
 needs a working resolver) and never runs in the gate.
 
-Interop matrix (loopback, test PEMs):
+Interop matrix (loopback, test PEMs; measured 2026-09-22/23 in
+`tasks/task-018`/`task-020` — re-run pending on the CI box):
 
 | Pair | Result |
 |---|---|
@@ -355,8 +405,17 @@ Interop matrix (loopback, test PEMs):
 - `read_*` caps the head at 16 KB; oversize is `Fail 413`.
 - Ports must be 1–65535; hosts reject whitespace, controls and NUL.
 - `fetch` reads at most 8 × 8192 bytes (64 KB cap), then truncates.
+  The HTTPS lane (`lib/https.bend`) has no such cap: it streams with
+  HTTP/2 flow control and a 16 MB WebSocket payload cap.
+- Client WebSocket frames are masked with a key drawn from the host
+  entropy pool (`IO.random_u32` → `getrandom`/`arc4random`, RFC 6455
+  §5.3). `show_masked(fin, op, payload, k0..k3)` stays public for tests
+  that want a fixed key on purpose; no production path uses it.
 - Name hosts resolve via `lib/dns.bend` (fail-closed, `Fail 601`–`605`);
   the resolved IP is transport-only — `Host` keeps the original name.
+- TLS verifies the chain and the hostname (`SSL_set1_host`) and SNIs
+  the original host; there is no custom-CA, client-cert or SNI-override
+  API, only `*_insecure` (`verify=False`) for loopback.
 
 ## Publish
 
@@ -409,6 +468,17 @@ bend tests/io/ws_loopback.bend        # 111
 bend tests/io/ws_msg.bend             # 1111
 bend tests/io/ws_framing.bend         # 13
 bend tests/io/ws_framed.bend          # 4
+bend tests/io/h2_flow.bend            # 11
+bend tests/io/h2_rst.bend             # 13
+bend tests/io/hpack_continuation.bend # 30
+bend tests/io/h2_frame_read.bend      # 8
+bend tests/io/https_http1_module.bend # 1
+bend tests/io/tls_alpn_dual.bend      # 1
+bend tests/io/ws_close.bend           # 10
+bend tests/io/ws_fragments.bend       # 9
+bend tests/io/ws_handshake_sub.bend   # 12
+bend tests/io/ws_mask.bend            # 19
+bend tests/io/wss_client_coalesce.bend # 1
 ```
 
 Each file ends with a `#|` line holding the expected output — that is the
@@ -454,10 +524,17 @@ four arguments.
 - HPACK full (done 2026-09-22, see `tasks/task-019-hpack-huffman-dyntab.md`):
   huffman decode + dynamic table + table-size updates; interop HTTPS
   bidirecional PASS; saturation 20/20 per lane (interp ~16.3s / C
-  ~2.2s for 40 exchanges — see `tasks/task-020-perf.md`).
-- HTTP/2 backlog: interleaved multiplexing (sequential + 2-slot mux
-  today), CONTINUATION, h2c (cleartext). Live smoke already fails
-  closed on CONTINUATION splits (`400 hpack eof*`) and frames
-  > 16384 (`413`).
+  ~2.2s for 40 exchanges — see `tasks/task-023-perf.md`).
+- HTTP/2 done (task-020, 2026-09-25): unbounded-slot interleaved mux,
+  CONTINUATION, flow control with `WINDOW_UPDATE` (connection and
+  stream), `MAX_FRAME_SIZE=65535`, `RST_STREAM`/`GOAWAY`/`PING` as
+  protocol events, HPACK dynamic table on the client, ALPN HTTP/1.1
+  fallback on the same port. Still out: h2c (cleartext), server push,
+  HPACK Huffman *encode* (literal-only is valid), `PRIORITY`.
+- Open: the client HPACK dynamic table is per response, so a
+  keep-alive connection does not reuse entries across responses;
+  trailers and 1xx informational responses are not surfaced; there is
+  no idle timeout on `keep-alive`.
 - IPv6 (AAAA) resolution and connect: `dns.bend` answers A only.
 - Cluster run of the suite (`--gate`) and a first hub `--publish`.
+- Performance (task-023, DEFERRED): runs after the remaining tasks.

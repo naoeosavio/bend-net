@@ -57,10 +57,15 @@ def unwrap(r):
       bs
 
 law pong_ping:
-  List<&2, U32>
+  IO(List<&2, U32>)
 
+# Two masked frames in one OutRaw; the masking key comes from the host
+# entropy pool (RFC 6455 section 5.3), so this is an IO step.
 def pong_ping():
-  List.append(&2, U32, unwrap(WS.client_out_bytes(WS.out_pong([115, 49]))), unwrap(WS.client_out_bytes(WS.OutOp{WS.op_ping(), [99, 49]})))
+  do IO<List<&2, U32>>:
+    a : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.client_out_bytes_random(WS.out_pong([115, 49]))
+    b : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.client_out_bytes_random(WS.OutOp{WS.op_ping(), [99, 49]})
+    return List.append(&2, U32, unwrap(a), unwrap(b))
 
 law cl.hs:
   IO(WS.WSOut)
@@ -111,8 +116,9 @@ def cl.ping1(s1, s2, pp):
   match s1:
     case 1:
       do IO<WS.WSOut>:
+        pp2 : List<&2, U32> <- pong_ping()
         w : Unit <- IO.print("OK PONG_S1")
-        return WS.OutRaw{pong_ping()}
+        return WS.OutRaw{pp2}
     case _:
       cl.pong2(s2, pp)
 
