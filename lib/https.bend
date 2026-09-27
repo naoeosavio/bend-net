@@ -529,15 +529,6 @@ def mux.some_of(st: H2.H2SrvSt) -> Bool:
         case Some{rh}:
           True{}
 
-def mux.rh_of(st: H2.H2SrvSt) -> H2.H2ReqHead:
-  match st:
-    case H2.H2SrvSt{head, body, sid, hp}:
-      match head:
-        case None{}:
-          H2.H2ReqHead{"", "", Nil{}}
-        case Some{+rh}:
-          rh
-
 def mux.body_of(st: H2.H2SrvSt) -> List<&2, U32>:
   match st:
     case H2.H2SrvSt{head, +body, sid, hp}:
@@ -547,6 +538,21 @@ def mux.req_of(+rh: H2.H2ReqHead, +body: List<&2, U32>) -> H2.H2Request:
   match rh:
     case H2.H2ReqHead{+method, +path, +headers}:
       H2.H2Request{method, path, headers, body}
+
+# Phase 2 (task-021): request straight from the slot, no +rh/+body.
+# One match on the slot (param, allowed); the head None case answers the
+# empty head, exactly what slot_rh + req_of did. Thin projection style
+# like h2_reqhead.rh/ok/tab: the caller holds one reusable Taken bind.
+def mux.req_of_st(st: H2.H2SrvSt, +payload: List<&2, U32>) -> H2.H2Request:
+  match st:
+    case H2.H2SrvSt{head, +body, +sid, hp}:
+      match head:
+        case None{}:
+          H2.H2Request{"", "", Nil{}, List.append(&2, U32, body, payload)}
+        case Some{+rh}:
+          match rh:
+            case H2.H2ReqHead{+method, +path, +headers}:
+              H2.H2Request{method, path, headers, List.append(&2, U32, body, payload)}
 
 def mux.decide5(ha: Bool, sa: Bool, hb: Bool, sb: Bool, +end: U32) -> U32:
   match ha sa hb sb end:
@@ -568,8 +574,17 @@ def mux.decide5(ha: Bool, sa: Bool, hb: Bool, sb: Bool, +end: U32) -> U32:
       4
 
 # Unbounded-slot leaves (Phase 5): pure helpers over List<H2SrvSt>
-# reusing mux.sid_of/some_of/rh_of/body_of and H2.hp_empty. The single
+# reusing mux.sid_of/some_of/body_of and H2.hp_empty. The single
 # @unsafe mux below is the only loop (helpers never call back into it).
+
+# Phase 2 (task-021): single-traversal take. A top-level A & B pair is not
+# Data and cannot be reused with +, so the take travels in a Data wrapper
+# (proven in /tmp/opencode/t2/taken.bend). One traversal O(S) always (args
+# are strict, so the tail recursion runs even on early match) replaces
+# three (slot_body + slot_rh + del). Callee above caller; match scrutinees
+# are params or pattern-bound vars; self-recursion only.
+type MuxTaken is Data:
+  MuxTaken{slots: List<&2, H2.H2SrvSt>, st: H2.H2SrvSt}
 
 def muxn.no_slots() -> List<&2, H2.H2SrvSt>:
   Nil{}
@@ -612,14 +627,64 @@ def muxn.del(slots: List<&2, H2.H2SrvSt>, +sid: U32) -> List<&2, H2.H2SrvSt>:
     case +st <> t:
       muxn.del_go(U32.is_eq(mux.sid_of(st), sid), st, muxn.del(t, sid))
 
+# Phase 2 take: find and remove in one traversal. take_go is the combiner
+# (no recursion); take_del is self-recursive only. On True the tail take
+# already ran (strict arg) and found nothing (sids are unique via put), so
+# its rest is the original tail: (rest, st) is correct. 1x O(S) always.
+def muxn.take_go(eq: Bool, +st: H2.H2SrvSt, p: MuxTaken) -> MuxTaken:
+  match eq:
+    case True{}:
+      match p:
+        case MuxTaken{+slots, st2}:
+          MuxTaken{slots, st}
+    case False{}:
+      match p:
+        case MuxTaken{+slots2, +found2}:
+          MuxTaken{(st <> slots2), found2}
+
+def muxn.take_del(slots: List<&2, H2.H2SrvSt>, +sid: U32) -> MuxTaken:
+  match slots:
+    case Nil{}:
+      MuxTaken{Nil{}, H2.H2SrvSt{None{}, Nil{}, 0, H2.hp_empty()}}
+    case +st <> t:
+      muxn.take_go(U32.is_eq(mux.sid_of(st), sid), st, muxn.take_del(t, sid))
+
+# Thin projections over one reusable Taken bind, like h2_reqhead.rh/ok/tab.
+def muxn.taken_slots(p: MuxTaken) -> List<&2, H2.H2SrvSt>:
+  match p:
+    case MuxTaken{+slots, st}:
+      slots
+
+def muxn.taken_st(p: MuxTaken) -> H2.H2SrvSt:
+  match p:
+    case MuxTaken{slots, +st}:
+      st
+
+# DATA continue: keep the slot with the appended body. Mirrors the old
+# put(St{Some{slot_rh}, append(slot_body), sid2}): rh from the head (empty
+# when None), hp reset to empty, sid preserved (equals sid2 when found).
+def muxn.data_cont_slots(p: MuxTaken, +payload: List<&2, U32>) -> List<&2, H2.H2SrvSt>:
+  match p:
+    case MuxTaken{+rest, st}:
+      match st:
+        case H2.H2SrvSt{head, +body, +sid, hp}:
+          match head:
+            case None{}:
+              ((H2.H2SrvSt{Some{H2.H2ReqHead{"", "", Nil{}}}, List.append(&2, U32, body, payload), sid, H2.hp_empty()} <> rest))
+            case Some{+rh}:
+              ((H2.H2SrvSt{Some{rh}, List.append(&2, U32, body, payload), sid, H2.hp_empty()} <> rest))
+
+# CONTINUATION fragment: head stays None, body grows. Mirrors the old
+# put(St{None{}, append(slot_body), sid2}).
+def muxn.frag_cont_slots(p: MuxTaken, +payload: List<&2, U32>) -> List<&2, H2.H2SrvSt>:
+  match p:
+    case MuxTaken{+rest, st}:
+      match st:
+        case H2.H2SrvSt{head, +body, +sid, hp}:
+          ((H2.H2SrvSt{None{}, List.append(&2, U32, body, payload), sid, H2.hp_empty()} <> rest))
+
 def muxn.put(slots: List<&2, H2.H2SrvSt>, +st: H2.H2SrvSt) -> List<&2, H2.H2SrvSt>:
   st <> muxn.del(slots, mux.sid_of(st))
-
-def muxn.slot_rh(+slots: List<&2, H2.H2SrvSt>, +sid: U32) -> H2.H2ReqHead:
-  mux.rh_of(muxn.get(slots, sid))
-
-def muxn.slot_body(+slots: List<&2, H2.H2SrvSt>, +sid: U32) -> List<&2, U32>:
-  mux.body_of(muxn.get(slots, sid))
 
 def muxn.fhas(fends: List<&2, U32>, +sid: U32) -> Bool:
   match fends:
@@ -811,15 +876,14 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       (sm, gm) = got
       match act:
         case 0:
-          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{Some{muxn.slot_rh(slots, sid2)}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.data_cont_slots(muxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           do IO<Unit>:
-            +oldb : List<&2, U32> = muxn.slot_body(slots, sid2)
-            +b1 : List<&2, U32> = List.append(&2, U32, oldb, payload)
-            req : H2.H2Request = mux.req_of(muxn.slot_rh(slots, sid2), b1)
+            +tp : MuxTaken = muxn.take_del(slots, sid2)
+            req : H2.H2Request = mux.req_of_st(muxn.taken_st(tp), payload)
             resp : H2.H2Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_srv.send_resp(sm, sid2, resp)
-            mux(~H, 0, mux.sent(sent), muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+            mux(~H, 0, mux.sent(sent), muxn.taken_slots(tp), muxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 4:
           mux.close_got(got)
         case _:
@@ -828,11 +892,13 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       (s6, g6) = got
       match act:
         case 0:
-          mux(~H, 0, got, muxn.put(slots, H2.H2SrvSt{None{}, List.append(&2, U32, muxn.slot_body(slots, sid2), payload), sid2, H2.hp_empty()}), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
+          mux(~H, 0, got, muxn.frag_cont_slots(muxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
-          +full : List<&2, U32> = List.append(&2, U32, muxn.slot_body(slots, sid2), payload)
+          +tp2 : MuxTaken = muxn.take_del(slots, sid2)
+          +full : List<&2, U32> = List.append(&2, U32, mux.body_of(muxn.taken_st(tp2)), payload)
           +pr6 : Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn> = H2.h2_reqhead.decode(full, tab)
-          mux(~H, 4, got, muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, typ, flags, sid2, Nil{}, cls, muxn.fend_flag(fends, sid2), H2.h2_reqhead.rh(pr6), muxn.head_act(0, H2.h2_reqhead.ok(pr6), muxn.fend_flag(fends, sid2)), H2.h2_reqhead.tab(pr6))
+          +ff : U32 = muxn.fend_flag(fends, sid2)
+          mux(~H, 4, got, muxn.taken_slots(tp2), muxn.fdel(fends, sid2), buf, typ, flags, sid2, Nil{}, cls, ff, H2.h2_reqhead.rh(pr6), muxn.head_act(0, H2.h2_reqhead.ok(pr6), ff), H2.h2_reqhead.tab(pr6))
         case _:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_goaway(s6, 0, 1)
