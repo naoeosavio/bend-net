@@ -40,14 +40,14 @@ def is_fail_str(r):
       0
 
 law req_ok:
-  for r: Result<&1, &1, U32 & String, H2.H2ReqHead>
+  for r: Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn>
   U32
 
 def req_ok(r):
   match r:
     case Fail{e}:
       0
-    case Done{rh}:
+    case Done{(rh, tab)}:
       match rh:
         case H2.H2ReqHead{+method, +path, +headers}:
           b2u(Bool.and(String.eq(method, "GET"), String.eq(path, "/")))
@@ -72,7 +72,7 @@ def main():
   +a = str_ok(H2.hpack_str.dec.go([140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255]), "www.example.com")
   +b = str_ok(H2.hpack_str.dec.go([130, 100, 2]), "302")
   +c = str_ok(H2.hpack_str.dec.go([3, 97, 98, 99]), "abc")
-  +d = req_ok(H2.h2_reqhead.of(H2.h2_reqhead.decode([130, 134, 132, 65, 140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255], H2.hp_empty())))
+  +d = req_ok(H2.h2_reqhead.decode([130, 134, 132, 65, 140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255], H2.hp_empty()))
   +e = head_ok(H2.h2_head.of(H2.h2_head.decode([72, 130, 100, 2], H2.hp_empty())))
   +f1 = is_fail_str(H2.hpack_str.dec.go([129, 255]))
   +f2 = is_fail_str(H2.hpack_str.dec.go([129, 0]))

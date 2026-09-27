@@ -503,20 +503,6 @@ def mux.ack_ping(got: Socket & H2.H2Got, +payload: List<&2, U32>) -> IO(Socket &
 # 5 head decode fail. DATA codes: 0 continue A, 1 answer A, 2 continue
 # B, 3 answer B, 4 stray skip, 5 DATA-before-HEADERS A, 6 same B.
 
-def mux.ok_of(r: Result<&1, &1, U32 & String, H2.H2ReqHead>) -> Bool:
-  match r:
-    case Fail{e}:
-      False{}
-    case Done{rh}:
-      True{}
-
-def mux.rh_or(r: Result<&1, &1, U32 & String, H2.H2ReqHead>) -> H2.H2ReqHead:
-  match r:
-    case Fail{e}:
-      H2.H2ReqHead{"", "", Nil{}}
-    case Done{+rh}:
-      rh
-
 def mux.decide4(ok: Bool, a: Bool, b: Bool, +end: U32) -> U32:
   match ok a b end:
     case False{} _ _ _:
@@ -799,8 +785,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
       match typ:
         case 1:
           +pr : Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn> = H2.h2_reqhead.decode(payload, tab)
-          +dec : Result<&1, &1, U32 & String, H2.H2ReqHead> = H2.h2_reqhead.of(pr)
-          mux(~H, 4, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, mux.rh_or(dec), muxn.head_act(muxn.need_u(typ, flags), mux.ok_of(dec), end), H2.h2_reqhead.tab_of(pr))
+          mux(~H, 4, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, H2.h2_reqhead.rh(pr), muxn.head_act(muxn.need_u(typ, flags), H2.h2_reqhead.ok(pr), end), H2.h2_reqhead.tab(pr))
         case 0:
           mux(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, H2.H2ReqHead{"", "", Nil{}}, muxn.decide_data(muxn.has(slots, sid2), end), tab)
         case _:
@@ -847,8 +832,7 @@ def mux(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, got: Socket & H2.H2Go
         case 1:
           +full : List<&2, U32> = List.append(&2, U32, muxn.slot_body(slots, sid2), payload)
           +pr6 : Result<&1, &1, U32 & String, H2.H2ReqHead & H2.HpDyn> = H2.h2_reqhead.decode(full, tab)
-          +dec6 : Result<&1, &1, U32 & String, H2.H2ReqHead> = H2.h2_reqhead.of(pr6)
-          mux(~H, 4, got, muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, typ, flags, sid2, Nil{}, cls, muxn.fend_flag(fends, sid2), mux.rh_or(dec6), muxn.head_act(0, mux.ok_of(dec6), muxn.fend_flag(fends, sid2)), H2.h2_reqhead.tab_of(pr6))
+          mux(~H, 4, got, muxn.del(slots, sid2), muxn.fdel(fends, sid2), buf, typ, flags, sid2, Nil{}, cls, muxn.fend_flag(fends, sid2), H2.h2_reqhead.rh(pr6), muxn.head_act(0, H2.h2_reqhead.ok(pr6), muxn.fend_flag(fends, sid2)), H2.h2_reqhead.tab(pr6))
         case _:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_goaway(s6, 0, 1)

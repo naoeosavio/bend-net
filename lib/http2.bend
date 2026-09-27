@@ -1791,15 +1791,32 @@ def h2_reqhead.decode(+bs: List<&2, U32>, +tab: HpDyn) ->
   Result<&1, &1, U32 & String, H2ReqHead & HpDyn>:
   h2_reqhead.go(512n, 0, bs, Fail{(0, "")}, "", "", H2ReqHead{"", "", Nil{}}, tab)
 
-def h2_reqhead.of(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
-  Result<&1, &1, U32 & String, H2ReqHead>:
+# The three projections the mux asks of one decode result: the head to
+# park in the slot, whether the decode succeeded, and the table the
+# decode left behind to keep encoding on the same connection. Three
+# thin projections on one reusable bind, not a single got handing back
+# (head, ok, table): the mux spends the three in the argument list of a
+# recursive call, and Bend only lets a def parameter be destructured, so
+# a returned pair or triple has nowhere to be unpacked there. A Fail
+# answers the empty head, False{} and the empty table -- the code was
+# never carried past this point, and an empty head cannot stand in for
+# "no header block": the decoder returns that same value for one.
+def h2_reqhead.rh(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) ->
+  H2ReqHead:
   match r:
     case Fail{e}:
-      Fail{e}
+      H2ReqHead{"", "", Nil{}}
     case Done{(h, t)}:
-      Done{h}
+      h
 
-def h2_reqhead.tab_of(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) -> HpDyn:
+def h2_reqhead.ok(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) -> Bool:
+  match r:
+    case Fail{e}:
+      False{}
+    case Done{(h, t)}:
+      True{}
+
+def h2_reqhead.tab(r: Result<&1, &1, U32 & String, H2ReqHead & HpDyn>) -> HpDyn:
   match r:
     case Fail{e}:
       hp_empty()
