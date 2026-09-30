@@ -181,12 +181,17 @@ def srv_send_after(got: Socket & H2.H2Got) -> IO(String):
     case H2.H2GotErr{code, msg}:
       IO.pure(String, "down")
 
+# Three client frames is the whole request: the connection preface and the
+# client's SETTINGS go out in h2_connect, then h2_request sends HEADERS and
+# always one DATA (empty, END_STREAM, when the body is empty -- RFC 9113
+# 6.2/6.3 does not ask for anything else). The peer used to read FOUR and so
+# blocked forever on a frame the client never sends, which is why this golden
+# never ran: it predates the reader rewrite it documents.
 def srv_frames(g0: Socket & H2.H2Got) -> IO(String):
   do IO<String>:
     g1 : Socket & H2.H2Got <- srv_next(g0)
     g2 : Socket & H2.H2Got <- srv_next(g1)
-    g3 : Socket & H2.H2Got <- srv_next(g2)
-    srv_send_after(g3)
+    srv_send_after(g2)
 
 def canned_magic(sock: Socket, +chunk: List<&2, U32>, +magic: U32) -> IO(String):
   match magic:
