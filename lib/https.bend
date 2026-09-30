@@ -920,7 +920,7 @@ def mux_pre(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, rs: Socket & Resu
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          mux_pre(~H, 1, (s0, Done{chunk}), acc2, H2.h2_srv.preface_ok(acc2), Nat.is_lt(H2.b_len(acc2), 24n))
+          mux_pre(~H, 1, (s0, Done{chunk}), acc2, H2.h2_srv.preface_ok(acc2), U32.is_lt(H2.b_len32(acc2), 24))
     case 1:
       (s1, r1) = rs
       match short:
@@ -936,7 +936,7 @@ def mux_pre(~H: H2.H2Request -> IO(H2.H2Response), phase: U32, rs: Socket & Resu
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_settings(), 0, 0, H2.h2_settings_initial_pay())
-            mux(~H, 0, mux.sent(sent), muxn.no_slots(), muxn.no_fends(), H2.b_drop(24n, acc), 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, H2.hp_empty())
+            mux(~H, 0, mux.sent(sent), muxn.no_slots(), muxn.no_fends(), H2.b_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, H2.H2ReqHead{"", "", Nil{}}, 4, H2.hp_empty())
         case _:
           TLS.tls_close(s2)
     case _:

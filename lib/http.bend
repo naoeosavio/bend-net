@@ -558,8 +558,139 @@ def from_string(s: String) -> U32 & List<&2, U32>:
   +bs = encode(s)
   (body_length(bs), bs)
 
+
+# U32-counted String ops (Phase 10.1): String.length/take/drop return and take
+# Nat in Base, so every cap check and every body cut paid a to_nat/from_nat at
+# the call site. These walk with U32 instead. Structural form: the String is
+# the first pattern-bound part and the U32 counter is only a guard inside the
+# arm, which is the shape the termination checker accepts (Phase 10.2).
+
+def str_len32.go(+s: String, +acc: U32) -> U32:
+  match s:
+    case SNil{}:
+      acc
+    case SCon{h, t}:
+      str_len32.go(t, (acc + 1 : U32))
+
+def str_len32(s: String) -> U32:
+  str_len32.go(s, 0)
+
+def str_drop32.go(+s: String, +n: U32) -> String:
+  match s:
+    case SNil{}:
+      SNil{}
+    case SCon{h, t}:
+      match n:
+        case 0:
+          SCon{h, t}
+        case _:
+          str_drop32.go(t, (n - 1 : U32))
+
+def str_drop32(s: String, n: U32) -> String:
+  str_drop32.go(s, n)
+
+def str_take32.go(+s: String, +n: U32) -> String:
+  match s:
+    case SNil{}:
+      SNil{}
+    case SCon{h, t}:
+      match n:
+        case 0:
+          SNil{}
+        case _:
+          SCon{h, str_take32.go(t, (n - 1 : U32))}
+
+def str_take32(s: String, n: U32) -> String:
+  str_take32.go(s, n)
+
+# Stack-safe bytes->String (Phase 11.1).
+# `decode` above is the total UTF-8 decoder and it is linear-recursive: every
+# byte costs one interpreter frame, so a body over ~24 KB dies with "machine
+# stack overflow" (measured on this box -- 16 KB passes, 24 KB does not; the
+# same shape in lib/httpx.bend is chunked for exactly this reason and survives
+# 4 MB). The fix is the HTTPX one -- cut the byte list into pieces, decode each
+# with bounded depth, then String.concat -- except that the cut has to land on
+# a UTF-8 SEQUENCE BOUNDARY, not every N bytes: a cut in the middle of a
+# multi-byte character would turn one Char into two U+FFFD, so `decode_all`
+# would stop agreeing with `decode` on non-ASCII bodies.
+#
+# A byte in 128..191 is a continuation, so a cut may never land right before
+# one: `decode.is_cont` decides that and the piece simply grows past the
+# nominal size until the boundary. Same bytes out, same Chars out, and each
+# `decode` call is now bounded by the piece instead of by the whole body.
+#
+# The `cut` flag rides as a plain Bool ARGUMENT (not a scrutinee): the checker
+# reads the self-call arguments left to right and needs the byte list to be the
+# one that shrinks, so it has to stay in first position.
+
+def decode_chunk() -> U32:
+  8192
+
+# True when the head byte of `bs` may be cut in front of: the list is over, or
+# the head starts a new character. `decode.is_cont` above (the same predicate
+# the decoder itself uses to recognise a continuation byte) is reused here
+# rather than re-implemented.
+def decode.starts_seq.at(+b: U32) -> Bool:
+  Bool.not(decode.is_cont(b))
+
+def decode.starts_seq(+bs: List<&2, U32>) -> Bool:
+  match bs:
+    case Nil{}:
+      False{}
+    case b <> t:
+      decode.starts_seq.at(b)
+
+def decode.pieces.put(acc: List<&2, List<&2, U32>>, ch: List<&2, U32>) -> List<&2, List<&2, U32>>:
+  match ch:
+    case Nil{}:
+      acc
+    case _:
+      List.reverse(&2, U32, ch) <> acc
+
+def decode.pieces.go(+bs: List<&2, U32>, cut: Bool, +n: U32, acc: List<&2, List<&2, U32>>, +ch: List<&2, U32>) ->
+  List<&2, List<&2, U32>>:
+  match bs:
+    case Nil{}:
+      decode.pieces.put(acc, ch)
+    case b <> rest:
+      match cut:
+        case True{}:
+          match n:
+            case 0:
+              decode.pieces.go(rest, decode.starts_seq(rest), (decode_chunk() - 1 : U32), decode.pieces.put(acc, ch), [b])
+            case _:
+              decode.pieces.go(rest, decode.starts_seq(rest), (n - 1 : U32), acc, b <> ch)
+        case False{}:
+          decode.pieces.go(rest, decode.starts_seq(rest), (decode_chunk() - 1 : U32), acc, b <> ch)
+
+def decode.pieces.at(bs: List<&2, U32>, cut: Bool) -> List<&2, List<&2, U32>>:
+  decode.pieces.go(bs, cut, decode_chunk(), Nil{}, Nil{})
+
+def decode.pieces(+bs: List<&2, U32>) -> List<&2, List<&2, U32>>:
+  decode.pieces.at(bs, decode.starts_seq(bs))
+
+def decode.strings.go(+ps: List<&2, List<&2, U32>>, acc: List<&2, String>) -> List<&2, String>:
+  match ps:
+    case Nil{}:
+      acc
+    case h <> t:
+      decode.strings.go(t, decode(h) <> acc)
+
+def decode.strings(+ps: List<&2, List<&2, U32>>) -> List<&2, String>:
+  decode.strings.go(ps, Nil{})
+
+# String.concat walks its argument list with String.append, which walks its
+# LEFT argument, so the frame count is O(total chars) no matter how the
+# list is built -- a fold with a String accumulator is the same depth. The
+# residual limit is therefore the interpreter stack against the finished
+# body, not the decoder: measured on this box, decode_all handles ~46 KB
+# where plain decode died at ~16 KB (Discovery 20).
+def decode_all(bs: List<&2, U32>) -> String:
+  String.concat(List.reverse(&2, String, decode.strings(decode.pieces(bs))))
+
+
 def to_string(bs: List<&2, U32>) -> String:
-  decode(bs)
+  decode_all(bs)
 
 # Small string helpers (reuse Base String.* everywhere else)
 
@@ -824,7 +955,7 @@ def read_url.http(url: String, is_http: Bool) ->
   Result<&1, &1, U32 & String, Bool & String & U32 & String>:
   match is_http:
     case True{}:
-      read_url.rest(String.drop(url, 7n), False{})
+      read_url.rest(str_drop32(url, 7), False{})
     case False{}:
       Fail{(400, "bad scheme")}
 
@@ -832,7 +963,7 @@ def read_url.scheme(url: String, is_https: Bool, is_http: Bool) ->
   Result<&1, &1, U32 & String, Bool & String & U32 & String>:
   match is_https:
     case True{}:
-      read_url.rest(String.drop(url, 8n), True{})
+      read_url.rest(str_drop32(url, 8), True{})
     case False{}:
       read_url.http(url, is_http)
 
@@ -975,7 +1106,7 @@ def content_length(hs: List<&1, String & String>) -> U32:
   Maybe.default(&2, U32, U32.read(get_header("0", "Content-Length", hs)), 0)
 
 def body_len.show(body: String) -> String:
-  Nat.show(String.length(body))
+  U32.show(str_len32(body))
 
 # Requests and responses
 # ----------------------
@@ -1135,7 +1266,7 @@ def read_request.capped(+s: String, ok: Bool) ->
       read_request.blank(s, has_blank(s))
 
 def read_request(+s: String) -> Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.capped(s, Nat.is_le(String.length(s), 16384n))
+  read_request.capped(s, U32.is_le(str_len32(s), 16384))
 
 def reason(st: U32) -> String:
   match st:
@@ -1286,7 +1417,7 @@ def read_response.capped(+s: String, ok: Bool) ->
       read_response.blank(s, has_blank(s))
 
 def read_response(+s: String) -> Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  read_response.capped(s, Nat.is_le(String.length(s), 16384n))
+  read_response.capped(s, U32.is_le(str_len32(s), 16384))
 
 def read_head.emit(is11: Bool, m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
   Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
@@ -1378,7 +1509,7 @@ def read_head.capped(+s: String, ok: Bool) ->
 
 def read_head(+s: String) ->
   Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.capped(s, Nat.is_le(String.length(s), 16384n))
+  read_head.capped(s, U32.is_le(str_len32(s), 16384))
 
 # Keep-alive
 # ----------
@@ -1423,20 +1554,28 @@ def with_connection(keep: Bool, resp: U32 & List<&1, String & String> & String) 
 
 # Chunked
 # -------
-# One state machine over Nat fuel: 0 reads a hex size, 1 skips
-# extensions, 2 reads data, 3 and 4 eat the data CRLF, 5 and 6 eat
-# the final CRLF. Every arm holds one recursive call, so it is
-# linear; validity ANDs through and gates the answer at the end.
-
-def length_nat.go(bs: List<&2, U32>, acc: Nat) -> Nat:
-  match bs:
-    case Nil{}:
-      acc
-    case h <> t:
-      length_nat.go(t, 1n+acc)
+# One state machine: 0 reads a hex size, 1 skips extensions, 2 reads
+# data, 3 and 4 eat the data CRLF, 5 and 6 eat the final CRLF. Every
+# arm holds one recursive call, so it is linear; validity ANDs through
+# and gates the answer at the end.
+#
+# Phase 10.1: `rem` (the bytes still owed by the chunk being read) is
+# U32 now, so the two `U32.to_nat(size)` bridges are gone. The Nat
+# `fuel` stays, and it is NOT the same situation as httpx's H1-lane
+# fuel: this def dispatches on `st` before it can look at the bytes,
+# and the checker reads self-call arguments left to right, so the
+# argument that shrinks must come first -- and the byte list cannot be
+# matched until `st` has been matched, or the state dispatch stops
+# working (Discovery 19). Defueling would mean inlining states 3 and 4
+# into state 2, which is a rewrite of the whole machine for no measured
+# gain, so the fuel stays and the file is at the HTTPX level.
+#
+# `length_nat` is now a shell over `body_length`: the file used to walk
+# every byte list twice, once per numeric type. The Nat signature stays
+# because lib/https_http1.bend calls it and is out of this phase's scope.
 
 def length_nat(bs: List<&2, U32>) -> Nat:
-  length_nat.go(bs, 0n)
+  U32.to_nat(body_length(bs))
 
 def unchunk.put(r: List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   (acc, ok) = r
@@ -1446,7 +1585,7 @@ def unchunk.put(r: List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, List<&2
     case False{}:
       Fail{(400, "bad chunked")}
 
-def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, valid: Bool, bs: List<&2, U32>) ->
+def unchunk.go(fuel: Nat, st: U32, rem: U32, size: U32, acc: List<&2, U32>, valid: Bool, bs: List<&2, U32>) ->
   List<&2, U32> & Bool:
   match fuel:
     case 0n:
@@ -1460,59 +1599,59 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
             case b <> rest:
               match b:
                 case 48:
-                  unchunk.go(f, 0, 0n, 0, acc, valid, rest)
+                  unchunk.go(f, 0, 0, 0, acc, valid, rest)
                 case 49:
-                  unchunk.go(f, 7, 0n, 1, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 1, acc, valid, rest)
                 case 50:
-                  unchunk.go(f, 7, 0n, 2, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 2, acc, valid, rest)
                 case 51:
-                  unchunk.go(f, 7, 0n, 3, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 3, acc, valid, rest)
                 case 52:
-                  unchunk.go(f, 7, 0n, 4, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 4, acc, valid, rest)
                 case 53:
-                  unchunk.go(f, 7, 0n, 5, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 5, acc, valid, rest)
                 case 54:
-                  unchunk.go(f, 7, 0n, 6, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 6, acc, valid, rest)
                 case 55:
-                  unchunk.go(f, 7, 0n, 7, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 7, acc, valid, rest)
                 case 56:
-                  unchunk.go(f, 7, 0n, 8, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 8, acc, valid, rest)
                 case 57:
-                  unchunk.go(f, 7, 0n, 9, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 9, acc, valid, rest)
                 case 65:
-                  unchunk.go(f, 7, 0n, 10, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 10, acc, valid, rest)
                 case 66:
-                  unchunk.go(f, 7, 0n, 11, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 11, acc, valid, rest)
                 case 67:
-                  unchunk.go(f, 7, 0n, 12, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 12, acc, valid, rest)
                 case 68:
-                  unchunk.go(f, 7, 0n, 13, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 13, acc, valid, rest)
                 case 69:
-                  unchunk.go(f, 7, 0n, 14, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 14, acc, valid, rest)
                 case 70:
-                  unchunk.go(f, 7, 0n, 15, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 15, acc, valid, rest)
                 case 97:
-                  unchunk.go(f, 7, 0n, 10, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 10, acc, valid, rest)
                 case 98:
-                  unchunk.go(f, 7, 0n, 11, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 11, acc, valid, rest)
                 case 99:
-                  unchunk.go(f, 7, 0n, 12, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 12, acc, valid, rest)
                 case 100:
-                  unchunk.go(f, 7, 0n, 13, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 13, acc, valid, rest)
                 case 101:
-                  unchunk.go(f, 7, 0n, 14, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 14, acc, valid, rest)
                 case 102:
-                  unchunk.go(f, 7, 0n, 15, acc, valid, rest)
+                  unchunk.go(f, 7, 0, 15, acc, valid, rest)
                 case 59:
-                  unchunk.go(f, 1, 0n, 0, acc, valid, rest)
+                  unchunk.go(f, 1, 0, 0, acc, valid, rest)
                 case 13:
                   match rest:
                     case 10 <> rest2:
-                      unchunk.go(f, 5, 0n, 0, acc, valid, rest2)
+                      unchunk.go(f, 5, 0, 0, acc, valid, rest2)
                     case _:
                       (acc, False{})
                 case _:
-                  unchunk.go(f, 0, 0n, 0, acc, False{}, rest)
+                  unchunk.go(f, 0, 0, 0, acc, False{}, rest)
         case 7:
           match bs:
             case Nil{}:
@@ -1520,59 +1659,59 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
             case b <> rest:
               match b:
                 case 48:
-                  unchunk.go(f, 7, 0n, (size * 16 + 0 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 0 : U32), acc, valid, rest)
                 case 49:
-                  unchunk.go(f, 7, 0n, (size * 16 + 1 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 1 : U32), acc, valid, rest)
                 case 50:
-                  unchunk.go(f, 7, 0n, (size * 16 + 2 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 2 : U32), acc, valid, rest)
                 case 51:
-                  unchunk.go(f, 7, 0n, (size * 16 + 3 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 3 : U32), acc, valid, rest)
                 case 52:
-                  unchunk.go(f, 7, 0n, (size * 16 + 4 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 4 : U32), acc, valid, rest)
                 case 53:
-                  unchunk.go(f, 7, 0n, (size * 16 + 5 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 5 : U32), acc, valid, rest)
                 case 54:
-                  unchunk.go(f, 7, 0n, (size * 16 + 6 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 6 : U32), acc, valid, rest)
                 case 55:
-                  unchunk.go(f, 7, 0n, (size * 16 + 7 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 7 : U32), acc, valid, rest)
                 case 56:
-                  unchunk.go(f, 7, 0n, (size * 16 + 8 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 8 : U32), acc, valid, rest)
                 case 57:
-                  unchunk.go(f, 7, 0n, (size * 16 + 9 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 9 : U32), acc, valid, rest)
                 case 65:
-                  unchunk.go(f, 7, 0n, (size * 16 + 10 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 10 : U32), acc, valid, rest)
                 case 66:
-                  unchunk.go(f, 7, 0n, (size * 16 + 11 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 11 : U32), acc, valid, rest)
                 case 67:
-                  unchunk.go(f, 7, 0n, (size * 16 + 12 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 12 : U32), acc, valid, rest)
                 case 68:
-                  unchunk.go(f, 7, 0n, (size * 16 + 13 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 13 : U32), acc, valid, rest)
                 case 69:
-                  unchunk.go(f, 7, 0n, (size * 16 + 14 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 14 : U32), acc, valid, rest)
                 case 70:
-                  unchunk.go(f, 7, 0n, (size * 16 + 15 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 15 : U32), acc, valid, rest)
                 case 97:
-                  unchunk.go(f, 7, 0n, (size * 16 + 10 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 10 : U32), acc, valid, rest)
                 case 98:
-                  unchunk.go(f, 7, 0n, (size * 16 + 11 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 11 : U32), acc, valid, rest)
                 case 99:
-                  unchunk.go(f, 7, 0n, (size * 16 + 12 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 12 : U32), acc, valid, rest)
                 case 100:
-                  unchunk.go(f, 7, 0n, (size * 16 + 13 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 13 : U32), acc, valid, rest)
                 case 101:
-                  unchunk.go(f, 7, 0n, (size * 16 + 14 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 14 : U32), acc, valid, rest)
                 case 102:
-                  unchunk.go(f, 7, 0n, (size * 16 + 15 : U32), acc, valid, rest)
+                  unchunk.go(f, 7, 0, (size * 16 + 15 : U32), acc, valid, rest)
                 case 59:
-                  unchunk.go(f, 1, 0n, size, acc, valid, rest)
+                  unchunk.go(f, 1, 0, size, acc, valid, rest)
                 case 13:
                   match rest:
                     case 10 <> rest2:
-                      unchunk.go(f, 2, U32.to_nat(size), 0, acc, valid, rest2)
+                      unchunk.go(f, 2, size, 0, acc, valid, rest2)
                     case _:
                       (acc, False{})
                 case _:
-                  unchunk.go(f, 7, 0n, size, acc, False{}, rest)
+                  unchunk.go(f, 7, 0, size, acc, False{}, rest)
         case 1:
           match bs:
             case Nil{}:
@@ -1582,27 +1721,27 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
                 case 13:
                   match rest:
                     case 10 <> rest2:
-                      unchunk.go(f, 2, U32.to_nat(size), 0, acc, valid, rest2)
+                      unchunk.go(f, 2, size, 0, acc, valid, rest2)
                     case _:
                       (acc, False{})
                 case _:
-                  unchunk.go(f, 1, 0n, size, acc, valid, rest)
+                  unchunk.go(f, 1, 0, size, acc, valid, rest)
         case 2:
           match rem:
-            case 0n:
-              unchunk.go(f, 3, 0n, size, acc, valid, bs)
-            case 1n+c:
+            case 0:
+              unchunk.go(f, 3, 0, size, acc, valid, bs)
+            case _:
               match bs:
                 case Nil{}:
                   (acc, False{})
                 case h <> t:
-                  unchunk.go(f, 2, c, size, h <> acc, valid, t)
+                  unchunk.go(f, 2, (rem - 1 : U32), size, h <> acc, valid, t)
         case 3:
           match bs:
             case Nil{}:
               (acc, False{})
             case 13 <> t:
-              unchunk.go(f, 4, 0n, size, acc, valid, t)
+              unchunk.go(f, 4, 0, size, acc, valid, t)
             case _:
               (acc, False{})
         case 4:
@@ -1610,7 +1749,7 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
             case Nil{}:
               (acc, False{})
             case 10 <> t:
-              unchunk.go(f, 0, 0n, 0, acc, valid, t)
+              unchunk.go(f, 0, 0, 0, acc, valid, t)
             case _:
               (acc, False{})
         case 5:
@@ -1618,7 +1757,7 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
             case Nil{}:
               (acc, False{})
             case 13 <> t:
-              unchunk.go(f, 6, 0n, size, acc, valid, t)
+              unchunk.go(f, 6, 0, size, acc, valid, t)
             case _:
               (acc, False{})
         case 6:
@@ -1637,7 +1776,7 @@ def unchunk.go(fuel: Nat, st: U32, rem: Nat, size: U32, acc: List<&2, U32>, vali
           (acc, False{})
 
 def unchunk(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  unchunk.put(unchunk.go(1n+length_nat(bs), 0, 0n, 0, Nil{}, True{}, bs))
+  unchunk.put(unchunk.go(1n+length_nat(bs), 0, 0, 0, Nil{}, True{}, bs))
 
 # Router
 # ------
@@ -1688,19 +1827,25 @@ def bs_head.go(bs: List<&2, U32>, e: Bool, w: U32, acc: List<&2, U32>) -> List<&
 def bs_head(bs: List<&2, U32>) -> List<&2, U32>:
   bs_head.go(bs, False{}, 0, Nil{})
 
-def bs_take.go(bs: List<&2, U32>, n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
+# Phase 10.1: the walk counts in U32 (a Content-Length is a U32), so the
+# `U32.to_nat` bridge at the call site is gone. The Nat entry below is a shell
+# kept only for lib/https_http1.bend, which is out of this phase's scope.
+def bs_take32.go(+bs: List<&2, U32>, +n: U32, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
       List.reverse(&2, U32, acc)
     case b <> t:
       match n:
-        case 0n:
+        case 0:
           List.reverse(&2, U32, acc)
-        case 1n+k:
-          bs_take.go(t, k, b <> acc)
+        case _:
+          bs_take32.go(t, (n - 1 : U32), b <> acc)
+
+def bs_take32(bs: List<&2, U32>, n: U32) -> List<&2, U32>:
+  bs_take32.go(bs, n, Nil{})
 
 def bs_take(bs: List<&2, U32>, n: Nat) -> List<&2, U32>:
-  bs_take.go(bs, n, Nil{})
+  bs_take32(bs, U32.from_nat(n))
 
 
 law fetch:
@@ -1737,7 +1882,7 @@ def fetch.body.unc(r: Result<&1, &1, U32 & String, List<&2, U32>>) ->
     case Fail{e}:
       Fail{e}
     case Done{bs}:
-      Done{decode(bs)}
+      Done{decode_all(bs)}
 
 def fetch.body.cl.put(cl: U32, raw: List<&2, U32>, over: Bool) ->
   Result<&1, &1, U32 & String, String>:
@@ -1745,14 +1890,14 @@ def fetch.body.cl.put(cl: U32, raw: List<&2, U32>, over: Bool) ->
     case True{}:
       Fail{(413, "body too large")}
     case False{}:
-      Done{decode(bs_take(raw, U32.to_nat(cl)))}
+      Done{decode_all(bs_take32(raw, cl))}
 
-def fetch.body.cl.len(+cl: U32, raw: List<&2, U32>, len: Nat) ->
+def fetch.body.cl.len(+cl: U32, raw: List<&2, U32>, len: U32) ->
   Result<&1, &1, U32 & String, String>:
-  fetch.body.cl.put(cl, raw, Bool.and(U32.is_gt(cl, 0), Bool.not(Nat.is_le(U32.to_nat(cl), len))))
+  fetch.body.cl.put(cl, raw, Bool.and(U32.is_gt(cl, 0), Bool.not(U32.is_le(cl, len))))
 
 def fetch.body.cl(cl: U32, +raw: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
-  fetch.body.cl.len(cl, raw, length_nat(raw))
+  fetch.body.cl.len(cl, raw, body_length(raw))
 
 def fetch.body.frame.go(hs: List<&1, String & String>, +cl: U32, +ch: Bool) -> U32 & Bool:
   match hs:
@@ -1799,8 +1944,21 @@ def fetch.body.head(meth: String, parsed: Result<&1, &1, U32 & String, U32 & Lis
       fr = fetch.body.frame.go(hs, 0, False{})
       fetch.body.frame(nb, raw, fr)
 
+# Phase 11.3: the recv accumulator rides REVERSED, so pushing a chunk
+# costs O(chunk) instead of O(body). `List.append` is linear-recursive
+# over its first argument, so the old `List.append(acc, part)` walked the
+# whole body on every recv -- 8 recvs of up to 8 KB meant 8 traversals of
+# up to 64 KB (Discovery 21). Each chunk is therefore reversed before the
+# prepend, and `fetch.body` reverses the whole once at the end: one
+# tail-recursive pass either way.
+def fetch.push(part: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
+  List.append(&2, U32, List.reverse(&2, U32, part), acc)
+
+def fetch.acc(bs: List<&2, U32>) -> List<&2, U32>:
+  List.reverse(&2, U32, bs)
+
 def fetch.body(meth: String, +acc: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
-  fetch.body.head(meth, read_response(decode(bs_head(acc))), bs_body(acc))
+  fetch.body.head(meth, read_response(decode_all(bs_head(acc))), bs_body(acc))
 
 # The recv loop is unrolled 8x and the index counts DOWN: afterNfn
 # handles the result of the Nth recv and calls recv(N+1) — so the
@@ -1814,7 +1972,7 @@ def fetch.body(meth: String, +acc: List<&2, U32>) -> Result<&1, &1, U32 & String
 def fetch.finish(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
     x : Unit <- Socket.close(sock)
-    return fetch.body(meth, acc)
+    return fetch.body(meth, fetch.acc(acc))
 
 def fetch.after8fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -1827,7 +1985,7 @@ def fetch.after8fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.finish(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.finish(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv8(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after8fn(meth, acc, m))
@@ -1843,7 +2001,7 @@ def fetch.after7fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv8(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv8(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv7(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after7fn(meth, acc, m))
@@ -1859,7 +2017,7 @@ def fetch.after6fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv7(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv7(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv6(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after6fn(meth, acc, m))
@@ -1875,7 +2033,7 @@ def fetch.after5fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv6(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv6(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv5(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after5fn(meth, acc, m))
@@ -1891,7 +2049,7 @@ def fetch.after4fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv5(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv5(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv4(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after4fn(meth, acc, m))
@@ -1907,7 +2065,7 @@ def fetch.after3fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv4(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv4(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv3(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after3fn(meth, acc, m))
@@ -1923,7 +2081,7 @@ def fetch.after2fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv3(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv3(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv2(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after2fn(meth, acc, m))
@@ -1939,7 +2097,7 @@ def fetch.after1fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, 
         case Nil{}:
           fetch.finish(sock2, meth, acc)
         case h <> t:
-          fetch.recv2(sock2, meth, List.append(&2, U32, acc, part))
+          fetch.recv2(sock2, meth, fetch.push(part, acc))
 
 def fetch.recv1(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
   IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after1fn(meth, acc, m))
@@ -2293,13 +2451,13 @@ def srv(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, Str
       (mm, pp, hd2, bd0, cl2, kp2) = rq
       +bd3 = bd0
       +cl3 = cl2
-      srv(~H, 2, (s, Done{SNil{}}), mp, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), is11, hd2, mm, pp, bd3, cl3, kp2, Nat.is_le(U32.to_nat(cl3), String.length(bd3)), acc)
+      srv(~H, 2, (s, Done{SNil{}}), mp, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), is11, hd2, mm, pp, bd3, cl3, kp2, U32.is_le(cl3, str_len32(bd3)), acc)
     case 2:
       (s, r) = mr
       match fit:
         case True{}:
           do IO<Unit>:
-            resp : U32 & List<&1, String & String> & String <- H(m, p, hd, String.take(body, U32.to_nat(cl)))
+            resp : U32 & List<&1, String & String> & String <- H(m, p, hd, str_take32(body, cl))
             shown : String <- IO.pass(String, srv.answer.resp(keep, resp))
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, shown)
             mr2 : Socket & Result<&1, &1, U32 & String, String> = srv.sent_str(sent)
@@ -2315,7 +2473,7 @@ def srv(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, Str
           Socket.close(s)
         case Done{part}:
           +body2 = body ++ part
-          srv(~H, 2, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body2, cl, keep, Nat.is_le(U32.to_nat(cl), String.length(body2)), acc)
+          srv(~H, 2, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body2, cl, keep, U32.is_le(cl, str_len32(body2)), acc)
     case 4:
       (s, r) = mr
       match r:
@@ -2324,7 +2482,7 @@ def srv(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, Str
         case Done{part}:
           match keep:
             case True{}:
-              +rest = String.drop(body, U32.to_nat(cl))
+              +rest = str_drop32(body, cl)
               srv(~H, 0, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body, cl, keep, fit, rest)
             case False{}:
               Socket.close(s)

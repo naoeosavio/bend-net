@@ -522,39 +522,39 @@ def h2_settings_one.go(+st: H2Settings, +id: U32, +val: U32) -> H2Settings:
 def h2_settings_one(+st: H2Settings, +id: U32, +val: U32) -> H2Settings:
   h2_settings_one.go(st, id, val)
 
-def h2_settings_apply_go(+fuel: Nat, +pay: List<&2, U32>, +st: H2Settings) -> H2Settings:
-  match fuel:
-    case 0n:
+# Phase 10.3: defueled. The fuel was b_len(pay) read left to right, but every
+# arm already passes `rest` (6 bytes shorter than `pay`), so the structural
+# recursion is the termination proof and the Nat counter is gone. Same walk,
+# one pass, no b_len pre-traversal.
+def h2_settings_apply_go(+pay: List<&2, U32>, +st: H2Settings) -> H2Settings:
+  match pay:
+    case Nil{}:
       st
-    case 1n+f:
-      match pay:
+    case +b0 <> r0:
+      match r0:
         case Nil{}:
           st
-        case +b0 <> r0:
-          match r0:
+        case +b1 <> r1:
+          match r1:
             case Nil{}:
               st
-            case +b1 <> r1:
-              match r1:
+            case +b2 <> r2:
+              match r2:
                 case Nil{}:
                   st
-                case +b2 <> r2:
-                  match r2:
+                case +b3 <> r3:
+                  match r3:
                     case Nil{}:
                       st
-                    case +b3 <> r3:
-                      match r3:
+                    case +b4 <> r4:
+                      match r4:
                         case Nil{}:
                           st
-                        case +b4 <> r4:
-                          match r4:
-                            case Nil{}:
-                              st
-                            case +b5 <> rest:
-                              h2_settings_apply_go(f, rest, h2_settings_one(st, (b0 * 256 + b1 : U32), u32_of4(b2, b3, b4, b5)))
+                        case +b5 <> rest:
+                          h2_settings_apply_go(rest, h2_settings_one(st, (b0 * 256 + b1 : U32), u32_of4(b2, b3, b4, b5)))
 
 def h2_settings_apply(+pay: List<&2, U32>, +st: H2Settings) -> H2Settings:
-  h2_settings_apply_go(b_len(pay), pay, st)
+  h2_settings_apply_go(pay, st)
 
 # HPACK ints (prefix + continuation, RFC 7541 section 5.1)
 # --------------------------------------------------------
