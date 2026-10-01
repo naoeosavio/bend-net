@@ -70,33 +70,69 @@ def x_len(bs: List<&2, U32>) -> Nat:
 # U32-counted list ops for the flow sender (Phase 12 item 2): the Nat
 # versions above force to_nat/from_nat conversions at every chunk step;
 # these keep the whole send path in U32 (RFC windows are U32).
-def x_take32.go(+bs: List<&2, U32>, +n: U32, acc: List<&2, U32>) -> List<&2, U32>:
+#
+# The counter is Nat on the inside and the API is U32 (TASK-026 Phase 2,
+# from TASK-023 Phases 12/13): U32 is Data U32{data: Word(32n)}, so every
+# decrement boxes and every guard is a match over Data, while Nat matches
+# 1n+p without allocating. Same shape (reversed build + x_cat), 16 KiB
+# buffer, measured in TASK-023: take 9,52 s -> 3,61 s and drop 12,92 s ->
+# 2,81 s for 200/400 calls. The conversion is O(1) and happens once per
+# call, not once per element.
+def x_take32.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
       x_cat(acc)
     case h <> t:
       match n:
-        case 0:
+        case 0n:
           x_cat(acc)
-        case _:
-          x_take32.go(t, (n - 1 : U32), h <> acc)
+        case 1n+p:
+          x_take32.go(t, p, h <> acc)
 
-def x_take32(+n: U32, bs: List<&2, U32>) -> List<&2, U32>:
-  x_take32.go(bs, n, Nil{})
+def x_take32(n: U32, bs: List<&2, U32>) -> List<&2, U32>:
+  x_take32.go(bs, U32.to_nat(n), Nil{})
 
-def x_drop32.go(+bs: List<&2, U32>, +n: U32) -> List<&2, U32>:
+def x_drop32.go(+bs: List<&2, U32>, +n: Nat) -> List<&2, U32>:
   match bs:
     case Nil{}:
       Nil{}
     case h <> t:
       match n:
-        case 0:
+        case 0n:
           h <> t
-        case _:
-          x_drop32.go(t, (n - 1 : U32))
+        case 1n+p:
+          x_drop32.go(t, p)
 
-def x_drop32(+n: U32, bs: List<&2, U32>) -> List<&2, U32>:
-  x_drop32.go(bs, n)
+def x_drop32(n: U32, bs: List<&2, U32>) -> List<&2, U32>:
+  x_drop32.go(bs, U32.to_nat(n))
+
+# Bounded walkers (TASK-026 Phase 2, from TASK-023 Phase 12 item 12.3):
+# the question every frame and header path asks is "are there n bytes
+# here?", never "how big is this buffer?". len_upto answers
+# min(n, len(bs)) and has_at_least is that question, both stopping at n
+# so the cost is bounded by n and not by whatever the buffer holds.
+# Measured in TASK-023: has_at_least(9) 1,27 s against
+# U32.is_le(9, x_len32(bs)) 34,22 s for 20000 calls (a full walk
+# answering a 9-byte question), and x_len32(x_take32(n, bs)) 7,65 s
+# against 2,50 s for the same answers. The counter is Nat for the reason
+# above, and has_at_least reuses the walker so the boundary (a buffer
+# that ends exactly at n) has one home.
+def x_len_upto.go(+bs: List<&2, U32>, +n: Nat, +acc: Nat) -> U32:
+  match bs:
+    case Nil{}:
+      U32.from_nat(acc)
+    case _ <> t:
+      match n:
+        case 0n:
+          U32.from_nat(acc)
+        case 1n+p:
+          x_len_upto.go(t, p, (1n + acc : Nat))
+
+def x_len_upto(n: U32, bs: List<&2, U32>) -> U32:
+  x_len_upto.go(bs, U32.to_nat(n), 0n)
+
+def x_has_at_least(+n: U32, bs: List<&2, U32>) -> Bool:
+  U32.is_eq(x_len_upto.go(bs, U32.to_nat(n), 0n), n)
 
 def x_len32.go(+bs: List<&2, U32>, +acc: U32) -> U32:
   match bs:
@@ -278,50 +314,50 @@ def x_settings_initial_pay() -> List<&2, U32>:
 # Types
 # -----
 
-type HttpxHdr is Data:
-  HttpxHdr{name: String, value: String}
+type Hdr is Data:
+  Hdr{name: String, value: String}
 
-type HttpxReqHead is Data:
-  HttpxReqHead{method: String, path: String, headers: List<&2, HttpxHdr>}
+type ReqHead is Data:
+  ReqHead{method: String, path: String, headers: List<&2, Hdr>}
 
-type HttpxReq is Data:
-  HttpxReq{method: String, path: String, headers: List<&2, HttpxHdr>, body: List<&2, U32>}
+type Request is Data:
+  Request{method: String, path: String, headers: List<&2, Hdr>, body: List<&2, U32>}
 
-type HttpxResp is Data:
-  HttpxResp{status: U32, headers: List<&2, HttpxHdr>, body: List<&2, U32>}
+type Response is Data:
+  Response{status: U32, headers: List<&2, Hdr>, body: List<&2, U32>}
 
-type HttpxHead is Data:
-  HttpxHead{status: U32, headers: List<&2, HttpxHdr>}
+type Head is Data:
+  Head{status: U32, headers: List<&2, Hdr>}
 
-type HttpxSt is Data:
-  HttpxSt{head: Maybe<&2, HttpxReqHead>, body: List<&2, U32>, sid: U32}
+type St is Data:
+  St{head: Maybe<&2, ReqHead>, body: List<&2, U32>, sid: U32}
 
-type HttpxFrame is Data:
-  HttpxFrame{typ: U32, flags: U32, sid: U32, payload: List<&2, U32>}
+type Frame is Data:
+  Frame{typ: U32, flags: U32, sid: U32, payload: List<&2, U32>}
 
 type HttpxFrameOut is Data:
-  HttpxFrameOk{frame: HttpxFrame, rest: List<&2, U32>}
+  HttpxFrameOk{frame: Frame, rest: List<&2, U32>}
   HttpxNeedMore{missing: U32}
   HttpxFrameBad{code: U32, msg: String}
 
-type HttpxGot is Data:
-  HttpxGotOk{frame: HttpxFrame, buf: List<&2, U32>}
-  HttpxGotErr{code: U32, msg: String}
+type Got is Data:
+  GotOk{frame: Frame, buf: List<&2, U32>}
+  GotErr{code: U32, msg: String}
 
 # Dynamic table, newest entry at the head; size sums entry sizes
 # (len(name) + len(value) + 32); max is the protocol limit 4096.
 # Per-connection state threaded through the decode loop (never in slots).
-type HttpxTab is Data:
-  HttpxTab{ents: List<&2, HttpxHdr>, size: U32, max: U32}
+type Tab is Data:
+  Tab{ents: List<&2, Hdr>, size: U32, max: U32}
 
-type HttpxHdrGot is Data:
-  HttpxHdrGot{name: String, value: String, rest: List<&2, U32>, tab: HttpxTab}
+type HdrGot is Data:
+  HdrGot{name: String, value: String, rest: List<&2, U32>, tab: Tab}
 
-type HttpxTaken is Data:
-  HttpxTaken{slots: List<&2, HttpxSt>, st: HttpxSt}
+type Taken is Data:
+  Taken{slots: List<&2, St>, st: St}
 
-type HttpxFendTaken is Data:
-  HttpxFendTaken{fends: List<&2, U32>, flag: U32}
+type FendTaken is Data:
+  FendTaken{fends: List<&2, U32>, flag: U32}
 
 # Frame write
 # -----------
@@ -401,7 +437,7 @@ def x_frame_payload(+pay: List<&2, U32>, +typ: U32, +flags: U32, +len: U32) -> L
 
 def x_frame.fin3(+typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, +len: U32) ->
   HttpxFrameOut:
-  HttpxFrameOk{HttpxFrame{typ, flags, sid, x_frame_payload(x_take32(len, rest), typ, flags, len)}, x_drop32(len, rest)}
+  HttpxFrameOk{Frame{typ, flags, sid, x_frame_payload(x_take32(len, rest), typ, flags, len)}, x_drop32(len, rest)}
 
 # Pad/prio strip (RFC 9113 6.1/6.2): PADDED rides flag 8 with a pad
 # length prefix (must be < payload, else protocol error), PRIORITY
@@ -528,19 +564,19 @@ def x_read.grow(r: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: L
       x_read.done(s, chunk, buf, U32.is_eq(x_len32(chunk), 0))
 
 @unsafe
-def x_read_loop(state: Socket & HttpxFrameOut & List<&2, U32>) -> IO(Socket & HttpxGot):
+def x_read_loop(state: Socket & HttpxFrameOut & List<&2, U32>) -> IO(Socket & Got):
   (s0, out, buf) = state
   match out:
     case HttpxFrameOk{frame, rest}:
-      IO.pure(Socket & HttpxGot, (s0, HttpxGotOk{frame, rest}))
+      IO.pure(Socket & Got, (s0, GotOk{frame, rest}))
     case HttpxFrameBad{code, msg}:
-      IO.pure(Socket & HttpxGot, (s0, HttpxGotErr{code, msg}))
+      IO.pure(Socket & Got, (s0, GotErr{code, msg}))
     case HttpxNeedMore{missing}:
-      do IO<Socket & HttpxGot>:
+      do IO<Socket & Got>:
         r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
         x_read_loop(x_read.grow(r1, buf))
 
-def x_read_frame(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & HttpxGot):
+def x_read_frame(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & Got):
   x_read_loop((sock, x_parse(buf), buf))
 
 # HPACK ints (prefix + continuation, RFC 7541 section 5.1)
@@ -1071,340 +1107,340 @@ def x_static_name(+idx: U32) -> String:
 # Dynamic table ops (insert + evict + lookup; newest at head)
 # -----------------------------------------------------------
 
-def x_tab.empty() -> HttpxTab:
-  HttpxTab{Nil{}, 0, 4096}
+def x_tab.empty() -> Tab:
+  Tab{Nil{}, 0, 4096}
 
 def x_tab.entry_size(+name: String, +value: String) -> U32:
   (x_str_len32(name) + x_str_len32(value) + 32 : U32)
 
-def x_tab.len.go(+ents: List<&2, HttpxHdr>, +n: U32) -> U32:
+def x_tab.len.go(+ents: List<&2, Hdr>, +n: U32) -> U32:
   match ents:
     case Nil{}:
       n
     case _ <> t:
       x_tab.len.go(t, (n + 1 : U32))
 
-def x_tab.len(+ents: List<&2, HttpxHdr>) -> U32:
+def x_tab.len(+ents: List<&2, Hdr>) -> U32:
   x_tab.len.go(ents, 0)
 
 # Structural eviction (no fuel: recurses on the tail, like x_tab.rev.go;
 # the Nil arm returns (Nil,0) — trim only calls with empty ents at size 0).
-def x_tab.fit.go(+ents: List<&2, HttpxHdr>, fit: Bool, +size: U32, +max: U32) ->
-  List<&2, HttpxHdr> & U32:
+def x_tab.fit.go(+ents: List<&2, Hdr>, fit: Bool, +size: U32, +max: U32) ->
+  List<&2, Hdr> & U32:
   match ents:
     case Nil{}:
       (Nil{}, 0)
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       match fit:
         case True{}:
-          (HttpxHdr{n, v} <> t, size)
+          (Hdr{n, v} <> t, size)
         case False{}:
           +ns = U32.sub(size, x_tab.entry_size(n, v))
           x_tab.fit.go(t, U32.is_le(ns, max), ns, max)
 
-def x_tab.rev.go(+ents: List<&2, HttpxHdr>, acc: List<&2, HttpxHdr>) -> List<&2, HttpxHdr>:
+def x_tab.rev.go(+ents: List<&2, Hdr>, acc: List<&2, Hdr>) -> List<&2, Hdr>:
   match ents:
     case Nil{}:
       acc
     case h <> t:
       x_tab.rev.go(t, h <> acc)
 
-def x_tab.rev(+ents: List<&2, HttpxHdr>) -> List<&2, HttpxHdr>:
+def x_tab.rev(+ents: List<&2, Hdr>) -> List<&2, Hdr>:
   x_tab.rev.go(ents, Nil{})
 
-def x_tab.done(p: List<&2, HttpxHdr> & U32, +max: U32) -> HttpxTab:
+def x_tab.done(p: List<&2, Hdr> & U32, +max: U32) -> Tab:
   (kept, sz) = p
-  HttpxTab{x_tab.rev(kept), sz, max}
+  Tab{x_tab.rev(kept), sz, max}
 
-def x_tab.trim(+ents: List<&2, HttpxHdr>, +size: U32, +max: U32) -> HttpxTab:
+def x_tab.trim(+ents: List<&2, Hdr>, +size: U32, +max: U32) -> Tab:
   +rev = x_tab.rev(ents)
   x_tab.done(x_tab.fit.go(rev, U32.is_le(size, max), size, max), max)
 
-def x_tab.do(+ents: List<&2, HttpxHdr>, +size: U32, +max: U32, +name: String, +value: String, +es: U32) -> HttpxTab:
+def x_tab.do(+ents: List<&2, Hdr>, +size: U32, +max: U32, +name: String, +value: String, +es: U32) -> Tab:
   +ns = (size + es : U32)
-  x_tab.trim(HttpxHdr{name, value} <> ents, ns, max)
+  x_tab.trim(Hdr{name, value} <> ents, ns, max)
 
-def x_tab.ins_fit(+ents: List<&2, HttpxHdr>, +size: U32, +max: U32, +name: String, +value: String, fits: Bool, +es: U32) -> HttpxTab:
+def x_tab.ins_fit(+ents: List<&2, Hdr>, +size: U32, +max: U32, +name: String, +value: String, fits: Bool, +es: U32) -> Tab:
   match fits:
     case False{}:
-      HttpxTab{Nil{}, 0, max}
+      Tab{Nil{}, 0, max}
     case True{}:
       x_tab.do(ents, size, max, name, value, es)
 
-def x_tab.ins_go(+tab: HttpxTab, +name: String, +value: String) -> HttpxTab:
+def x_tab.ins_go(+tab: Tab, +name: String, +value: String) -> Tab:
   match tab:
-    case HttpxTab{+ents, +size, +max}:
+    case Tab{+ents, +size, +max}:
       +es = x_tab.entry_size(name, value)
       x_tab.ins_fit(ents, size, max, name, value, U32.is_le(es, max), es)
 
-def x_tab.insert(+tab: HttpxTab, +name: String, +value: String) -> HttpxTab:
+def x_tab.insert(+tab: Tab, +name: String, +value: String) -> Tab:
   x_tab.ins_go(tab, name, value)
 
-def x_tab.resize.go(+tab: HttpxTab, +max: U32) -> HttpxTab:
+def x_tab.resize.go(+tab: Tab, +max: U32) -> Tab:
   match tab:
-    case HttpxTab{+ents, +size, +old}:
+    case Tab{+ents, +size, +old}:
       x_tab.trim(ents, size, max)
 
-def x_tab.resize(+tab: HttpxTab, +max: U32) -> HttpxTab:
+def x_tab.resize(+tab: Tab, +max: U32) -> Tab:
   x_tab.resize.go(tab, max)
 
 # got: bounds-check + fetch in one walk (was lookup.go len-full + at-partial).
-def x_tab.lookup.got(+ents: List<&2, HttpxHdr>, +k: U32) -> Result<&1, &1, U32 & String, HttpxHdr>:
+def x_tab.lookup.got(+ents: List<&2, Hdr>, +k: U32) -> Result<&1, &1, U32 & String, Hdr>:
   match ents:
     case Nil{}:
       Fail{(502, "hpack dyn bounds")}
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       match k:
         case 0:
-          Done{HttpxHdr{n, v}}
+          Done{Hdr{n, v}}
         case _:
           x_tab.lookup.got(t, (k - 1 : U32))
 
-def x_tab.lookup(+tab: HttpxTab, +idx: U32) -> Result<&1, &1, U32 & String, HttpxHdr>:
+def x_tab.lookup(+tab: Tab, +idx: U32) -> Result<&1, &1, U32 & String, Hdr>:
   match tab:
-    case HttpxTab{+ents, +size, +max}:
+    case Tab{+ents, +size, +max}:
       x_tab.lookup.got(ents, idx)
 
-def x_tab.static_hdr(sp: String & String) -> HttpxHdr:
+def x_tab.static_hdr(sp: String & String) -> Hdr:
   (n, v) = sp
-  HttpxHdr{n, v}
+  Hdr{n, v}
 
-def x_tab.addr.go(+tab: HttpxTab, +idx: U32, is_static: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdr>:
+def x_tab.addr.go(+tab: Tab, +idx: U32, is_static: Bool) ->
+  Result<&1, &1, U32 & String, Hdr>:
   match is_static:
     case True{}:
       Done{x_tab.static_hdr(x_static.go(idx))}
     case False{}:
       x_tab.lookup(tab, (idx - 62 : U32))
 
-def x_tab.addr(+tab: HttpxTab, +idx: U32) -> Result<&1, &1, U32 & String, HttpxHdr>:
+def x_tab.addr(+tab: Tab, +idx: U32) -> Result<&1, &1, U32 & String, Hdr>:
   x_tab.addr.go(tab, idx, U32.is_le(idx, 61))
 
 # One header field (incremental entries update the table)
 # -------------------------------------------------------
 
-def x_hdr.full(+idx: U32, +rest: List<&2, U32>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.full(+idx: U32, +rest: List<&2, U32>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match idx:
     case 1:
-      Done{HttpxHdrGot{":authority", "", rest, tab}}
+      Done{HdrGot{":authority", "", rest, tab}}
     case 2:
-      Done{HttpxHdrGot{":method", "GET", rest, tab}}
+      Done{HdrGot{":method", "GET", rest, tab}}
     case 3:
-      Done{HttpxHdrGot{":method", "POST", rest, tab}}
+      Done{HdrGot{":method", "POST", rest, tab}}
     case 4:
-      Done{HttpxHdrGot{":path", "/", rest, tab}}
+      Done{HdrGot{":path", "/", rest, tab}}
     case 5:
-      Done{HttpxHdrGot{":path", "/index.html", rest, tab}}
+      Done{HdrGot{":path", "/index.html", rest, tab}}
     case 6:
-      Done{HttpxHdrGot{":scheme", "http", rest, tab}}
+      Done{HdrGot{":scheme", "http", rest, tab}}
     case 7:
-      Done{HttpxHdrGot{":scheme", "https", rest, tab}}
+      Done{HdrGot{":scheme", "https", rest, tab}}
     case 8:
-      Done{HttpxHdrGot{":status", "200", rest, tab}}
+      Done{HdrGot{":status", "200", rest, tab}}
     case 9:
-      Done{HttpxHdrGot{":status", "204", rest, tab}}
+      Done{HdrGot{":status", "204", rest, tab}}
     case 10:
-      Done{HttpxHdrGot{":status", "206", rest, tab}}
+      Done{HdrGot{":status", "206", rest, tab}}
     case 11:
-      Done{HttpxHdrGot{":status", "304", rest, tab}}
+      Done{HdrGot{":status", "304", rest, tab}}
     case 12:
-      Done{HttpxHdrGot{":status", "400", rest, tab}}
+      Done{HdrGot{":status", "400", rest, tab}}
     case 13:
-      Done{HttpxHdrGot{":status", "404", rest, tab}}
+      Done{HdrGot{":status", "404", rest, tab}}
     case 14:
-      Done{HttpxHdrGot{":status", "500", rest, tab}}
+      Done{HdrGot{":status", "500", rest, tab}}
     case 15:
-      Done{HttpxHdrGot{"accept-charset", "", rest, tab}}
+      Done{HdrGot{"accept-charset", "", rest, tab}}
     case 16:
-      Done{HttpxHdrGot{"accept-encoding", "gzip, deflate", rest, tab}}
+      Done{HdrGot{"accept-encoding", "gzip, deflate", rest, tab}}
     case 17:
-      Done{HttpxHdrGot{"accept-language", "", rest, tab}}
+      Done{HdrGot{"accept-language", "", rest, tab}}
     case 18:
-      Done{HttpxHdrGot{"accept-ranges", "", rest, tab}}
+      Done{HdrGot{"accept-ranges", "", rest, tab}}
     case 19:
-      Done{HttpxHdrGot{"accept", "", rest, tab}}
+      Done{HdrGot{"accept", "", rest, tab}}
     case 20:
-      Done{HttpxHdrGot{"access-control-allow-origin", "", rest, tab}}
+      Done{HdrGot{"access-control-allow-origin", "", rest, tab}}
     case 21:
-      Done{HttpxHdrGot{"age", "", rest, tab}}
+      Done{HdrGot{"age", "", rest, tab}}
     case 22:
-      Done{HttpxHdrGot{"allow", "", rest, tab}}
+      Done{HdrGot{"allow", "", rest, tab}}
     case 23:
-      Done{HttpxHdrGot{"authorization", "", rest, tab}}
+      Done{HdrGot{"authorization", "", rest, tab}}
     case 24:
-      Done{HttpxHdrGot{"cache-control", "", rest, tab}}
+      Done{HdrGot{"cache-control", "", rest, tab}}
     case 25:
-      Done{HttpxHdrGot{"content-disposition", "", rest, tab}}
+      Done{HdrGot{"content-disposition", "", rest, tab}}
     case 26:
-      Done{HttpxHdrGot{"content-encoding", "", rest, tab}}
+      Done{HdrGot{"content-encoding", "", rest, tab}}
     case 27:
-      Done{HttpxHdrGot{"content-language", "", rest, tab}}
+      Done{HdrGot{"content-language", "", rest, tab}}
     case 28:
-      Done{HttpxHdrGot{"content-length", "", rest, tab}}
+      Done{HdrGot{"content-length", "", rest, tab}}
     case 29:
-      Done{HttpxHdrGot{"content-location", "", rest, tab}}
+      Done{HdrGot{"content-location", "", rest, tab}}
     case 30:
-      Done{HttpxHdrGot{"content-range", "", rest, tab}}
+      Done{HdrGot{"content-range", "", rest, tab}}
     case 31:
-      Done{HttpxHdrGot{"content-type", "", rest, tab}}
+      Done{HdrGot{"content-type", "", rest, tab}}
     case 32:
-      Done{HttpxHdrGot{"cookie", "", rest, tab}}
+      Done{HdrGot{"cookie", "", rest, tab}}
     case 33:
-      Done{HttpxHdrGot{"date", "", rest, tab}}
+      Done{HdrGot{"date", "", rest, tab}}
     case 34:
-      Done{HttpxHdrGot{"etag", "", rest, tab}}
+      Done{HdrGot{"etag", "", rest, tab}}
     case 35:
-      Done{HttpxHdrGot{"expect", "", rest, tab}}
+      Done{HdrGot{"expect", "", rest, tab}}
     case 36:
-      Done{HttpxHdrGot{"expires", "", rest, tab}}
+      Done{HdrGot{"expires", "", rest, tab}}
     case 37:
-      Done{HttpxHdrGot{"from", "", rest, tab}}
+      Done{HdrGot{"from", "", rest, tab}}
     case 38:
-      Done{HttpxHdrGot{"host", "", rest, tab}}
+      Done{HdrGot{"host", "", rest, tab}}
     case 39:
-      Done{HttpxHdrGot{"if-match", "", rest, tab}}
+      Done{HdrGot{"if-match", "", rest, tab}}
     case 40:
-      Done{HttpxHdrGot{"if-modified-since", "", rest, tab}}
+      Done{HdrGot{"if-modified-since", "", rest, tab}}
     case 41:
-      Done{HttpxHdrGot{"if-none-match", "", rest, tab}}
+      Done{HdrGot{"if-none-match", "", rest, tab}}
     case 42:
-      Done{HttpxHdrGot{"if-range", "", rest, tab}}
+      Done{HdrGot{"if-range", "", rest, tab}}
     case 43:
-      Done{HttpxHdrGot{"if-unmodified-since", "", rest, tab}}
+      Done{HdrGot{"if-unmodified-since", "", rest, tab}}
     case 44:
-      Done{HttpxHdrGot{"last-modified", "", rest, tab}}
+      Done{HdrGot{"last-modified", "", rest, tab}}
     case 45:
-      Done{HttpxHdrGot{"link", "", rest, tab}}
+      Done{HdrGot{"link", "", rest, tab}}
     case 46:
-      Done{HttpxHdrGot{"location", "", rest, tab}}
+      Done{HdrGot{"location", "", rest, tab}}
     case 47:
-      Done{HttpxHdrGot{"max-forwards", "", rest, tab}}
+      Done{HdrGot{"max-forwards", "", rest, tab}}
     case 48:
-      Done{HttpxHdrGot{"proxy-authenticate", "", rest, tab}}
+      Done{HdrGot{"proxy-authenticate", "", rest, tab}}
     case 49:
-      Done{HttpxHdrGot{"proxy-authorization", "", rest, tab}}
+      Done{HdrGot{"proxy-authorization", "", rest, tab}}
     case 50:
-      Done{HttpxHdrGot{"range", "", rest, tab}}
+      Done{HdrGot{"range", "", rest, tab}}
     case 51:
-      Done{HttpxHdrGot{"referer", "", rest, tab}}
+      Done{HdrGot{"referer", "", rest, tab}}
     case 52:
-      Done{HttpxHdrGot{"refresh", "", rest, tab}}
+      Done{HdrGot{"refresh", "", rest, tab}}
     case 53:
-      Done{HttpxHdrGot{"retry-after", "", rest, tab}}
+      Done{HdrGot{"retry-after", "", rest, tab}}
     case 54:
-      Done{HttpxHdrGot{"server", "", rest, tab}}
+      Done{HdrGot{"server", "", rest, tab}}
     case 55:
-      Done{HttpxHdrGot{"set-cookie", "", rest, tab}}
+      Done{HdrGot{"set-cookie", "", rest, tab}}
     case 56:
-      Done{HttpxHdrGot{"strict-transport-security", "", rest, tab}}
+      Done{HdrGot{"strict-transport-security", "", rest, tab}}
     case 57:
-      Done{HttpxHdrGot{"transfer-encoding", "", rest, tab}}
+      Done{HdrGot{"transfer-encoding", "", rest, tab}}
     case 58:
-      Done{HttpxHdrGot{"user-agent", "", rest, tab}}
+      Done{HdrGot{"user-agent", "", rest, tab}}
     case 59:
-      Done{HttpxHdrGot{"vary", "", rest, tab}}
+      Done{HdrGot{"vary", "", rest, tab}}
     case 60:
-      Done{HttpxHdrGot{"via", "", rest, tab}}
+      Done{HdrGot{"via", "", rest, tab}}
     case 61:
-      Done{HttpxHdrGot{"www-authenticate", "", rest, tab}}
+      Done{HdrGot{"www-authenticate", "", rest, tab}}
     case _:
       Fail{(502, "hpack dyn")}
 
-def x_hdr.indexed.go(+idx: U32, +rest: List<&2, U32>, +tab: HttpxTab, ok: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.indexed.go(+idx: U32, +rest: List<&2, U32>, +tab: Tab, ok: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match ok:
     case False{}:
       Fail{(502, "hpack bad index")}
     case True{}:
       x_hdr.full(idx, rest, tab)
 
-def x_hdr.indexed.num(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.indexed.num(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(+idx, +rest)}:
       x_hdr.indexed.go(idx, rest, tab, U32.is_ge(idx, 1))
 
-def x_hdr.indexed.go2(+b0: U32, +rest: List<&2, U32>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.indexed.go2(+b0: U32, +rest: List<&2, U32>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   x_hdr.indexed.num(x_int.dec.go(b0, 127, rest), tab)
 
-def x_hdr.dyn.at(+rest: List<&2, U32>, +tab: HttpxTab, r: Result<&1, &1, U32 & String, HttpxHdr>) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.dyn.at(+rest: List<&2, U32>, +tab: Tab, r: Result<&1, &1, U32 & String, Hdr>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{h}:
       match h:
-        case HttpxHdr{+n, +v}:
-          Done{HttpxHdrGot{n, v, rest, tab}}
+        case Hdr{+n, +v}:
+          Done{HdrGot{n, v, rest, tab}}
 
-def x_hdr.dyn.go(+idx: U32, +rest: List<&2, U32>, +tab: HttpxTab, static: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.dyn.go(+idx: U32, +rest: List<&2, U32>, +tab: Tab, static: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match static:
     case True{}:
       x_hdr.full(idx, rest, tab)
     case False{}:
       x_hdr.dyn.at(rest, tab, x_tab.addr(tab, idx))
 
-def x_hdr.dyn.num(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.dyn.num(r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(+idx, +rest)}:
       x_hdr.dyn.go(idx, rest, tab, U32.is_le(idx, 61))
 
-def x_hdr.lit.put(+name: String, +value: String, +rest: List<&2, U32>, +tab: HttpxTab, is_incr: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.put(+name: String, +value: String, +rest: List<&2, U32>, +tab: Tab, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_incr:
     case False{}:
-      Done{HttpxHdrGot{name, value, rest, tab}}
+      Done{HdrGot{name, value, rest, tab}}
     case True{}:
-      Done{HttpxHdrGot{name, value, rest, x_tab.insert(tab, name, value)}}
+      Done{HdrGot{name, value, rest, x_tab.insert(tab, name, value)}}
 
-def x_hdr.lit.val(+name: String, +tab: HttpxTab, is_incr: Bool, r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.val(+name: String, +tab: Tab, is_incr: Bool, r: Result<&1, &1, U32 & String, String & List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(value, rest)}:
       x_hdr.lit.put(name, value, rest, tab, is_incr)
 
-def x_hdr.lit.name(r: Result<&1, &1, U32 & String, String & List<&2, U32>>, +tab: HttpxTab, is_incr: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.name(r: Result<&1, &1, U32 & String, String & List<&2, U32>>, +tab: Tab, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(name, rest2)}:
       x_hdr.lit.val(name, tab, is_incr, x_str.dec.go(rest2))
 
-def x_hdr.lit.named(+rest: List<&2, U32>, +tab: HttpxTab, is_incr: Bool, r: Result<&1, &1, U32 & String, HttpxHdr>) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.named(+rest: List<&2, U32>, +tab: Tab, is_incr: Bool, r: Result<&1, &1, U32 & String, Hdr>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{h}:
       match h:
-        case HttpxHdr{+n, +v}:
+        case Hdr{+n, +v}:
           x_hdr.lit.val(n, tab, is_incr, x_str.dec.go(rest))
 
-def x_hdr.lit.nameat(+idx: U32, +rest: List<&2, U32>, +tab: HttpxTab, is_incr: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.nameat(+idx: U32, +rest: List<&2, U32>, +tab: Tab, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   x_hdr.lit.named(rest, tab, is_incr, x_tab.addr(tab, idx))
 
-def x_hdr.lit.zero(+rest: List<&2, U32>, +tab: HttpxTab, is_incr: Bool, +idx: U32, is_new: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.zero(+rest: List<&2, U32>, +tab: Tab, is_incr: Bool, +idx: U32, is_new: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_new:
     case True{}:
       x_hdr.lit.name(x_str.dec.go(rest), tab, is_incr)
     case False{}:
       x_hdr.lit.nameat(idx, rest, tab, is_incr)
 
-def x_hdr.lit.go(+b0: U32, +rest: List<&2, U32>, +tab: HttpxTab, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, is_incr: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit.go(+b0: U32, +rest: List<&2, U32>, +tab: Tab, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
@@ -1418,56 +1454,56 @@ def x_hdr.lit.mask(is_incr: Bool) -> U32:
     case False{}:
       15
 
-def x_hdr.lit(+b0: U32, +rest: List<&2, U32>, is_incr: Bool, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.lit(+b0: U32, +rest: List<&2, U32>, is_incr: Bool, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_incr:
     case True{}:
       x_hdr.lit.go(b0, rest, tab, x_int.dec.go(b0, 63, rest), True{})
     case False{}:
       x_hdr.lit.go(b0, rest, tab, x_int.dec.go(b0, 15, rest), False{})
 
-def x_hdr.table.sized(+rest: List<&2, U32>, +tab: HttpxTab, +ns: U32, ok: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.table.sized(+rest: List<&2, U32>, +tab: Tab, +ns: U32, ok: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match ok:
     case False{}:
       Fail{(502, "hpack table too big")}
     case True{}:
-      Done{HttpxHdrGot{"", "", rest, x_tab.resize(tab, ns)}}
+      Done{HdrGot{"", "", rest, x_tab.resize(tab, ns)}}
 
-def x_hdr.table.go(+tab: HttpxTab, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.table.go(+tab: Tab, r: Result<&1, &1, U32 & String, U32 & List<&2, U32>>) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{(+ns, +rest)}:
       x_hdr.table.sized(rest, tab, ns, U32.is_le(ns, 4096))
 
-def x_hdr.after_table(+b0: U32, +rest: List<&2, U32>, +tab: HttpxTab, is_table: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.after_table(+b0: U32, +rest: List<&2, U32>, +tab: Tab, is_table: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_table:
     case True{}:
       x_hdr.table.go(tab, x_int.dec.go(b0, 31, rest))
     case False{}:
       x_hdr.lit(b0, rest, False{}, tab)
 
-def x_hdr.after_incr(+b0: U32, +rest: List<&2, U32>, +tab: HttpxTab, is_incr: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.after_incr(+b0: U32, +rest: List<&2, U32>, +tab: Tab, is_incr: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_incr:
     case True{}:
       x_hdr.lit(b0, rest, True{}, tab)
     case False{}:
       x_hdr.after_table(b0, rest, tab, U32.is_ge(b0, 32))
 
-def x_hdr.after_idx(+b0: U32, +rest: List<&2, U32>, +tab: HttpxTab, is_idx: Bool) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.after_idx(+b0: U32, +rest: List<&2, U32>, +tab: Tab, is_idx: Bool) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match is_idx:
     case True{}:
       x_hdr.dyn.num(x_int.dec.go(b0, 127, rest), tab)
     case False{}:
       x_hdr.after_incr(b0, rest, tab, U32.is_ge(b0, 64))
 
-def x_hdr.dec(+bs: List<&2, U32>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHdrGot>:
+def x_hdr.dec(+bs: List<&2, U32>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, HdrGot>:
   match bs:
     case Nil{}:
       Fail{(400, "hpack eof")}
@@ -1477,33 +1513,33 @@ def x_hdr.dec(+bs: List<&2, U32>, +tab: HttpxTab) ->
 # Header block -> request head (phased loop, fuel-bounded)
 # --------------------------------------------------------
 
-def x_req.pick2(+method: String, +path: String, +headers: List<&2, HttpxHdr>, +name: String, +value: String, +is_path: Bool) -> HttpxReqHead:
+def x_req.pick2(+method: String, +path: String, +headers: List<&2, Hdr>, +name: String, +value: String, +is_path: Bool) -> ReqHead:
   match is_path:
     case True{}:
-      HttpxReqHead{method, value, headers}
+      ReqHead{method, value, headers}
     case False{}:
-      HttpxReqHead{method, path, headers}
+      ReqHead{method, path, headers}
 
-def x_req.pick(+method: String, +path: String, +headers: List<&2, HttpxHdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> HttpxReqHead:
+def x_req.pick(+method: String, +path: String, +headers: List<&2, Hdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> ReqHead:
   match is_meth:
     case True{}:
-      HttpxReqHead{value, path, headers}
+      ReqHead{value, path, headers}
     case False{}:
       x_req.pick2(method, path, headers, name, value, is_path)
 
-def x_req.apply3(+method: String, +path: String, +headers: List<&2, HttpxHdr>, +name: String, +value: String, is_meth: Bool, is_path: Bool, pseudo: Bool) -> HttpxReqHead:
+def x_req.apply3(+method: String, +path: String, +headers: List<&2, Hdr>, +name: String, +value: String, is_meth: Bool, is_path: Bool, pseudo: Bool) -> ReqHead:
   match pseudo:
     case True{}:
       x_req.pick(method, path, headers, name, value, is_meth, is_path)
     case False{}:
-      HttpxReqHead{method, path, List.append(&2, HttpxHdr, headers, [HttpxHdr{name, value}])}
+      ReqHead{method, path, List.append(&2, Hdr, headers, [Hdr{name, value}])}
 
-def x_req.apply2(+method: String, +path: String, +headers: List<&2, HttpxHdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> HttpxReqHead:
+def x_req.apply2(+method: String, +path: String, +headers: List<&2, Hdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> ReqHead:
   x_req.apply3(method, path, headers, name, value, is_meth, is_path, Bool.or(is_meth, is_path))
 
-def x_req.apply(+st: HttpxReqHead, +name: String, +value: String, is_meth: Bool, is_path: Bool) -> HttpxReqHead:
+def x_req.apply(+st: ReqHead, +name: String, +value: String, is_meth: Bool, is_path: Bool) -> ReqHead:
   match st:
-    case HttpxReqHead{+method, +path, +headers}:
+    case ReqHead{+method, +path, +headers}:
       x_req.apply2(method, path, headers, name, value, is_meth, is_path)
 
 def x_req.phase(emit: Bool) -> U32:
@@ -1514,8 +1550,8 @@ def x_req.phase(emit: Bool) -> U32:
       3
 
 @unsafe
-def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HttpxHdrGot>, +name: String, +value: String, st: HttpxReqHead, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>:
+def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: ReqHead, +tab: Tab) ->
+  Result<&1, &1, U32 & String, ReqHead & Tab>:
   match fuel:
     case 0n:
       Fail{(502, "too many headers")}
@@ -1531,7 +1567,7 @@ def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 
           match r:
             case Fail{e}:
               Fail{e}
-            case Done{HttpxHdrGot{+n, +v, +rrest, +tab2}}:
+            case Done{HdrGot{+n, +v, +rrest, +tab2}}:
               x_req.go(f, 2, rrest, Fail{(0, "")}, n, v, st, tab2)
         case 2:
           +st2 = x_req.apply(st, name, value, String.eq(name, ":method"), String.eq(name, ":path"))
@@ -1539,61 +1575,61 @@ def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 
         case _:
           x_req.go(f, 0, bs, r, "", "", st, tab)
 
-def x_req.decode(+bs: List<&2, U32>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>:
-  x_req.go(512n, 0, bs, Fail{(0, "")}, "", "", HttpxReqHead{"", "", Nil{}}, tab)
+def x_req.decode(+bs: List<&2, U32>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, ReqHead & Tab>:
+  x_req.go(512n, 0, bs, Fail{(0, "")}, "", "", ReqHead{"", "", Nil{}}, tab)
 
-def x_req.rh(r: Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>) -> HttpxReqHead:
+def x_req.rh(r: Result<&1, &1, U32 & String, ReqHead & Tab>) -> ReqHead:
   match r:
     case Fail{e}:
-      HttpxReqHead{"", "", Nil{}}
+      ReqHead{"", "", Nil{}}
     case Done{(+h, t)}:
       h
 
-def x_req.ok(r: Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>) -> Bool:
+def x_req.ok(r: Result<&1, &1, U32 & String, ReqHead & Tab>) -> Bool:
   match r:
     case Fail{e}:
       False{}
     case Done{(h, t)}:
       True{}
 
-def x_req.tab(r: Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>) -> HttpxTab:
+def x_req.tab(r: Result<&1, &1, U32 & String, ReqHead & Tab>) -> Tab:
   match r:
     case Fail{e}:
-      HttpxTab{Nil{}, 0, 4096}
+      Tab{Nil{}, 0, 4096}
     case Done{(h, +t)}:
       t
 
 # got (Phase 14 A-cirurgia, piloto httpx_stream): 1 match responde a tripla;
 # o caller nunca desdobra — a fase 7 do loop casa o param e ventila.
-def x_req.got(dr: Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab>) -> HttpxReqHead & Bool & HttpxTab:
+def x_req.got(dr: Result<&1, &1, U32 & String, ReqHead & Tab>) -> ReqHead & Bool & Tab:
   match dr:
     case Fail{e}:
-      (HttpxReqHead{"", "", Nil{}}, False{}, HttpxTab{Nil{}, 0, 4096})
+      (ReqHead{"", "", Nil{}}, False{}, Tab{Nil{}, 0, 4096})
     case Done{(+h, +t)}:
       (h, True{}, t)
 
-def x_req.no_got() -> HttpxReqHead & Bool & HttpxTab:
-  (HttpxReqHead{"", "", Nil{}}, False{}, HttpxTab{Nil{}, 0, 4096})
+def x_req.no_got() -> ReqHead & Bool & Tab:
+  (ReqHead{"", "", Nil{}}, False{}, Tab{Nil{}, 0, 4096})
 
 # Response head decode (mirror of x_req.go, apply on :status)
 # ------------------------------------------------------------
 
-def x_resp.apply2(+status: U32, +headers: List<&2, HttpxHdr>, +name: String, +value: String, is_status: Bool) -> HttpxHead:
+def x_resp.apply2(+status: U32, +headers: List<&2, Hdr>, +name: String, +value: String, is_status: Bool) -> Head:
   match is_status:
     case True{}:
-      HttpxHead{Maybe.default(&2, U32, U32.read(value), 0), headers}
+      Head{Maybe.default(&2, U32, U32.read(value), 0), headers}
     case False{}:
-      HttpxHead{status, List.append(&2, HttpxHdr, headers, [HttpxHdr{name, value}])}
+      Head{status, List.append(&2, Hdr, headers, [Hdr{name, value}])}
 
-def x_resp.apply(+st: HttpxHead, +name: String, +value: String, is_status: Bool) -> HttpxHead:
+def x_resp.apply(+st: Head, +name: String, +value: String, is_status: Bool) -> Head:
   match st:
-    case HttpxHead{+status, +headers}:
+    case Head{+status, +headers}:
       x_resp.apply2(status, headers, name, value, is_status)
 
 @unsafe
-def x_resp.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HttpxHdrGot>, +name: String, +value: String, st: HttpxHead, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHead & HttpxTab>:
+def x_resp.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HdrGot>, +name: String, +value: String, st: Head, +tab: Tab) ->
+  Result<&1, &1, U32 & String, Head & Tab>:
   match fuel:
     case 0n:
       Fail{(502, "too many headers")}
@@ -1609,7 +1645,7 @@ def x_resp.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32
           match r:
             case Fail{e}:
               Fail{e}
-            case Done{HttpxHdrGot{+n, +v, +rrest, +tab2}}:
+            case Done{HdrGot{+n, +v, +rrest, +tab2}}:
               x_resp.go(f, 2, rrest, Fail{(0, "")}, n, v, st, tab2)
         case 2:
           +st2 = x_resp.apply(st, name, value, String.eq(name, ":status"))
@@ -1617,28 +1653,28 @@ def x_resp.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32
         case _:
           x_resp.go(f, 0, bs, r, "", "", st, tab)
 
-def x_resp.decode(+bs: List<&2, U32>, +tab: HttpxTab) ->
-  Result<&1, &1, U32 & String, HttpxHead & HttpxTab>:
-  x_resp.go(512n, 0, bs, Fail{(0, "")}, "", "", HttpxHead{0, Nil{}}, tab)
+def x_resp.decode(+bs: List<&2, U32>, +tab: Tab) ->
+  Result<&1, &1, U32 & String, Head & Tab>:
+  x_resp.go(512n, 0, bs, Fail{(0, "")}, "", "", Head{0, Nil{}}, tab)
 
-def x_resp.rh(r: Result<&1, &1, U32 & String, HttpxHead & HttpxTab>) -> HttpxHead:
+def x_resp.rh(r: Result<&1, &1, U32 & String, Head & Tab>) -> Head:
   match r:
     case Fail{e}:
-      HttpxHead{0, Nil{}}
+      Head{0, Nil{}}
     case Done{(+h, t)}:
       h
 
-def x_resp.ok(r: Result<&1, &1, U32 & String, HttpxHead & HttpxTab>) -> Bool:
+def x_resp.ok(r: Result<&1, &1, U32 & String, Head & Tab>) -> Bool:
   match r:
     case Fail{e}:
       False{}
     case Done{(h, t)}:
       True{}
 
-def x_resp.tab(r: Result<&1, &1, U32 & String, HttpxHead & HttpxTab>) -> HttpxTab:
+def x_resp.tab(r: Result<&1, &1, U32 & String, Head & Tab>) -> Tab:
   match r:
     case Fail{e}:
-      HttpxTab{Nil{}, 0, 4096}
+      Tab{Nil{}, 0, 4096}
     case Done{(h, +t)}:
       t
 
@@ -1648,14 +1684,14 @@ def x_resp.tab(r: Result<&1, &1, U32 & String, HttpxHead & HttpxTab>) -> HttpxTa
 def x_lit.enc(+name: String, +value: String) -> List<&2, U32>:
   List.append(&2, U32, [0], List.append(&2, U32, x_str.enc(name), x_str.enc(value)))
 
-def x_block.go(hs: List<&2, HttpxHdr>, acc: List<&2, U32>) -> List<&2, U32>:
+def x_block.go(hs: List<&2, Hdr>, acc: List<&2, U32>) -> List<&2, U32>:
   match hs:
     case Nil{}:
       acc
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       x_block.go(t, List.append(&2, U32, acc, x_lit.enc(n, v)))
 
-def x_block(hs: List<&2, HttpxHdr>) -> List<&2, U32>:
+def x_block(hs: List<&2, Hdr>) -> List<&2, U32>:
   x_block.go(hs, Nil{})
 
 # Classify / preface / responses
@@ -1791,9 +1827,9 @@ def x_cls_odd(+typ: U32, +odd: U32, +flags: U32, +payload: List<&2, U32>) -> U32
 def x_cls(+typ: U32, +sid: U32, +flags: U32, +payload: List<&2, U32>) -> U32:
   x_cls_odd(typ, U32.and(sid, 1), flags, payload)
 
-def x_classify(+frame: HttpxFrame) -> U32:
+def x_classify(+frame: Frame) -> U32:
   match frame:
-    case HttpxFrame{+typ, +flags, +sid, +payload}:
+    case Frame{+typ, +flags, +sid, +payload}:
       x_cls(typ, sid, flags, payload)
 
 def x_send_raw_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
@@ -1872,13 +1908,13 @@ def x_flow_sw(p: U32 & U32) -> U32:
   (a, b) = p
   b
 
-def x_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HttpxGot:
+def x_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
   (s, r) = sent
   match r:
     case Fail{(code, msg)}:
-      (s, HttpxGotErr{code, msg})
+      (s, GotErr{code, msg})
     case Done{u}:
-      (s, HttpxGotErr{0, "next"})
+      (s, GotErr{0, "next"})
 
 def x_chunk_of(+cw: U32, +sw: U32, +blen: U32) -> U32:
   x_flow_min(x_flow_min(x_flow_min(cw, sw), x_max_send()), blen)
@@ -1922,50 +1958,50 @@ def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
                         case +b5 <> rest:
                           x_settings.iw_of(rest, x_settings.iw_find(cur, (((b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32))), U32.is_eq((b0 * 256 + b1 : U32), 4)))
 
-def x_flow.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> Socket & HttpxGot:
+def x_flow.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> Socket & Got:
   (s2, r2) = sent
   match r2:
     case Fail{(code, msg)}:
-      (s2, HttpxGotErr{code, msg})
+      (s2, GotErr{code, msg})
     case Done{u}:
-      (s2, HttpxGotOk{HttpxFrame{0, 0, 0, Nil{}}, buf})
+      (s2, GotOk{Frame{0, 0, 0, Nil{}}, buf})
 
-def x_flow.ack(got: Socket & HttpxGot, buf: List<&2, U32>) -> IO(Socket & HttpxGot):
+def x_flow.ack(got: Socket & Got, buf: List<&2, U32>) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HttpxGot, x_flow.acked(sent, buf))
+    IO.pure(Socket & Got, x_flow.acked(sent, buf))
 
-def x_flow_wu_bad(got: Socket & HttpxGot) -> Socket & Result<&1, &1, U32 & String, Unit>:
+def x_flow_wu_bad(got: Socket & Got) -> Socket & Result<&1, &1, U32 & String, Unit>:
   (s, g) = got
   (s, Fail{(502, "bad window_update")})
 
-def x_flow.pair(got: Socket & HttpxGot) -> Socket & HttpxGot:
+def x_flow.pair(got: Socket & Got) -> Socket & Got:
   (s, g) = got
-  (s, HttpxGotErr{0, "next"})
+  (s, GotErr{0, "next"})
 
 @unsafe
-def x_send_data_flow(+phase: U32, got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
+def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   match phase:
     case 0:
       (s0, g0) = got
       match g0:
-        case HttpxGotErr{code0, msg0}:
+        case GotErr{code0, msg0}:
           match code0:
             case 0:
               match body:
                 case Nil{}:
                   x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
                 case +b <> r:
-                  x_send_data_flow(4, (s0, HttpxGotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p)
+                  x_send_data_flow(4, (s0, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p)
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s0, Fail{(code0, msg0)}))
-        case HttpxGotOk{+frame0, +buf0}:
-          x_send_data_flow(0, (s0, HttpxGotErr{0, "next"}), sid, body, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p)
+        case GotOk{+frame0, +buf0}:
+          x_send_data_flow(0, (s0, GotErr{0, "next"}), sid, body, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p)
     case 4:
       (s4, g4) = got
-      x_send_data_flow(5, (s4, HttpxGotErr{0, "next"}), sid, body, cw, sw, buf, cl, x_chunk_of(cw, sw, x_len32(body)), Nil{}, x_chunk_pos(x_chunk_of(cw, sw, x_len32(body))), sid2p)
+      x_send_data_flow(5, (s4, GotErr{0, "next"}), sid, body, cw, sw, buf, cl, x_chunk_of(cw, sw, x_len32(body)), Nil{}, x_chunk_pos(x_chunk_of(cw, sw, x_len32(body))), sid2p)
     case 5:
       (s5, g5) = got
       x_flow.chunker(got, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
@@ -1975,11 +2011,11 @@ def x_send_data_flow(+phase: U32, got: Socket & HttpxGot, +sid: U32, +body: List
     case 9:
       (s9, g9) = got
       match g9:
-        case HttpxGotErr{code9, msg9}:
+        case GotErr{code9, msg9}:
           IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s9, Fail{(code9, msg9)}))
-        case HttpxGotOk{+frame9, +buf9}:
+        case GotOk{+frame9, +buf9}:
           match frame9:
-            case HttpxFrame{+typ9, +flags9, +sid29, +payload9}:
+            case Frame{+typ9, +flags9, +sid29, +payload9}:
               x_send_data_flow(12, got, sid, body, cw, sw, buf9, x_flow.cls(typ9), ful, payload9, x_wu_ok(payload9), sid29)
     case 12:
       (s12, g12) = got
@@ -2005,7 +2041,7 @@ def x_flow.cls(+typ: U32) -> U32:
     case _:
       0
 
-def x_flow.chunker(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32) ->
+def x_flow.chunker(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   (s5, g5) = got
   match ok:
@@ -2015,20 +2051,20 @@ def x_flow.chunker(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw:
         x_send_data_flow(6, x_flow_sent(sent), sid, x_drop32(ful, body), (cw - ful : U32), (sw - ful : U32), buf, 0, 0, Nil{}, True{}, sid2p)
     case False{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        got2 : Socket & HttpxGot <- x_read_frame(s5, buf)
+        got2 : Socket & Got <- x_read_frame(s5, buf)
         x_send_data_flow(9, got2, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
 
-def x_flow.reste(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
+def x_flow.reste(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   (s6, g6) = got
   match body:
     case Nil{}:
       x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
     case +b <> r:
-      x_send_data_flow(0, (s6, HttpxGotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
+      x_send_data_flow(0, (s6, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
 
 @unsafe
-def x_flow.do_act(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>) ->
+def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   (s, g) = got
   match cl:
@@ -2036,7 +2072,7 @@ def x_flow.do_act(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: 
       x_flow.wu(got, sid, body, cw, sw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2))
     case 4:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        got2 : Socket & HttpxGot <- x_flow.ack(got, buf)
+        got2 : Socket & Got <- x_flow.ack(got, buf)
         x_send_data_flow(4, got2, sid, body, cw, x_settings.iw_of(pay2, sw), buf, 0, 0, Nil{}, True{}, sid2p)
     case 6:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
@@ -2049,10 +2085,10 @@ def x_flow.do_act(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: 
     case 9:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{(502, "continuation")}))
     case _:
-      x_send_data_flow(4, (s, HttpxGotErr{0, "next"}), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
+      x_send_data_flow(4, (s, GotErr{0, "next"}), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
 
 @unsafe
-def x_flow.wu(got: Socket & HttpxGot, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool) ->
+def x_flow.wu(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   match ok:
     case True{}:
@@ -2067,7 +2103,7 @@ def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: 
     case True{}:
       x_send_data_frame(sock, sid, body)
     case False{}:
-      x_send_data_flow(0, (sock, HttpxGotErr{0, "next"}), sid, body, x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0)
+      x_send_data_flow(0, (sock, GotErr{0, "next"}), sid, body, x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0)
 
 def x_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
@@ -2098,9 +2134,9 @@ def x_send_resp_head(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U3
         case False{}:
           x_send_resp_body2(sock, sid, body)
 
-def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  hs = List.append(&2, HttpxHdr, [HttpxHdr{":status", U32.show(status)}], headers)
+  hs = List.append(&2, Hdr, [Hdr{":status", U32.show(status)}], headers)
   blk = x_block(hs)
   +empty = U32.is_eq(x_len32(body), 0)
   flags = (x_f_end_headers() + x_b2u(empty) : U32)
@@ -2108,18 +2144,18 @@ def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, Htt
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_raw_frame(sock, x_t_headers(), flags, sid, blk)
     x_send_resp_head(sent, sid, body, empty)
 
-def x_send_resp(sock: Socket, +sid: U32, +resp: HttpxResp) ->
+def x_send_resp(sock: Socket, +sid: U32, +resp: Response) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   match resp:
-    case HttpxResp{+status, +headers, +body}:
+    case Response{+status, +headers, +body}:
       x_send_resp.go(sock, sid, status, headers, body)
 
-# Httpx slots (unbounded List<HttpxSt>; single-traversal take in Data wrapper)
+# Httpx slots (unbounded List<St>; single-traversal take in Data wrapper)
 # -----------------------------------------------------------------------
 
-def httpx.sid_of(st: HttpxSt) -> U32:
+def httpx.sid_of(st: St) -> U32:
   match st:
-    case HttpxSt{head, body, +sid}:
+    case St{head, body, +sid}:
       sid
 
 # Ack only a fresh (non-ACK) SETTINGS: acking an ACK back would ping-pong
@@ -2133,61 +2169,61 @@ def httpx.cls_fix(base: U32, +flags: U32) -> U32:
 
 # Parking value: the loop reads on every turn, so the carrier only has to
 # carry the socket while no frame is in hand.
-def httpx.again(s: Socket) -> Socket & HttpxGot:
-  (s, HttpxGotOk{HttpxFrame{0, 0, 0, Nil{}}, Nil{}})
+def httpx.again(s: Socket) -> Socket & Got:
+  (s, GotOk{Frame{0, 0, 0, Nil{}}, Nil{}})
 
-def httpx.close_got(got: Socket & HttpxGot) -> IO(Unit):
+def httpx.close_got(got: Socket & Got) -> IO(Unit):
   (s, g) = got
   TLS.tls_close(s)
 
 # Housekeeping sends keep the connection alive even if the write fails:
 # the next read answers the dead socket and closes the connection.
-def httpx.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HttpxGot:
+def httpx.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
   (s2, r) = sent
   httpx.again(s2)
 
-def httpx.ack(got: Socket & HttpxGot) -> IO(Socket & HttpxGot):
+def httpx.ack(got: Socket & Got) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HttpxGot, httpx.sent(sent))
+    IO.pure(Socket & Got, httpx.sent(sent))
 
-def httpx.ack_ping(got: Socket & HttpxGot, +payload: List<&2, U32>) -> IO(Socket & HttpxGot):
+def httpx.ack_ping(got: Socket & Got, +payload: List<&2, U32>) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, payload)
-    IO.pure(Socket & HttpxGot, httpx.sent(sent))
+    IO.pure(Socket & Got, httpx.sent(sent))
 
-def httpx.body_of(st: HttpxSt) -> List<&2, U32>:
+def httpx.body_of(st: St) -> List<&2, U32>:
   match st:
-    case HttpxSt{head, +body, sid}:
+    case St{head, +body, sid}:
       body
 
-def httpx.req_of(+rh: HttpxReqHead, +body: List<&2, U32>) -> HttpxReq:
+def httpx.req_of(+rh: ReqHead, +body: List<&2, U32>) -> Request:
   match rh:
-    case HttpxReqHead{+method, +path, +headers}:
-      HttpxReq{method, path, headers, body}
+    case ReqHead{+method, +path, +headers}:
+      Request{method, path, headers, body}
 
 # Request straight from the slot, no +rh/+body. Thin projection style:
 # the caller holds one reusable Taken bind.
-def httpx.req_of_st(st: HttpxSt, +payload: List<&2, U32>) -> HttpxReq:
+def httpx.req_of_st(st: St, +payload: List<&2, U32>) -> Request:
   match st:
-    case HttpxSt{head, +body, +sid}:
+    case St{head, +body, +sid}:
       match head:
         case None{}:
-          HttpxReq{"", "", Nil{}, x_cat(x_rev_push(payload, body))}
+          Request{"", "", Nil{}, x_cat(x_rev_push(payload, body))}
         case Some{+rh}:
           match rh:
-            case HttpxReqHead{+method, +path, +headers}:
-              HttpxReq{method, path, headers, x_cat(x_rev_push(payload, body))}
+            case ReqHead{+method, +path, +headers}:
+              Request{method, path, headers, x_cat(x_rev_push(payload, body))}
 
-def httpxn.no_slots() -> List<&2, HttpxSt>:
+def httpxn.no_slots() -> List<&2, St>:
   Nil{}
 
 def httpxn.no_fends() -> List<&2, U32>:
   Nil{}
 
-def httpxn.has(slots: List<&2, HttpxSt>, +sid: U32) -> Bool:
+def httpxn.has(slots: List<&2, St>, +sid: U32) -> Bool:
   match slots:
     case Nil{}:
       False{}
@@ -2196,11 +2232,11 @@ def httpxn.has(slots: List<&2, HttpxSt>, +sid: U32) -> Bool:
 
 # Single-traversal fragment probe: slot with sid exists AND head is None.
 # 2 traversals + S clones -> 1 traversal, S incs (sids unique via put).
-def httpxn.has_some_go(eq: Bool, st: HttpxSt, rec: Bool) -> Bool:
+def httpxn.has_some_go(eq: Bool, st: St, rec: Bool) -> Bool:
   match eq:
     case True{}:
       match st:
-        case HttpxSt{head, body, sid}:
+        case St{head, body, sid}:
           match head:
             case None{}:
               True{}
@@ -2209,21 +2245,21 @@ def httpxn.has_some_go(eq: Bool, st: HttpxSt, rec: Bool) -> Bool:
     case False{}:
       rec
 
-def httpxn.has_some(slots: List<&2, HttpxSt>, +sid: U32) -> Bool:
+def httpxn.has_some(slots: List<&2, St>, +sid: U32) -> Bool:
   match slots:
     case Nil{}:
       False{}
     case +st <> t:
       httpxn.has_some_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxn.has_some(t, sid))
 
-def httpxn.del_go(eq: Bool, +st: HttpxSt, rest: List<&2, HttpxSt>) -> List<&2, HttpxSt>:
+def httpxn.del_go(eq: Bool, +st: St, rest: List<&2, St>) -> List<&2, St>:
   match eq:
     case True{}:
       rest
     case False{}:
       st <> rest
 
-def httpxn.del(slots: List<&2, HttpxSt>, +sid: U32) -> List<&2, HttpxSt>:
+def httpxn.del(slots: List<&2, St>, +sid: U32) -> List<&2, St>:
   match slots:
     case Nil{}:
       Nil{}
@@ -2233,55 +2269,55 @@ def httpxn.del(slots: List<&2, HttpxSt>, +sid: U32) -> List<&2, HttpxSt>:
 # Single-traversal take in a Data wrapper (a top-level A & B pair is not
 # Data and admits no + reuse). 1x O(S) always: strict args run the tail
 # even on early match; sids unique via put so the tail found nothing.
-def httpxn.take_go(eq: Bool, +st: HttpxSt, p: HttpxTaken) -> HttpxTaken:
+def httpxn.take_go(eq: Bool, +st: St, p: Taken) -> Taken:
   match eq:
     case True{}:
       match p:
-        case HttpxTaken{+slots, st2}:
-          HttpxTaken{slots, st}
+        case Taken{+slots, st2}:
+          Taken{slots, st}
     case False{}:
       match p:
-        case HttpxTaken{+slots2, +found2}:
-          HttpxTaken{(st <> slots2), found2}
+        case Taken{+slots2, +found2}:
+          Taken{(st <> slots2), found2}
 
-def httpxn.take_del(slots: List<&2, HttpxSt>, +sid: U32) -> HttpxTaken:
+def httpxn.take_del(slots: List<&2, St>, +sid: U32) -> Taken:
   match slots:
     case Nil{}:
-      HttpxTaken{Nil{}, HttpxSt{None{}, Nil{}, 0}}
+      Taken{Nil{}, St{None{}, Nil{}, 0}}
     case +st <> t:
       httpxn.take_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxn.take_del(t, sid))
 
-def httpxn.taken_slots(p: HttpxTaken) -> List<&2, HttpxSt>:
+def httpxn.taken_slots(p: Taken) -> List<&2, St>:
   match p:
-    case HttpxTaken{+slots, st}:
+    case Taken{+slots, st}:
       slots
 
-def httpxn.taken_st(p: HttpxTaken) -> HttpxSt:
+def httpxn.taken_st(p: Taken) -> St:
   match p:
-    case HttpxTaken{slots, +st}:
+    case Taken{slots, +st}:
       st
 
 # DATA continue: keep the slot with the pushed rev-body, hp-less.
-def httpxn.data_cont_slots(p: HttpxTaken, +payload: List<&2, U32>) -> List<&2, HttpxSt>:
+def httpxn.data_cont_slots(p: Taken, +payload: List<&2, U32>) -> List<&2, St>:
   match p:
-    case HttpxTaken{+rest, st}:
+    case Taken{+rest, st}:
       match st:
-        case HttpxSt{head, +body, +sid}:
+        case St{head, +body, +sid}:
           match head:
             case None{}:
-              ((HttpxSt{Some{HttpxReqHead{"", "", Nil{}}}, x_rev_push(payload, body), sid} <> rest))
+              ((St{Some{ReqHead{"", "", Nil{}}}, x_rev_push(payload, body), sid} <> rest))
             case Some{+rh}:
-              ((HttpxSt{Some{rh}, x_rev_push(payload, body), sid} <> rest))
+              ((St{Some{rh}, x_rev_push(payload, body), sid} <> rest))
 
 # CONTINUATION fragment: head stays None, rev-body grows.
-def httpxn.frag_cont_slots(p: HttpxTaken, +payload: List<&2, U32>) -> List<&2, HttpxSt>:
+def httpxn.frag_cont_slots(p: Taken, +payload: List<&2, U32>) -> List<&2, St>:
   match p:
-    case HttpxTaken{+rest, st}:
+    case Taken{+rest, st}:
       match st:
-        case HttpxSt{head, +body, +sid}:
-          ((HttpxSt{None{}, x_rev_push(payload, body), sid} <> rest))
+        case St{head, +body, +sid}:
+          ((St{None{}, x_rev_push(payload, body), sid} <> rest))
 
-def httpxn.put(slots: List<&2, HttpxSt>, +st: HttpxSt) -> List<&2, HttpxSt>:
+def httpxn.put(slots: List<&2, St>, +st: St) -> List<&2, St>:
   st <> httpxn.del(slots, httpx.sid_of(st))
 
 def httpxn.fdel_go(eq: Bool, +x: U32, rest: List<&2, U32>) -> List<&2, U32>:
@@ -2299,32 +2335,32 @@ def httpxn.fdel(fends: List<&2, U32>, +sid: U32) -> List<&2, U32>:
       httpxn.fdel_go(U32.is_eq(x, sid), x, httpxn.fdel(t, sid))
 
 # Fused fends take: find + remove + flag in one traversal (2 -> 1).
-def httpxn.fdel_flag_go(eq: Bool, +x: U32, p: HttpxFendTaken) -> HttpxFendTaken:
+def httpxn.fdel_flag_go(eq: Bool, +x: U32, p: FendTaken) -> FendTaken:
   match eq:
     case True{}:
       match p:
-        case HttpxFendTaken{+rest, flag}:
-          HttpxFendTaken{rest, 1}
+        case FendTaken{+rest, flag}:
+          FendTaken{rest, 1}
     case False{}:
       match p:
-        case HttpxFendTaken{+rest2, +flag2}:
-          HttpxFendTaken{(x <> rest2), flag2}
+        case FendTaken{+rest2, +flag2}:
+          FendTaken{(x <> rest2), flag2}
 
-def httpxn.fdel_flag(fends: List<&2, U32>, +sid: U32) -> HttpxFendTaken:
+def httpxn.fdel_flag(fends: List<&2, U32>, +sid: U32) -> FendTaken:
   match fends:
     case Nil{}:
-      HttpxFendTaken{Nil{}, 0}
+      FendTaken{Nil{}, 0}
     case +x <> t:
       httpxn.fdel_flag_go(U32.is_eq(x, sid), x, httpxn.fdel_flag(t, sid))
 
-def httpxn.ftaken_fends(p: HttpxFendTaken) -> List<&2, U32>:
+def httpxn.ftaken_fends(p: FendTaken) -> List<&2, U32>:
   match p:
-    case HttpxFendTaken{+fends, flag}:
+    case FendTaken{+fends, flag}:
       fends
 
-def httpxn.ftaken_flag(p: HttpxFendTaken) -> U32:
+def httpxn.ftaken_flag(p: FendTaken) -> U32:
   match p:
-    case HttpxFendTaken{fends, +flag}:
+    case FendTaken{fends, +flag}:
       flag
 
 def httpxn.fput(fends: List<&2, U32>, +sid: U32) -> List<&2, U32>:
@@ -2337,7 +2373,7 @@ def httpxn.fend_up(fends: List<&2, U32>, +sid: U32, is_end: Bool) -> List<&2, U3
     case False{}:
       httpxn.fdel(fends, sid)
 
-def httpxn.frag_has(+slots: List<&2, HttpxSt>, +sid: U32) -> Bool:
+def httpxn.frag_has(+slots: List<&2, St>, +sid: U32) -> Bool:
   httpxn.has_some(slots, sid)
 
 # HEADERS action codes: 0 claim slot, 1 answer now, 5 decode fail,
@@ -2425,100 +2461,100 @@ def x_send_rst(sock: Socket, +sid: U32, +code: U32) ->
 # Receive-side credit leaf for the server loops (mold client_on.wu_best,
 # buf carried): best-effort double WINDOW_UPDATE (conn 0 + stream sid);
 # a failed credit still delivers the frame, the dead socket fails next read.
-def httpx.wo(got: Socket & HttpxGot) -> Socket:
+def httpx.wo(got: Socket & Got) -> Socket:
   (sx, gx) = got
   sx
 
 def httpx.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) ->
-  Socket & HttpxGot:
+  Socket & Got:
   (s, r) = sent
   match r:
     case Fail{(code, msg)}:
-      (s, HttpxGotErr{code, msg})
+      (s, GotErr{code, msg})
     case Done{u}:
-      (s, HttpxGotOk{HttpxFrame{0, 0, 0, Nil{}}, buf})
+      (s, GotOk{Frame{0, 0, 0, Nil{}}, buf})
 
-def httpx.wu_er(got: Socket & HttpxGot, buf: List<&2, U32>, +sid: U32, +payload: List<&2, U32>) ->
-  IO(Socket & HttpxGot):
+def httpx.wu_er(got: Socket & Got, buf: List<&2, U32>, +sid: U32, +payload: List<&2, U32>) ->
+  IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_wu_len(s, sid, x_len32(payload))
-    IO.pure(Socket & HttpxGot, httpx.wu_kept(sent, buf))
+    IO.pure(Socket & Got, httpx.wu_kept(sent, buf))
 
 # Main interleave loop (single @unsafe self-recursive def; phase-0 reset
 # spelled out at each site). Single Socket carrier threaded whole, slot
 # decisions as Bool/U32 params computed in caller arg position, open
-# streams as List<HttpxSt> + fragment END_STREAM ledger fends.
+# streams as List<St> + fragment END_STREAM ledger fends.
 # Phases: 0 read, 1 decompose, 2 connection dispatch (cls),
 # 3 stream dispatch (typ), 4 HEADERS-complete, 5 DATA, 6 CONTINUATION.
 # 13 params + handler (was 14 + handler with the HpDyn tab).
 
 @unsafe
-def httpx(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & HttpxGot, +slots: List<&2, HttpxSt>, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: HttpxReqHead, act: U32, +tab: HttpxTab) ->
+def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: List<&2, St>, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: ReqHead, act: U32, +tab: Tab) ->
   IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
-        httpx(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+        got2 : Socket & Got <- x_read_frame(s0, buf)
+        httpx(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
+        case GotErr{code1, msg1}:
           TLS.tls_close(s1)
-        case HttpxGotOk{+frame, +buf2}:
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              httpx(~H, 2, (s1, HttpxGotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), HttpxReqHead{"", "", Nil{}}, 4, tab)
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              httpx(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), ReqHead{"", "", Nil{}}, 4, tab)
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.ack(got)
-            httpx(~H, 0, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+            got2 : Socket & Got <- httpx.ack(got)
+            httpx(~H, 0, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 4:
           do IO<Unit>:
-            gotp : Socket & HttpxGot <- httpx.ack_ping(got, payload)
-            httpx(~H, 0, gotp, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+            gotp : Socket & Got <- httpx.ack_ping(got, payload)
+            httpx(~H, 0, gotp, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 5:
           httpx.close_got(got)
         case 2:
-          httpx(~H, 0, got, httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 7:
-          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), HttpxReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), tab)
+          httpx(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), tab)
         case 6:
-          httpx(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, 4, tab)
         case 0:
-          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case _:
-          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
     case 3:
       match typ:
         case 1:
-          +dr : Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab> = x_req.decode(payload, tab)
+          +dr : Result<&1, &1, U32 & String, ReqHead & Tab> = x_req.decode(payload, tab)
           httpx(~H, 4, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, x_req.rh(dr), httpxn.head_act(httpxn.need_u(typ, flags), x_req.ok(dr), end), x_req.tab(dr))
         case 0:
-          httpx(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, httpxn.decide_data(httpxn.has(slots, sid2), end), tab)
+          httpx(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, httpxn.decide_data(httpxn.has(slots, sid2), end), tab)
         case _:
-          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          httpx(~H, 0, got, httpxn.put(slots, HttpxSt{Some{rh}, Nil{}, sid2}), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, httpxn.put(slots, St{Some{rh}, Nil{}, sid2}), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           do IO<Unit>:
-            req : HttpxReq = httpx.req_of(rh, Nil{})
-            resp : HttpxResp <- H(req)
+            req : Request = httpx.req_of(rh, Nil{})
+            resp : Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s4, sid2, resp)
-            httpx(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+            httpx(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 6:
-          httpx(~H, 0, got, httpxn.put(slots, HttpxSt{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 5:
           TLS.tls_close(s4)
         case _:
@@ -2528,16 +2564,16 @@ def httpx(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & HttpxGot, +sl
       match act:
         case 0:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er((sb, gb), buf, sid2, payload)
-            httpx(~H, 0, got2, httpxn.data_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+            got2 : Socket & Got <- httpx.wu_er((sb, gb), buf, sid2, payload)
+            httpx(~H, 0, got2, httpxn.data_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er((sb, gb), buf, sid2, payload)
-            +tp : HttpxTaken = httpxn.take_del(slots, sid2)
-            req : HttpxReq = httpx.req_of_st(httpxn.taken_st(tp), payload)
-            resp : HttpxResp <- H(req)
+            got2 : Socket & Got <- httpx.wu_er((sb, gb), buf, sid2, payload)
+            +tp : Taken = httpxn.take_del(slots, sid2)
+            req : Request = httpx.req_of_st(httpxn.taken_st(tp), payload)
+            resp : Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx(~H, 0, httpx.sent(sent), httpxn.taken_slots(tp), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+            httpx(~H, 0, httpx.sent(sent), httpxn.taken_slots(tp), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 4:
           httpx.close_got(got)
         case _:
@@ -2546,12 +2582,12 @@ def httpx(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & HttpxGot, +sl
       (s6, g6) = got
       match act:
         case 0:
-          httpx(~H, 0, got, httpxn.frag_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+          httpx(~H, 0, got, httpxn.frag_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 1:
-          +tp2 : HttpxTaken = httpxn.take_del(slots, sid2)
+          +tp2 : Taken = httpxn.take_del(slots, sid2)
           +full : List<&2, U32> = x_cat(x_rev_push(payload, httpx.body_of(httpxn.taken_st(tp2))))
-          +dr6 : Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab> = x_req.decode(full, tab)
-          +fp : HttpxFendTaken = httpxn.fdel_flag(fends, sid2)
+          +dr6 : Result<&1, &1, U32 & String, ReqHead & Tab> = x_req.decode(full, tab)
+          +fp : FendTaken = httpxn.fdel_flag(fends, sid2)
           +ff : U32 = httpxn.ftaken_flag(fp)
           httpx(~H, 4, got, httpxn.taken_slots(tp2), httpxn.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, cls, ff, x_req.rh(dr6), httpxn.head_act(0, x_req.ok(dr6), ff), x_req.tab(dr6))
         case _:
@@ -2559,13 +2595,13 @@ def httpx(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & HttpxGot, +sl
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s6, 0, 1)
             httpxn.cont_failed(sent)
     case _:
-      httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, tab)
+      httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
 
 # Preface entry (owns the byte buffer end-to-end, so pipelined frames are
 # never dropped between streams). Below httpx: calls upward.
 
 @unsafe
-def httpx_pre(~H: HttpxReq -> IO(HttpxResp), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+def httpx_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
   IO(Unit):
   match phase:
     case 0:
@@ -2591,14 +2627,14 @@ def httpx_pre(~H: HttpxReq -> IO(HttpxResp), phase: U32, rs: Socket & Result<&1,
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            httpx(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, x_tab.empty())
+            httpx(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, x_tab.empty())
         case _:
           TLS.tls_close(s2)
     case _:
       (s9, r9) = rs
       TLS.tls_close(s9)
 
-def httpx_start(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def httpx_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
     httpx_pre(~H, 0, r1, Nil{}, 0, False{})
@@ -2606,16 +2642,16 @@ def httpx_start(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
 # Accept plumbing (httpx-only, H2-only): every connection runs httpx_start.
 # No H1 split — ALPN non-H2 closes fail-closed.
 
-def httpx_spawn.go(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def httpx_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   httpx_start(~H, sock)
 
-def httpx_spawn(~H: HttpxReq -> IO(HttpxResp), sock: Socket, l: Listener) ->
+def httpx_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
     x : Unit <- IO.spawn(Unit, httpx_spawn.go(~H, sock))
     return l
 
-def httpx_conn(~H: HttpxReq -> IO(HttpxResp), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def httpx_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
@@ -2629,14 +2665,14 @@ def httpx_alpn_close(sock: Socket, l: Listener) -> IO(Listener):
     x : Unit <- TLS.tls_close(sock)
     return l
 
-def httpx_alpn_go(~H: HttpxReq -> IO(HttpxResp), is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+def httpx_alpn_go(~H: Request -> IO(Response), is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
   match is_h2:
     case True{}:
       httpx_spawn(~H, sock, listener)
     case False{}:
       httpx_alpn_close(sock, listener)
 
-def httpx_alpn_conn(~H: HttpxReq -> IO(HttpxResp), accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
+def httpx_alpn_conn(~H: Request -> IO(Response), accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
   match result:
     case Fail{e}:
@@ -2649,7 +2685,7 @@ def httpx_alpn_conn(~H: HttpxReq -> IO(HttpxResp), accepted: Listener & Result<&
 # handshake with h2/http1.1 offer but serves H2 only (non-H2 closes).
 
 @unsafe
-def server_on_concurrent(~H: HttpxReq -> IO(HttpxResp), l: Listener, +cert: String, +key: String) ->
+def server_on_concurrent(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
@@ -2658,7 +2694,7 @@ def server_on_concurrent(~H: HttpxReq -> IO(HttpxResp), l: Listener, +cert: Stri
     return z
 
 @unsafe
-def server_on_concurrent_alpn(~H: HttpxReq -> IO(HttpxResp), listener: Listener, +cert: String, +key: String) ->
+def server_on_concurrent_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
@@ -2672,28 +2708,28 @@ def server_on_concurrent_alpn(~H: HttpxReq -> IO(HttpxResp), listener: Listener,
 # codec pieces reuse x_* above, validation is local (same Fail 400).
 # ---------------------------------------------------------------------
 
-type HttpxCont is Data:
-  HttpxCont{block: List<&2, U32>, rest: List<&2, U32>}
+type Cont is Data:
+  Cont{block: List<&2, U32>, rest: List<&2, U32>}
 
-type HttpxCliSt is Data:
-  HttpxCliSt{sid: U32, tab: HttpxTab}
+type CliSt is Data:
+  CliSt{sid: U32, tab: Tab}
 
-type HttpxStreamEv is Data:
-  StreamHead{head: HttpxHead}
+type StreamEv is Data:
+  StreamHead{head: Head}
   StreamData{chunk: List<&2, U32>, fin: Bool}
   StreamFail{code: U32, msg: String}
 
-type HttpxStreamOut is Data:
+type StreamOut is Data:
   StreamContinue{}
   StreamCancel{}
 
-type HttpxSrvEv is Data:
-  ReqHead{slot: U32, head: HttpxReqHead}
-  ReqData{slot: U32, chunk: List<&2, U32>, fin: Bool}
+type SrvEv is Data:
+  SrvReqHead{slot: U32, head: ReqHead}
+  SrvReqData{slot: U32, chunk: List<&2, U32>, fin: Bool}
 
-type HttpxSrvOut is Data:
+type SrvOut is Data:
   NeedMore{}
-  RespondEarly{resp: HttpxResp}
+  RespondEarly{resp: Response}
 
 # Local validation (same Fail 400 as https valid.go; no http import)
 # ------------------------------------------------------------------
@@ -2773,35 +2809,35 @@ def client_on.valid_path(+p: String) -> Bool:
 def client_on.valid.go(+host: String, +port: U32, +path: String) -> Bool:
   Bool.and(client_on.valid_host(host), Bool.and(client_on.valid_port(port), client_on.valid_path(path)))
 
-# Authority + request block (mirror https with_authority, HttpxHdr)
+# Authority + request block (mirror https with_authority, Hdr)
 # ---------------------------------------------------------------
 
-def client_on.drop_authority.go(+n: String, +v: String, rec: List<&2, HttpxHdr>, is_auth: Bool) ->
-  List<&2, HttpxHdr>:
+def client_on.drop_authority.go(+n: String, +v: String, rec: List<&2, Hdr>, is_auth: Bool) ->
+  List<&2, Hdr>:
   match is_auth:
     case True{}:
       rec
     case False{}:
-      HttpxHdr{n, v} <> rec
+      Hdr{n, v} <> rec
 
-def client_on.drop_authority(hs: List<&2, HttpxHdr>) -> List<&2, HttpxHdr>:
+def client_on.drop_authority(hs: List<&2, Hdr>) -> List<&2, Hdr>:
   match hs:
     case Nil{}:
       Nil{}
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       +nn = n
       +vv = v
       client_on.drop_authority.go(nn, vv, client_on.drop_authority(t), String.eq(nn, ":authority"))
 
-def client_on.with_authority(+host: String, +port: U32, hs: List<&2, HttpxHdr>) ->
-  List<&2, HttpxHdr>:
-  HttpxHdr{":authority", host ++ ":" ++ U32.show(port)} <> client_on.drop_authority(hs)
+def client_on.with_authority(+host: String, +port: U32, hs: List<&2, Hdr>) ->
+  List<&2, Hdr>:
+  Hdr{":authority", host ++ ":" ++ U32.show(port)} <> client_on.drop_authority(hs)
 
-def client_on.req_hdrs(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>) ->
-  List<&2, HttpxHdr>:
-  List.append(&2, HttpxHdr, [HttpxHdr{":method", method}, HttpxHdr{":path", path}, HttpxHdr{":scheme", "https"}], client_on.with_authority(host, port, hs))
+def client_on.req_hdrs(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
+  List<&2, Hdr>:
+  List.append(&2, Hdr, [Hdr{":method", method}, Hdr{":path", path}, Hdr{":scheme", "https"}], client_on.with_authority(host, port, hs))
 
-def client_on.req_block(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>) ->
+def client_on.req_block(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
   List<&2, U32>:
   x_block(client_on.req_hdrs(host, port, method, path, hs))
 
@@ -2837,85 +2873,85 @@ def client_on.cont_cls_of(+typ: U32, +sid2: U32, +sid: U32, +flags: U32) -> U32:
   client_on.cont_cls(typ, sid2, sid, flags, client_on.cont_ok(typ, sid2, sid))
 
 def client_on.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxCont>):
+  IO(Socket & Result<&1, &1, U32 & String, Cont>):
   (s, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxCont>, (s, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s, Fail{e}))
     case Done{u}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxCont>, (s, Fail{(502, "continuation")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s, Fail{(502, "continuation")}))
 
 @unsafe
-def client_on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & HttpxGot, +cls: U32, +frag: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxCont>):
+def client_on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & Got, +cls: U32, +frag: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Cont>):
   match phase:
     case 0:
       (s0, g0) = prev
       match g0:
-        case HttpxGotErr{code, msg}:
+        case GotErr{code, msg}:
           match code:
             case 0:
-              do IO<Socket & Result<&1, &1, U32 & String, HttpxCont>>:
-                got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
+              do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
+                got2 : Socket & Got <- x_read_frame(s0, buf)
                 client_on.cont_read(0, sid, acc, buf, got2, 0, Nil{})
             case _:
-              IO.pure(Socket & Result<&1, &1, U32 & String, HttpxCont>, (s0, Fail{(code, msg)}))
-        case HttpxGotOk{+frame, +buf2}:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s0, Fail{(code, msg)}))
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ, +flags, +sid2, +payload}:
-              client_on.cont_read(1, sid, acc, buf2, (s0, HttpxGotErr{0, "next"}), client_on.cont_cls_of(typ, sid2, sid, flags), payload)
+            case Frame{+typ, +flags, +sid2, +payload}:
+              client_on.cont_read(1, sid, acc, buf2, (s0, GotErr{0, "next"}), client_on.cont_cls_of(typ, sid2, sid, flags), payload)
     case 1:
       (s1, g1) = prev
       match cls:
         case 0:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxCont>, (s1, Done{HttpxCont{List.append(&2, U32, acc, frag), buf}}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s1, Done{Cont{List.append(&2, U32, acc, frag), buf}}))
         case 1:
-          client_on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, HttpxGotErr{0, "next"}), 0, Nil{})
+          client_on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, GotErr{0, "next"}), 0, Nil{})
         case _:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxCont>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s1, 0, 1)
             client_on.cont_failed(sent)
     case _:
       (sx, gx) = prev
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxCont>, (sx, Fail{(502, "bad phase")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (sx, Fail{(502, "bad phase")}))
 
 def client_on.cont_start(sock: Socket, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxCont>):
-  client_on.cont_read(0, sid, acc, buf, (sock, HttpxGotErr{0, "next"}), 0, Nil{})
+  IO(Socket & Result<&1, &1, U32 & String, Cont>):
+  client_on.cont_read(0, sid, acc, buf, (sock, GotErr{0, "next"}), 0, Nil{})
 
 # Single-stream drain leafs (once/keep-alive share; streaming adds WU)
 # ---------------------------------------------------------------------
 
-def client_on.again(s: Socket) -> Socket & HttpxGot:
-  (s, HttpxGotOk{HttpxFrame{0, 0, 0, Nil{}}, Nil{}})
+def client_on.again(s: Socket) -> Socket & Got:
+  (s, GotOk{Frame{0, 0, 0, Nil{}}, Nil{}})
 
-def client_on.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HttpxGot:
+def client_on.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
   (s2, r) = sent
   client_on.again(s2)
 
-def client_on.ack(got: Socket & HttpxGot) -> IO(Socket & HttpxGot):
+def client_on.ack(got: Socket & Got) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HttpxGot, client_on.sent(sent))
+    IO.pure(Socket & Got, client_on.sent(sent))
 
-def client_on.ack_ping(got: Socket & HttpxGot, +payload: List<&2, U32>) -> IO(Socket & HttpxGot):
+def client_on.ack_ping(got: Socket & Got, +payload: List<&2, U32>) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, payload)
-    IO.pure(Socket & HttpxGot, client_on.sent(sent))
+    IO.pure(Socket & Got, client_on.sent(sent))
 
-def client_on.resp_of(+head: HttpxHead, +body: List<&2, U32>) -> HttpxResp:
+def client_on.resp_of(+head: Head, +body: List<&2, U32>) -> Response:
   match head:
-    case HttpxHead{+status, +headers}:
-      HttpxResp{status, headers, body}
+    case Head{+status, +headers}:
+      Response{status, headers, body}
 
-def client_on.head_status(+head: HttpxHead) -> U32:
+def client_on.head_status(+head: Head) -> U32:
   match head:
-    case HttpxHead{+status, headers}:
+    case Head{+status, headers}:
       status
 
-def client_on.has_head(+head: HttpxHead) -> Bool:
+def client_on.has_head(+head: Head) -> Bool:
   U32.is_ne(client_on.head_status(head), 0)
 
 def client_on.mine_go(+cls: U32, is_stream: Bool, is_mine: Bool) -> U32:
@@ -2941,20 +2977,20 @@ def client_on.head_flags(is_empty: Bool) -> U32:
     case False{}:
       x_f_end_headers()
 
-def client_on.fail(got: Socket & HttpxGot, +tab: HttpxTab, +code: U32, +msg: String) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab):
+def client_on.fail(got: Socket & Got, +tab: Tab, +code: U32, +msg: String) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
-  IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab, (s, Fail{(code, msg)}, tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Fail{(code, msg)}, tab))
 
-def client_on.done(got: Socket & HttpxGot, +tab: HttpxTab, +head: HttpxHead, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab):
+def client_on.done(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
-  IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab, (s, Done{client_on.resp_of(head, x_cat(body))}, tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client_on.resp_of(head, x_cat(body))}, tab))
 
-def client_on.done_data(got: Socket & HttpxGot, +tab: HttpxTab, +head: HttpxHead, +body: List<&2, U32>, +payload: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab):
+def client_on.done_data(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>, +payload: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
-  IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab, (s, Done{client_on.resp_of(head, x_cat(x_rev_push(payload, body)))}, tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client_on.resp_of(head, x_cat(x_rev_push(payload, body)))}, tab))
 
 # Single-stream response drain (once shape; keep-alive threads tab/sid
 # outside). Phases: 0 read, 1 decompose, 2 conn dispatch, 3 stream
@@ -2965,32 +3001,32 @@ def client_on.done_data(got: Socket & HttpxGot, +tab: HttpxTab, +head: HttpxHead
 # ---------------------------------------------------------------------
 
 @unsafe
-def client_on.drain(phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +tab: HttpxTab, +head: HttpxHead, +body: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab):
+def client_on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +body: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   match phase:
     case 0:
       (s0, g0) = got
-      do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
+      do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+        got2 : Socket & Got <- x_read_frame(s0, buf)
         client_on.drain(1, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab, (s1, Fail{(code1, msg1)}, tab))
-        case HttpxGotOk{+frame, +buf2}:
+        case GotErr{code1, msg1}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s1, Fail{(code1, msg1)}, tab))
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              client_on.drain(2, (s1, HttpxGotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              client_on.drain(2, (s1, GotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
     case 2:
       match cls:
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-            got2 : Socket & HttpxGot <- client_on.ack(got)
+          do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+            got2 : Socket & Got <- client_on.ack(got)
             client_on.drain(0, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 4:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-            gotp : Socket & HttpxGot <- client_on.ack_ping(got, payload)
+          do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+            gotp : Socket & Got <- client_on.ack_ping(got, payload)
             client_on.drain(0, gotp, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
           client_on.fail(got, tab, 502, "goaway")
@@ -3011,7 +3047,7 @@ def client_on.drain(phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +ta
     case 3:
       match typ:
         case 1:
-          +dr : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(payload, tab)
+          +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
           client_on.drain(4, got, buf, x_resp.tab(dr), x_resp.rh(dr), body, typ, flags, sid2, payload, cls, end, exp, httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
         case 0:
           client_on.drain(5, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, httpxn.decide_data(client_on.has_head(head), end))
@@ -3024,8 +3060,8 @@ def client_on.drain(phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +ta
         case 1:
           client_on.done(got, tab, head, body)
         case 6:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-            cres : Socket & Result<&1, &1, U32 & String, HttpxCont> <- client_on.cont_start(httpx.wo(got), exp, payload, buf)
+          do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+            cres : Socket & Result<&1, &1, U32 & String, Cont> <- client_on.cont_start(httpx.wo(got), exp, payload, buf)
             client_on.drain_conted(cres, tab, body, end, exp)
         case 5:
           client_on.fail(got, tab, 502, "head decode")
@@ -3034,12 +3070,12 @@ def client_on.drain(phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +ta
     case 5:
       match act:
         case 0:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-            got2 : Socket & HttpxGot <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
+          do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
             client_on.drain(0, got2, buf, tab, head, x_rev_push(payload, body), 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab>:
-            got2 : Socket & HttpxGot <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
+          do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
+            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
             client_on.done_data(got2, tab, head, body, payload)
         case 4:
           client_on.fail(got, tab, 502, "stray data")
@@ -3057,16 +3093,16 @@ def client_on.drain(phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +ta
 # ---------------------------------------------------------------------
 
 @unsafe
-def client_on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, HttpxCont>, +tab: HttpxTab, +body: List<&2, U32>, +end: U32, +exp: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab):
+def client_on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +body: List<&2, U32>, +end: U32, +exp: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (cs, cr) = cres
   match cr:
     case Fail{(fc, fm)}:
       client_on.fail(client_on.again(cs), tab, fc, fm)
     case Done{+mc}:
       match mc:
-        case HttpxCont{+block, +rest}:
-          +dr2 : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(block, tab)
+        case Cont{+block, +rest}:
+          +dr2 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(block, tab)
           client_on.drain(4, client_on.again(cs), rest, x_resp.tab(dr2), x_resp.rh(dr2), body, 1, 4, exp, Nil{}, 0, end, exp, httpxn.head_act(0, x_resp.ok(dr2), end))
 
 # Dial + preface (ALPN h2 required; non-H2 closes fail-closed 615)
@@ -3143,7 +3179,7 @@ def client_on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +
         case False{}:
           x_send_data_start(sock, sid, body)
 
-def client_on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def client_on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   +empty = U32.is_eq(x_len32(body), 0)
   do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
@@ -3153,41 +3189,41 @@ def client_on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +meth
 # Once (dial, one exchange sid 1, close). Insecure twin for loopback.
 # ------------------------------------------------------------------
 
-def client_once.drained(drained: Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once.drained(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   (s, r, t) = drained
   match r:
     case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{+resp}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Done{resp})
+        IO.pure(Result<&1, &1, U32 & String, Response>, Done{resp})
 
 def client_once.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+  IO(Result<&1, &1, U32 & String, Response>):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{u}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
-        drained : Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab <- client_on.drain(0, (sock, HttpxGotErr{0, "next"}), Nil{}, x_tab.empty(), HttpxHead{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, 1, 4)
+      do IO<Result<&1, &1, U32 & String, Response>>:
+        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client_on.drain(0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, 1, 4)
         client_once.drained(drained)
 
-def client_once.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
-  do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+def client_once.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, 1, host, port, method, path, hs, body)
     client_once.sent(sent)
 
 # H1 lane, ported patterns (Phase 11): http.bend is the base that works,
 # so its shapes come over verbatim (window scan, recurse-in-args with
-# match-result-as-param, fuel loops) — but speaking HttpxReq/HttpxResp/HttpxHdr
+# match-result-as-param, fuel loops) — but speaking Request/Response/Hdr
 # natively, so no pairs converters and no encode/decode layer are needed.
 # Subset, fail-closed: no chunked (→502), client requires Content-Length
 # (missing →502, never hangs on keep-alive), server treats missing CL as
@@ -3215,14 +3251,14 @@ def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) 
     case False{}:
       List.append(&2, U32, acc, x_str_bytes(n ++ ": " ++ v ++ "\r\n"))
 
-def x_h1.render_hs.go(hs: List<&2, HttpxHdr>, acc: List<&2, U32>) -> List<&2, U32>:
+def x_h1.render_hs.go(hs: List<&2, Hdr>, acc: List<&2, U32>) -> List<&2, U32>:
   match hs:
     case Nil{}:
       acc
-    case HttpxHdr{+n, +v} <> t:
+    case Hdr{+n, +v} <> t:
       x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, acc, x_h1.forbidden(n)))
 
-def x_h1.render_req.go(bad: Bool, +method: String, +path: String, +host: String, +port: U32, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def x_h1.render_req.go(bad: Bool, +method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
   match bad:
     case True{}:
@@ -3230,7 +3266,7 @@ def x_h1.render_req.go(bad: Bool, +method: String, +path: String, +host: String,
     case False{}:
       Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\nContent-Length: " ++ U32.show(x_len32(body)) ++ "\r\n")), x_str_bytes("\r\n")), body)}
 
-def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
   x_h1.render_req.go(Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body)
 
@@ -3257,7 +3293,7 @@ def x_h1.reason(st: U32) -> String:
     case _:
       SNil{}
 
-def x_h1.show_resp(+status: U32, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) -> List<&2, U32>:
+def x_h1.show_resp(+status: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) -> List<&2, U32>:
   List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(x_len32(body)) ++ "\r\n")), x_str_bytes("\r\n")), body)
 
 # Blank-line cut over bytes (window 218762506 = \r\n\r\n, same as
@@ -3338,7 +3374,7 @@ def x_h1.req_tok(parts: List<&2, String>) -> Result<&1, &1, U32 & String, String
     case Nil{}:
       Fail{(400, "bad request line")}
 
-def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Bool>) -> Result<&1, &1, U32 & String, HttpxReqHead>:
+def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Bool>) -> Result<&1, &1, U32 & String, ReqHead>:
   match r:
     case Fail{e}:
       Fail{e}
@@ -3347,26 +3383,26 @@ def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Boo
         case (m, p, v, ok):
           match ok:
             case True{}:
-              Done{HttpxReqHead{m, p, Nil{}}}
+              Done{ReqHead{m, p, Nil{}}}
             case False{}:
               Fail{(400, "bad request")}
 
-def x_h1.req_join.hs(+m: String, +p: String, hs: Result<&1, &1, U32 & String, List<&2, HttpxHdr>>) ->
-  Result<&1, &1, U32 & String, HttpxReqHead>:
+def x_h1.req_join.hs(+m: String, +p: String, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
+  Result<&1, &1, U32 & String, ReqHead>:
   match hs:
     case Fail{e}:
       Fail{e}
     case Done{+headers}:
-      Done{HttpxReqHead{m, p, headers}}
+      Done{ReqHead{m, p, headers}}
 
-def x_h1.req_join(tok: Result<&1, &1, U32 & String, HttpxReqHead>, hs: Result<&1, &1, U32 & String, List<&2, HttpxHdr>>) ->
-  Result<&1, &1, U32 & String, HttpxReqHead>:
+def x_h1.req_join(tok: Result<&1, &1, U32 & String, ReqHead>, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
+  Result<&1, &1, U32 & String, ReqHead>:
   match tok:
     case Fail{e}:
       Fail{e}
     case Done{+rh}:
       match rh:
-        case HttpxReqHead{+m, +p, +hs0}:
+        case ReqHead{+m, +p, +hs0}:
           x_h1.req_join.hs(m, p, hs)
 
 # Status line: version + numeric code (Maybe.default like http.bend:976).
@@ -3427,8 +3463,8 @@ def x_h1.strip_cr(s: String) -> String:
 def x_h1.hdr_val(+line: String, +nlen: Nat) -> String:
   String.trim(String.drop(line, (nlen + 1n : Nat)))
 
-def x_h1.parse_hdr(done: Bool, parts: List<&2, String>, +line: String, rec: Result<&1, &1, U32 & String, List<&2, HttpxHdr>>) ->
-  Result<&1, &1, U32 & String, List<&2, HttpxHdr>>:
+def x_h1.parse_hdr(done: Bool, parts: List<&2, String>, +line: String, rec: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
+  Result<&1, &1, U32 & String, List<&2, Hdr>>:
   match done:
     case True{}:
       Done{Nil{}}
@@ -3445,10 +3481,10 @@ def x_h1.parse_hdr(done: Bool, parts: List<&2, String>, +line: String, rec: Resu
                 case Fail{e}:
                   Fail{e}
                 case Done{+tl}:
-                  Done{HttpxHdr{n, x_h1.hdr_val(line, String.length(n))} <> tl}
+                  Done{Hdr{n, x_h1.hdr_val(line, String.length(n))} <> tl}
 
 def x_h1.parse_hs(lines: List<&2, String>) ->
-  Result<&1, &1, U32 & String, List<&2, HttpxHdr>>:
+  Result<&1, &1, U32 & String, List<&2, Hdr>>:
   match lines:
     case Nil{}:
       Done{Nil{}}
@@ -3466,14 +3502,14 @@ def x_h1.cl_at(is_cl: Bool, +v: String, +acc: U32) -> U32:
     case False{}:
       acc
 
-def x_h1.cl_of.go(hs: List<&2, HttpxHdr>, +acc: U32) -> U32:
+def x_h1.cl_of.go(hs: List<&2, Hdr>, +acc: U32) -> U32:
   match hs:
     case Nil{}:
       acc
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       x_h1.cl_of.go(t, x_h1.cl_at(x_h1.eq_ci(n, "content-length"), v, acc))
 
-def x_h1.cl_of(hs: List<&2, HttpxHdr>) -> U32:
+def x_h1.cl_of(hs: List<&2, Hdr>) -> U32:
   x_h1.cl_of.go(hs, 0)
 
 def x_h1.te_at(is_te: Bool, +v: String, acc: Bool) -> Bool:
@@ -3483,14 +3519,14 @@ def x_h1.te_at(is_te: Bool, +v: String, acc: Bool) -> Bool:
     case False{}:
       acc
 
-def x_h1.te_go(hs: List<&2, HttpxHdr>, acc: Bool) -> Bool:
+def x_h1.te_go(hs: List<&2, Hdr>, acc: Bool) -> Bool:
   match hs:
     case Nil{}:
       acc
-    case HttpxHdr{n, v} <> t:
+    case Hdr{n, v} <> t:
       x_h1.te_go(t, x_h1.te_at(x_h1.eq_ci(n, "transfer-encoding"), v, acc))
 
-def x_h1.is_chunked(hs: List<&2, HttpxHdr>) -> Bool:
+def x_h1.is_chunked(hs: List<&2, Hdr>) -> Bool:
   x_h1.te_go(hs, False{})
 
 def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
@@ -3514,89 +3550,89 @@ def x_h1.no_body(+method: String, +status: U32) -> Bool:
 # ---------------------------------------------------------------------
 
 @unsafe
-def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, HttpxHdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, Hdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
       match fuel:
         case 0n:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s0, Fail{(413, "response too long")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
         case 1n+f:
           match enough:
             case True{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s0, Done{HttpxResp{code, hs, x_take32(cl, rest)}}))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Done{Response{code, hs, x_take32(cl, rest)}}))
             case False{}:
-              do IO<Socket & Result<&1, &1, U32 & String, HttpxResp>>:
+              do IO<Socket & Result<&1, &1, U32 & String, Response>>:
                 r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
                 x_h1.cli.bd(1, r, f, False{}, code, hs, rest, cl)
     case 1:
       (s1, r1) = got
       match r1:
         case Fail{e}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s1, Fail{e}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{e}))
         case Done{+part}:
           match part:
             case Nil{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s1, Fail{(400, "eof")}))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +rest2 = List.append(&2, U32, rest, part)
               x_h1.cli.bd(0, (s1, Done{Nil{}}), fuel, U32.is_ge(x_len32(rest2), cl), code, hs, rest2, cl)
     case _:
       (s9, r9) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s9, Fail{(502, "bad phase")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
 
-def x_h1.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, HttpxHdr>, nbody: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, Hdr>, nbody: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match nbody:
     case True{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Done{HttpxResp{code, hs, Nil{}}}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Done{Response{code, hs, Nil{}}}))
     case False{}:
       match chunked:
         case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Fail{(502, "chunked refused")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(502, "chunked refused")}))
         case False{}:
           +clc = x_h1.cl_of(hs)
           x_h1.cli.bd(0, (sock, Done{Nil{}}), fuel, U32.is_ge(x_len32(rest), clc), code, hs, rest, clc)
 
-def x_h1.cli.hd(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, HttpxHdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.hd(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match hsres:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+hs}:
       x_h1.cli.hd2(sock, rest, fuel, code, hs, nbody, x_h1.is_chunked(hs))
 
-def x_h1.cli.coded(sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, HttpxHdr>>) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.coded(sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match coderes:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+code}:
       x_h1.cli.hd(sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
 
-def x_h1.cli.parsed(s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.parsed(s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
   +rest = x_h1.split_rest(x_h1.split(acc2))
   x_h1.cli.coded(s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
 
 @unsafe
-def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
       match fuel:
         case 0n:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s0, Fail{(413, "response too long")}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
         case 1n+f:
-          do IO<Socket & Result<&1, &1, U32 & String, HttpxResp>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Response>>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
             x_h1.cli.head(1, r, acc, f, method, False{})
     case 1:
       (s1, r1) = got
       match r1:
         case Fail{e}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s1, Fail{e}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{e}))
         case Done{+part}:
           match part:
             case Nil{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s1, Fail{(400, "eof")}))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
               x_h1.cli.head(2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
@@ -3609,41 +3645,41 @@ def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2
           x_h1.cli.parsed(s2, acc, fuel, method)
     case _:
       (s9, r9) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (s9, Fail{(502, "bad phase")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
 
-def x_h1.exch.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.exch.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{u}:
       x_h1.cli.head(0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
 
-def x_h1.exch.send(sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.exch.send(sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match rendered:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+bytes}:
-      do IO<Socket & Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Response>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, bytes)
         x_h1.exch.sent(sent, method)
 
-def x_h1.exch.done(out: Socket & Result<&1, &1, U32 & String, HttpxResp>) -> IO(Result<&1, &1, U32 & String, HttpxResp>):
+def x_h1.exch.done(out: Socket & Result<&1, &1, U32 & String, Response>) -> IO(Result<&1, &1, U32 & String, Response>):
   (s, r) = out
   match r:
     case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{+resp}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Done{resp})
+        IO.pure(Result<&1, &1, U32 & String, Response>, Done{resp})
 
-def x_h1.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
-  do IO<Result<&1, &1, U32 & String, HttpxResp>>:
-    out : Socket & Result<&1, &1, U32 & String, HttpxResp> <- x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
+def x_h1.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
+    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
     x_h1.exch.done(out)
 
 # H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
@@ -3656,34 +3692,34 @@ def h1_once.dial(+host: String, +port: U32, insecure: Bool) -> IO(Result<&1, &1,
     case False{}:
       TLS.tls_connect_noalpn(host, port)
 
-def h1_once.conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def h1_once.conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match conn:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{sock}:
       x_h1.exch(sock, host, port, method, path, hs, body)
 
-def h1_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def h1_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+          do IO<Result<&1, &1, U32 & String, Response>>:
             conn : Result<&1, &1, U32 & String, Socket> <- h1_once.dial(host, port, insecure)
             h1_once.conn(conn, host, port, method, path, hs, body)
         case False{}:
-          IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{(413, "req too large")})
+          IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(413, "req too large")})
     case False{}:
-      IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{(400, "bad request")})
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(400, "bad request")})
 
-def h1_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def h1_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   h1_once.fit(host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
-def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   h1_once.fit(host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
 # Dual-dial dispatch for once/fetch: h2 → preface+exchange (existing
@@ -3698,58 +3734,58 @@ def client_once.dial(+host: String, +port: U32, insecure: Bool) -> IO(Result<&1,
     case False{}:
       TLS.tls_connect_any(host, port)
 
-def client_once.h2go(r: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once.h2go(r: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match r:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{sock2}:
       client_once.exch(sock2, host, port, method, path, hs, body)
 
-def client_once.by_proto(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, is_h2: Bool) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once.by_proto(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, is_h2: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match is_h2:
     case True{}:
-      do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+      do IO<Result<&1, &1, U32 & String, Response>>:
         pre : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_preface(sock)
         mid : Result<&1, &1, U32 & String, Socket> <- client_on.prefaced(pre)
         client_once.h2go(mid, host, port, method, path, hs, body)
     case False{}:
       x_h1.exch(sock, host, port, method, path, hs, body)
 
-def client_once.dispatched(d: Result<&1, &1, U32 & String, Socket & String>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once.dispatched(d: Result<&1, &1, U32 & String, Socket & String>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match d:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{e})
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{value}:
       (sock, protocol) = value
       client_once.by_proto(sock, host, port, method, path, hs, body, TLS.tls_alpn_is_h2(protocol))
 
-def client_once.dialgo(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
-  do IO<Result<&1, &1, U32 & String, HttpxResp>>:
+def client_once.dialgo(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
     d : Result<&1, &1, U32 & String, Socket & String> <- client_once.dial(host, port, insecure)
     client_once.dispatched(d, host, port, method, path, hs, body)
 
-def client_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   match fit:
     case True{}:
       match ok:
         case True{}:
           client_once.dialgo(host, port, method, path, hs, body, insecure)
         case False{}:
-          IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{(413, "req too large")})
+          IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(413, "req too large")})
     case False{}:
-      IO.pure(Result<&1, &1, U32 & String, HttpxResp>, Fail{(400, "bad request")})
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(400, "bad request")})
 
-def client_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   client_once.fit(host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
-def client_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, HttpxResp>):
+def client_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
   client_once.fit(host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
 # URL + fetch (Phase 9): read_url ported verbatim from http.bend:653-840
@@ -3890,36 +3926,36 @@ def httpx_url.read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & Stri
 # as String; fetch_bytes answers raw bytes. insecure=False{} verifies.
 # ---------------------------------------------------------------------
 
-def fetch.text(r: Result<&1, &1, U32 & String, HttpxResp>) ->
+def fetch.text(r: Result<&1, &1, U32 & String, Response>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match r:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
     case Done{+resp}:
       match resp:
-        case HttpxResp{+status, +headers, +body}:
+        case Response{+status, +headers, +body}:
           IO.pure(Result<&1, &1, U32 & String, String>, Done{x_bytes_str(body)})
 
-def fetch.raw(r: Result<&1, &1, U32 & String, HttpxResp>) ->
+def fetch.raw(r: Result<&1, &1, U32 & String, Response>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   match r:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{e})
     case Done{+resp}:
       match resp:
-        case HttpxResp{+status, +headers, +body}:
+        case Response{+status, +headers, +body}:
           IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Done{body})
 
 def fetch.get(+host: String, port: U32, path: String, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
-    r : Result<&1, &1, U32 & String, HttpxResp> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
+    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
     fetch.text(r)
 
 def fetch_bytes.get(+host: String, port: U32, path: String, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-    r : Result<&1, &1, U32 & String, HttpxResp> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
+    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
     fetch.raw(r)
 
 def fetch.host(host: String, +port: U32, path: String, insecure: Bool, ok: Bool) ->
@@ -3999,13 +4035,13 @@ def fetch_bytes_insecure(+url: String) -> IO(Result<&1, &1, U32 & String, List<&
 # insecure=False{} verifies.
 # ---------------------------------------------------------------------
 
-def send_request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: String, insecure: Bool) ->
+def send_request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
-    r : Result<&1, &1, U32 & String, HttpxResp> <- client_once.dialgo(host, port, method, path, hs, x_str_bytes(body), insecure)
+    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, method, path, hs, x_str_bytes(body), insecure)
     fetch.text(r)
 
-def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: String, insecure: Bool, fit: Bool) ->
+def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   match fit:
     case True{}:
@@ -4013,21 +4049,21 @@ def send_request.fit(+host: String, +port: U32, +path: String, +method: String, 
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
 
-def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: String) ->
+def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   send_request.fit(host, port, path, method, hs, body, False{}, client_on.valid.go(host, port, path))
 
-def send_request_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: String) ->
+def send_request_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   send_request.fit(host, port, path, method, hs, body, True{}, client_on.valid.go(host, port, path))
 
-def send_request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool) ->
+def send_request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-    r : Result<&1, &1, U32 & String, HttpxResp> <- client_once.dialgo(host, port, method, path, hs, body, insecure)
+    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, method, path, hs, body, insecure)
     fetch.raw(r)
 
-def send_request_bytes.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool) ->
+def send_request_bytes.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   match fit:
     case True{}:
@@ -4035,11 +4071,11 @@ def send_request_bytes.fit(+host: String, +port: U32, +path: String, +method: St
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad request")})
 
-def send_request_bytes(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def send_request_bytes(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   send_request_bytes.fit(host, port, path, method, hs, body, False{}, client_on.valid.go(host, port, path))
 
-def send_request_bytes_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def send_request_bytes_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   send_request_bytes.fit(host, port, path, method, hs, body, True{}, client_on.valid.go(host, port, path))
 
@@ -4048,7 +4084,7 @@ def send_request_bytes_insecure(+host: String, +port: U32, +path: String, +metho
 # (best-effort, mold h2_send_wu_len); Cancel sends RST_STREAM (8) + Fail.
 # ---------------------------------------------------------------------
 
-def client_on.is_cont(+out: HttpxStreamOut) -> Bool:
+def client_on.is_cont(+out: StreamOut) -> Bool:
   match out:
     case StreamContinue{}:
       True{}
@@ -4079,12 +4115,12 @@ def client_on.sdata_act(is_cont: Bool, has: Bool, +end: U32) -> U32:
     case _ _ _:
       0
 
-def client_on.sfail(got: Socket & HttpxGot, +code: U32, +msg: String) ->
+def client_on.sfail(got: Socket & Got, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Fail{(code, msg)}))
 
-def client_on.sdone(got: Socket & HttpxGot, +total: U32, +fins: U32) ->
+def client_on.sdone(got: Socket & Got, +total: U32, +fins: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Done{(total, fins)}))
@@ -4094,7 +4130,7 @@ def client_on.cancel_done(rst: Socket & Result<&1, &1, U32 & String, Unit>) ->
   (s2, r2) = rst
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s2, Fail{(8, "cancelled")}))
 
-def client_on.cancelled(got: Socket & HttpxGot, +sid: U32) ->
+def client_on.cancelled(got: Socket & Got, +sid: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
@@ -4102,19 +4138,19 @@ def client_on.cancelled(got: Socket & HttpxGot, +sid: U32) ->
     client_on.cancel_done(rst)
 
 def client_on.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) ->
-  Socket & HttpxGot:
+  Socket & Got:
   (s, r) = sent
   match r:
     case Fail{(code, msg)}:
-      (s, HttpxGotErr{code, msg})
+      (s, GotErr{code, msg})
     case Done{u}:
-      (s, HttpxGotOk{HttpxFrame{0, 0, 0, Nil{}}, buf})
+      (s, GotOk{Frame{0, 0, 0, Nil{}}, buf})
 
-def client_on.wu_blest(got: Socket & HttpxGot, buf: List<&2, U32>, +sid: U32, +inc: U32) -> IO(Socket & HttpxGot):
+def client_on.wu_blest(got: Socket & Got, buf: List<&2, U32>, +sid: U32, +inc: U32) -> IO(Socket & Got):
   (s, g) = got
-  do IO<Socket & HttpxGot>:
+  do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_wu_len(s, sid, inc)
-    IO.pure(Socket & HttpxGot, client_on.wu_kept(sent, buf))
+    IO.pure(Socket & Got, client_on.wu_kept(sent, buf))
 
 # CONTINUATION inline leaves for sdrop (Phase 15 item 2): fresh Err-next
 # pair to (re)enter the cont-read phase, and GOAWAY-fail mapping for a
@@ -4122,8 +4158,8 @@ def client_on.wu_blest(got: Socket & HttpxGot, buf: List<&2, U32>, +sid: U32, +i
 # Pure leaves above the loop (callee-above-caller, no ~H inside).
 # ---------------------------------------------------------------------
 
-def client_on.sdrop_next(s: Socket) -> Socket & HttpxGot:
-  (s, HttpxGotErr{0, "next"})
+def client_on.sdrop_next(s: Socket) -> Socket & Got:
+  (s, GotErr{0, "next"})
 
 def client_on.sdrop_sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
@@ -4135,32 +4171,32 @@ def client_on.sdrop_sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) 
       IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Fail{(502, "continuation")}))
 
 @unsafe
-def client_on.sdrop(~H: HttpxStreamEv -> HttpxStreamOut, phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +tab: HttpxTab, +head: HttpxHead, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
+def client_on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
+        got2 : Socket & Got <- x_read_frame(s0, buf)
         client_on.sdrop(~H, 1, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
+        case GotErr{code1, msg1}:
           IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s1, Fail{(code1, msg1)}))
-        case HttpxGotOk{+frame, +buf2}:
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              client_on.sdrop(~H, 2, (s1, HttpxGotOk{frame, buf2}), buf2, tab, head, total, fins, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              client_on.sdrop(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, head, total, fins, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
     case 2:
       match cls:
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & HttpxGot <- client_on.ack(got)
+            got2 : Socket & Got <- client_on.ack(got)
             client_on.sdrop(~H, 0, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 4:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            gotp : Socket & HttpxGot <- client_on.ack_ping(got, payload)
+            gotp : Socket & Got <- client_on.ack_ping(got, payload)
             client_on.sdrop(~H, 0, gotp, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
           client_on.sfail(got, 502, "goaway")
@@ -4181,16 +4217,16 @@ def client_on.sdrop(~H: HttpxStreamEv -> HttpxStreamOut, phase: U32, got: Socket
     case 3:
       match typ:
         case 1:
-          +dr : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(payload, tab)
-          +nh : HttpxHead = x_resp.rh(dr)
-          +nt : HttpxTab = x_resp.tab(dr)
+          +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
+          +nh : Head = x_resp.rh(dr)
+          +nt : Tab = x_resp.tab(dr)
           +ok : Bool = x_resp.ok(dr)
           +need : U32 = httpxn.need_u(typ, flags)
-          +out : HttpxStreamOut = H(StreamHead{nh})
+          +out : StreamOut = H(StreamHead{nh})
           client_on.sdrop(~H, 4, got, buf, nt, nh, total, fins, typ, flags, sid2, payload, cls, end, exp, client_on.stream_act(client_on.is_cont(out), need, ok, end))
         case 0:
           +fin : Bool = U32.is_eq(end, 1)
-          +out0 : HttpxStreamOut = H(StreamData{payload, fin})
+          +out0 : StreamOut = H(StreamData{payload, fin})
           client_on.sdrop(~H, 5, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, client_on.sdata_act(client_on.is_cont(out0), client_on.has_head(head), end))
         case _:
           client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
@@ -4212,11 +4248,11 @@ def client_on.sdrop(~H: HttpxStreamEv -> HttpxStreamOut, phase: U32, got: Socket
       match act:
         case 0:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & HttpxGot <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
+            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
             client_on.sdrop(~H, 0, got2, buf, tab, head, (total + x_len32(payload) : U32), fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & HttpxGot <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
+            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
             client_on.sdone(got2, (total + x_len32(payload) : U32), (fins + 1 : U32))
         case 4:
           client_on.sfail(got, 502, "stray data")
@@ -4227,23 +4263,23 @@ def client_on.sdrop(~H: HttpxStreamEv -> HttpxStreamOut, phase: U32, got: Socket
     case 6:
       (s6, g6) = got
       match g6:
-        case HttpxGotErr{code6, msg6}:
+        case GotErr{code6, msg6}:
           match code6:
             case 0:
               do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-                got6 : Socket & HttpxGot <- x_read_frame(s6, buf)
+                got6 : Socket & Got <- x_read_frame(s6, buf)
                 client_on.sdrop(~H, 6, got6, buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s6, Fail{(code6, msg6)}))
-        case HttpxGotOk{+frame6, +buf6}:
+        case GotOk{+frame6, +buf6}:
           match frame6:
-            case HttpxFrame{+typ6, +flags6, +sid6, +pay6}:
-              client_on.sdrop(~H, 7, (s6, HttpxGotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, exp, flags6), end, exp, 0)
+            case Frame{+typ6, +flags6, +sid6, +pay6}:
+              client_on.sdrop(~H, 7, (s6, GotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, exp, flags6), end, exp, 0)
     case 7:
       (s7, g7) = got
       match cls:
         case 0:
-          +dr7 : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(payload, tab)
+          +dr7 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
           client_on.sdrop(~H, 4, client_on.again(s7), buf, x_resp.tab(dr7), x_resp.rh(dr7), total, fins, typ, flags, sid2, Nil{}, cls, end, exp, httpxn.head_act(0, x_resp.ok(dr7), end))
         case 1:
           client_on.sdrop(~H, 6, client_on.sdrop_next(s7), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
@@ -4270,7 +4306,7 @@ def client_stream.drained(drained: Socket & Result<&1, &1, U32 & String, U32 & U
         x : Unit <- TLS.tls_close(s)
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Done{counts})
 
-def client_stream.sent(~H: HttpxStreamEv -> HttpxStreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   (sock, r) = sent
   match r:
@@ -4280,16 +4316,16 @@ def client_stream.sent(~H: HttpxStreamEv -> HttpxStreamOut, sent: Socket & Resul
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client_on.sdrop(~H, 0, (sock, HttpxGotErr{0, "next"}), Nil{}, x_tab.empty(), HttpxHead{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client_on.sdrop(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
         client_stream.drained(drained)
 
-def client_stream.exch(~H: HttpxStreamEv -> HttpxStreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def client_stream.exch(~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, 1, host, port, method, path, hs, body)
     client_stream.sent(~H, sent)
 
-def client_stream.conn(~H: HttpxStreamEv -> HttpxStreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def client_stream.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   match conn:
     case Fail{e}:
@@ -4297,7 +4333,7 @@ def client_stream.conn(~H: HttpxStreamEv -> HttpxStreamOut, conn: Result<&1, &1,
     case Done{sock}:
       client_stream.exch(~H, sock, host, port, method, path, hs, body)
 
-def client_stream.go(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool) ->
+def client_stream.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   match insecure:
     case True{}:
@@ -4309,7 +4345,7 @@ def client_stream.go(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port: 
         conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
         client_stream.conn(~H, conn, host, port, method, path, hs, body)
 
-def client_stream.fit(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
+def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   match fit:
     case True{}:
@@ -4321,206 +4357,206 @@ def client_stream.fit(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port:
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(400, "bad request")})
 
-def client_on_stream(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def client_on_stream(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   client_stream.fit(~H, host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
-def client_on_stream_insecure(~H: HttpxStreamEv -> HttpxStreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
+def client_on_stream_insecure(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   client_stream.fit(~H, host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
 # Keep-alive (Phase C): one dial, sequential sids 1,3,5…, caller threads
-# Socket + HttpxCliSt{sid,tab} (tab persists for dyn reuse). Request never
+# Socket + CliSt{sid,tab} (tab persists for dyn reuse). Request never
 # closes (caller closes after last); validation fails keep sid/tab.
 # ---------------------------------------------------------------------
 
-def client_on.st_sid(+st: HttpxCliSt) -> U32:
+def client_on.st_sid(+st: CliSt) -> U32:
   match st:
-    case HttpxCliSt{+sid, tab}:
+    case CliSt{+sid, tab}:
       sid
 
-def client_on.st_tab(+st: HttpxCliSt) -> HttpxTab:
+def client_on.st_tab(+st: CliSt) -> Tab:
   match st:
-    case HttpxCliSt{sid, +tab}:
+    case CliSt{sid, +tab}:
       tab
 
 def client_on.next_sid(+sid: U32) -> U32:
   (sid + 2 : U32)
 
-def client_on.next_st(+st: HttpxCliSt, +tab: HttpxTab) -> HttpxCliSt:
+def client_on.next_st(+st: CliSt, +tab: Tab) -> CliSt:
   match st:
-    case HttpxCliSt{+sid, old}:
-      HttpxCliSt{client_on.next_sid(sid), tab}
+    case CliSt{+sid, old}:
+      CliSt{client_on.next_sid(sid), tab}
 
 def client_on.wrap_conn(conn: Result<&1, &1, U32 & String, Socket>) ->
-  Result<&1, &1, U32 & String, Socket & HttpxCliSt>:
+  Result<&1, &1, U32 & String, Socket & CliSt>:
   match conn:
     case Fail{e}:
       Fail{e}
     case Done{sock}:
-      Done{(sock, HttpxCliSt{1, x_tab.empty()})}
+      Done{(sock, CliSt{1, x_tab.empty()})}
 
 def client_on.keep_connect(+host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket & HttpxCliSt>):
-  do IO<Result<&1, &1, U32 & String, Socket & HttpxCliSt>>:
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
     conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & HttpxCliSt>, client_on.wrap_conn(conn))
+    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client_on.wrap_conn(conn))
 
 def client_on.keep_connect_insecure(+host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket & HttpxCliSt>):
-  do IO<Result<&1, &1, U32 & String, Socket & HttpxCliSt>>:
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
     conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_insecure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & HttpxCliSt>, client_on.wrap_conn(conn))
+    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client_on.wrap_conn(conn))
 
-def client_on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab, +st: HttpxCliSt) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt):
+def client_on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab, +st: CliSt) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   (s, r, t) = drained
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, (s, Fail{e}, client_on.next_st(st, t)))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Fail{e}, client_on.next_st(st, t)))
     case Done{+resp}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, (s, Done{resp}, client_on.next_st(st, t)))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Done{resp}, client_on.next_st(st, t)))
 
-def client_on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: HttpxCliSt) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt):
+def client_on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: CliSt) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, (sock, Fail{e}, st))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{e}, st))
     case Done{u}:
-      do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt>:
-        drained : Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxTab <- client_on.drain(0, (sock, HttpxGotErr{0, "next"}), Nil{}, client_on.st_tab(st), HttpxHead{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client_on.st_sid(st), 4)
+      do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
+        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client_on.drain(0, (sock, GotErr{0, "next"}), Nil{}, client_on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client_on.st_sid(st), 4)
         client_on.drained_keep(drained, st)
 
-def client_on.exch_keep(sock: Socket, +st: HttpxCliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt):
-  do IO<Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt>:
+def client_on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
+  do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, client_on.st_sid(st), host, port, method, path, hs, body)
     client_on.sent_keep(sent, st)
 
-def client_on.fit_keep(sock: Socket, +st: HttpxCliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt):
+def client_on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   match fit:
     case True{}:
       match ok:
         case True{}:
           client_on.exch_keep(sock, st, host, port, method, path, hs, body)
         case False{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, (sock, Fail{(413, "req too large")}, st))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(413, "req too large")}, st))
     case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, (sock, Fail{(400, "bad request")}, st))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(400, "bad request")}, st))
 
-def client_on_request(sock: Socket, +st: HttpxCliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HttpxHdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt):
+def client_on_request(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   client_on.fit_keep(sock, st, host, port, method, path, hs, body, client_on.valid.go(host, port, path), client_on.body_ok(body))
 
 # Sequential batch entry (Phase 10): one dial, N requests back-to-back
 # on sids 1,3,5..., answers in request order. First Fail aborts the
 # batch fail-closed (socket closed, Fail out). Single self-recursive
 # def would need mutual step/done, so done dispatches inline (same
-# phased-loop discipline as drain/sdrop). HttpxCliSt/HttpxReq/HttpxResp are
+# phased-loop discipline as drain/sdrop). CliSt/Request/Response are
 # Data: stale binds drop freely, Socket always closes or threads.
 # ---------------------------------------------------------------------
 
-def client_seq.rev.go(+xs: List<&2, HttpxResp>, acc: List<&2, HttpxResp>) -> List<&2, HttpxResp>:
+def client_seq.rev.go(+xs: List<&2, Response>, acc: List<&2, Response>) -> List<&2, Response>:
   match xs:
     case Nil{}:
       acc
     case +h <> t:
       client_seq.rev.go(t, h <> acc)
 
-def client_seq.rev(+xs: List<&2, HttpxResp>) -> List<&2, HttpxResp>:
+def client_seq.rev(+xs: List<&2, Response>) -> List<&2, Response>:
   client_seq.rev.go(xs, Nil{})
 
-def client_seq.done(rest: List<&2, HttpxReq>, +acc: List<&2, HttpxResp>, got: Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, List<&2, HttpxResp>>):
+def client_seq.done(rest: List<&2, Request>, +acc: List<&2, Response>, got: Socket & Result<&1, &1, U32 & String, Response> & CliSt, +host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   match rest:
     case Nil{}:
       (s0, r0, st0) = got
       match r0:
         case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
             x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, HttpxResp>>, Fail{e})
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
         case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
             x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, HttpxResp>>, Done{client_seq.rev(resp <> acc)})
-    case HttpxReq{+method, +path, +headers, +body} <> t:
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{client_seq.rev(resp <> acc)})
+    case Request{+method, +path, +headers, +body} <> t:
       (s2, r2, st2) = got
       match r2:
         case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
             x : Unit <- TLS.tls_close(s2)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, HttpxResp>>, Fail{e})
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
         case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
-            got3 : Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt <- client_on_request(s2, st2, host, port, method, path, headers, body)
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            got3 : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client_on_request(s2, st2, host, port, method, path, headers, body)
             client_seq.done(t, resp <> acc, got3, host, port)
 
-def client_seq.first(sock: Socket, +st: HttpxCliSt, +host: String, +port: U32, reqs: List<&2, HttpxReq>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, HttpxResp>>):
+def client_seq.first(sock: Socket, +st: CliSt, +host: String, +port: U32, reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   match reqs:
     case Nil{}:
-      do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
+      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
         x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, List<&2, HttpxResp>>, Done{Nil{}})
-    case HttpxReq{+method, +path, +headers, +body} <> t:
-      do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
-        got : Socket & Result<&1, &1, U32 & String, HttpxResp> & HttpxCliSt <- client_on_request(sock, st, host, port, method, path, headers, body)
+        IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
+    case Request{+method, +path, +headers, +body} <> t:
+      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+        got : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client_on_request(sock, st, host, port, method, path, headers, body)
         client_seq.done(t, Nil{}, got, host, port)
 
-def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & HttpxCliSt>, +host: String, +port: U32, reqs: List<&2, HttpxReq>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, HttpxResp>>):
+def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   match conn:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, HttpxResp>>, Fail{e})
+      IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
     case Done{value}:
       (sock0, st0) = value
       client_seq.first(sock0, st0, host, port, reqs)
 
-def client_on(+host: String, +port: U32, +reqs: List<&2, HttpxReq>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, HttpxResp>>):
-  do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
-    conn : Result<&1, &1, U32 & String, Socket & HttpxCliSt> <- client_on.keep_connect(host, port)
+def client_on(+host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client_on.keep_connect(host, port)
     client_seq.conn(conn, host, port, reqs)
 
-def client_on_insecure(+host: String, +port: U32, +reqs: List<&2, HttpxReq>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, HttpxResp>>):
-  do IO<Result<&1, &1, U32 & String, List<&2, HttpxResp>>>:
-    conn : Result<&1, &1, U32 & String, Socket & HttpxCliSt> <- client_on.keep_connect_insecure(host, port)
+def client_on_insecure(+host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client_on.keep_connect_insecure(host, port)
     client_seq.conn(conn, host, port, reqs)
 
 # Concurrent slots (Phase D): response assembly per sid. New ClSt type
-# (head is HttpxHead, not HttpxReqHead, so HttpxSt ops cannot reuse without
+# (head is Head, not ReqHead, so St ops cannot reuse without
 # copy); ops mirror httpxn.* single-traversal, clone-free (S incs, no
 # clones). fends/CONT stays Fail 502 (single-HEADERS peers); fdel_flag
 # remains for later CONT if a peer fragments.
 # ---------------------------------------------------------------------
 
-type HttpxClSt is Data:
-  HttpxClSt{head: Maybe<&2, HttpxHead>, body: List<&2, U32>, sid: U32}
+type ClSt is Data:
+  ClSt{head: Maybe<&2, Head>, body: List<&2, U32>, sid: U32}
 
-type HttpxClTaken is Data:
-  HttpxClTaken{slots: List<&2, HttpxClSt>, st: HttpxClSt}
+type ClTaken is Data:
+  ClTaken{slots: List<&2, ClSt>, st: ClSt}
 
-def httpxc.sid_of(st: HttpxClSt) -> U32:
+def httpxc.sid_of(st: ClSt) -> U32:
   match st:
-    case HttpxClSt{head, body, +sid}:
+    case ClSt{head, body, +sid}:
       sid
 
-def httpxc.has(slots: List<&2, HttpxClSt>, +sid: U32) -> Bool:
+def httpxc.has(slots: List<&2, ClSt>, +sid: U32) -> Bool:
   match slots:
     case Nil{}:
       False{}
     case +st <> t:
       Bool.or(U32.is_eq(httpxc.sid_of(st), sid), httpxc.has(t, sid))
 
-def httpxc.has_some_go(eq: Bool, st: HttpxClSt, rec: Bool) -> Bool:
+def httpxc.has_some_go(eq: Bool, st: ClSt, rec: Bool) -> Bool:
   match eq:
     case True{}:
       match st:
-        case HttpxClSt{head, body, sid}:
+        case ClSt{head, body, sid}:
           match head:
             case None{}:
               True{}
@@ -4529,121 +4565,121 @@ def httpxc.has_some_go(eq: Bool, st: HttpxClSt, rec: Bool) -> Bool:
     case False{}:
       rec
 
-def httpxc.has_some(slots: List<&2, HttpxClSt>, +sid: U32) -> Bool:
+def httpxc.has_some(slots: List<&2, ClSt>, +sid: U32) -> Bool:
   match slots:
     case Nil{}:
       False{}
     case +st <> t:
       httpxc.has_some_go(U32.is_eq(httpxc.sid_of(st), sid), st, httpxc.has_some(t, sid))
 
-def httpxc.del_go(eq: Bool, +st: HttpxClSt, rest: List<&2, HttpxClSt>) -> List<&2, HttpxClSt>:
+def httpxc.del_go(eq: Bool, +st: ClSt, rest: List<&2, ClSt>) -> List<&2, ClSt>:
   match eq:
     case True{}:
       rest
     case False{}:
       st <> rest
 
-def httpxc.del(slots: List<&2, HttpxClSt>, +sid: U32) -> List<&2, HttpxClSt>:
+def httpxc.del(slots: List<&2, ClSt>, +sid: U32) -> List<&2, ClSt>:
   match slots:
     case Nil{}:
       Nil{}
     case +st <> t:
       httpxc.del_go(U32.is_eq(httpxc.sid_of(st), sid), st, httpxc.del(t, sid))
 
-def httpxc.take_go(eq: Bool, +st: HttpxClSt, p: HttpxClTaken) -> HttpxClTaken:
+def httpxc.take_go(eq: Bool, +st: ClSt, p: ClTaken) -> ClTaken:
   match eq:
     case True{}:
       match p:
-        case HttpxClTaken{+slots, st2}:
-          HttpxClTaken{slots, st}
+        case ClTaken{+slots, st2}:
+          ClTaken{slots, st}
     case False{}:
       match p:
-        case HttpxClTaken{+slots2, +found2}:
-          HttpxClTaken{(st <> slots2), found2}
+        case ClTaken{+slots2, +found2}:
+          ClTaken{(st <> slots2), found2}
 
-def httpxc.take_del(slots: List<&2, HttpxClSt>, +sid: U32) -> HttpxClTaken:
+def httpxc.take_del(slots: List<&2, ClSt>, +sid: U32) -> ClTaken:
   match slots:
     case Nil{}:
-      HttpxClTaken{Nil{}, HttpxClSt{None{}, Nil{}, 0}}
+      ClTaken{Nil{}, ClSt{None{}, Nil{}, 0}}
     case +st <> t:
       httpxc.take_go(U32.is_eq(httpxc.sid_of(st), sid), st, httpxc.take_del(t, sid))
 
-def httpxc.taken_slots(p: HttpxClTaken) -> List<&2, HttpxClSt>:
+def httpxc.taken_slots(p: ClTaken) -> List<&2, ClSt>:
   match p:
-    case HttpxClTaken{+slots, st}:
+    case ClTaken{+slots, st}:
       slots
 
-def httpxc.taken_st(p: HttpxClTaken) -> HttpxClSt:
+def httpxc.taken_st(p: ClTaken) -> ClSt:
   match p:
-    case HttpxClTaken{slots, +st}:
+    case ClTaken{slots, +st}:
       st
 
-def httpxc.put(slots: List<&2, HttpxClSt>, +st: HttpxClSt) -> List<&2, HttpxClSt>:
+def httpxc.put(slots: List<&2, ClSt>, +st: ClSt) -> List<&2, ClSt>:
   st <> httpxc.del(slots, httpxc.sid_of(st))
 
-def httpxc.body_of(st: HttpxClSt) -> List<&2, U32>:
+def httpxc.body_of(st: ClSt) -> List<&2, U32>:
   match st:
-    case HttpxClSt{head, +body, sid}:
+    case ClSt{head, +body, sid}:
       body
 
-def httpxc.head_of(st: HttpxClSt) -> HttpxHead:
+def httpxc.head_of(st: ClSt) -> Head:
   match st:
-    case HttpxClSt{head, body, sid}:
+    case ClSt{head, body, sid}:
       match head:
         case None{}:
-          HttpxHead{0, Nil{}}
+          Head{0, Nil{}}
         case Some{+h}:
           h
 
-def httpxc.resp_of(+head: HttpxHead, +body: List<&2, U32>) -> HttpxResp:
+def httpxc.resp_of(+head: Head, +body: List<&2, U32>) -> Response:
   match head:
-    case HttpxHead{+status, +headers}:
-      HttpxResp{status, headers, body}
+    case Head{+status, +headers}:
+      Response{status, headers, body}
 
-def httpxc.req_of_st(st: HttpxClSt, +payload: List<&2, U32>) -> HttpxResp:
+def httpxc.req_of_st(st: ClSt, +payload: List<&2, U32>) -> Response:
   match st:
-    case HttpxClSt{head, +body, +sid}:
+    case ClSt{head, +body, +sid}:
       match head:
         case None{}:
-          HttpxResp{0, Nil{}, x_cat(x_rev_push(payload, body))}
+          Response{0, Nil{}, x_cat(x_rev_push(payload, body))}
         case Some{+rh}:
           match rh:
-            case HttpxHead{+status, +headers}:
-              HttpxResp{status, headers, x_cat(x_rev_push(payload, body))}
+            case Head{+status, +headers}:
+              Response{status, headers, x_cat(x_rev_push(payload, body))}
 
-def httpxc.data_cont_slots(p: HttpxClTaken, +payload: List<&2, U32>) -> List<&2, HttpxClSt>:
+def httpxc.data_cont_slots(p: ClTaken, +payload: List<&2, U32>) -> List<&2, ClSt>:
   match p:
-    case HttpxClTaken{+rest, st}:
+    case ClTaken{+rest, st}:
       match st:
-        case HttpxClSt{head, +body, +sid}:
+        case ClSt{head, +body, +sid}:
           match head:
             case None{}:
-              ((HttpxClSt{Some{HttpxHead{0, Nil{}}}, x_rev_push(payload, body), sid} <> rest))
+              ((ClSt{Some{Head{0, Nil{}}}, x_rev_push(payload, body), sid} <> rest))
             case Some{+rh}:
-              ((HttpxClSt{Some{rh}, x_rev_push(payload, body), sid} <> rest))
+              ((ClSt{Some{rh}, x_rev_push(payload, body), sid} <> rest))
 
 # Concurrent send-all (pipelined HEADERS+DATA, sids 1,3,5…; aborts on
 # first send Fail; caller validates bodies/paths upfront)
 # ---------------------------------------------------------------------
 
-def client_conc.count_go(reqs: List<&2, HttpxReq>, +acc: U32) -> U32:
+def client_conc.count_go(reqs: List<&2, Request>, +acc: U32) -> U32:
   match reqs:
     case Nil{}:
       acc
     case _ <> t:
       client_conc.count_go(t, (acc + 1 : U32))
 
-def client_conc.count(reqs: List<&2, HttpxReq>) -> U32:
+def client_conc.count(reqs: List<&2, Request>) -> U32:
   client_conc.count_go(reqs, 0)
 
-def client_conc.valid_go(reqs: List<&2, HttpxReq>, +host: String, +port: U32, ok: Bool) -> Bool:
+def client_conc.valid_go(reqs: List<&2, Request>, +host: String, +port: U32, ok: Bool) -> Bool:
   match reqs:
     case Nil{}:
       ok
-    case HttpxReq{method, path, headers, body} <> t:
+    case Request{method, path, headers, body} <> t:
       client_conc.valid_go(t, host, port, Bool.and(ok, Bool.and(client_on.valid.go(host, port, path), client_on.body_ok(body))))
 
-def client_conc.valid_all(reqs: List<&2, HttpxReq>, +host: String, +port: U32) -> Bool:
+def client_conc.valid_all(reqs: List<&2, Request>, +host: String, +port: U32) -> Bool:
   client_conc.valid_go(reqs, host, port, True{})
 
 def client_conc.send_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket:
@@ -4651,12 +4687,12 @@ def client_conc.send_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> 
   s
 
 @unsafe
-def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HttpxReq>) ->
+def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, Request>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   match reqs:
     case Nil{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
-    case HttpxReq{+method, +path, +headers, +body} <> t:
+    case Request{+method, +path, +headers, +body} <> t:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, sid, host, port, method, path, headers, body)
         client_conc.send_all(client_conc.send_kept(sent), (sid + 2 : U32), host, port, t)
@@ -4664,12 +4700,12 @@ def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, req
 # Concurrent drain leafs (sum, no tab return; connection closes after)
 # --------------------------------------------------------------------
 
-def client_conc.fail(got: Socket & HttpxGot, +code: U32, +msg: String) ->
+def client_conc.fail(got: Socket & Got, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s, Fail{(code, msg)}))
 
-def client_conc.done(got: Socket & HttpxGot, +total: U32) ->
+def client_conc.done(got: Socket & Got, +total: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s, Done{total}))
@@ -4686,8 +4722,8 @@ def client_conc.finish_next(+pending: U32) -> U32:
 # the conc result type. No ~H inside (leaves above the loop).
 # ---------------------------------------------------------------------
 
-def client_conc.next(s: Socket) -> Socket & HttpxGot:
-  (s, HttpxGotErr{0, "next"})
+def client_conc.next(s: Socket) -> Socket & Got:
+  (s, GotErr{0, "next"})
 
 def client_conc.sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, U32>):
@@ -4699,67 +4735,67 @@ def client_conc.sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
       IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s, Fail{(502, "continuation")}))
 
 @unsafe
-def client_conc.drain(~H: HttpxResp -> U32, phase: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +tab: HttpxTab, +slots: List<&2, HttpxClSt>, +pending: U32, +total: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +nh: HttpxHead, act: U32) ->
+def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +slots: List<&2, ClSt>, +pending: U32, +total: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +nh: Head, act: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32>):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
-        client_conc.drain(~H, 1, got2, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+        got2 : Socket & Got <- x_read_frame(s0, buf)
+        client_conc.drain(~H, 1, got2, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
+        case GotErr{code1, msg1}:
           IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s1, Fail{(code1, msg1)}))
-        case HttpxGotOk{+frame, +buf2}:
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              client_conc.drain(~H, 2, (s1, HttpxGotOk{frame, buf2}), buf2, tab, slots, pending, total, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), HttpxHead{0, Nil{}}, 4)
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              client_conc.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), Head{0, Nil{}}, 4)
     case 2:
       match cls:
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-            got2 : Socket & HttpxGot <- client_on.ack(got)
-            client_conc.drain(~H, 0, got2, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+            got2 : Socket & Got <- client_on.ack(got)
+            client_conc.drain(~H, 0, got2, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 4:
           do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-            gotp : Socket & HttpxGot <- client_on.ack_ping(got, payload)
-            client_conc.drain(~H, 0, gotp, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+            gotp : Socket & Got <- client_on.ack_ping(got, payload)
+            client_conc.drain(~H, 0, gotp, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 5:
           client_conc.fail(got, 502, "goaway")
         case 7:
-          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 9:
           client_conc.fail(got, 502, "bad window_update")
         case 8:
           client_conc.fail(got, 502, "continuation")
         case 2:
-          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.del(slots, sid2), (pending - 1 : U32), total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.del(slots, sid2), (pending - 1 : U32), total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 6:
-          client_conc.drain(~H, 3, got, buf, tab, slots, pending, total, typ, flags, sid2, payload, cls, end, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 3, got, buf, tab, slots, pending, total, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, 4)
         case 0:
-          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case _:
-          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
     case 3:
       match typ:
         case 1:
-          +dr : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(payload, tab)
+          +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
           client_conc.drain(~H, 4, got, buf, x_resp.tab(dr), slots, pending, total, typ, flags, sid2, payload, cls, end, x_resp.rh(dr), httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
         case 0:
-          client_conc.drain(~H, 5, got, buf, tab, slots, pending, total, typ, flags, sid2, payload, cls, end, HttpxHead{0, Nil{}}, httpxn.decide_data(httpxc.has(slots, sid2), end))
+          client_conc.drain(~H, 5, got, buf, tab, slots, pending, total, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, httpxn.decide_data(httpxc.has(slots, sid2), end))
         case _:
-          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
     case 4:
       match act:
         case 0:
-          client_conc.drain(~H, 0, got, buf, tab, httpxc.put(slots, HttpxClSt{Some{nh}, Nil{}, sid2}), pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, httpxc.put(slots, ClSt{Some{nh}, Nil{}, sid2}), pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 1:
           +sc1 : U32 = H(httpxc.resp_of(nh, Nil{}))
-          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, slots, (pending - 1 : U32), (total + sc1 : U32), 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, slots, (pending - 1 : U32), (total + sc1 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 6:
-          client_conc.drain(~H, 6, client_conc.next(httpx.wo(got)), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, HttpxHead{0, Nil{}}, 0)
+          client_conc.drain(~H, 6, client_conc.next(httpx.wo(got)), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, 0)
         case 5:
           client_conc.fail(got, 502, "head decode")
         case _:
@@ -4767,12 +4803,12 @@ def client_conc.drain(~H: HttpxResp -> U32, phase: U32, got: Socket & HttpxGot, 
     case 5:
       match act:
         case 0:
-          client_conc.drain(~H, 0, got, buf, tab, httpxc.data_cont_slots(httpxc.take_del(slots, sid2), payload), pending, total, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, 0, got, buf, tab, httpxc.data_cont_slots(httpxc.take_del(slots, sid2), payload), pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 1:
-          +tp1 : HttpxClTaken = httpxc.take_del(slots, sid2)
-          +resp1 : HttpxResp = httpxc.req_of_st(httpxc.taken_st(tp1), payload)
+          +tp1 : ClTaken = httpxc.take_del(slots, sid2)
+          +resp1 : Response = httpxc.req_of_st(httpxc.taken_st(tp1), payload)
           +sc5 : U32 = H(resp1)
-          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.taken_slots(tp1), (pending - 1 : U32), (total + sc5 : U32), 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.taken_slots(tp1), (pending - 1 : U32), (total + sc5 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 4:
           client_conc.fail(got, 502, "stray data")
         case _:
@@ -4782,26 +4818,26 @@ def client_conc.drain(~H: HttpxResp -> U32, phase: U32, got: Socket & HttpxGot, 
     case 6:
       (s6, g6) = got
       match g6:
-        case HttpxGotErr{code6, msg6}:
+        case GotErr{code6, msg6}:
           match code6:
             case 0:
               do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-                got6 : Socket & HttpxGot <- x_read_frame(s6, buf)
-                client_conc.drain(~H, 6, got6, buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, HttpxHead{0, Nil{}}, 0)
+                got6 : Socket & Got <- x_read_frame(s6, buf)
+                client_conc.drain(~H, 6, got6, buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, 0)
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s6, Fail{(code6, msg6)}))
-        case HttpxGotOk{+frame6, +buf6}:
+        case GotOk{+frame6, +buf6}:
           match frame6:
-            case HttpxFrame{+typ6, +flags6, +sid6, +pay6}:
-              client_conc.drain(~H, 8, (s6, HttpxGotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, sid2, flags6), end, HttpxHead{0, Nil{}}, 0)
+            case Frame{+typ6, +flags6, +sid6, +pay6}:
+              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, sid2, flags6), end, Head{0, Nil{}}, 0)
     case 8:
       (s8, g8) = got
       match cls:
         case 0:
-          +dr8 : Result<&1, &1, U32 & String, HttpxHead & HttpxTab> = x_resp.decode(payload, tab)
+          +dr8 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
           client_conc.drain(~H, 4, client_conc.next(s8), buf, x_resp.tab(dr8), slots, pending, total, typ, flags, sid2, Nil{}, cls, end, x_resp.rh(dr8), httpxn.head_act(0, x_resp.ok(dr8), end))
         case 1:
-          client_conc.drain(~H, 6, client_conc.next(s8), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, HttpxHead{0, Nil{}}, 0)
+          client_conc.drain(~H, 6, client_conc.next(s8), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, 0)
         case _:
           do IO<Socket & Result<&1, &1, U32 & String, U32>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s8, 0, 1)
@@ -4825,7 +4861,7 @@ def client_conc.drained(drained: Socket & Result<&1, &1, U32 & String, U32>) ->
         x : Unit <- TLS.tls_close(s)
         IO.pure(Result<&1, &1, U32 & String, U32>, Done{total})
 
-def client_conc.after_send(~H: HttpxResp -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit>, +pending: U32) ->
+def client_conc.after_send(~H: Response -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   (sock, r) = sent
   match r:
@@ -4835,16 +4871,16 @@ def client_conc.after_send(~H: HttpxResp -> U32, sent: Socket & Result<&1, &1, U
         IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32> <- client_conc.drain(~H, 0, (sock, HttpxGotErr{0, "next"}), Nil{}, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, Nil{}, 0, 0, HttpxHead{0, Nil{}}, 4)
+        drained : Socket & Result<&1, &1, U32 & String, U32> <- client_conc.drain(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         client_conc.drained(drained)
 
-def client_conc.exch(~H: HttpxResp -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, HttpxReq>, +pending: U32) ->
+def client_conc.exch(~H: Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   do IO<Result<&1, &1, U32 & String, U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_conc.send_all(sock, 1, host, port, reqs)
     client_conc.after_send(~H, sent, pending)
 
-def client_conc.conn(~H: HttpxResp -> U32, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, HttpxReq>, +pending: U32) ->
+def client_conc.conn(~H: Response -> U32, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   match conn:
     case Fail{e}:
@@ -4852,7 +4888,7 @@ def client_conc.conn(~H: HttpxResp -> U32, conn: Result<&1, &1, U32 & String, So
     case Done{sock}:
       client_conc.exch(~H, sock, host, port, reqs, pending)
 
-def client_conc.go(~H: HttpxResp -> U32, +host: String, +port: U32, reqs: List<&2, HttpxReq>, +pending: U32, insecure: Bool) ->
+def client_conc.go(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32>):
   match insecure:
     case True{}:
@@ -4864,7 +4900,7 @@ def client_conc.go(~H: HttpxResp -> U32, +host: String, +port: U32, reqs: List<&
         conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
         client_conc.conn(~H, conn, host, port, reqs, pending)
 
-def client_conc.fit_n(~H: HttpxResp -> U32, +host: String, +port: U32, reqs: List<&2, HttpxReq>, +pending: U32, insecure: Bool) ->
+def client_conc.fit_n(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32>):
   match pending:
     case 0:
@@ -4872,7 +4908,7 @@ def client_conc.fit_n(~H: HttpxResp -> U32, +host: String, +port: U32, reqs: Lis
     case _:
       client_conc.go(~H, host, port, reqs, pending, insecure)
 
-def client_conc.fit(~H: HttpxResp -> U32, +host: String, +port: U32, +reqs: List<&2, HttpxReq>, insecure: Bool, valid: Bool) ->
+def client_conc.fit(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>, insecure: Bool, valid: Bool) ->
   IO(Result<&1, &1, U32 & String, U32>):
   match valid:
     case True{}:
@@ -4880,33 +4916,33 @@ def client_conc.fit(~H: HttpxResp -> U32, +host: String, +port: U32, +reqs: List
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, U32>, Fail{(400, "bad request")})
 
-def client_on_concurrent(~H: HttpxResp -> U32, +host: String, +port: U32, +reqs: List<&2, HttpxReq>) ->
+def client_on_concurrent(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, U32>):
   client_conc.fit(~H, host, port, reqs, False{}, client_conc.valid_all(reqs, host, port))
 
-def client_on_concurrent_insecure(~H: HttpxResp -> U32, +host: String, +port: U32, +reqs: List<&2, HttpxReq>) ->
+def client_on_concurrent_insecure(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, U32>):
   client_conc.fit(~H, host, port, reqs, True{}, client_conc.valid_all(reqs, host, port))
 
 # Server streaming (Phase F): sibling httpx_stream loop with pure handler
-# ~H: HttpxSrvEv -> HttpxSrvOut (NeedMore buffers like today, RespondEarly
+# ~H: SrvEv -> SrvOut (NeedMore buffers like today, RespondEarly
 # sends + frees + skips rest via stray-skip). Shares take_del/has/
 # put/classify/preface/plumbing (no copy); self-recursive own loop (no
 # mutual with httpx). No WU sends (backpressure via withheld WU, like httpx).
 # Stray DATA skips (not closes) to allow early-rest skipping.
 # ---------------------------------------------------------------------
 
-def httpxs.is_more(+out: HttpxSrvOut) -> Bool:
+def httpxs.is_more(+out: SrvOut) -> Bool:
   match out:
     case NeedMore{}:
       True{}
     case RespondEarly{resp}:
       False{}
 
-def httpxs.out_resp(+out: HttpxSrvOut) -> HttpxResp:
+def httpxs.out_resp(+out: SrvOut) -> Response:
   match out:
     case NeedMore{}:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
 
@@ -4934,29 +4970,29 @@ def httpxs.data_act(is_more: Bool, has: Bool, +end: U32) -> U32:
     case _ _ _:
       0
 
-def httpxs.head_out(+out: HttpxSrvOut, +end: U32) -> U32 & HttpxResp:
+def httpxs.head_out(+out: SrvOut, +end: U32) -> U32 & Response:
   match out:
     case NeedMore{}:
       match end:
         case 1:
-          (7, HttpxResp{0, Nil{}, Nil{}})
+          (7, Response{0, Nil{}, Nil{}})
         case _:
-          (0, HttpxResp{0, Nil{}, Nil{}})
+          (0, Response{0, Nil{}, Nil{}})
     case RespondEarly{+resp}:
       (1, resp)
 
-def httpxs.data_out(+out: HttpxSrvOut, fin: Bool) -> U32 & HttpxResp:
+def httpxs.data_out(+out: SrvOut, fin: Bool) -> U32 & Response:
   match out:
     case NeedMore{}:
       match fin:
         case True{}:
-          (7, HttpxResp{0, Nil{}, Nil{}})
+          (7, Response{0, Nil{}, Nil{}})
         case False{}:
-          (0, HttpxResp{0, Nil{}, Nil{}})
+          (0, Response{0, Nil{}, Nil{}})
     case RespondEarly{+resp}:
       (1, resp)
 
-def httpxs.head_act_from_out(+out: HttpxSrvOut, +end: U32) -> U32:
+def httpxs.head_act_from_out(+out: SrvOut, +end: U32) -> U32:
   match out:
     case NeedMore{}:
       match end:
@@ -4967,14 +5003,14 @@ def httpxs.head_act_from_out(+out: HttpxSrvOut, +end: U32) -> U32:
     case RespondEarly{resp}:
       1
 
-def httpxs.head_resp_from_out(+out: HttpxSrvOut) -> HttpxResp:
+def httpxs.head_resp_from_out(+out: SrvOut) -> Response:
   match out:
     case NeedMore{}:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
 
-def httpxs.data_act_from_out(+out: HttpxSrvOut, fin: Bool) -> U32:
+def httpxs.data_act_from_out(+out: SrvOut, fin: Bool) -> U32:
   match out:
     case NeedMore{}:
       match fin:
@@ -4985,50 +5021,50 @@ def httpxs.data_act_from_out(+out: HttpxSrvOut, fin: Bool) -> U32:
     case RespondEarly{resp}:
       1
 
-def httpxs.data_resp_from_out(+out: HttpxSrvOut) -> HttpxResp:
+def httpxs.data_resp_from_out(+out: SrvOut) -> Response:
   match out:
     case NeedMore{}:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
 
-def httpxs.head_act_of(~H: HttpxSrvEv -> HttpxSrvOut, ok: Bool, +need: U32, +end: U32, +nh: HttpxReqHead, +nt: HttpxTab, +sid: U32) -> U32:
+def httpxs.head_act_of(~H: SrvEv -> SrvOut, ok: Bool, +need: U32, +end: U32, +nh: ReqHead, +nt: Tab, +sid: U32) -> U32:
   match ok need:
     case _ 1:
       6
     case False{} 0:
       5
     case True{} 0:
-      httpxs.head_act_from_out(H(ReqHead{sid, nh}), end)
+      httpxs.head_act_from_out(H(SrvReqHead{sid, nh}), end)
     case _ _:
       5
 
-def httpxs.head_resp_of(~H: HttpxSrvEv -> HttpxSrvOut, ok: Bool, +need: U32, +end: U32, +nh: HttpxReqHead, +nt: HttpxTab, +sid: U32) -> HttpxResp:
+def httpxs.head_resp_of(~H: SrvEv -> SrvOut, ok: Bool, +need: U32, +end: U32, +nh: ReqHead, +nt: Tab, +sid: U32) -> Response:
   match ok need:
     case _ 1:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case False{} 0:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case True{} 0:
-      httpxs.head_resp_from_out(H(ReqHead{sid, nh}))
+      httpxs.head_resp_from_out(H(SrvReqHead{sid, nh}))
     case _ _:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
 
-def httpxs.data_act_of(~H: HttpxSrvEv -> HttpxSrvOut, has: Bool, +payload: List<&2, U32>, +fin: Bool, +sid: U32) -> U32:
+def httpxs.data_act_of(~H: SrvEv -> SrvOut, has: Bool, +payload: List<&2, U32>, +fin: Bool, +sid: U32) -> U32:
   match has:
     case False{}:
       8
     case True{}:
-      httpxs.data_act_from_out(H(ReqData{sid, payload, fin}), fin)
+      httpxs.data_act_from_out(H(SrvReqData{sid, payload, fin}), fin)
 
-def httpxs.data_resp_of(~H: HttpxSrvEv -> HttpxSrvOut, has: Bool, +payload: List<&2, U32>, +fin: Bool, +sid: U32) -> HttpxResp:
+def httpxs.data_resp_of(~H: SrvEv -> SrvOut, has: Bool, +payload: List<&2, U32>, +fin: Bool, +sid: U32) -> Response:
   match has:
     case False{}:
-      HttpxResp{0, Nil{}, Nil{}}
+      Response{0, Nil{}, Nil{}}
     case True{}:
-      httpxs.data_resp_from_out(H(ReqData{sid, payload, fin}))
+      httpxs.data_resp_from_out(H(SrvReqData{sid, payload, fin}))
 
-def httpxs.goaway_close(got: Socket & HttpxGot) -> IO(Unit):
+def httpxs.goaway_close(got: Socket & Got) -> IO(Unit):
   (s, g) = got
   do IO<Unit>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s, 0, 1)
@@ -5036,74 +5072,74 @@ def httpxs.goaway_close(got: Socket & HttpxGot) -> IO(Unit):
 
 # Sibling interleave loop (own @unsafe self-recursion, no mutual with
 # httpx; shares take_del/has/put/classify/preface/plumbing, no copy).
-# Delivers ReqHead on HEADERS-complete and ReqData per DATA before
+# Delivers SrvReqHead on HEADERS-complete and SrvReqData per DATA
 # END_STREAM; NeedMore buffers like today, RespondEarly sends + frees +
 # skips rest (stray-skip, not close). No WU sends (backpressure held).
 # ---------------------------------------------------------------------
 
 @unsafe
-def httpx_stream(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, got: Socket & HttpxGot, +slots: List<&2, HttpxSt>, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: HttpxReqHead, act: U32, +resp: HttpxResp, +tab: HttpxTab, +drt: HttpxReqHead & Bool & HttpxTab) ->
+def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: List<&2, St>, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: ReqHead, act: U32, +resp: Response, +tab: Tab, +drt: ReqHead & Bool & Tab) ->
   IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
-        httpx_stream(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+        got2 : Socket & Got <- x_read_frame(s0, buf)
+        httpx_stream(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
+        case GotErr{code1, msg1}:
           TLS.tls_close(s1)
-        case HttpxGotOk{+frame, +buf2}:
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              httpx_stream(~H, 2, (s1, HttpxGotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              httpx_stream(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.ack(got)
-            httpx_stream(~H, 0, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            got2 : Socket & Got <- httpx.ack(got)
+            httpx_stream(~H, 0, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 4:
           do IO<Unit>:
-            gotp : Socket & HttpxGot <- httpx.ack_ping(got, payload)
-            httpx_stream(~H, 0, gotp, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            gotp : Socket & Got <- httpx.ack_ping(got, payload)
+            httpx_stream(~H, 0, gotp, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
           httpx.close_got(got)
         case 2:
-          httpx_stream(~H, 0, got, httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx_stream(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), HttpxReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
-          httpx_stream(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 0:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case _:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 3:
       match typ:
         case 1:
-          httpx_stream(~H, 7, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.got(x_req.decode(payload, tab)))
+          httpx_stream(~H, 7, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.got(x_req.decode(payload, tab)))
         case 0:
-          httpx_stream(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, httpxs.data_act_of(~H, httpxn.has(slots, sid2), payload, U32.is_eq(end, 1), sid2), httpxs.data_resp_of(~H, httpxn.has(slots, sid2), payload, U32.is_eq(end, 1), sid2), tab, x_req.no_got())
+          httpx_stream(~H, 5, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, httpxs.data_act_of(~H, httpxn.has(slots, sid2), payload, U32.is_eq(end, 1), sid2), httpxs.data_resp_of(~H, httpxn.has(slots, sid2), payload, U32.is_eq(end, 1), sid2), tab, x_req.no_got())
         case _:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          httpx_stream(~H, 0, got, httpxn.put(slots, HttpxSt{Some{rh}, Nil{}, sid2}), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, httpxn.put(slots, St{Some{rh}, Nil{}, sid2}), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s4, sid2, resp)
-            httpx_stream(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
-          httpx_stream(~H, 0, got, httpxn.put(slots, HttpxSt{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
           TLS.tls_close(s4)
         case 7:
@@ -5115,15 +5151,15 @@ def httpx_stream(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, got: Socket & HttpxG
       match act:
         case 0:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er((sb2, gb2), buf, sid2, payload)
-            httpx_stream(~H, 0, got2, httpxn.data_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            got2 : Socket & Got <- httpx.wu_er((sb2, gb2), buf, sid2, payload)
+            httpx_stream(~H, 0, got2, httpxn.data_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er((sb2, gb2), buf, sid2, payload)
+            got2 : Socket & Got <- httpx.wu_er((sb2, gb2), buf, sid2, payload)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx_stream(~H, 0, httpx.sent(sent), httpxn.taken_slots(httpxn.take_del(slots, sid2)), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.taken_slots(httpxn.take_del(slots, sid2)), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 8:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
           TLS.tls_close(sb2)
         case _:
@@ -5132,14 +5168,14 @@ def httpx_stream(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, got: Socket & HttpxG
       (s6, g6) = got
       match act:
         case 0:
-          httpx_stream(~H, 0, got, httpxn.frag_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 0, got, httpxn.frag_cont_slots(httpxn.take_del(slots, sid2), payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
-          +tp2 : HttpxTaken = httpxn.take_del(slots, sid2)
+          +tp2 : Taken = httpxn.take_del(slots, sid2)
           +full : List<&2, U32> = x_cat(x_rev_push(payload, httpx.body_of(httpxn.taken_st(tp2))))
-          +dr6 : Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab> = x_req.decode(full, tab)
-          +fp : HttpxFendTaken = httpxn.fdel_flag(fends, sid2)
+          +dr6 : Result<&1, &1, U32 & String, ReqHead & Tab> = x_req.decode(full, tab)
+          +fp : FendTaken = httpxn.fdel_flag(fends, sid2)
           +ff : U32 = httpxn.ftaken_flag(fp)
-          httpx_stream(~H, 7, got, httpxn.taken_slots(tp2), httpxn.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, cls, ff, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6))
+          httpx_stream(~H, 7, got, httpxn.taken_slots(tp2), httpxn.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, cls, ff, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6))
         case _:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s6, 0, 1)
@@ -5152,13 +5188,13 @@ def httpx_stream(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, got: Socket & HttpxG
               +nu = httpxn.need_u(typ, flags)
               httpx_stream(~H, 4, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, h, httpxs.head_act_of(~H, ok, nu, end, h, t, sid2), httpxs.head_resp_of(~H, ok, nu, end, h, t, sid2), t, x_req.no_got())
     case _:
-      httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, tab, x_req.no_got())
+      httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
 
 # Streaming accept plumbing (H2-only, no H1 split; non-H2 fail-closed)
 # ---------------------------------------------------------------------
 
 @unsafe
-def httpxs_pre(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+def httpxs_pre(~H: SrvEv -> SrvOut, phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
   IO(Unit):
   match phase:
     case 0:
@@ -5184,28 +5220,28 @@ def httpxs_pre(~H: HttpxSrvEv -> HttpxSrvOut, phase: U32, rs: Socket & Result<&1
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            httpx_stream(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 4, HttpxResp{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got())
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got())
         case _:
           TLS.tls_close(s2)
     case _:
       (s9, r9) = rs
       TLS.tls_close(s9)
 
-def httpxs_start(~H: HttpxSrvEv -> HttpxSrvOut, sock: Socket) -> IO(Unit):
+def httpxs_start(~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
     httpxs_pre(~H, 0, r1, Nil{}, 0, False{})
 
-def httpxs_spawn.go(~H: HttpxSrvEv -> HttpxSrvOut, sock: Socket) -> IO(Unit):
+def httpxs_spawn.go(~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
   httpxs_start(~H, sock)
 
-def httpxs_spawn(~H: HttpxSrvEv -> HttpxSrvOut, sock: Socket, l: Listener) ->
+def httpxs_spawn(~H: SrvEv -> SrvOut, sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
     x : Unit <- IO.spawn(Unit, httpxs_spawn.go(~H, sock))
     return l
 
-def httpxs_conn(~H: HttpxSrvEv -> HttpxSrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def httpxs_conn(~H: SrvEv -> SrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
@@ -5219,14 +5255,14 @@ def httpxs_alpn_close(sock: Socket, l: Listener) -> IO(Listener):
     x : Unit <- TLS.tls_close(sock)
     return l
 
-def httpxs_alpn_go(~H: HttpxSrvEv -> HttpxSrvOut, is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+def httpxs_alpn_go(~H: SrvEv -> SrvOut, is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
   match is_h2:
     case True{}:
       httpxs_spawn(~H, sock, listener)
     case False{}:
       httpxs_alpn_close(sock, listener)
 
-def httpxs_alpn_conn(~H: HttpxSrvEv -> HttpxSrvOut, accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
+def httpxs_alpn_conn(~H: SrvEv -> SrvOut, accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
   match result:
     case Fail{e}:
@@ -5236,7 +5272,7 @@ def httpxs_alpn_conn(~H: HttpxSrvEv -> HttpxSrvOut, accepted: Listener & Result<
       httpxs_alpn_go(~H, TLS.tls_alpn_is_h2(protocol), listener, sock)
 
 @unsafe
-def server_on_stream(~H: HttpxSrvEv -> HttpxSrvOut, l: Listener, +cert: String, +key: String) ->
+def server_on_stream(~H: SrvEv -> SrvOut, l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
@@ -5245,7 +5281,7 @@ def server_on_stream(~H: HttpxSrvEv -> HttpxSrvOut, l: Listener, +cert: String, 
     return z
 
 @unsafe
-def server_on_stream_alpn(~H: HttpxSrvEv -> HttpxSrvOut, listener: Listener, +cert: String, +key: String) ->
+def server_on_stream_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
@@ -5293,43 +5329,43 @@ def httpx.seq_cnext(has_frag: Bool) -> U32:
       8
 
 @unsafe
-def httpx_seq(~H: HttpxReq -> IO(HttpxResp), phase: U32, act: U32, +endh: U32, got: Socket & HttpxGot, +buf: List<&2, U32>, +tab: HttpxTab, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: HttpxReqHead, +sid_a: U32, +body: List<&2, U32>, +frag: List<&2, U32>, frag_end: U32, +need: U32) ->
+def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +rh: ReqHead, +sid_a: U32, +body: List<&2, U32>, +frag: List<&2, U32>, frag_end: U32, +need: U32) ->
   IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HttpxGot <- x_read_frame(s0, buf)
+        got2 : Socket & Got <- x_read_frame(s0, buf)
         httpx_seq(~H, 1, 4, 0, got2, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, body, frag, frag_end, 0)
     case 1:
       (s1, g1) = got
       match g1:
-        case HttpxGotErr{code1, msg1}:
+        case GotErr{code1, msg1}:
           TLS.tls_close(s1)
-        case HttpxGotOk{+frame, +buf2}:
+        case GotOk{+frame, +buf2}:
           match frame:
-            case HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              httpx_seq(~H, 2, 4, 0, (s1, HttpxGotOk{frame, buf2}), buf2, tab, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), rh, sid_a, body, frag, frag_end, 0)
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              httpx_seq(~H, 2, 4, 0, (s1, GotOk{frame, buf2}), buf2, tab, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), rh, sid_a, body, frag, frag_end, 0)
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.ack(got)
+            got2 : Socket & Got <- httpx.ack(got)
             httpx_seq(~H, 0, 4, 0, got2, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, body, frag, frag_end, 0)
         case 4:
           do IO<Unit>:
-            gotp : Socket & HttpxGot <- httpx.ack_ping(got, payload)
+            gotp : Socket & Got <- httpx.ack_ping(got, payload)
             httpx_seq(~H, 0, 4, 0, gotp, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, body, frag, frag_end, 0)
         case 5:
           httpx.close_got(got)
         case 2:
-          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case 7:
           httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, body, frag, frag_end, 0)
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx_seq(~H, httpx.seq_cnext(Bool.not(U32.is_eq(x_len32(frag), 0))), 4, U32.and(flags, x_f_end_headers()), got, buf, tab, typ, flags, sid2, payload, cls, end, HttpxReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
+          httpx_seq(~H, httpx.seq_cnext(Bool.not(U32.is_eq(x_len32(frag), 0))), 4, U32.and(flags, x_f_end_headers()), got, buf, tab, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
         case 6:
           httpx_seq(~H, httpx.seq_tphase(typ, Bool.or(httpx.seq_open(U32.is_eq(sid_a, 0)), Bool.not(U32.is_eq(x_len32(frag), 0)))), httpxn.decide_data(Bool.and(httpx.seq_open(U32.is_eq(sid_a, 0)), U32.is_eq(sid2, sid_a)), end), 0, got, buf, tab, typ, flags, sid2, payload, cls, end, rh, sid_a, body, frag, frag_end, httpxn.need_u(typ, flags))
         case 0:
@@ -5337,7 +5373,7 @@ def httpx_seq(~H: HttpxReq -> IO(HttpxResp), phase: U32, act: U32, +endh: U32, g
         case _:
           httpx.close_got(got)
     case 3:
-      +dr : Result<&1, &1, U32 & String, HttpxReqHead & HttpxTab> = x_req.decode(payload, tab)
+      +dr : Result<&1, &1, U32 & String, ReqHead & Tab> = x_req.decode(payload, tab)
       httpx_seq(~H, 9, httpxn.head_act(need, x_req.ok(dr), end), endh, got, buf, x_req.tab(dr), typ, flags, sid2, payload, cls, end, x_req.rh(dr), sid_a, body, frag, frag_end, need)
     case 9:
       match act:
@@ -5346,12 +5382,12 @@ def httpx_seq(~H: HttpxReq -> IO(HttpxResp), phase: U32, act: U32, +endh: U32, g
         case 1:
           (s3, g3) = got
           do IO<Unit>:
-            req : HttpxReq = httpx.req_of(rh, Nil{})
-            resp : HttpxResp <- H(req)
+            req : Request = httpx.req_of(rh, Nil{})
+            resp : Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s3, sid2, resp)
-            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case 6:
-          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, sid_a, body, x_cat(payload), end, 0)
+          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, sid_a, body, x_cat(payload), end, 0)
         case 5:
           httpx.close_got(got)
         case _:
@@ -5360,16 +5396,16 @@ def httpx_seq(~H: HttpxReq -> IO(HttpxResp), phase: U32, act: U32, +endh: U32, g
       match act:
         case 0:
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er(got, buf, sid2, payload)
+            got2 : Socket & Got <- httpx.wu_er(got, buf, sid2, payload)
             httpx_seq(~H, 0, 4, 0, got2, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, x_rev_push(payload, body), frag, frag_end, 0)
         case 1:
           (s4, g4) = got
           do IO<Unit>:
-            got2 : Socket & HttpxGot <- httpx.wu_er(got, buf, sid2, payload)
-            req : HttpxReq = httpx.req_of(rh, x_cat(x_rev_push(payload, body)))
-            resp : HttpxResp <- H(req)
+            got2 : Socket & Got <- httpx.wu_er(got, buf, sid2, payload)
+            req : Request = httpx.req_of(rh, x_cat(x_rev_push(payload, body)))
+            resp : Response <- H(req)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case 4:
           httpx.close_got(got)
         case _:
@@ -5377,10 +5413,10 @@ def httpx_seq(~H: HttpxReq -> IO(HttpxResp), phase: U32, act: U32, +endh: U32, g
     case 5:
       match endh:
         case 0:
-          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, sid_a, body, x_rev_push(payload, frag), frag_end, 0)
+          httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, sid_a, body, x_rev_push(payload, frag), frag_end, 0)
         case 4:
           +full : List<&2, U32> = x_cat(x_rev_push(payload, frag))
-          httpx_seq(~H, 3, 4, 0, got, buf, tab, 1, flags, sid2, full, cls, frag_end, HttpxReqHead{"", "", Nil{}}, sid_a, body, Nil{}, 0, 0)
+          httpx_seq(~H, 3, 4, 0, got, buf, tab, 1, flags, sid2, full, cls, frag_end, ReqHead{"", "", Nil{}}, sid_a, body, Nil{}, 0, 0)
         case _:
           (s5, g5) = got
           do IO<Unit>:
@@ -5408,7 +5444,7 @@ def seq_pre.recv(rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO
   TLS.tls_recv_bytes(s1, 16384)
 
 @unsafe
-def seq_pre(~H: HttpxReq -> IO(HttpxResp), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+def seq_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
   IO(Unit):
   match phase:
     case 0:
@@ -5433,14 +5469,14 @@ def seq_pre(~H: HttpxReq -> IO(HttpxResp), phase: U32, rs: Socket & Result<&1, &
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), x_drop32(24, acc), x_tab.empty(), 0, 0, 0, Nil{}, 0, 0, HttpxReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), x_drop32(24, acc), x_tab.empty(), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case _:
           TLS.tls_close(s2)
     case _:
       (s9, r9) = rs
       TLS.tls_close(s9)
 
-def seq_start(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def seq_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
     seq_pre(~H, 0, r1, Nil{}, 0, False{})
@@ -5448,16 +5484,16 @@ def seq_start(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
 # Accept plumbing (sequential, H2-only): every connection runs seq_start.
 # ---------------------------------------------------------------------
 
-def seq_spawn.go(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def seq_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   seq_start(~H, sock)
 
-def seq_spawn(~H: HttpxReq -> IO(HttpxResp), sock: Socket, l: Listener) ->
+def seq_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
     x : Unit <- IO.spawn(Unit, seq_spawn.go(~H, sock))
     return l
 
-def seq_conn(~H: HttpxReq -> IO(HttpxResp), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def seq_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
@@ -5467,7 +5503,7 @@ def seq_conn(~H: HttpxReq -> IO(HttpxResp), m: Listener & Result<&1, &1, U32 & S
       seq_spawn(~H, sock, l)
 
 @unsafe
-def server_on(~H: HttpxReq -> IO(HttpxResp), l: Listener, +cert: String, +key: String) ->
+def server_on(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
@@ -5476,8 +5512,8 @@ def server_on(~H: HttpxReq -> IO(HttpxResp), l: Listener, +cert: String, +key: S
     return z
 
 # H1 serve (Phase 11): one-shot per connection (answer + close, no H1
-# keep-alive — mirror https_http1 http1_serve). Handlers speak HttpxReq /
-# HttpxResp natively, so server_on_alpn takes ONE handler for both lanes.
+# keep-alive — mirror https_http1 http1_serve). Handlers speak Request /
+# Response natively, so server_on_alpn takes ONE handler for both lanes.
 # ---------------------------------------------------------------------
 
 def x_h1.srv.needs_body(+m: String) -> Bool:
@@ -5487,17 +5523,17 @@ def x_h1.srv.sent_close(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO
   (s2, r2) = sent
   TLS.tls_close(s2)
 
-def x_h1.srv.respond(sock: Socket, +resp: HttpxResp) -> IO(Unit):
+def x_h1.srv.respond(sock: Socket, +resp: Response) -> IO(Unit):
   match resp:
-    case HttpxResp{+status, +headers, +body}:
+    case Response{+status, +headers, +body}:
       do IO<Unit>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, x_h1.show_resp(status, headers, body))
         x_h1.srv.sent_close(sent)
 
-def x_h1.srv.answer(~H: HttpxReq -> IO(HttpxResp), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: HttpxReq) -> IO(Unit):
+def x_h1.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request) -> IO(Unit):
   (s, r) = got
   do IO<Unit>:
-    resp : HttpxResp <- H(req)
+    resp : Response <- H(req)
     x_h1.srv.respond(s, resp)
 
 def x_h1.srv.fail_close(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
@@ -5509,7 +5545,7 @@ def x_h1.srv.recv(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> 
   TLS.tls_recv_bytes(s0, 16384)
 
 @unsafe
-def x_h1.srv.bd(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, HttpxHdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
+def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
   match phase:
     case 0:
       match fuel:
@@ -5518,7 +5554,7 @@ def x_h1.srv.bd(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & Result<
         case 1n+f:
           match enough:
             case True{}:
-              x_h1.srv.answer(~H, got, HttpxReq{m, p, hs, x_take32(cl, have)})
+              x_h1.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)})
             case False{}:
               do IO<Unit>:
                 r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(got)
@@ -5539,44 +5575,44 @@ def x_h1.srv.bd(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & Result<
       (s9, r9) = got
       TLS.tls_close(s9)
 
-def x_h1.srv.cl(~H: HttpxReq -> IO(HttpxResp), s: Socket, +m: String, +p: String, +hs: List<&2, HttpxHdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) -> IO(Unit):
+def x_h1.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) -> IO(Unit):
   match big:
     case True{}:
-      x_h1.srv.respond(s, HttpxResp{413, Nil{}, Nil{}})
+      x_h1.srv.respond(s, Response{413, Nil{}, Nil{}})
     case False{}:
       x_h1.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, U32.is_ge(x_len32(rest), cl))
 
-def x_h1.srv.go(~H: HttpxReq -> IO(HttpxResp), s: Socket, +m: String, +p: String, +hs: List<&2, HttpxHdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
+def x_h1.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
   match needs:
     case False{}:
-      x_h1.srv.answer(~H, (s, Done{Nil{}}), HttpxReq{m, p, hs, Nil{}})
+      x_h1.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}})
     case True{}:
       match chunked:
         case True{}:
-          x_h1.srv.respond(s, HttpxResp{502, Nil{}, Nil{}})
+          x_h1.srv.respond(s, Response{502, Nil{}, Nil{}})
         case False{}:
           x_h1.srv.cl(~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1.srv.ruled(~H: HttpxReq -> IO(HttpxResp), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, HttpxReqHead>) -> IO(Unit):
+def x_h1.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) -> IO(Unit):
   match joinres:
     case Fail{e}:
       TLS.tls_close(s1)
     case Done{+rh}:
       match rh:
-        case HttpxReqHead{+m, +p, +hs}:
+        case ReqHead{+m, +p, +hs}:
           x_h1.srv.go(~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
 def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
   (s, r) = got
   s
 
-def x_h1.srv.parsed(~H: HttpxReq -> IO(HttpxResp), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
+def x_h1.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
   +rest = x_h1.split_rest(x_h1.split(acc))
   x_h1.srv.ruled(~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
 
 @unsafe
-def x_h1.srv.head(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
+def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
   match phase:
     case 0:
       (s0, r0) = got
@@ -5609,19 +5645,19 @@ def x_h1.srv.head(~H: HttpxReq -> IO(HttpxResp), phase: U32, got: Socket & Resul
       (s9, r9) = got
       TLS.tls_close(s9)
 
-def x_h1.serve_start(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def x_h1.serve_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   x_h1.srv.head(~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
 
-def h1_spawn.go(~H: HttpxReq -> IO(HttpxResp), sock: Socket) -> IO(Unit):
+def h1_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   x_h1.serve_start(~H, sock)
 
-def h1_spawn(~H: HttpxReq -> IO(HttpxResp), sock: Socket, l: Listener) ->
+def h1_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
     x : Unit <- IO.spawn(Unit, h1_spawn.go(~H, sock))
     return l
 
-def h1_conn(~H: HttpxReq -> IO(HttpxResp), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def h1_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
@@ -5630,14 +5666,14 @@ def h1_conn(~H: HttpxReq -> IO(HttpxResp), m: Listener & Result<&1, &1, U32 & St
     case Done{sock}:
       h1_spawn(~H, sock, l)
 
-def httpxa_alpn_go(~H: HttpxReq -> IO(HttpxResp), is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
+def httpxa_alpn_go(~H: Request -> IO(Response), is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
   match is_h2:
     case True{}:
       seq_spawn(~H, sock, listener)
     case False{}:
       h1_spawn(~H, sock, listener)
 
-def httpxa_alpn_conn(~H: HttpxReq -> IO(HttpxResp), accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
+def httpxa_alpn_conn(~H: Request -> IO(Response), accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
   match result:
     case Fail{e}:
@@ -5647,7 +5683,7 @@ def httpxa_alpn_conn(~H: HttpxReq -> IO(HttpxResp), accepted: Listener & Result<
       httpxa_alpn_go(~H, TLS.tls_alpn_is_h2(protocol), listener, sock)
 
 @unsafe
-def server_on_alpn(~H: HttpxReq -> IO(HttpxResp), listener: Listener, +cert: String, +key: String) ->
+def server_on_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
@@ -5657,7 +5693,7 @@ def server_on_alpn(~H: HttpxReq -> IO(HttpxResp), listener: Listener, +cert: Str
     return z
 
 @unsafe
-def server_on_http1(~H: HttpxReq -> IO(HttpxResp), listener: Listener, +cert: String, +key: String) ->
+def server_on_http1(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <-
