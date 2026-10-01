@@ -15,27 +15,27 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def tab_size(tab: HTTPX.HttpxTab) -> U32:
+def tab_size(tab: HTTPX.Tab) -> U32:
   match tab:
-    case HTTPX.HttpxTab{ents, size, max}:
+    case HTTPX.Tab{ents, size, max}:
       size
 
-def hdr_eq(h: HTTPX.HttpxHdr, wn: String, wv: String) -> U32:
+def hdr_eq(h: HTTPX.Hdr, wn: String, wv: String) -> U32:
   match h:
-    case HTTPX.HttpxHdr{n, v}:
+    case HTTPX.Hdr{n, v}:
       b2u(Bool.and(String.eq(n, wn), String.eq(v, wv)))
 
-def lookup_t.go(r: Result<&1, &1, U32 & String, HTTPX.HttpxHdr>, wn: String, wv: String) -> U32:
+def lookup_t.go(r: Result<&1, &1, U32 & String, HTTPX.Hdr>, wn: String, wv: String) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{h}:
       hdr_eq(h, wn, wv)
 
-def lookup_t(tab: HTTPX.HttpxTab, idx: U32, wn: String, wv: String) -> U32:
+def lookup_t(tab: HTTPX.Tab, idx: U32, wn: String, wv: String) -> U32:
   lookup_t.go(HTTPX.x_tab.lookup(tab, idx), wn, wv)
 
-def is_fail_hdr(r: Result<&1, &1, U32 & String, HTTPX.HttpxHdr>) -> U32:
+def is_fail_hdr(r: Result<&1, &1, U32 & String, HTTPX.Hdr>) -> U32:
   match r:
     case Fail{e}:
       1
@@ -44,7 +44,7 @@ def is_fail_hdr(r: Result<&1, &1, U32 & String, HTTPX.HttpxHdr>) -> U32:
 
 # One table with the two RFC 7541 C.3.1 entries, 57 + 53 = 110 bytes.
 
-def two_tab() -> HTTPX.HttpxTab:
+def two_tab() -> HTTPX.Tab:
   HTTPX.x_tab.insert(HTTPX.x_tab.insert(HTTPX.x_tab.empty(), ":authority",
     "www.example.com"), "cache-control", "no-cache")
 
@@ -66,17 +66,17 @@ def v3_newest_first() -> U32:
 # Eviction: the oldest entry goes first, so trimming 110 down to 60 keeps the
 # newest 53-byte entry and drops the older 57-byte one.
 
-def v4_evict(tab: HTTPX.HttpxTab) -> U32:
+def v4_evict(tab: HTTPX.Tab) -> U32:
   match tab:
-    case HTTPX.HttpxTab{ents, size, tmax}:
+    case HTTPX.Tab{ents, size, tmax}:
       b2u(U32.is_eq(tab_size(HTTPX.x_tab.trim(ents, size, 60)), 53))
 
 # An entry that cannot fit empties the table (RFC 7541 section 4.4), forced
 # here through the same predicate x_tab.insert uses.
 
-def v5_oversize(tab: HTTPX.HttpxTab) -> U32:
+def v5_oversize(tab: HTTPX.Tab) -> U32:
   match tab:
-    case HTTPX.HttpxTab{ents, size, tmax}:
+    case HTTPX.Tab{ents, size, tmax}:
       tab_size(HTTPX.x_tab.ins_fit(ents, size, tmax, "x", "y", False{},
         HTTPX.x_tab.entry_size("x", "y")))
 
@@ -92,14 +92,14 @@ def v7_entry_size() -> U32:
 # A resize below one entry empties the table: the path a peer
 # SETTINGS_HEADER_TABLE_SIZE update takes.
 
-def v8_resize(tab: HTTPX.HttpxTab) -> U32:
+def v8_resize(tab: HTTPX.Tab) -> U32:
   +small = HTTPX.x_tab.resize(tab, 0)
   (b2u(U32.is_eq(tab_size(small), 0))
     + b2u(U32.is_eq(lookup_t(small, 0, ":authority", "www.example.com"), 0)) : U32)
 
 # Three inserts keep newest-first order across the whole walk.
 
-def v9_order(tab: HTTPX.HttpxTab) -> U32:
+def v9_order(tab: HTTPX.Tab) -> U32:
   +t3 = HTTPX.x_tab.insert(HTTPX.x_tab.insert(tab, "x-a", "1"), "x-b", "2")
   (lookup_t(t3, 0, "x-b", "2") + lookup_t(t3, 1, "x-a", "1")
     + lookup_t(t3, 2, ":authority", "www.example.com") : U32)

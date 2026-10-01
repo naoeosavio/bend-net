@@ -31,27 +31,27 @@ def b2u(b: Bool) -> U32:
       0
 
 # Server handler: plain echo (Head buffers, Data answers 200 immediately).
-def h2(ev: HTTPX.HttpxSrvEv) -> HTTPX.HttpxSrvOut:
+def h2(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
-    case HTTPX.ReqHead{slot, head}:
+    case HTTPX.SrvReqHead{slot, head}:
       HTTPX.NeedMore{}
-    case HTTPX.ReqData{slot, +chunk, fin}:
-      HTTPX.RespondEarly{HTTPX.HttpxResp{200, Nil{}, chunk}}
+    case HTTPX.SrvReqData{slot, +chunk, fin}:
+      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
 
 # Raw client collector: single stream, counts one 200 head + "hi" body.
-def cc_acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.HttpxGot:
+def cc_acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
   (s2, r) = sent
   match r:
     case Fail{e}:
-      (s2, HTTPX.HttpxGotErr{616, "tls io"})
+      (s2, HTTPX.GotErr{616, "tls io"})
     case Done{u}:
-      (s2, HTTPX.HttpxGotErr{0, "next"})
+      (s2, HTTPX.GotErr{0, "next"})
 
-def cc_ack(got: Socket & HTTPX.HttpxGot) -> IO(Socket & HTTPX.HttpxGot):
+def cc_ack(got: Socket & HTTPX.Got) -> IO(Socket & HTTPX.Got):
   (s, g) = got
-  do IO<Socket & HTTPX.HttpxGot>:
+  do IO<Socket & HTTPX.Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_settings(), HTTPX.x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HTTPX.HttpxGot, cc_acked(sent))
+    IO.pure(Socket & HTTPX.Got, cc_acked(sent))
 
 def cc_act_settings_ack(+typ: U32, +flags: U32) -> Bool:
   Bool.and(U32.is_eq(typ, HTTPX.x_t_settings()), U32.is_eq(flags, 1))
@@ -96,13 +96,13 @@ def cc_act_go(is_ack: Bool, +typ: U32) -> U32:
 def cc_act(+typ: U32, +flags: U32) -> U32:
   cc_act_go(cc_act_settings_ack(typ, flags), typ)
 
-def cc_status(dec: Result<&1, &1, U32 & String, HTTPX.HttpxHead & HTTPX.HttpxTab>) -> U32:
+def cc_status(dec: Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab>) -> U32:
   match dec:
     case Fail{e}:
       0
     case Done{(+h, t)}:
       match h:
-        case HTTPX.HttpxHead{status, headers}:
+        case HTTPX.Head{status, headers}:
           status
 
 def cc_hit(+status: U32, +sid: U32) -> Bool:
@@ -138,12 +138,12 @@ def cc_score_go(fin: Bool) -> U32:
 def cc_score(+n: U32, +bokn: U32) -> U32:
   cc_score_go(cc_fin_u(n, bokn))
 
-def cc_done_got(got: Socket & HTTPX.HttpxGot, +n: U32, +bokn: U32) -> Socket & U32:
+def cc_done_got(got: Socket & HTTPX.Got, +n: U32, +bokn: U32) -> Socket & U32:
   (s, g) = got
   (s, cc_score(n, bokn))
 
 @unsafe
-def cc(phase: U32, got: Socket & HTTPX.HttpxGot, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +n: U32, +bokn: U32, fin: Bool) ->
+def cc(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +n: U32, +bokn: U32, fin: Bool) ->
   IO(Socket & U32):
   match phase:
     case 0:
@@ -155,7 +155,7 @@ def cc(phase: U32, got: Socket & HTTPX.HttpxGot, +buf: List<&2, U32>, +typ: U32,
     case 1:
       (s1, g1) = got
       do IO<Socket & U32>:
-        got2 : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(s1, buf)
+        got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s1, buf)
         cc(5, got2, buf, 0, 0, 0, Nil{}, n, bokn, fin)
     case 2:
       cc_dispat(cc_act(typ, flags), got, buf, typ, flags, sid, payload, n, bokn, fin)
@@ -166,26 +166,26 @@ def cc(phase: U32, got: Socket & HTTPX.HttpxGot, +buf: List<&2, U32>, +typ: U32,
     case 5:
       (s5, g5) = got
       match g5:
-        case HTTPX.HttpxGotErr{code5, msg5}:
+        case HTTPX.GotErr{code5, msg5}:
           match code5:
             case 0:
               cc(1, got, buf, 0, 0, 0, Nil{}, n, bokn, fin)
             case _:
               IO.pure(Socket & U32, (s5, cc_score(n, bokn)))
-        case HTTPX.HttpxGotOk{+frame5, +buf5}:
+        case HTTPX.GotOk{+frame5, +buf5}:
           match frame5:
-            case HTTPX.HttpxFrame{+typ5, +flags5, +sid5, +payload5}:
-              cc_dispat(cc_act(typ5, flags5), (s5, HTTPX.HttpxGotOk{frame5, buf5}), buf5, typ5, flags5, sid5, payload5, n, bokn, fin)
+            case HTTPX.Frame{+typ5, +flags5, +sid5, +payload5}:
+              cc_dispat(cc_act(typ5, flags5), (s5, HTTPX.GotOk{frame5, buf5}), buf5, typ5, flags5, sid5, payload5, n, bokn, fin)
     case _:
       (s8, g8) = got
       IO.pure(Socket & U32, (s8, cc_score(n, bokn)))
 
-def cc_dispat(act: U32, got: Socket & HTTPX.HttpxGot, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +n: U32, +bokn: U32, fin: Bool) ->
+def cc_dispat(act: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +n: U32, +bokn: U32, fin: Bool) ->
   IO(Socket & U32):
   match act:
     case 1:
       do IO<Socket & U32>:
-        got2 : Socket & HTTPX.HttpxGot <- cc_ack(got)
+        got2 : Socket & HTTPX.Got <- cc_ack(got)
         cc(0, got2, buf, 0, 0, 0, Nil{}, n, bokn, cc_fin_u(n, bokn))
     case 2:
       cc(3, got, buf, typ, flags, sid, payload, n, bokn, fin)
@@ -202,7 +202,7 @@ def client_collect_done(done: Socket & U32) -> IO(U32):
 
 def client_collect(sock: Socket) -> IO(U32):
   do IO<U32>:
-    got : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(sock, Nil{})
+    got : Socket & HTTPX.Got <- HTTPX.x_read_frame(sock, Nil{})
     done : Socket & U32 <- cc(5, got, Nil{}, 0, 0, 0, Nil{}, 0, 0, False{})
     client_collect_done(done)
 

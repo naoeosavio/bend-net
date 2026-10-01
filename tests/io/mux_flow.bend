@@ -21,10 +21,10 @@ def mux_flow.body.go(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
 def mux_flow.body() -> List<&2, U32>:
   mux_flow.body.go(25000n, Nil{})
 
-def mux_echo(req: HTTPX.HttpxReq) -> IO(HTTPX.HttpxResp):
+def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case HTTPX.HttpxReq{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.HttpxResp, HTTPX.HttpxResp{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def dbg_srv(n: U32) -> U32:
   n
@@ -44,7 +44,7 @@ def client_score(counts: U32 & Bool) -> U32:
   (total, ok) = counts
   b2u(Bool.and(U32.is_eq(total, 25000), Bool.not(ok)))
 
-def h(ev: HTTPX.HttpxStreamEv) -> HTTPX.HttpxStreamOut:
+def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
   match ev:
     case HTTPX.StreamHead{head}:
       HTTPX.StreamContinue{}

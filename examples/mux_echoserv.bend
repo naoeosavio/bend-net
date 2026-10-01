@@ -6,10 +6,10 @@
 import Base
 import ../lib/httpx.bend as HTTPX
 
-def echo(req: HTTPX.HttpxReq) -> IO(HTTPX.HttpxResp):
+def echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case HTTPX.HttpxReq{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.HttpxResp, HTTPX.HttpxResp{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 law server:
   for l: Listener

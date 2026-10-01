@@ -7,10 +7,10 @@ import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.HttpxReq) -> IO(HTTPX.HttpxResp):
+def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case HTTPX.HttpxReq{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.HttpxResp, HTTPX.HttpxResp{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -19,42 +19,42 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def score_one(+want: String, r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> U32:
+def score_one(+want: String, r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.HttpxResp{+status, +headers, +body}:
+        case HTTPX.Response{+status, +headers, +body}:
           b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
 
-def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt, +s1: U32, +port: U32) -> IO(U32):
+def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +s1: U32, +port: U32) -> IO(U32):
   (sock2, r2, st2) = got
   do IO<U32>:
     +s12 : U32 = (s1 + score_one("hello", r2) : U32)
     x : Unit <- TLS.tls_close(sock2)
     IO.pure(U32, s12)
 
-def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt, +port: U32) -> IO(U32):
+def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
   (sock1, r1, st1) = got
   do IO<U32>:
     +s1 : U32 = score_one("hi", r1)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt <- HTTPX.client_on_request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     req2(got2, s1, port)
 
-def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.HttpxCliSt>, +port: U32) -> IO(U32):
+def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt <- HTTPX.client_on_request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.HttpxCliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:

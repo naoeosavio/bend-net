@@ -20,12 +20,12 @@ def report_body(+status: U32, +body: List<&2, U32>) -> IO(Unit):
     _ : Unit <- IO.print("DONE 3/3")
     IO.die(Unit, 0, "")
 
-def report_resp(resp: HTTPX.HttpxResp) -> IO(Unit):
+def report_resp(resp: HTTPX.Response) -> IO(Unit):
   match resp:
-    case HTTPX.HttpxResp{+status, +headers, +body}:
+    case HTTPX.Response{+status, +headers, +body}:
       report_body(status, body)
 
-def report(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> IO(Unit):
+def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
   match r:
     case Fail{(c, e)}:
       report_fail(c, e)
@@ -35,5 +35,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     _ : Unit <- IO.print("STEP dial api.binance.com:443")
-    r : Result<&1, &1, U32 & String, HTTPX.HttpxResp> <- HTTPX.client_once("api.binance.com", 443, "GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{})
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once("api.binance.com", 443, "GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{})
     report(r)

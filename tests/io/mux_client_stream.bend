@@ -6,10 +6,10 @@
 import Base
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.HttpxReq) -> IO(HTTPX.HttpxResp):
+def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case HTTPX.HttpxReq{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.HttpxResp, HTTPX.HttpxResp{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -18,7 +18,7 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def h(ev: HTTPX.HttpxStreamEv) -> HTTPX.HttpxStreamOut:
+def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
   match ev:
     case HTTPX.StreamHead{head}:
       HTTPX.StreamContinue{}

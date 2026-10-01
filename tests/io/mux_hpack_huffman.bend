@@ -63,9 +63,9 @@ def v6_truncated() -> U32:
 def req_blk() -> List<&2, U32>:
   [130, 134, 132, 65, 140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255]
 
-def req_head(head: HTTPX.HttpxReqHead, ok: Bool) -> U32:
+def req_head(head: HTTPX.ReqHead, ok: Bool) -> U32:
   match head:
-    case HTTPX.HttpxReqHead{method, path, headers}:
+    case HTTPX.ReqHead{method, path, headers}:
       b2u(Bool.and(ok, Bool.and(String.eq(method, "GET"), String.eq(path, "/"))))
 
 def v7_req_block() -> U32:
@@ -75,9 +75,9 @@ def v7_req_block() -> U32:
 # Indexed ":status 302" (0x48) plus the Huffman literal from v2: the response
 # side of the same two layers.
 
-def resp_head(head: HTTPX.HttpxHead, ok: Bool) -> U32:
+def resp_head(head: HTTPX.Head, ok: Bool) -> U32:
   match head:
-    case HTTPX.HttpxHead{status, headers}:
+    case HTTPX.Head{status, headers}:
       b2u(Bool.and(ok, U32.is_eq(status, 302)))
 
 def v8_resp_block() -> U32:

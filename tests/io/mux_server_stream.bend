@@ -1,5 +1,5 @@
 # lib (lib_mux_server_stream): streaming upload against HTTPX.server_on_stream.
-# Server streams ReqHead/ReqData to a pure per-chunk-cap handler (cap 3):
+# Server streams SrvReqHead/SrvReqData to a pure per-chunk-cap handler (cap 3):
 # Head -> NeedMore; Data chunk>3 -> RespondEarly 413 (drop, free, skip
 # rest via stray-skip); Data <=3 with fin -> RespondEarly echo 200.
 # Client is mini keep-alive (HTTPX.client_on keep_connect + request, sids
@@ -23,65 +23,65 @@ def cap() -> U32:
 def over_cap(+chunk: List<&2, U32>) -> Bool:
   U32.is_gt(HTTPX.x_len32(chunk), cap())
 
-def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.HttpxSrvOut:
+def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
   match is_over:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.HttpxResp{413, Nil{}, Nil{}}}
+      HTTPX.RespondEarly{HTTPX.Response{413, Nil{}, Nil{}}}
     case False{}:
-      HTTPX.RespondEarly{HTTPX.HttpxResp{200, Nil{}, chunk}}
+      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
 
-def h(ev: HTTPX.HttpxSrvEv) -> HTTPX.HttpxSrvOut:
+def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
-    case HTTPX.ReqHead{slot, head}:
+    case HTTPX.SrvReqHead{slot, head}:
       HTTPX.NeedMore{}
-    case HTTPX.ReqData{slot, +chunk, fin}:
+    case HTTPX.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 
-def score_echo(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> U32:
+def score_echo(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.HttpxResp{+status, +headers, +body}:
+        case HTTPX.Response{+status, +headers, +body}:
           b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hi")), 1)))
 
-def score_early(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> U32:
+def score_early(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.HttpxResp{+status, +headers, +body}:
+        case HTTPX.Response{+status, +headers, +body}:
           b2u(U32.is_eq(status, 413))
 
-def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt, +s1: U32, +port: U32) -> IO(U32):
+def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +s1: U32, +port: U32) -> IO(U32):
   (sock2, r2, st2) = got
   do IO<U32>:
     +s12 : U32 = (s1 + score_early(r2) : U32)
     x : Unit <- TLS.tls_close(sock2)
     IO.pure(U32, s12)
 
-def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt, +port: U32) -> IO(U32):
+def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
   (sock1, r1, st1) = got
   do IO<U32>:
     +s1 : U32 = score_echo(r1)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt <- HTTPX.client_on_request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     req2(got2, s1, port)
 
-def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.HttpxCliSt>, +port: U32) -> IO(U32):
+def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.HttpxResp> & HTTPX.HttpxCliSt <- HTTPX.client_on_request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.HttpxCliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:

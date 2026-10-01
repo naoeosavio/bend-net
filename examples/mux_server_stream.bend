@@ -15,18 +15,18 @@ def cap() -> U32:
 def over_cap(+chunk: List<&2, U32>) -> Bool:
   U32.is_gt(U32.from_nat(HTTPX.x_len(chunk)), cap())
 
-def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.HttpxSrvOut:
+def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
   match is_over:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.HttpxResp{413, Nil{}, Nil{}}}
+      HTTPX.RespondEarly{HTTPX.Response{413, Nil{}, Nil{}}}
     case False{}:
-      HTTPX.RespondEarly{HTTPX.HttpxResp{200, Nil{}, chunk}}
+      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
 
-def h(ev: HTTPX.HttpxSrvEv) -> HTTPX.HttpxSrvOut:
+def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
-    case HTTPX.ReqHead{slot, head}:
+    case HTTPX.SrvReqHead{slot, head}:
       HTTPX.NeedMore{}
-    case HTTPX.ReqData{slot, +chunk, fin}:
+    case HTTPX.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 
 law server:

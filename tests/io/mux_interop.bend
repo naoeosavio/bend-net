@@ -16,10 +16,10 @@ def body1() -> List<&2, U32>:
 def body2() -> List<&2, U32>:
   [119, 111, 114, 108, 100, 33]
 
-def mux_ok(req: HTTPX.HttpxReq) -> IO(HTTPX.HttpxResp):
+def mux_ok(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case HTTPX.HttpxReq{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.HttpxResp, HTTPX.HttpxResp{200, Nil{}, Nil{}})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, Nil{}})
 
 # Client collect: gather HEADERS for sids 1, 3, 5 and 7 (handler
 # answers 200 with empty bodies, so no DATA is ever read). Score is 1
@@ -38,26 +38,26 @@ def coll.score_go(eq: Bool) -> U32:
 def coll.score(+n: U32) -> U32:
   coll.score_go(U32.is_eq(n, 4))
 
-def coll.hd_ok(dec: Result<&1, &1, U32 & String, HTTPX.HttpxHead & HTTPX.HttpxTab>) -> Bool:
+def coll.hd_ok(dec: Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab>) -> Bool:
   match dec:
     case Fail{e}:
       False{}
     case Done{h}:
       True{}
 
-def coll.head_of(dec: Result<&1, &1, U32 & String, HTTPX.HttpxHead & HTTPX.HttpxTab>) -> HTTPX.HttpxHead:
+def coll.head_of(dec: Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab>) -> HTTPX.Head:
   match dec:
     case Fail{e}:
-      HTTPX.HttpxHead{0, Nil{}}
+      HTTPX.Head{0, Nil{}}
     case Done{(+h, t)}:
       h
 
-def coll.is200(+h: HTTPX.HttpxHead) -> Bool:
+def coll.is200(+h: HTTPX.Head) -> Bool:
   match h:
-    case HTTPX.HttpxHead{status, headers}:
+    case HTTPX.Head{status, headers}:
       U32.is_eq(status, 200)
 
-def coll.hit(ok: Bool, +h: HTTPX.HttpxHead, +e: U32) -> Bool:
+def coll.hit(ok: Bool, +h: HTTPX.Head, +e: U32) -> Bool:
   match ok e:
     case True{} 1:
       coll.is200(h)
@@ -74,21 +74,21 @@ def coll.bump(hit: Bool, +n: U32) -> U32:
 def coll.fin4(+n: U32) -> Bool:
   U32.is_ge(n, 4)
 
-def coll.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.HttpxGot:
+def coll.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
   (s2, r) = sent
   match r:
     case Fail{e}:
-      (s2, HTTPX.HttpxGotErr{616, "tls io"})
+      (s2, HTTPX.GotErr{616, "tls io"})
     case Done{u}:
-      (s2, HTTPX.HttpxGotErr{0, "next"})
+      (s2, HTTPX.GotErr{0, "next"})
 
-def coll.ack(got: Socket & HTTPX.HttpxGot) -> IO(Socket & HTTPX.HttpxGot):
+def coll.ack(got: Socket & HTTPX.Got) -> IO(Socket & HTTPX.Got):
   (s, g) = got
-  do IO<Socket & HTTPX.HttpxGot>:
+  do IO<Socket & HTTPX.Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_settings(), HTTPX.x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HTTPX.HttpxGot, coll.acked(sent))
+    IO.pure(Socket & HTTPX.Got, coll.acked(sent))
 
-def coll.done_got(got: Socket & HTTPX.HttpxGot, +n: U32) -> Socket & U32:
+def coll.done_got(got: Socket & HTTPX.Got, +n: U32) -> Socket & U32:
   (s, g) = got
   (s, coll.score(n))
 
@@ -108,7 +108,7 @@ def coll.setact(+typ: U32, +flags: U32) -> U32:
       0
 
 @unsafe
-def coll(phase: U32, got: Socket & HTTPX.HttpxGot, +n: U32, fin: Bool, +buf: List<&2, U32>, typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +h: HTTPX.HttpxHead, +okH: Bool, +e01: U32) ->
+def coll(phase: U32, got: Socket & HTTPX.Got, +n: U32, fin: Bool, +buf: List<&2, U32>, typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +h: HTTPX.Head, +okH: Bool, +e01: U32) ->
   IO(Socket & U32):
   match phase:
     case 0:
@@ -116,38 +116,38 @@ def coll(phase: U32, got: Socket & HTTPX.HttpxGot, +n: U32, fin: Bool, +buf: Lis
         case True{}:
           IO.pure(Socket & U32, coll.done_got(got, n))
         case False{}:
-          coll(1, got, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+          coll(1, got, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 1:
       (s1, g1) = got
       match g1:
-        case HTTPX.HttpxGotErr{code, msg}:
+        case HTTPX.GotErr{code, msg}:
           match code:
             case 0:
               do IO<Socket & U32>:
-                got2 : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(s1, buf)
-                coll(1, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+                got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s1, buf)
+                coll(1, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
             case _:
               IO.pure(Socket & U32, (s1, coll.score(n)))
-        case HTTPX.HttpxGotOk{+frame, +buf2}:
+        case HTTPX.GotOk{+frame, +buf2}:
           match frame:
-            case HTTPX.HttpxFrame{+typ2, +flags2, +sid22, +payload2}:
-              coll(2, (s1, HTTPX.HttpxGotOk{frame, buf2}), n, fin, buf2, coll.setact(typ2, flags2), flags2, sid22, payload2, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+            case HTTPX.Frame{+typ2, +flags2, +sid22, +payload2}:
+              coll(2, (s1, HTTPX.GotOk{frame, buf2}), n, fin, buf2, coll.setact(typ2, flags2), flags2, sid22, payload2, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 2:
       (s2, g2) = got
       match typ:
         case 1:
           do IO<Socket & U32>:
-            got2 : Socket & HTTPX.HttpxGot <- coll.ack(got)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- coll.ack(got)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
         case 2:
           coll(4, got, n, fin, buf, typ, flags, sid2, payload, coll.head_of(HTTPX.x_resp.decode(payload, HTTPX.x_tab.empty())), coll.hd_ok(HTTPX.x_resp.decode(payload, HTTPX.x_tab.empty())), U32.and(flags, HTTPX.x_f_end_stream()))
         case _:
           do IO<Socket & U32>:
-            got2 : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(s2, buf)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s2, buf)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 4:
       +n2 = coll.bump(coll.hit(okH, h, e01), n)
-      coll(5, got, n2, coll.fin4(n2), buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+      coll(5, got, n2, coll.fin4(n2), buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 5:
       (s5, g5) = got
       match fin:
@@ -155,8 +155,8 @@ def coll(phase: U32, got: Socket & HTTPX.HttpxGot, +n: U32, fin: Bool, +buf: Lis
           IO.pure(Socket & U32, coll.done_got(got, n))
         case False{}:
           do IO<Socket & U32>:
-            got2 : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(s5, buf)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s5, buf)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case _:
       IO.pure(Socket & U32, coll.done_got(got, n))
 
@@ -168,8 +168,8 @@ def client.collect.done(done: Socket & U32) -> IO(U32):
 
 def client.collect(sock: Socket) -> IO(U32):
   do IO<U32>:
-    got : Socket & HTTPX.HttpxGot <- HTTPX.x_read_frame(sock, Nil{})
-    done : Socket & U32 <- coll(0, got, 0, False{}, Nil{}, 0, 0, 0, Nil{}, HTTPX.HttpxHead{0, Nil{}}, False{}, 0)
+    got : Socket & HTTPX.Got <- HTTPX.x_read_frame(sock, Nil{})
+    done : Socket & U32 <- coll(0, got, 0, False{}, Nil{}, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     client.collect.done(done)
 
 # Raw pipelined sends via mini-H2 (no http2): HEADERS(1) HEADERS(3)

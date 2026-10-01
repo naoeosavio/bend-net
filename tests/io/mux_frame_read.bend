@@ -49,14 +49,14 @@ def is_bad_413(out: HTTPX.HttpxFrameOut) -> U32:
     case _:
       0
 
-def frame_payload_len(frame: HTTPX.HttpxFrame) -> U32:
+def frame_payload_len(frame: HTTPX.Frame) -> U32:
   match frame:
-    case HTTPX.HttpxFrame{typ, flags, sid, payload}:
+    case HTTPX.Frame{typ, flags, sid, payload}:
       HTTPX.x_len32(payload)
 
-def frame_sid_of(frame: HTTPX.HttpxFrame) -> U32:
+def frame_sid_of(frame: HTTPX.Frame) -> U32:
   match frame:
-    case HTTPX.HttpxFrame{typ, flags, sid, payload}:
+    case HTTPX.Frame{typ, flags, sid, payload}:
       sid
 
 def frame_len(out: HTTPX.HttpxFrameOut) -> U32:
@@ -121,19 +121,19 @@ def chk_parser() -> U32:
 # the encoded block is far past one TLS record (the reader must be able to
 # assemble a head frame split across reads).
 
-def pads.go(n: Nat, acc: List<&2, HTTPX.HttpxHdr>) -> List<&2, HTTPX.HttpxHdr>:
+def pads.go(n: Nat, acc: List<&2, HTTPX.Hdr>) -> List<&2, HTTPX.Hdr>:
   match n:
     case 0n:
       acc
     case 1n+k:
-      HTTPX.HttpxHdr{"x-pad",
+      HTTPX.Hdr{"x-pad",
         "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuv"} <> pads.go(k, acc)
 
-def pads(n: Nat) -> List<&2, HTTPX.HttpxHdr>:
+def pads(n: Nat) -> List<&2, HTTPX.Hdr>:
   pads.go(n, Nil{})
 
-def head_block() -> List<&2, HTTPX.HttpxHdr>:
-  HTTPX.HttpxHdr{":status", "200"} <> (pads(8n))
+def head_block() -> List<&2, HTTPX.Hdr>:
+  HTTPX.Hdr{":status", "200"} <> (pads(8n))
 
 def chk_pieces() -> U32:
   b2u(U32.is_gt(HTTPX.x_len32(HTTPX.x_block(head_block())), 300))

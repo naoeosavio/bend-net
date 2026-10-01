@@ -38,12 +38,12 @@ def report_resp_after(is_200: Bool, +body: List<&2, U32>, +status: U32) -> IO(Un
     case False{}:
       report_bad(status)
 
-def report_resp(resp: HTTPX.HttpxResp) -> IO(Unit):
+def report_resp(resp: HTTPX.Response) -> IO(Unit):
   match resp:
-    case HTTPX.HttpxResp{+status, +headers, +body}:
+    case HTTPX.Response{+status, +headers, +body}:
       report_resp_after(U32.is_eq(status, 200), body, status)
 
-def report(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> IO(Unit):
+def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
   match r:
     case Fail{(c, e)}:
       report_fail("POST", c, e)
@@ -53,5 +53,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.HttpxResp>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     p : Unit <- IO.print("STEP dial")
-    r : Result<&1, &1, U32 & String, HTTPX.HttpxResp> <- HTTPX.client_once_insecure("127.0.0.1", 19893, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", 19893, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     report(r)
