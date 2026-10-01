@@ -449,11 +449,11 @@ def x_frame.fin2(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32
     case True{}:
       x_frame.fin3(typ, flags, sid, rest, len)
     case False{}:
-      HttpxNeedMore{(len - x_len32(x_take32(len, rest)) : U32)}
+      HttpxNeedMore{(len - x_len_upto(len, rest) : U32)}
 
 def x_frame.fin(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32) ->
   HttpxFrameOut:
-  x_frame.fin2(typ, flags, sid, rest, len, U32.is_eq(len, x_len32(x_take32(len, rest))))
+  x_frame.fin2(typ, flags, sid, rest, len, x_has_at_least(len, rest))
 
 def x_frame.len_ok(+len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, ok_len: Bool) ->
   HttpxFrameOut:
@@ -539,8 +539,8 @@ def x_parse.short(+bs: List<&2, U32>, +have: U32, short: Bool) -> HttpxFrameOut:
       x_frame.hd9.b0(bs)
 
 def x_parse(+bs: List<&2, U32>) -> HttpxFrameOut:
-  +have = x_len32(bs)
-  x_parse.short(bs, have, U32.is_lt(have, 9))
+  +have = x_len_upto(9, bs)
+  x_parse.short(bs, have, Bool.not(x_has_at_least(9, bs)))
 
 # Frame read loop (no flow-credit sends: responses stay small)
 # ------------------------------------------------------------
@@ -561,7 +561,7 @@ def x_read.grow(r: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: L
     case Fail{(code, msg)}:
       (s, HttpxFrameBad{code, msg}, buf)
     case Done{+chunk}:
-      x_read.done(s, chunk, buf, U32.is_eq(x_len32(chunk), 0))
+      x_read.done(s, chunk, buf, List.is_empty(&2, U32, chunk))
 
 @unsafe
 def x_read_loop(state: Socket & HttpxFrameOut & List<&2, U32>) -> IO(Socket & Got):
@@ -745,7 +745,7 @@ def x_huff_ones(+bits: List<&2, U32>) -> Bool:
       Bool.and(U32.is_eq(b, 1), x_huff_ones(t))
 
 def x_huff_pad(+bits: List<&2, U32>) -> Bool:
-  Bool.and(U32.is_lt(x_len32(bits), 8), x_huff_ones(bits))
+  Bool.and(Bool.not(x_has_at_least(8, bits)), x_huff_ones(bits))
 
 def x_huff_empty(+bits: List<&2, U32>) -> Bool:
   match bits:
@@ -890,7 +890,7 @@ def x_str.whole(+n: U32, +rest: List<&2, U32>, +taken: List<&2, U32>, whole: Boo
 
 def x_str.fin(+n: U32, +rest: List<&2, U32>, +taken: List<&2, U32>) ->
   Result<&1, &1, U32 & String, String & List<&2, U32>>:
-  x_str.whole(n, rest, taken, U32.is_eq(n, x_len32(taken)))
+  x_str.whole(n, rest, taken, x_has_at_least(n, rest))
 
 def x_str.capped(+n: U32, +rest: List<&2, U32>, capped: Bool) ->
   Result<&1, &1, U32 & String, String & List<&2, U32>>:
@@ -922,7 +922,7 @@ def x_str.huffed(+n: U32, +rest: List<&2, U32>, r: Result<&1, &1, U32 & String, 
     case Fail{e}:
       Fail{e}
     case Done{bs}:
-      x_str.huffin(bs, x_drop32(n, rest), U32.is_eq(n, x_len32(x_take32(n, rest))))
+      x_str.huffin(bs, x_drop32(n, rest), x_has_at_least(n, rest))
 
 def x_str.huf2(+n: U32, +rest: List<&2, U32>) ->
   Result<&1, &1, U32 & String, String & List<&2, U32>>:
@@ -2138,7 +2138,7 @@ def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, Hdr
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   hs = List.append(&2, Hdr, [Hdr{":status", U32.show(status)}], headers)
   blk = x_block(hs)
-  +empty = U32.is_eq(x_len32(body), 0)
+  +empty = List.is_empty(&2, U32, body)
   flags = (x_f_end_headers() + x_b2u(empty) : U32)
   do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_raw_frame(sock, x_t_headers(), flags, sid, blk)
@@ -2611,7 +2611,7 @@ def httpx_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          httpx_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), U32.is_lt(x_len32(acc2), 24))
+          httpx_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
     case 1:
       (s1, r1) = rs
       match short:
@@ -3181,7 +3181,7 @@ def client_on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +
 
 def client_on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  +empty = U32.is_eq(x_len32(body), 0)
+  +empty = List.is_empty(&2, U32, body)
   do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req_head(sock, sid, client_on.req_block(host, port, method, path, hs), empty)
     client_on.send_req_body(sent, sid, body, empty)
@@ -3576,7 +3576,7 @@ def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, 
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +rest2 = List.append(&2, U32, rest, part)
-              x_h1.cli.bd(0, (s1, Done{Nil{}}), fuel, U32.is_ge(x_len32(rest2), cl), code, hs, rest2, cl)
+              x_h1.cli.bd(0, (s1, Done{Nil{}}), fuel, x_has_at_least(cl, rest2), code, hs, rest2, cl)
     case _:
       (s9, r9) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
@@ -3591,7 +3591,7 @@ def x_h1.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(502, "chunked refused")}))
         case False{}:
           +clc = x_h1.cl_of(hs)
-          x_h1.cli.bd(0, (sock, Done{Nil{}}), fuel, U32.is_ge(x_len32(rest), clc), code, hs, rest, clc)
+          x_h1.cli.bd(0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
 
 def x_h1.cli.hd(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match hsres:
@@ -5204,7 +5204,7 @@ def httpxs_pre(~H: SrvEv -> SrvOut, phase: U32, rs: Socket & Result<&1, &1, U32 
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          httpxs_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), U32.is_lt(x_len32(acc2), 24))
+          httpxs_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
     case 1:
       (s1, r1) = rs
       match short:
@@ -5365,9 +5365,9 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx_seq(~H, httpx.seq_cnext(Bool.not(U32.is_eq(x_len32(frag), 0))), 4, U32.and(flags, x_f_end_headers()), got, buf, tab, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
+          httpx_seq(~H, httpx.seq_cnext(Bool.not(List.is_empty(&2, U32, frag))), 4, U32.and(flags, x_f_end_headers()), got, buf, tab, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
         case 6:
-          httpx_seq(~H, httpx.seq_tphase(typ, Bool.or(httpx.seq_open(U32.is_eq(sid_a, 0)), Bool.not(U32.is_eq(x_len32(frag), 0)))), httpxn.decide_data(Bool.and(httpx.seq_open(U32.is_eq(sid_a, 0)), U32.is_eq(sid2, sid_a)), end), 0, got, buf, tab, typ, flags, sid2, payload, cls, end, rh, sid_a, body, frag, frag_end, httpxn.need_u(typ, flags))
+          httpx_seq(~H, httpx.seq_tphase(typ, Bool.or(httpx.seq_open(U32.is_eq(sid_a, 0)), Bool.not(List.is_empty(&2, U32, frag)))), httpxn.decide_data(Bool.and(httpx.seq_open(U32.is_eq(sid_a, 0)), U32.is_eq(sid2, sid_a)), end), 0, got, buf, tab, typ, flags, sid2, payload, cls, end, rh, sid_a, body, frag, frag_end, httpxn.need_u(typ, flags))
         case 0:
           httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, rh, sid_a, body, frag, frag_end, 0)
         case _:
@@ -5454,7 +5454,7 @@ def seq_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &1,
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          seq_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), U32.is_lt(x_len32(acc2), 24))
+          seq_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
     case 1:
       match short:
         case True{}:
@@ -5570,7 +5570,7 @@ def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1
               TLS.tls_close(s1)
             case h <> t:
               +have2 = List.append(&2, U32, have, part)
-              x_h1.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, U32.is_ge(x_len32(have2), cl))
+              x_h1.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
     case _:
       (s9, r9) = got
       TLS.tls_close(s9)
@@ -5580,7 +5580,7 @@ def x_h1.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, 
     case True{}:
       x_h1.srv.respond(s, Response{413, Nil{}, Nil{}})
     case False{}:
-      x_h1.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, U32.is_ge(x_len32(rest), cl))
+      x_h1.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
 def x_h1.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
   match needs:
