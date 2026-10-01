@@ -28,23 +28,23 @@ def b2u(b: Bool) -> U32:
 # Parser contract. Frame header on the wire is len(3) type(1) flags(1) sid(4),
 # so a 9-byte buffer is the smallest complete header.
 
-def is_need_more(out: HTTPX.HttpxFrameOut) -> U32:
+def is_need_more(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxNeedMore{missing}:
+    case HTTPX.NeedMore{missing, rest}:
       1
     case _:
       0
 
-def need_exact(out: HTTPX.HttpxFrameOut, want: U32) -> U32:
+def need_exact(out: HTTPX.UnitOut, want: U32) -> U32:
   match out:
-    case HTTPX.HttpxNeedMore{missing}:
+    case HTTPX.NeedMore{missing, rest}:
       b2u(U32.is_eq(missing, want))
     case _:
       0
 
-def is_bad_413(out: HTTPX.HttpxFrameOut) -> U32:
+def is_bad_413(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxFrameBad{code, msg}:
+    case HTTPX.Bad{code, msg}:
       b2u(U32.is_eq(code, 413))
     case _:
       0
@@ -59,23 +59,23 @@ def frame_sid_of(frame: HTTPX.Frame) -> U32:
     case HTTPX.Frame{typ, flags, sid, payload}:
       sid
 
-def frame_len(out: HTTPX.HttpxFrameOut) -> U32:
+def frame_len(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxFrameOk{frame, rest}:
-      frame_payload_len(frame)
+    case HTTPX.Got{unit, fin, rest}:
+      frame_payload_len(HTTPX.x_frame_of(unit))
     case _:
       0
 
-def frame_sid(out: HTTPX.HttpxFrameOut) -> U32:
+def frame_sid(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxFrameOk{frame, rest}:
-      frame_sid_of(frame)
+    case HTTPX.Got{unit, fin, rest}:
+      frame_sid_of(HTTPX.x_frame_of(unit))
     case _:
       0
 
-def frame_rest(out: HTTPX.HttpxFrameOut) -> U32:
+def frame_rest(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxFrameOk{frame, rest}:
+    case HTTPX.Got{unit, fin, rest}:
       HTTPX.x_len32(rest)
     case _:
       0
@@ -89,7 +89,7 @@ def v_empty() -> U32:
 def v_half_header() -> U32:
   need_exact(HTTPX.x_parse([0, 0, 4, 0, 0, 0, 0, 1]), 1)
 
-# The payload counter in HttpxNeedMore is not pinned: the loops only branch on
+# The payload counter in NeedMore is not pinned: the loops only branch on
 # the constructor (x_read_loop ignores the count), so a truncated frame just
 # has to come back as NeedMore.
 def v_short_payload() -> U32:

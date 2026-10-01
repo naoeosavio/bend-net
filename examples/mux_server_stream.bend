@@ -25,7 +25,7 @@ def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
 def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
     case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.NeedMore{}
+      HTTPX.Continue{}
     case HTTPX.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 

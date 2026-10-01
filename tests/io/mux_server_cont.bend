@@ -34,7 +34,7 @@ def b2u(b: Bool) -> U32:
 def h2(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
     case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.NeedMore{}
+      HTTPX.Continue{}
     case HTTPX.SrvReqData{slot, +chunk, fin}:
       HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
 

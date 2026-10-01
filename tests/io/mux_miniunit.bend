@@ -19,14 +19,16 @@ def frame_score_frame(frame: HTTPX.Frame, rest: List<&2, U32>) -> U32:
         Bool.and(U32.is_eq(sid, 1),
           Bool.and(U32.is_eq(HTTPX.x_eq(payload, [10, 20]), 1), U32.is_eq(HTTPX.x_len32(rest), 0)))))
 
-def frame_score(out: HTTPX.HttpxFrameOut) -> U32:
+def frame_score(out: HTTPX.UnitOut) -> U32:
   match out:
-    case HTTPX.HttpxFrameBad{code, msg}:
+    case HTTPX.Bad{code, msg}:
       0
-    case HTTPX.HttpxNeedMore{missing}:
+    case HTTPX.NeedMore{missing, rest}:
       0
-    case HTTPX.HttpxFrameOk{+frame, +rest}:
-      frame_score_frame(frame, rest)
+    case HTTPX.Got{+unit, +fin, +rest}:
+      frame_score_frame(HTTPX.x_frame_of(unit), rest)
+    case HTTPX.End{rest}:
+      0
 
 def frame_t() -> U32:
   frame_score(HTTPX.x_parse(HTTPX.x_frame_write(1, 4, 1, [10, 20])))

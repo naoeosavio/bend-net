@@ -1,6 +1,6 @@
 # lib (lib_mux_server_stream): streaming upload against HTTPX.server_on_stream.
 # Server streams SrvReqHead/SrvReqData to a pure per-chunk-cap handler (cap 3):
-# Head -> NeedMore; Data chunk>3 -> RespondEarly 413 (drop, free, skip
+# Head -> Continue; Data chunk>3 -> RespondEarly 413 (drop, free, skip
 # rest via stray-skip); Data <=3 with fin -> RespondEarly echo 200.
 # Client is mini keep-alive (HTTPX.client_on keep_connect + request, sids
 # 1,3, no http2 import, fast check): POST "hi" (2B, echo 200) then POST
@@ -33,7 +33,7 @@ def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
 def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
   match ev:
     case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.NeedMore{}
+      HTTPX.Continue{}
     case HTTPX.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 

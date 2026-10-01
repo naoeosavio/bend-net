@@ -335,10 +335,20 @@ type St is Data:
 type Frame is Data:
   Frame{typ: U32, flags: U32, sid: U32, payload: List<&2, U32>}
 
-type HttpxFrameOut is Data:
-  HttpxFrameOk{frame: Frame, rest: List<&2, U32>}
-  HttpxNeedMore{missing: U32}
-  HttpxFrameBad{code: U32, msg: String}
+# One step of the frame decoder: a unit came out, the bytes are not all
+# here yet, the message ended, or the bytes are invalid (TASK-026 Phase 3,
+# from TASK-023 Phases 9/11). The unit is RAW BYTES — x_frame_of(unit)
+# builds the Frame record — and NeedMore carries the buffer back because a
+# decoder that consumed bytes has to hand them over. End has no producer
+# in this lane (a frame stream has no terminator), and it exists because
+# the shape mirrors lib/core/type.bend's CT.UnitOut one for one: the day
+# the lanes share a contract it is a requalification, not a redesign, and
+# a match over four variants names all four.
+type UnitOut is Data:
+  Got{unit: List<&2, U32>, fin: Bool, rest: List<&2, U32>}
+  NeedMore{missing: U32, rest: List<&2, U32>}
+  End{rest: List<&2, U32>}
+  Bad{code: U32, msg: String}
 
 type Got is Data:
   GotOk{frame: Frame, buf: List<&2, U32>}
@@ -434,147 +444,235 @@ def x_strip_prio(+pay: List<&2, U32>, has_prio: Bool) -> List<&2, U32>:
 def x_frame_payload(+pay: List<&2, U32>, +typ: U32, +flags: U32, +len: U32) -> List<&2, U32>:
   x_strip_prio(x_strip_pad(pay, U32.is_eq(U32.and(flags, 8), 8), len), U32.is_eq(U32.and(flags, 32), 32))
 
+# END_STREAM is flag bit 0, and it is the protocol-neutral fin of the
+# shared outcome.
+def x_frame.end_of(+flags: U32) -> Bool:
+  U32.is_eq(U32.and(flags, x_f_end_stream()), 1)
 
-def x_frame.fin3(+typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, +len: U32) ->
-  HttpxFrameOut:
-  HttpxFrameOk{Frame{typ, flags, sid, x_frame_payload(x_take32(len, rest), typ, flags, len)}, x_drop32(len, rest)}
+# The 3 length bytes and the 4 stream id bytes of the frame header
+# (RFC 9113 section 4.1), as arithmetic. They are here, and not written
+# twice, because this lane has two readers of the header: the walk below,
+# which peels the bytes off a shrinking buffer one at a time, and
+# x_frame_of, which reads them by position out of a whole frame. Same two
+# numbers, one code each.
+def x_frame.len3(+l0: U32, +l1: U32, +l2: U32) -> U32:
+  (l0 * 65536 + l1 * 256 + l2 : U32)
+
+def x_frame.sid4(+s0: U32, +s1: U32, +s2: U32, +s3: U32) -> U32:
+  (s0 * 16777216 + s1 * 65536 + s2 * 256 + U32.and(s3, 127) : U32)
+
+# The record one frame's raw bytes decode to — the price this lane pays
+# for the shared outcome (TASK-026 Phase 3). UnitOut's unit is RAW BYTES
+# (TASK-023 Phase 9 item 2.2), so the Frame the walk used to build in
+# place is built here, from the 9 header bytes the unit starts with. Only
+# the reading differs from the walk's; the arithmetic above is shared and
+# the strip is the same x_frame_payload.
+#
+# at answers the i-th header byte, 0 past the end. That arm is
+# unreachable from the codec — a Got's unit is 9 + len bytes by
+# construction — and it exists so this stays one def instead of a
+# nine-deep cascade of Nil arms.
+@unsafe
+def x_frame_of.at.go(+hd: List<&2, U32>, i: U32) -> U32:
+  match hd:
+    case Nil{}:
+      0
+    case b <> t:
+      match i:
+        case 0:
+          b
+        case _:
+          x_frame_of.at.go(t, (i - 1 : U32))
+
+def x_frame_of.at_i(hd: List<&2, U32>, i: U32) -> U32:
+  x_frame_of.at.go(hd, i)
+
+def x_frame_of(+unit: List<&2, U32>) -> Frame:
+  +hd = List.take(&2, U32, unit, 9n)
+  +len = x_frame.len3(x_frame_of.at_i(hd, 0), x_frame_of.at_i(hd, 1), x_frame_of.at_i(hd, 2))
+  +typ = x_frame_of.at_i(hd, 3)
+  +flags = x_frame_of.at_i(hd, 4)
+  +sid = x_frame.sid4(x_frame_of.at_i(hd, 5), x_frame_of.at_i(hd, 6), x_frame_of.at_i(hd, 7), x_frame_of.at_i(hd, 8))
+  Frame{typ, flags, sid, x_frame_payload(x_drop32(9, unit), typ, flags, len)}
+
+# Frame walk
+# ----------
+# The walk answers UnitOut, so it is Got / NeedMore / End / Bad — three
+# outcomes plus the one this lane cannot produce. What each means here:
+# - Got{unit = the WHOLE FRAME, fin = END_STREAM, rest = the tail}: the
+#   header is complete and the payload is there. The unit is raw bytes and
+#   it starts at the frame header, because that is the slice x_frame_of
+#   reads the record out of (it takes the first 9 bytes as the header and
+#   strips pad/prio from the rest). The walk carries the buffer it started
+#   with — `orig` on every def below — precisely so the slice is taken
+#   once, at x_frame.fin3, from the whole buffer: the bytes are otherwise
+#   unrecoverable, since the walk has already eaten the nine header bytes
+#   off its own copy;
+# - NeedMore{missing, rest}: fewer than 9 header bytes, or fewer payload
+#   bytes than the length declares. missing counts what is still owed,
+#   which is the split-safe path (a 9-byte header across two reads);
+# - Bad{code, msg}: a protocol error — 413 above the max frame size, 400
+#   on the eof that closed a half-frame, or whatever the socket reported.
+#   The eof answer is deliberately Bad and not End: a truncated frame is
+#   an error;
+# - End: nothing in this lane produces it. A frame stream has no
+#   terminator, so "the message is complete" has no H2 meaning; x_read_loop
+#   carries the arm because the type has four and a match needs all of
+#   them, and it answers the only thing that can be true if it ever
+#   arrives (the connection is done).
+def x_frame.fin3(+orig: List<&2, U32>, +flags: U32, +len: U32) -> UnitOut:
+  +whole = (9 + len : U32)
+  Got{x_take32(whole, orig), x_frame.end_of(flags), x_drop32(whole, orig)}
 
 # Pad/prio strip (RFC 9113 6.1/6.2): PADDED rides flag 8 with a pad
 # length prefix (must be < payload, else protocol error), PRIORITY
 # rides flag 32 with a 5-byte fixed field. Frames without the flags come
 # through untouched (passthrough gate in x_strip_pad.dec).
-def x_frame.fin2(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32, ok: Bool) ->
-  HttpxFrameOut:
+def x_frame.fin2(orig: List<&2, U32>, typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32, ok: Bool) ->
+  UnitOut:
   match ok:
     case True{}:
-      x_frame.fin3(typ, flags, sid, rest, len)
+      x_frame.fin3(orig, flags, len)
     case False{}:
-      HttpxNeedMore{(len - x_len_upto(len, rest) : U32)}
+      NeedMore{(len - x_len_upto(len, rest) : U32), rest}
 
-def x_frame.fin(typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32) ->
-  HttpxFrameOut:
-  x_frame.fin2(typ, flags, sid, rest, len, x_has_at_least(len, rest))
+# "Did the payload arrive?" is asked with has_at_least and answered with
+# len_upto — both stop at len — instead of materializing the slice with
+# take to measure it and then materializing it again to hand it over
+# (TASK-023 Phase 12 item 12.3). x_frame.fin3 is where the frame IS
+# materialized, once, from the buffer the walk started with.
+def x_frame.fin(orig: List<&2, U32>, typ: U32, flags: U32, sid: U32, +rest: List<&2, U32>, +len: U32) ->
+  UnitOut:
+  x_frame.fin2(orig, typ, flags, sid, rest, len, x_has_at_least(len, rest))
 
-def x_frame.len_ok(+len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, ok_len: Bool) ->
-  HttpxFrameOut:
+def x_frame.len_ok(orig: List<&2, U32>, +len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, ok_len: Bool) ->
+  UnitOut:
   match ok_len:
     case False{}:
-      HttpxFrameBad{413, "frame too large"}
+      Bad{413, "frame too large"}
     case True{}:
-      x_frame.fin(typ, flags, sid, rest, len24)
+      x_frame.fin(orig, typ, flags, sid, rest, len24)
 
-def x_frame.hd9.go(+len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>) ->
-  HttpxFrameOut:
-  x_frame.len_ok(len24, typ, flags, sid, rest, U32.is_le(len24, x_max_frame()))
+def x_frame.hd9.go(orig: List<&2, U32>, +len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>) ->
+  UnitOut:
+  x_frame.len_ok(orig, len24, typ, flags, sid, rest, U32.is_le(len24, x_max_frame()))
 
-def x_frame.hd9.b8(+len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +s2: U32, +rest8: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b8(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +s2: U32, +rest8: List<&2, U32>) -> UnitOut:
   match rest8:
     case +s3 <> rest:
-      +sid = (((s0 * 16777216 + s1 * 65536 + s2 * 256 + U32.and(s3, 127) : U32)))
-      x_frame.hd9.go((len_hi * 65536 + b1 * 256 + b2 : U32), typ, flags, sid, rest)
+      x_frame.hd9.go(orig, x_frame.len3(len_hi, b1, b2), typ, flags, x_frame.sid4(s0, s1, s2, s3), rest)
     case Nil{}:
-      HttpxNeedMore{1}
+      NeedMore{1, rest8}
 
-def x_frame.hd9.b7(+len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +rest7: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b7(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +rest7: List<&2, U32>) -> UnitOut:
   match rest7:
     case +s2 <> rest8:
-      x_frame.hd9.b8(len_hi, b1, b2, typ, flags, s0, s1, s2, rest8)
+      x_frame.hd9.b8(orig, len_hi, b1, b2, typ, flags, s0, s1, s2, rest8)
     case Nil{}:
-      HttpxNeedMore{2}
+      NeedMore{2, rest7}
 
-def x_frame.hd9.b6(+len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +rest6: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b6(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +rest6: List<&2, U32>) -> UnitOut:
   match rest6:
     case +s1 <> rest7:
-      x_frame.hd9.b7(len_hi, b1, b2, typ, flags, s0, s1, rest7)
+      x_frame.hd9.b7(orig, len_hi, b1, b2, typ, flags, s0, s1, rest7)
     case Nil{}:
-      HttpxNeedMore{3}
+      NeedMore{3, rest6}
 
-def x_frame.hd9.b5(+len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +rest5: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b5(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +rest5: List<&2, U32>) -> UnitOut:
   match rest5:
     case +s0 <> rest6:
-      x_frame.hd9.b6(len_hi, b1, b2, typ, flags, s0, rest6)
+      x_frame.hd9.b6(orig, len_hi, b1, b2, typ, flags, s0, rest6)
     case Nil{}:
-      HttpxNeedMore{4}
+      NeedMore{4, rest5}
 
-def x_frame.hd9.b4(+len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +rest4: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b4(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +rest4: List<&2, U32>) -> UnitOut:
   match rest4:
     case +fl <> rest5:
-      x_frame.hd9.b5(len_hi, b1, b2, typ, fl, rest5)
+      x_frame.hd9.b5(orig, len_hi, b1, b2, typ, fl, rest5)
     case Nil{}:
-      HttpxNeedMore{5}
+      NeedMore{5, rest4}
 
-def x_frame.hd9.b3(+len_hi: U32, +b1: U32, +b2: U32, +rest3: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b3(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +rest3: List<&2, U32>) -> UnitOut:
   match rest3:
     case +typ <> rest4:
-      x_frame.hd9.b4(len_hi, b1, b2, typ, rest4)
+      x_frame.hd9.b4(orig, len_hi, b1, b2, typ, rest4)
     case Nil{}:
-      HttpxNeedMore{6}
+      NeedMore{6, rest3}
 
-def x_frame.hd9.b2(+len_hi: U32, +b1: U32, +rest2: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b2(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +rest2: List<&2, U32>) -> UnitOut:
   match rest2:
     case +b2 <> rest3:
-      x_frame.hd9.b3(len_hi, b1, b2, rest3)
+      x_frame.hd9.b3(orig, len_hi, b1, b2, rest3)
     case Nil{}:
-      HttpxNeedMore{7}
+      NeedMore{7, rest2}
 
-def x_frame.hd9.b1(+len_hi: U32, +rest: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b1(orig: List<&2, U32>, +len_hi: U32, +rest: List<&2, U32>) -> UnitOut:
   match rest:
     case +b1 <> rest2:
-      x_frame.hd9.b2(len_hi, b1, rest2)
+      x_frame.hd9.b2(orig, len_hi, b1, rest2)
     case Nil{}:
-      HttpxNeedMore{8}
+      NeedMore{8, rest}
 
-def x_frame.hd9.b0(+rest: List<&2, U32>) -> HttpxFrameOut:
+def x_frame.hd9.b0(orig: List<&2, U32>, +rest: List<&2, U32>) -> UnitOut:
   match rest:
     case +len_hi <> rest2:
-      x_frame.hd9.b1(len_hi, rest2)
+      x_frame.hd9.b1(orig, len_hi, rest2)
     case Nil{}:
-      HttpxNeedMore{9}
+      NeedMore{9, rest}
 
-def x_parse.short(+bs: List<&2, U32>, +have: U32, short: Bool) -> HttpxFrameOut:
+def x_parse.short(orig: List<&2, U32>, +bs: List<&2, U32>, +have: U32, short: Bool) -> UnitOut:
   match short:
     case True{}:
-      HttpxNeedMore{(9 - have : U32)}
+      NeedMore{(9 - have : U32), bs}
     case False{}:
-      x_frame.hd9.b0(bs)
+      x_frame.hd9.b0(orig, bs)
 
-def x_parse(+bs: List<&2, U32>) -> HttpxFrameOut:
+# The header's nine bytes are the only thing the walk has to count for
+# itself: len_upto(9) answers "short or not" and the exact count when it
+# is short, without walking the payload that follows (TASK-023 Phase 12
+# item 12.3: the full len for a 9-byte question was the expensive shape).
+def x_parse(+bs: List<&2, U32>) -> UnitOut:
   +have = x_len_upto(9, bs)
-  x_parse.short(bs, have, Bool.not(x_has_at_least(9, bs)))
+  x_parse.short(bs, bs, have, U32.is_lt(have, 9))
 
 # Frame read loop (no flow-credit sends: responses stay small)
 # ------------------------------------------------------------
 
 def x_read.done(s: Socket, +chunk: List<&2, U32>, +buf: List<&2, U32>, is_eof: Bool) ->
-  Socket & HttpxFrameOut & List<&2, U32>:
+  Socket & UnitOut & List<&2, U32>:
   match is_eof:
     case True{}:
-      (s, HttpxFrameBad{400, "eof"}, buf)
+      (s, Bad{400, "eof"}, buf)
     case False{}:
       +buf2 = List.append(&2, U32, buf, chunk)
       (s, x_parse(buf2), buf2)
 
 def x_read.grow(r: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>) ->
-  Socket & HttpxFrameOut & List<&2, U32>:
+  Socket & UnitOut & List<&2, U32>:
   (s, res) = r
   match res:
     case Fail{(code, msg)}:
-      (s, HttpxFrameBad{code, msg}, buf)
+      (s, Bad{code, msg}, buf)
     case Done{+chunk}:
       x_read.done(s, chunk, buf, List.is_empty(&2, U32, chunk))
 
 @unsafe
-def x_read_loop(state: Socket & HttpxFrameOut & List<&2, U32>) -> IO(Socket & Got):
+def x_read_loop(state: Socket & UnitOut & List<&2, U32>) -> IO(Socket & Got):
   (s0, out, buf) = state
   match out:
-    case HttpxFrameOk{frame, rest}:
-      IO.pure(Socket & Got, (s0, GotOk{frame, rest}))
-    case HttpxFrameBad{code, msg}:
+    case Got{+unit, fin, +rest}:
+      IO.pure(Socket & Got, (s0, GotOk{x_frame_of(unit), rest}))
+    case Bad{code, msg}:
       IO.pure(Socket & Got, (s0, GotErr{code, msg}))
-    case HttpxNeedMore{missing}:
+    case NeedMore{missing, rest}:
       do IO<Socket & Got>:
         r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
         x_read_loop(x_read.grow(r1, buf))
+    case End{rest}:
+      # Nothing in this lane produces End (see the walk's note). If it ever
+      # does, the only true reading is "the connection is done", which is
+      # the answer the eof already gives.
+      IO.pure(Socket & Got, (s0, GotErr{400, "eof"}))
 
 def x_read_frame(sock: Socket, +buf: List<&2, U32>) -> IO(Socket & Got):
   x_read_loop((sock, x_parse(buf), buf))
@@ -2728,7 +2826,7 @@ type SrvEv is Data:
   SrvReqData{slot: U32, chunk: List<&2, U32>, fin: Bool}
 
 type SrvOut is Data:
-  NeedMore{}
+  Continue{}
   RespondEarly{resp: Response}
 
 # Local validation (same Fail 400 as https valid.go; no http import)
@@ -4925,7 +5023,7 @@ def client_on_concurrent_insecure(~H: Response -> U32, +host: String, +port: U32
   client_conc.fit(~H, host, port, reqs, True{}, client_conc.valid_all(reqs, host, port))
 
 # Server streaming (Phase F): sibling httpx_stream loop with pure handler
-# ~H: SrvEv -> SrvOut (NeedMore buffers like today, RespondEarly
+# ~H: SrvEv -> SrvOut (Continue buffers like today, RespondEarly
 # sends + frees + skips rest via stray-skip). Shares take_del/has/
 # put/classify/preface/plumbing (no copy); self-recursive own loop (no
 # mutual with httpx). No WU sends (backpressure via withheld WU, like httpx).
@@ -4934,14 +5032,14 @@ def client_on_concurrent_insecure(~H: Response -> U32, +host: String, +port: U32
 
 def httpxs.is_more(+out: SrvOut) -> Bool:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       True{}
     case RespondEarly{resp}:
       False{}
 
 def httpxs.out_resp(+out: SrvOut) -> Response:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
@@ -4972,7 +5070,7 @@ def httpxs.data_act(is_more: Bool, has: Bool, +end: U32) -> U32:
 
 def httpxs.head_out(+out: SrvOut, +end: U32) -> U32 & Response:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       match end:
         case 1:
           (7, Response{0, Nil{}, Nil{}})
@@ -4983,7 +5081,7 @@ def httpxs.head_out(+out: SrvOut, +end: U32) -> U32 & Response:
 
 def httpxs.data_out(+out: SrvOut, fin: Bool) -> U32 & Response:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       match fin:
         case True{}:
           (7, Response{0, Nil{}, Nil{}})
@@ -4994,7 +5092,7 @@ def httpxs.data_out(+out: SrvOut, fin: Bool) -> U32 & Response:
 
 def httpxs.head_act_from_out(+out: SrvOut, +end: U32) -> U32:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       match end:
         case 1:
           7
@@ -5005,14 +5103,14 @@ def httpxs.head_act_from_out(+out: SrvOut, +end: U32) -> U32:
 
 def httpxs.head_resp_from_out(+out: SrvOut) -> Response:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
 
 def httpxs.data_act_from_out(+out: SrvOut, fin: Bool) -> U32:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       match fin:
         case True{}:
           7
@@ -5023,7 +5121,7 @@ def httpxs.data_act_from_out(+out: SrvOut, fin: Bool) -> U32:
 
 def httpxs.data_resp_from_out(+out: SrvOut) -> Response:
   match out:
-    case NeedMore{}:
+    case Continue{}:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
@@ -5073,7 +5171,7 @@ def httpxs.goaway_close(got: Socket & Got) -> IO(Unit):
 # Sibling interleave loop (own @unsafe self-recursion, no mutual with
 # httpx; shares take_del/has/put/classify/preface/plumbing, no copy).
 # Delivers SrvReqHead on HEADERS-complete and SrvReqData per DATA
-# END_STREAM; NeedMore buffers like today, RespondEarly sends + frees +
+# END_STREAM; Continue buffers like today, RespondEarly sends + frees +
 # skips rest (stray-skip, not close). No WU sends (backpressure held).
 # ---------------------------------------------------------------------
 
