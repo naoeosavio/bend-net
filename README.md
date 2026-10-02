@@ -263,18 +263,22 @@ Architecture (the two delivery modes, why streaming handlers are pure):
 
 | Function | Description |
 |---|---|
-| `server_on_concurrent(~H, l, cert, key)` / `server_on_concurrent_alpn` | Interleaved httpx echoing `HttpxReq -> IO(HttpxResp)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server_on_alpn` for the H1 split) |
-| `server_on_stream(~H, l, cert, key)` / `server_on_stream_alpn` | Upload streaming: `ReqHead`/`ReqData` events to a pure `~H`, `NeedMore` buffers, `RespondEarly` answers without draining |
-| `client_once(_insecure)` | Single-shot POST on stream 1, answers the full `HttpxResp` |
-| `send_request(_insecure)` | Any method with headers and a `String` body over `client_once`; answers the response body as `String` |
-| `send_request_bytes(_insecure)` | Same with raw-bytes body in and out |
-| `client_on.keep_connect(_insecure)` + `client_on_request` | Keep-alive: one dial, sids 1, 3, 5, ... threading `HttpxCliSt{sid, tab}` |
-| `client_on_concurrent(_insecure)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: HttpxResp -> U32` |
-| `client_on_stream(_insecure)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`/`StreamFail`); `StreamCancel` sends `RST_STREAM` |
-| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `httpx_url.read_url` (ported from `http.bend`, no import); `http://` refused `400`; answers `String` / raw bytes |
-| `server_on(~H, l, cert, key)` | Sequential generic server (one stream at a time, same wire contract as the httpx; pipelined HEADERS gets `RST_STREAM` 7) |
-| `server_on_alpn(~H, l, cert, key)` / `server_on_http1` | ALPN split with one handler for both lanes / H1-only (H1 lane is a local port of `http.bend` shapes: no chunked, `Content-Length` framing, one-shot connections) |
-| `client_on(_insecure)` | Sequential batch entry: one dial, N requests (sids 1, 3, 5, ...), answers in order; first `Fail` aborts |
+| `server.on(~H, l, cert, key)` / `server.on_alpn` | Sequential generic server (one stream at a time; pipelined HEADERS gets `RST_STREAM` 7) / ALPN split with one handler for both lanes |
+| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: no chunked, `Content-Length` framing, one-shot connections) |
+| `server.on_h1_plain(~H, l)` / `server.echo_h1_plain(l)` | The same H1 server over plain TCP (`TCP.listen`/`accept`), no cert/key — the `http://` peer |
+| `server.once(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants |
+| `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
+| `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
+| `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming: `SrvReqHead`/`SrvReqData` events to a pure `~H`, `Continue` buffers, `RespondEarly` answers without draining |
+| `client.once(_insecure)(host, port, Request)` | One-shot: `client.on` of a single request plus the unwrap (H1 connections dispatch to the H1 lane) |
+| `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests (sids 1, 3, 5, ...), answers in order; first `Fail` aborts; H2-only |
+| `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
+| `client.connect(_insecure)(host, port)` | The threaded primitive: hands back `Socket & CliSt{sid, tab, is_h2}`; `client.request(sock, st, ...)` does one exchange on it |
+| `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
+| `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); `StreamCancel` sends `RST_STREAM` |
+| `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
+| `request_bytes(_insecure)` | Same with raw-bytes body in and out |
+| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `httpx_url.read_url` (ported from `http.bend`, no import); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
 | `h1_once(_insecure)` | Single-shot over the H1 lane (no-ALPN dial, WSS-style) |
 
 Limits (fail-closed, by design): responses are literal-only, DATA sliced
@@ -288,27 +292,29 @@ literal, Huffman strings, minimal dyn table), which is what `node:http2`
 needs.
 
 ```sh
-bend tests/io/mux_miniunit.bend           # 1 (pure frame + HPACK roundtrip, ~2s)
-bend tests/io/mux_client.bend             # 1 (once vs mini server)
-bend tests/io/mux_interop.bend            # 1 (4 crossed streams vs mini server)
-bend tests/io/mux_client_once.bend        # 1
-bend tests/io/mux_client_keepalive.bend   # 3
-bend tests/io/mux_client_concurrent.bend  # 4
-bend tests/io/mux_client_stream.bend      # 1
-bend tests/io/mux_server_stream.bend      # 2
-bend tests/io/mux_read_url.bend           # 1 (pure URL vectors)
-bend tests/io/mux_fetch.bend              # 1 (fetch by URL vs mini server)
-bend tests/io/mux_client_seq.bend         # 3 (batch entry vs mini server)
-bend tests/io/mux_server_seq.bend         # 2 (keep-alive vs sequential server)
-bend tests/io/mux_http1_fallback.bend     # 1 (dual client vs H1 server)
-bend tests/io/mux_server_alpn.bend        # 2 (ALPN split, H2 + H1 clients)
-bend tests/io/mux_flow.bend               # 1 (25 KB up+down through pump v2 + WU credit)
-bend tests/io/mux_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once drain)
-bend tests/io/mux_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
-bend tests/io/mux_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
-bend tests/io/mux_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
-bend tests/io/mux_server_cont.bend        # 1 (fragmented HEADERS+CONT vs httpx_stream)
-bend tests/io/mux_send_request.bend       # 2 (String + bytes bodies vs mini server)
+bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK roundtrip, ~2s)
+bend tests/io/httpx_client.bend           # 1 (once vs mini server)
+bend tests/io/httpx_interop.bend          # 1 (4 crossed streams vs mini server)
+bend tests/io/httpx_client_once.bend      # 1
+bend tests/io/httpx_client_keepalive.bend # 3
+bend tests/io/httpx_client_concurrent.bend # 4
+bend tests/io/httpx_client_stream.bend    # 1
+bend tests/io/httpx_server_stream.bend    # 2
+bend tests/io/httpx_read_url.bend         # 1 (pure URL vectors)
+bend tests/io/httpx_fetch.bend            # 1 (fetch by URL vs mini server)
+bend tests/io/httpx_client_seq.bend       # 3 (batch entry vs mini server)
+bend tests/io/httpx_server_seq.bend       # 2 (keep-alive vs sequential server)
+bend tests/io/httpx_http1_fallback.bend   # 1 (dual client vs H1 server)
+bend tests/io/httpx_server_alpn.bend      # 2 (ALPN split, H2 + H1 clients)
+bend tests/io/httpx_echo_once.bend        # 2 (server.once + server.echo, client.once/echo)
+bend tests/io/httpx_plain_h1.bend         # 2 (http:// end to end over server.on_h1_plain)
+bend tests/io/httpx_flow.bend             # 1 (25 KB up+down through pump v2 + WU credit)
+bend tests/io/httpx_client_cont.bend      # 1 (fragmented HEADERS+CONT vs once drain)
+bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
+bend tests/io/httpx_client_cont_conc.bend # 1 (same peer vs concurrent drain)
+bend tests/io/httpx_concurrent_cont.bend  # 1 (fragmented HEADERS+CONT vs httpx loop)
+bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx_stream)
+bend tests/io/httpx_request.bend     # 2 (String + bytes bodies vs mini server)
 ```
 
 ## WebSocket
@@ -435,22 +441,22 @@ prints a `BOOK` line per update (symbol, best bid/ask price and size)
 until the 15 s sleep in `main` halts the run — pipe it through `head`.
 
 HTTPX interop (`lib/httpx.bend`, manual only — never in the gate):
-`mux_echoserv.bend` serves the mini-H2 echo on an ephemeral port
+`httpx_echoserv.bend` serves the mini-H2 echo on an ephemeral port
 (printed to stdout; binary builds in <45s);
-`mux_server_stream.bend` serves the streaming-upload cap-3 handler on
-an ephemeral port; `mux_client_once.bend` dials a node echo server
-(`mux_node_echoserv.js 19893 1`) with `client_once_insecure` and checks
+`httpx_server_stream.bend` serves the streaming-upload cap-3 handler on
+an ephemeral port; `httpx_client_once.bend` dials a node echo server
+(`mux_node_echoserv.js 19893 1`) with `client.once_insecure` and checks
 status 200 + echo; `mux_node_client.js [port] [n]` fires N concurrent
 POSTs on one `node:http2` session (`DONE n/2N+2`);
 `mux_node_echoserv.js [port] [n]` is the H2-only echo for Bend clients;
 `mux_node_bigserv.js [port] [n]` answers 100 KB for streaming-download
 clients. Measured 2026-09-27: N=20 `DONE 42/42` under node and bun
-against the C binary server; `mux_client_once_bulk.bend` GETs the live
-Binance `exchangeInfo` feed (~5.8 MB JSON) via `client_once` and
+against the C binary server; `httpx_client_once_bulk.bend` GETs the live
+Binance `exchangeInfo` feed (~5.8 MB JSON) via `client.once` and
 prints status + length + head — measured 2026-09-28: `STATUS 200
 LEN 5851449 DONE 3/3` (build the C binary first, interp is too slow
 for multi-MB bodies).
-`mux_fetch_bulk.bend` GETs the live
+`httpx_fetch_bulk.bend` GETs the live
 Binance `exchangeInfo` feed (~5.8 MB JSON) via `fetch_bytes` and
 prints length + head — measured 2026-09-28: `LEN 5851449 DONE 2/2`
 (build the C binary first, interp is too slow
@@ -571,27 +577,27 @@ bend tests/io/ws_fragments.bend       # 9
 bend tests/io/ws_handshake_sub.bend   # 12
 bend tests/io/ws_mask.bend            # 19
 bend tests/io/wss_client_coalesce.bend # 1
-bend tests/io/mux_miniunit.bend           # 1
-bend tests/io/mux_client.bend             # 1
-bend tests/io/mux_interop.bend            # 1
-bend tests/io/mux_client_once.bend        # 1
-bend tests/io/mux_client_keepalive.bend   # 3
-bend tests/io/mux_client_concurrent.bend  # 4
-bend tests/io/mux_client_stream.bend      # 1
-bend tests/io/mux_server_stream.bend      # 2
-bend tests/io/mux_read_url.bend           # 1 (pure URL vectors)
-bend tests/io/mux_fetch.bend              # 1 (fetch by URL vs mini server)
-bend tests/io/mux_client_seq.bend         # 3 (batch entry vs mini server)
-bend tests/io/mux_server_seq.bend         # 2 (keep-alive vs sequential server)
-bend tests/io/mux_http1_fallback.bend     # 1 (dual client vs H1 server)
-bend tests/io/mux_server_alpn.bend        # 2 (ALPN split, H2 + H1 clients)
-bend tests/io/mux_flow.bend               # 1 (25 KB up+down through pump v2 + WU credit)
-bend tests/io/mux_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once drain)
-bend tests/io/mux_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
-bend tests/io/mux_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
-bend tests/io/mux_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
-bend tests/io/mux_server_cont.bend        # 1 (fragmented HEADERS+CONT vs httpx_stream)
-bend tests/io/mux_send_request.bend       # 2 (String + bytes bodies vs mini server)
+bend tests/io/httpx_miniunit.bend           # 1
+bend tests/io/httpx_client.bend             # 1
+bend tests/io/httpx_interop.bend            # 1
+bend tests/io/httpx_client_once.bend        # 1
+bend tests/io/httpx_client_keepalive.bend   # 3
+bend tests/io/httpx_client_concurrent.bend  # 4
+bend tests/io/httpx_client_stream.bend      # 1
+bend tests/io/httpx_server_stream.bend      # 2
+bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
+bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
+bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
+bend tests/io/httpx_server_seq.bend         # 2 (keep-alive vs sequential server)
+bend tests/io/httpx_http1_fallback.bend     # 1 (dual client vs H1 server)
+bend tests/io/httpx_server_alpn.bend        # 2 (ALPN split, H2 + H1 clients)
+bend tests/io/httpx_flow.bend               # 1 (25 KB up+down through pump v2 + WU credit)
+bend tests/io/httpx_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once drain)
+bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
+bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
+bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
+
+bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
 bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
 bend tests/io/core_read_url.bend          # 1 (core URL vectors + valid_* gates)
 ```
