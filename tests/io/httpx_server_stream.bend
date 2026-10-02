@@ -1,4 +1,4 @@
-# lib (lib_mux_server_stream): streaming upload against HTTPX.server_on_stream.
+# lib (lib_httpx_server_stream): streaming upload against HTTPX.server.stream.
 # Server streams SrvReqHead/SrvReqData to a pure per-chunk-cap handler (cap 3):
 # Head -> Continue; Data chunk>3 -> RespondEarly 413 (drop, free, skip
 # rest via stray-skip); Data <=3 with fin -> RespondEarly echo 200.
@@ -90,7 +90,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_stream(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.stream(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

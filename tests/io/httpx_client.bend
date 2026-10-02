@@ -1,12 +1,13 @@
-# lib (lib_mux_client_once): mini-H2 client_once against mini-H2 server.
-# Server is HTTPX.server_on_concurrent echoing the body; client is
-# HTTPX.client.once_insecure POST "hello" (literal HPACK, single DATA).
-# Golden 1 iff status 200 and body echoes "hello". Covers the
-# bend-to-bend once path with the standalone codec only (no http2).
+# lib (lib_httpx_client): mini-H2 client_once against the standalone mini-H2 httpx.
+# Server is HTTPX.server.concurrent echoing the body; client is
+# HTTPX.client.once_insecure POST "hello" (literal HPACK, single DATA,
+# no http2 import — pure mini-codec byte path, fast check + small binary).
+# Golden 1 iff status 200 and body echoes "hello".
 import Base
+import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
@@ -33,7 +34,7 @@ def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
     case Done{+resp}:
       client_score_resp(resp)
 
-def client(port: U32) -> IO(U32):
+def client(+port: U32) -> IO(U32):
   do IO<U32>:
     r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
     IO.pure(U32, client_score(r))
@@ -44,7 +45,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

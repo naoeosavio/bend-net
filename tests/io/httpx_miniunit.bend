@@ -1,4 +1,4 @@
-# lib (lib_mux_miniunit): pure roundtrips of the mini-H2 inside httpx.bend.
+# lib (lib_httpx_miniunit): pure roundtrips of the mini-H2 inside httpx.bend.
 # No IO, no TLS: frame write->parse and HPACK block->request-head must
 # come back byte-identical. Golden 1. Runs in seconds (unlike the
 # TLS goldens) so it gates every mini-codec change.

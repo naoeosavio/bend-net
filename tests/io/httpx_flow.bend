@@ -1,4 +1,4 @@
-# lib (mux_flow): big POST echo — 25 KB up through the flow sender
+# lib (httpx_flow): big POST echo — 25 KB up through the flow sender
 # (client slices to peer windows, server gives WU credit per DATA) and
 # 25 KB down (server slices + client drain credits back). 25 KB covers 2
 # DATA frames each way — max this lane can build in interp without a
@@ -11,17 +11,17 @@ import ../../lib/httpx.bend as HTTPX
 # 25 KB = 25000 one-byte nodes (46); Nat countdown local to this test
 # (harness exception like listen_any: a U32 countdown without a list arg
 # fails the termination checker; the lib path stays U32).
-def mux_flow.body.go(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
+def httpx_flow.body.go(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
   match n:
     case 0n:
       acc
     case 1n+m:
-      mux_flow.body.go(m, 46 <> acc)
+      httpx_flow.body.go(m, 46 <> acc)
 
-def mux_flow.body() -> List<&2, U32>:
-  mux_flow.body.go(25000n, Nil{})
+def httpx_flow.body() -> List<&2, U32>:
+  httpx_flow.body.go(25000n, Nil{})
 
-def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
@@ -68,7 +68,7 @@ def client_score_counts(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, mux_flow.body())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, httpx_flow.body())
     IO.pure(U32, client_score_counts(r))
 
 law server_side:
@@ -77,7 +77,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

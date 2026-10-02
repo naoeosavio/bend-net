@@ -1810,7 +1810,7 @@ def x_wu_ok.go(+b0: U32, +b1: U32, +b2: U32, +b3: U32) -> Bool:
 # RFC 9113 section 6.9: the increment field is exactly 4 bytes, so a
 # WINDOW_UPDATE with any other length is a connection error. The old
 # x_wu_ok stopped after 4 bytes and ignored the tail, which let a 5+ byte
-# frame through as a valid credit (found porting h2_rst.bend to mux_rst).
+# frame through as a valid credit (found porting h2_rst.bend to httpx_rst).
 def x_wu_ok.empty(+rest: List<&2, U32>) -> Bool:
   match rest:
     case Nil{}:
@@ -2783,22 +2783,22 @@ def httpx_alpn_conn(~H: Request -> IO(Response), accepted: Listener & Result<&1,
 # handshake with h2/http1.1 offer but serves H2 only (non-H2 closes).
 
 @unsafe
-def server_on_concurrent(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
+def server.concurrent(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
     l2 : Listener <- httpx_conn(~H, m)
-    z : Unit <- server_on_concurrent(~H, l2, cert, key)
+    z : Unit <- server.concurrent(~H, l2, cert, key)
     return z
 
 @unsafe
-def server_on_concurrent_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
+def server.concurrent_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
       TLS.tls_accept_alpn(listener, cert, key)
     next : Listener <- httpx_alpn_conn(~H, accepted)
-    z : Unit <- server_on_concurrent_alpn(~H, next, cert, key)
+    z : Unit <- server.concurrent_alpn(~H, next, cert, key)
     return z
 
 # Client H2 (Phase 8: A x_resp above; B once; E stream; C keep-alive;
@@ -5423,22 +5423,22 @@ def httpxs_alpn_conn(~H: SrvEv -> SrvOut, accepted: Listener & Result<&1, &1, U3
       httpxs_alpn_go(~H, TLS.tls_alpn_is_h2(protocol), listener, sock)
 
 @unsafe
-def server_on_stream(~H: SrvEv -> SrvOut, l: Listener, +cert: String, +key: String) ->
+def server.stream(~H: SrvEv -> SrvOut, l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
     l2 : Listener <- httpxs_conn(~H, m)
-    z : Unit <- server_on_stream(~H, l2, cert, key)
+    z : Unit <- server.stream(~H, l2, cert, key)
     return z
 
 @unsafe
-def server_on_stream_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert: String, +key: String) ->
+def server.stream_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
       TLS.tls_accept_alpn(listener, cert, key)
     next : Listener <- httpxs_alpn_conn(~H, accepted)
-    z : Unit <- server_on_stream_alpn(~H, next, cert, key)
+    z : Unit <- server.stream_alpn(~H, next, cert, key)
     return z
 
 # Sequential server (Phase 10): one stream at a time per connection, same
@@ -5654,17 +5654,46 @@ def seq_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & Str
       seq_spawn(~H, sock, l)
 
 @unsafe
-def server_on(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
+def server.on(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
     l2 : Listener <- seq_conn(~H, m)
-    z : Unit <- server_on(~H, l2, cert, key)
+    z : Unit <- server.on(~H, l2, cert, key)
     return z
+
+# server.on already speaks H2 only; the explicit name is the mono-protocol
+# entry the ALPN-dispatching server.on_alpn complements.
+def server.on_h2(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  server.on(~H, l, cert, key)
+
+# One connection and stop: the same accept and the same per-connection
+# lane as server.on, without the recursion. This is the entry a test or a
+# single-shot server wants, and it is why no acceptor has to recurse.
+def server.once(~H: Request -> IO(Response), l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
+    l2 : Listener <- seq_conn(~H, m)
+    return Unit{}
+
+# The fixed echo handler: status 200, no headers, the request body back
+# (mirror of http.bend echo.body:2290). server.echo is the whole server
+# built on it, for the H2-only and the ALPN entries.
+def echo_body(req: Request) -> IO(Response):
+  match req:
+    case Request{method, path, headers, body}:
+      IO.pure(Response, Response{200, Nil{}, body})
+
+def server.echo(l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  server.on(echo_body, l, cert, key)
+
 
 # H1 serve (Phase 11): one-shot per connection (answer + close, no H1
 # keep-alive — mirror https_http1 http1_serve). Handlers speak Request /
-# Response natively, so server_on_alpn takes ONE handler for both lanes.
+# Response natively, so server.on_alpn takes ONE handler for both lanes.
 # ---------------------------------------------------------------------
 
 def x_h1.srv.needs_body(+m: String) -> Bool:
@@ -5834,21 +5863,25 @@ def httpxa_alpn_conn(~H: Request -> IO(Response), accepted: Listener & Result<&1
       httpxa_alpn_go(~H, TLS.tls_alpn_is_h2(protocol), listener, sock)
 
 @unsafe
-def server_on_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
+def server.on_alpn(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
       TLS.tls_accept_alpn(listener, cert, key)
     next : Listener <- httpxa_alpn_conn(~H, accepted)
-    z : Unit <- server_on_alpn(~H, next, cert, key)
+    z : Unit <- server.on_alpn(~H, next, cert, key)
     return z
 
+def server.echo_alpn(l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  server.on_alpn(echo_body, l, cert, key)
+
 @unsafe
-def server_on_http1(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
+def server.on_h1(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
   IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <-
       TLS.tls_accept_http1(listener, cert, key)
     next : Listener <- h1_conn(~H, accepted)
-    z : Unit <- server_on_http1(~H, next, cert, key)
+    z : Unit <- server.on_h1(~H, next, cert, key)
     return z

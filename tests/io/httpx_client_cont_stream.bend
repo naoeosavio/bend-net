@@ -1,11 +1,11 @@
-# lib (mux_client_cont_conc): fragmented response HEADERS against the
-# concurrent client (mold mux_client_cont: server raw, client real).
+# lib (httpx_client_cont_stream): fragmented response HEADERS against the
+# streaming client (mold httpx_client_cont: server raw, client real).
 # Server answers HEADERS (sid 1, no END_HEADERS) + CONT (END_HEADERS) +
-# DATA (END_STREAM "hello"). Client is
-# HTTPX.client.concurrent_insecure with 1 request (sid 1, pending 1).
-# Golden 1 iff the single echo scores — proves client_conc.drain
-# reassembles CONT inline-blocking (no per-stream ledger, RFC 9113
-# §6.10 forbids interleave mid-sequence). Pre-fix: Fail 502.
+# DATA (END_STREAM "hello"). Client is HTTPX.client.stream_insecure
+# POST "hello" with a pure Continue handler. Golden 1 iff total bytes 5
+# and fins 1 — proves client.on.sdrop reassembles CONT without
+# re-delivering StreamHead (phase 7 rejoins phase 4 handler-free).
+# Pre-fix behavior: Fail 502 "fragmented".
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -30,24 +30,27 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def h(resp: HTTPX.Response) -> U32:
-  match resp:
-    case HTTPX.Response{+status, +headers, +body}:
-      b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, hello_bytes()), 1)))
+def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+  match ev:
+    case HTTPX.StreamHead{head}:
+      HTTPX.StreamContinue{}
+    case HTTPX.StreamData{chunk, fin}:
+      HTTPX.StreamContinue{}
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/echo", Nil{}, hello_bytes()}]
+def client_score_counts(counts: U32 & U32) -> U32:
+  (total, fins) = counts
+  b2u(Bool.and(U32.is_eq(total, 5), U32.is_eq(fins, 1)))
 
-def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
+def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
   match r:
     case Fail{e}:
       0
-    case Done{+total}:
-      total
+    case Done{counts}:
+      client_score_counts(counts)
 
-def client(+port: U32) -> IO(U32):
+def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
     IO.pure(U32, client_score(r))
 
 # Raw server: preface (magic 24 via tls_recv_bytes) + SETTINGS send, then

@@ -1,5 +1,5 @@
-# lib (lib_mux_interop): truly interleaved streams on one TLS+H2
-# connection against HTTPX.server_on_concurrent (lib/httpx.bend standalone).
+# lib (lib_httpx_interop): truly interleaved streams on one TLS+H2
+# connection against HTTPX.server.concurrent (lib/httpx.bend standalone).
 # Same wire as tests/io/https_mux.bend but with the httpx's OWN mini-H2
 # client (no http2 import): pipelines HEADERS(1,3,5,7) then
 # DATA(7,5,3,1,END) raw via HTTPX.x_send_frame — four open streams at
@@ -16,7 +16,7 @@ def body1() -> List<&2, U32>:
 def body2() -> List<&2, U32>:
   [119, 111, 114, 108, 100, 33]
 
-def mux_ok(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_ok(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, Nil{}})
@@ -299,7 +299,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_ok, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_ok, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

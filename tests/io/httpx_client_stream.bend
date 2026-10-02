@@ -1,15 +1,15 @@
-# lib (lib_mux_fetch): fetch by URL against the mini-H2 httpx (Phase 9).
-# Server answers every request 200 "hello"; client is
-# HTTPX.fetch_insecure("https://127.0.0.1:port/hello") (GET by URL through
-# httpx_url.read_url, no http import). Golden 1 iff the body comes back
-# as the String "hello".
+# lib (lib_httpx_client_stream): streaming download against mini-H2 server.
+# Server is HTTPX.server.concurrent echoing the body; client is
+# HTTPX.client.stream_insecure POST "hello" with a pure Continue
+# handler (no body accumulation, O(1) per chunk). Golden 1 iff total
+# bytes 5 and fins 1 (one HEADERS + one DATA with END_STREAM).
 import Base
 import ../../lib/httpx.bend as HTTPX
 
-def mux_hello(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_str_bytes("hello")})
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -18,19 +18,27 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def client_score(r: Result<&1, &1, U32 & String, String>) -> U32:
+def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+  match ev:
+    case HTTPX.StreamHead{head}:
+      HTTPX.StreamContinue{}
+    case HTTPX.StreamData{chunk, fin}:
+      HTTPX.StreamContinue{}
+
+def client_score_counts(counts: U32 & U32) -> U32:
+  (total, fins) = counts
+  b2u(Bool.and(U32.is_eq(total, 5), U32.is_eq(fins, 1)))
+
+def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
   match r:
     case Fail{e}:
       0
-    case Done{body}:
-      b2u(String.eq(body, "hello"))
+    case Done{counts}:
+      client_score_counts(counts)
 
-def client_url(+port: U32) -> String:
-  "https://127.0.0.1:" ++ U32.show(port) ++ "/hello"
-
-def client(+port: U32) -> IO(U32):
+def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure(client_url(port))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     IO.pure(U32, client_score(r))
 
 law server_side:
@@ -39,7 +47,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_hello, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

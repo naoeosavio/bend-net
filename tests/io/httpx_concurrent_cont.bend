@@ -1,11 +1,11 @@
-# lib (mux_server_cont): fragmented request HEADERS against the real
-# HTTPX.server_on_stream (mold mux_interop, inverted: client raw, server
+# lib (httpx_concurrent_cont): fragmented request HEADERS against the real
+# HTTPX.server.concurrent (mold httpx_server_cont: client raw, server
 # real). Client pipelines HEADERS (sid 1, no END_HEADERS) + CONT
 # (END_HEADERS) + DATA (END_STREAM "hi") raw via HTTPX.x_send_frame; the
-# server must park the fragment (fends), finish on CONT (phase 6) and
-# answer 200 echoing "hi" via the streaming handler. Golden 1 iff the
-# single 200 head plus the "hi" body are collected. Pre-fix behavior:
-# close on the partial HEADERS (no 200, score 0).
+# httpx must park the fragment (fends), finish on CONT (phase 6) and
+# answer 200 echoing "hi". Golden 1 iff the single 200 head plus the
+# "hi" body are collected. Covers the rev-body park/finish discipline
+# on the httpx loop (twin of the httpx_stream path).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -30,13 +30,10 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-# Server handler: plain echo (Head buffers, Data answers 200 immediately).
-def h2(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
-  match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.Continue{}
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+  match req:
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 # Raw client collector: single stream, counts one 200 head + "hi" body.
 def cc_acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
@@ -270,7 +267,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_stream(~h2, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

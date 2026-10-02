@@ -1,4 +1,4 @@
-# lib (lib_mux_frame_read): the mini-H2 frame reader must be a single
+# lib (lib_httpx_frame_read): the mini-H2 frame reader must be a single
 # unbounded loop, not a fixed number of reads: any public peer splits a
 # response over many TLS records (Cloudflare ships ~1.4KB per record, so a
 # 3.6KB HEADERS block alone needs three reads), and a reader with a read

@@ -1,13 +1,12 @@
-# lib (lib_mux_client): mini-H2 client_once against the standalone mini-H2 httpx.
-# Server is HTTPX.server_on_concurrent echoing the body; client is
-# HTTPX.client.once_insecure POST "hello" (literal HPACK, single DATA,
-# no http2 import — pure mini-codec byte path, fast check + small binary).
-# Golden 1 iff status 200 and body echoes "hello".
+# lib (lib_httpx_client_seq): sequential batch entry against mini-H2 server.
+# Server echoes bodies; client is HTTPX.client.on_insecure with 3 requests
+# ("hello-0/1/2") on one dial (sids 1,3,5), answers back in request
+# order. Golden 3 (one per echo body, order-insensitive sum like the
+# concurrent golden).
 import Base
-import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
@@ -19,24 +18,34 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def client_score_body(+status: U32, +body: List<&2, U32>) -> U32:
-  b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello")), 1)))
+def is_want(+body: List<&2, U32>) -> Bool:
+  Bool.or(Bool.or(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-0")), 1), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-1")), 1)), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-2")), 1))
 
-def client_score_resp(resp: HTTPX.Response) -> U32:
+def hit(+resp: HTTPX.Response) -> U32:
   match resp:
     case HTTPX.Response{+status, +headers, +body}:
-      client_score_body(status, body)
+      b2u(Bool.and(U32.is_eq(status, 200), is_want(body)))
 
-def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def total(rs: List<&2, HTTPX.Response>) -> U32:
+  match rs:
+    case Nil{}:
+      0
+    case +h <> t:
+      (hit(h) + total(t) : U32)
+
+def reqs() -> List<&2, HTTPX.Request>:
+  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")}]
+
+def client_score(r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) -> U32:
   match r:
     case Fail{e}:
       0
-    case Done{+resp}:
-      client_score_resp(resp)
+    case Done{+rs}:
+      total(rs)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
+    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <- HTTPX.client.on_insecure("127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 law server_side:
@@ -45,7 +54,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:
@@ -98,4 +107,4 @@ def main():
     b : Listener & U32 <- listen_any(32n, 18440)
     main_go(b)
 
-#|1
+#|3

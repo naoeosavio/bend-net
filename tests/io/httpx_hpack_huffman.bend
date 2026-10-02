@@ -1,4 +1,4 @@
-# lib (lib_mux_hpack_huffman): HPACK string vectors (RFC 7541 Appendix B/C)
+# lib (lib_httpx_hpack_huffman): HPACK string vectors (RFC 7541 Appendix B/C)
 # over the mini-H2 inside httpx.bend: C.4.1 ":authority" "www.example.com"
 # (f1 e3 ... f4 ff behind the 0x8c length byte), C.6.1 ":status" "302"
 # (64 02), a raw string with no Huffman bit set, and the three fail-closed

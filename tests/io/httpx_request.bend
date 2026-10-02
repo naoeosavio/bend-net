@@ -1,5 +1,5 @@
-# lib (mux_send_request): String-body requests against mini-H2 server.
-# Server is HTTPX.server_on_concurrent echoing the body; client is
+# lib (httpx_request): String-body requests against mini-H2 server.
+# Server is HTTPX.server.concurrent echoing the body; client is
 # HTTPX.request_insecure POST "hello" (String in, String out) plus
 # HTTPX.request_bytes_insecure (String in, raw bytes out).
 # Golden 2 iff both answered bodies are "hello". Covers the textual
@@ -7,7 +7,7 @@
 import Base
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
@@ -51,7 +51,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

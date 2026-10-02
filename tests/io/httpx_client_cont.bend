@@ -1,5 +1,5 @@
-# lib (mux_client_cont): fragmented response HEADERS via synthetic raw
-# peer (mold mux_interop, inverted: server raw, client real). Server reads
+# lib (httpx_client_cont): fragmented response HEADERS via synthetic raw
+# peer (mold httpx_interop, inverted: server raw, client real). Server reads
 # the client preface + SETTINGS/HEADERS/DATA, then answers with HEADERS
 # (sid 1, no END_HEADERS) + CONT (END_HEADERS) + DATA (END_STREAM "hello").
 # Client is HTTPX.client.once_insecure POST "hello". Golden 1 iff status 200

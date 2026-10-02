@@ -1,4 +1,4 @@
-# lib (lib_mux_rst): RST_STREAM + GOAWAY wire shapes and the control-frame
+# lib (lib_httpx_rst): RST_STREAM + GOAWAY wire shapes and the control-frame
 # class table the 3 server loops and the 3 client drains dispatch on. Pure
 # layer, no IO: every control frame type must land on its own class (a loop
 # that misroutes one silently drops or doubles a stream), the client must
@@ -6,7 +6,7 @@
 # must be byte-exact. Ported from h2_rst.bend (same intent, mini-H2 class
 # numbers) when the http2.bend codec was retired; the IO half of the original
 # (abort stream 1, finish stream 3, then GOAWAY) is covered behaviourally by
-# mux_client_stream's cancel golden and mux_concurrent_cont. Golden 1 iff all
+# httpx_client_stream's cancel golden and httpx_concurrent_cont. Golden 1 iff all
 # 12 vectors score.
 import Base
 import ../../lib/httpx.bend as HTTPX

@@ -1,5 +1,5 @@
-# lib (lib_mux_client_concurrent): pipelined N=4 POSTs on one TLS+H2
-# connection against HTTPX.server_on_concurrent. Client sends 4 requests
+# lib (lib_httpx_client_concurrent): pipelined N=4 POSTs on one TLS+H2
+# connection against HTTPX.server.concurrent. Client sends 4 requests
 # (sids 1,3,5,7) back-to-back, then drains 4 responses in any order
 # via slots (no per-sid sequential wait). Handler scores 1 per echo
 # body in hello-0..3. Golden 4 (sum).
@@ -7,7 +7,7 @@ import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
 
-def mux_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
     case HTTPX.Request{+method, +path, +headers, +body}:
       IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
@@ -48,7 +48,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server_on_concurrent(~mux_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

@@ -1,4 +1,4 @@
-# lib (lib_mux_tab_dyn): HPACK dynamic table unit (RFC 7541 section 2.3 and
+# lib (lib_httpx_tab_dyn): HPACK dynamic table unit (RFC 7541 section 2.3 and
 # section 4, C.3 sizes) over the mini-H2 inside httpx.bend: insert sizing (57,
 # 110), newest-first lookup, eviction to max, oversize empties the table,
 # out-of-bounds fails 502. Pure layer, no IO, so it gates every change in the
