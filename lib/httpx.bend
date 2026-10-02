@@ -3374,24 +3374,50 @@ def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) 
     case False{}:
       List.append(&2, U32, acc, x_str_bytes(n ++ ": " ++ v ++ "\r\n"))
 
-def x_h1.render_hs.go(hs: List<&2, Hdr>, acc: List<&2, U32>) -> List<&2, U32>:
+# Upgrade renders keep `connection`/`upgrade` (the handshake's own headers):
+# forbidden() still drops the rest. Case-insensitive like the parse side.
+def x_h1.render_hs.keep(upgrade: Bool, +n: String) -> Bool:
+  match upgrade:
+    case True{}:
+      Bool.or(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(n, "upgrade"))
+    case False{}:
+      False{}
+
+def x_h1.render_hs.go(hs: List<&2, Hdr>, acc: List<&2, U32>, +upgrade: Bool) -> List<&2, U32>:
   match hs:
     case Nil{}:
       acc
     case Hdr{+n, +v} <> t:
-      x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, acc, x_h1.forbidden(n)))
+      x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, acc, Bool.and(x_h1.forbidden(n), Bool.not(x_h1.render_hs.keep(upgrade, n)))), upgrade)
 
-def x_h1.render_req.go(bad: Bool, +method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+# An upgrade handshake carries no body framing: with upgrade=True an empty
+# body renders no Content-Length at all (a 101 must not claim one); any
+# non-empty body still counts exactly as before.
+def x_h1.render_cl.empty(upgrade: Bool) -> String:
+  match upgrade:
+    case True{}:
+      ""
+    case False{}:
+      "Content-Length: 0\r\n"
+
+def x_h1.render_cl(+body: List<&2, U32>, upgrade: Bool) -> String:
+  match body:
+    case Nil{}:
+      x_h1.render_cl.empty(upgrade)
+    case _ <> _:
+      "Content-Length: " ++ U32.show(x_len32(body)) ++ "\r\n"
+
+def x_h1.render_req.go(+upgrade: Bool, bad: Bool, +method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
   match bad:
     case True{}:
       Fail{(400, "bad request")}
     case False{}:
-      Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\nContent-Length: " ++ U32.show(x_len32(body)) ++ "\r\n")), x_str_bytes("\r\n")), body)}
+      Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\n" ++ x_h1.render_cl(body, upgrade)), upgrade), x_str_bytes("\r\n")), body)}
 
 def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
-  x_h1.render_req.go(Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body)
+  x_h1.render_req.go(False{}, Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body)
 
 def x_h1.reason(st: U32) -> String:
   match st:
@@ -3416,8 +3442,10 @@ def x_h1.reason(st: U32) -> String:
     case _:
       SNil{}
 
+# Responses render with upgrade=False today: no handler emits Upgrade yet.
+# Phase 3 (answer_open/show_resp_head) revisits this for the 101 path.
 def x_h1.show_resp(+status: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(x_len32(body)) ++ "\r\n")), x_str_bytes("\r\n")), body)
+  List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(x_len32(body)) ++ "\r\n"), False{}), x_str_bytes("\r\n")), body)
 
 # Blank-line cut over bytes (window 218762506 = \r\n\r\n, same as
 # http.bend bs_head; the discriminant rides a param, never a match on
@@ -3837,6 +3865,142 @@ def x_h1.cli.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
   IO(Socket & Result<&1, &1, U32 & String, Response>):
   x_h1.cli.exch.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
+# H1 upgrade chain (101): the head half of the exchange, stopping at the
+# head. Like the plain chain above, but the nbody=True arm hands the triple
+# (socket, response, rest) over instead of dropping the rest — those bytes
+# past the head are the first frame bytes, and head_open never reads a
+# body: nbody=False is Fail 502 "upgrade without 101", fail-closed.
+# No chunked consult here: a 101 carries no body by definition.
+# ---------------------------------------------------------------------
+
+def x_h1.cli.hd2_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, Hdr>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match nbody:
+    case True{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Done{(Response{code, hs, Nil{}}, rest)}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Fail{(502, "upgrade without 101")}))
+
+def x_h1.cli.hd_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match hsres:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+hs}:
+      x_h1.cli.hd2_open(~recv, ~send, ~close, sock, rest, fuel, code, hs, nbody)
+
+def x_h1.cli.coded_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match coderes:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+code}:
+      x_h1.cli.hd_open(~recv, ~send, ~close, sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
+
+def x_h1.cli.parsed_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
+  +rest = x_h1.split_rest(x_h1.split(acc2))
+  x_h1.cli.coded_open(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
+@unsafe
+def x_h1.cli.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (s0, Fail{(413, "response too long")}))
+        case 1n+f:
+          do IO<Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.cli.head_open(~recv, ~send, ~close, 1, r, acc, f, method, False{})
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (s1, Fail{e}))
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              x_h1.cli.head_open(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
+    case 2:
+      (s2, r2) = got
+      match found:
+        case False{}:
+          x_h1.cli.head_open(~recv, ~send, ~close, 0, (s2, Done{Nil{}}), acc, fuel, method, False{})
+        case True{}:
+          x_h1.cli.parsed_open(~recv, ~send, ~close, s2, acc, fuel, method)
+    case _:
+      (s9, r9) = got
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (s9, Fail{(502, "bad phase")}))
+
+def x_h1.exch.sent_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  (sock, r) = sent
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{u}:
+      x_h1.cli.head_open(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
+
+def x_h1.exch.send_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match rendered:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+bytes}:
+      do IO<Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.exch.sent_open(~recv, ~send, ~close, sent, method)
+
+# The handshake exchange: like x_h1.cli.exch (same 400/413 before any byte
+# leaves) but rendered with upgrade=True and answered by the _open chain,
+# so the socket comes back live with the bytes past the head. Not closing
+# is the caller's job — that is the whole point of the triple.
+def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match fit:
+    case True{}:
+      match ok:
+        case True{}:
+          x_h1.exch.send_open(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body), method)
+        case False{}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>,
+            (sock, Fail{(413, "req too large")}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>,
+        (sock, Fail{(400, "bad request")}))
+
+def x_h1.cli.exch.open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  x_h1.cli.exch.open.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+
+# Post-dial runner for the upgrade handshake, the _open pair of h1_once.conn:
+# the dial differs per lane, the grammar after it is one.
+def h1_open.rewrap(out: Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  (s, r) = out
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>, Fail{e})
+    case Done{pr}:
+      (resp, rest) = pr
+      IO.pure(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>, Done{(s, resp, rest)})
+
+def h1_open.sock(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +req: Request) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  match req:
+    case Request{method, path, headers, body}:
+      do IO<Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>>:
+        out : Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>> <- x_h1.cli.exch.open(~recv, ~send, ~close, sock, host, port, method, path, headers, body)
+        h1_open.rewrap(out)
+
+def h1_open.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +req: Request) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>, Fail{e})
+    case Done{sock}:
+      h1_open.sock(~recv, ~send, ~close, sock, host, port, req)
+
 # H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
 # ---------------------------------------------------------------------
 
@@ -3879,6 +4043,20 @@ def h1_once(+host: String, +port: U32, +method: String, +path: String, hs: List<
 def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
   h1_once.fit(host, port, method, path, hs, body, True{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
+
+def h1_open.go(+host: String, +port: U32, +req: Request, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- h1_once.dial(host, port, insecure)
+    h1_open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, req)
+
+def h1_open(+host: String, +port: U32, +req: Request) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  h1_open.go(host, port, req, False{})
+
+def h1_open_insecure(+host: String, +port: U32, +req: Request) ->
+  IO(Result<&1, &1, U32 & String, Socket & Response & List<&2, U32>>):
+  h1_open.go(host, port, req, True{})
 
 # Dual-dial dispatch for once/fetch: h2 → preface+exchange (existing
 # path, byte-identical); http/1.1 → H1 lane on the same socket (this
