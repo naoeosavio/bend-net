@@ -257,7 +257,8 @@ law client:
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client.on.connect_insecure("127.0.0.1", port)
+    c : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client.on.h2_only(c)
     client_conn(conn, port)
 
 law server_side:

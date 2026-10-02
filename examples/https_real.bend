@@ -34,8 +34,8 @@ def main() -> IO(Unit):
   do IO<Unit>:
     a : Result<&1, &1, U32 & String, String> <- HTTPX.fetch("https://example.com/")
     x : Unit <- emit("GET example.com (fetch)", a)
-    b : Result<&1, &1, U32 & String, String> <- HTTPX.send_request("example.com", 443, "/post", "POST", HTTPX.Hdr{"content-type", "text/plain"} <> Nil{}, "bend")
-    y : Unit <- emit("POST example.com/post (send_request)", b)
+    b : Result<&1, &1, U32 & String, String> <- HTTPX.request("example.com", 443, "/post", "POST", HTTPX.Hdr{"content-type", "text/plain"} <> Nil{}, "bend")
+    y : Unit <- emit("POST example.com/post (request)", b)
     c : Result<&1, &1, U32 & String, String> <- HTTPX.fetch("https://www.cloudflare.com/")
     z : Unit <- emit("GET cloudflare.com (fetch)", c)
     d : Result<&1, &1, U32 & String, String> <- HTTPX.fetch("https://info.cern.ch/")

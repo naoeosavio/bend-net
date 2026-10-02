@@ -162,7 +162,7 @@ def case_head(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/", "HEAD", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "HEAD", [], "")
     chk_eq(chan, SNil{}, r)
 
 law case_head_chunked:
@@ -173,7 +173,7 @@ def case_head_chunked(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/", "HEAD", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "HEAD", [], "")
     chk_eq(chan, SNil{}, r)
 
 law case_204:
@@ -184,7 +184,7 @@ def case_204(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 204 No Content\r\nContent-Length: 7\r\nConnection: close\r\n\r\nignored"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/", "GET", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
     chk_eq(chan, SNil{}, r)
 
 law case_get_ok:
@@ -195,7 +195,7 @@ def case_get_ok(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/", "GET", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
     chk_eq(chan, "hello", r)
 
 law case_get_413:
@@ -206,7 +206,7 @@ def case_get_413(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/", "GET", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
     chk_code(chan, 413, r)
 
 law main_go:

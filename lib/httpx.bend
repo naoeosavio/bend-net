@@ -2810,7 +2810,7 @@ type Cont is Data:
   Cont{block: List<&2, U32>, rest: List<&2, U32>}
 
 type CliSt is Data:
-  CliSt{sid: U32, tab: Tab}
+  CliSt{sid: U32, tab: Tab, is_h2: Bool}
 
 type StreamEv is Data:
   StreamHead{head: Head}
@@ -3231,9 +3231,10 @@ def client.on.alpn_go(sock: Socket, is_h2: Bool) ->
         pre : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_preface(sock)
         client.on.prefaced(pre)
     case False{}:
-      do IO<Result<&1, &1, U32 & String, Socket>>:
-        x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{(615, "alpn mismatch")})
+      # H1 connection: no preface, the socket goes straight to the H1 lane
+      # (x_h1.exch); client.on refuses it with 615 because the batch lane
+      # only speaks H2, and client.once dispatches to the H1 one-shot.
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
 
 def client.on.alpn_conn(conn: Result<&1, &1, U32 & String, Socket & String>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
@@ -3244,17 +3245,58 @@ def client.on.alpn_conn(conn: Result<&1, &1, U32 & String, Socket & String>) ->
       (sock, protocol) = value
       client.on.alpn_go(sock, TLS.tls_alpn_is_h2(protocol))
 
-def client.on.connect_secure(+host: String, +port: U32) ->
+def client.on.connected(pre: Result<&1, &1, U32 & String, Socket>, is_h2: Bool) ->
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  match pre:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, Fail{e})
+    case Done{sock2}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, Done{(sock2, CliSt{1, x_tab.empty(), is_h2})})
+
+def client.on.connected_go(conn: Result<&1, &1, U32 & String, Socket & String>) ->
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, Fail{e})
+    case Done{value}:
+      (sock, protocol) = value
+      +is_h2 = TLS.tls_alpn_is_h2(protocol)
+      do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
+        pre : Result<&1, &1, U32 & String, Socket> <- client.on.alpn_go(sock, is_h2)
+        client.on.connected(pre, is_h2)
+
+# The streaming and concurrent lanes are H2-only: they need the H2 slot
+# machinery, so an H1 connection is closed with 615 — the answer the old
+# H2-strict connect gave — instead of being handed to a lane that cannot
+# speak it. Only client.once dispatches to the H1 one-shot.
+def client.on.h2_only(conn: Result<&1, &1, U32 & String, Socket & CliSt>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
-  do IO<Result<&1, &1, U32 & String, Socket>>:
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
+    case Done{value}:
+      (sock, st) = value
+      match st:
+        case CliSt{sid, tab, is_h2}:
+          match is_h2:
+            case True{}:
+              IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
+            case False{}:
+              do IO<Result<&1, &1, U32 & String, Socket>>:
+                x : Unit <- TLS.tls_close(sock)
+                IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{(615, "alpn mismatch")})
+
+def client.on.connect_secure(+host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
     conn : Result<&1, &1, U32 & String, Socket & String> <- TLS.tls_connect_any(host, port)
-    client.on.alpn_conn(conn)
+    client.on.connected_go(conn)
 
 def client.on.connect_insecure(+host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket>):
-  do IO<Result<&1, &1, U32 & String, Socket>>:
+  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
+  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
     conn : Result<&1, &1, U32 & String, Socket & String> <- TLS.tls_connect_any_insecure(host, port)
-    client.on.alpn_conn(conn)
+    client.on.connected_go(conn)
 
 # Request send (HEADERS + one DATA; upload cap 16KB checked by caller)
 # --------------------------------------------------------------------
@@ -3789,358 +3831,6 @@ def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, 
 # replaces the 615 close; keep_connect stays H2-strict).
 # ---------------------------------------------------------------------
 
-def client_once.dial(+host: String, +port: U32, insecure: Bool) -> IO(Result<&1, &1, U32 & String, Socket & String>):
-  match insecure:
-    case True{}:
-      TLS.tls_connect_any_insecure(host, port)
-    case False{}:
-      TLS.tls_connect_any(host, port)
-
-def client_once.h2go(r: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match r:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{sock2}:
-      client_once.exch(sock2, host, port, method, path, hs, body)
-
-def client_once.by_proto(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, is_h2: Bool) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match is_h2:
-    case True{}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        pre : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_preface(sock)
-        mid : Result<&1, &1, U32 & String, Socket> <- client_on.prefaced(pre)
-        client_once.h2go(mid, host, port, method, path, hs, body)
-    case False{}:
-      x_h1.exch(sock, host, port, method, path, hs, body)
-
-def client_once.dispatched(d: Result<&1, &1, U32 & String, Socket & String>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match d:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{value}:
-      (sock, protocol) = value
-      client_once.by_proto(sock, host, port, method, path, hs, body, TLS.tls_alpn_is_h2(protocol))
-
-def client_once.dialgo(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  do IO<Result<&1, &1, U32 & String, Response>>:
-    d : Result<&1, &1, U32 & String, Socket & String> <- client_once.dial(host, port, insecure)
-    client_once.dispatched(d, host, port, method, path, hs, body)
-
-def client_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match fit:
-    case True{}:
-      match ok:
-        case True{}:
-          client_once.dialgo(host, port, method, path, hs, body, insecure)
-        case False{}:
-          IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(413, "req too large")})
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(400, "bad request")})
-
-def client_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  client_once.fit(host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
-
-def client_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  client_once.fit(host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
-
-# URL + fetch (Phase 9): read_url ported verbatim from http.bend:653-840
-# with a httpx_url prefix and no import — the chain only needs Base plus
-# the client_on.valid_host/port/path copies already living above.
-# fetch* mirrors https.bend:286-396 over client_once.dialgo (GET, Nil body);
-# http:// refuses with 400 (TLS-only, same contract as https.fetch).
-# No laws: the httpx keeps no publish surface (dono decision).
-# ---------------------------------------------------------------------
-
-def httpx_url.default_port(secure: Bool) -> U32:
-  match secure:
-    case True{}:
-      443
-    case False{}:
-      80
-
-def httpx_url.strip_host(h: String) -> String:
-  String.trim(h)
-
-def httpx_url.split_host_port.put(h: Char, t: String, host: String, port: String, rec: String & String, is_colon: Bool) -> String & String:
-  match is_colon:
-    case True{}:
-      (host, t)
-    case False{}:
-      rec
-
-def httpx_url.split_host_port.go(s: String, +host: String, +port: String) -> String & String:
-  match s:
-    case SNil{}:
-      (host, port)
-    case SCon{+h, +t}:
-      httpx_url.split_host_port.put(h, t, host, port, httpx_url.split_host_port.go(t, host ++ Char.show(h), port), Char.is_eq(h, ':'))
-
-def httpx_url.split_host_port(s: String) -> String & String:
-  httpx_url.split_host_port.go(s, SNil{}, SNil{})
-
-def httpx_url.split_host_path.put(h: Char, t: String, acc: String, rec: String & String, is_slash: Bool) -> String & String:
-  match is_slash:
-    case True{}:
-      (acc, SCon{h, t})
-    case False{}:
-      rec
-
-def httpx_url.split_host_path.go(s: String, +acc: String) -> String & String:
-  match s:
-    case SNil{}:
-      (acc, SNil{})
-    case SCon{+h, +t}:
-      httpx_url.split_host_path.put(h, t, acc, httpx_url.split_host_path.go(t, acc ++ Char.show(h)), Char.is_eq(h, '/'))
-
-def httpx_url.split_host_path(s: String) -> String & String:
-  httpx_url.split_host_path.go(s, SNil{})
-
-def httpx_url.norm_path(p: String) -> String:
-  match p:
-    case SNil{}:
-      "/"
-    case SCon{h, t}:
-      p
-
-def httpx_url.done(secure: Bool, host: String, port: U32, path: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match ok:
-    case True{}:
-      Done{(secure, host, port, path)}
-    case False{}:
-      Fail{(400, "bad url")}
-
-def httpx_url.explicit.put(secure: Bool, host: String, +path: String, port: Maybe<&2, U32>) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match port:
-    case None{}:
-      Fail{(400, "bad port")}
-    case Some{p}:
-      +c = p
-      httpx_url.done(secure, host, c, path, Bool.and(client_on.valid_port(c), client_on.valid_path(path)))
-
-def httpx_url.explicit(secure: Bool, host: String, portstr: String, path: String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  httpx_url.explicit.put(secure, host, path, U32.read(portstr))
-
-def httpx_url.port.go(+secure: Bool, host: String, portstr: String, +path: String, no_port: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match no_port:
-    case True{}:
-      httpx_url.done(secure, host, httpx_url.default_port(secure), path, client_on.valid_path(path))
-    case False{}:
-      httpx_url.explicit(secure, host, portstr, path)
-
-def httpx_url.port(secure: Bool, host: String, +portstr: String, path: String, host_ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match host_ok:
-    case False{}:
-      Fail{(400, "bad host")}
-    case True{}:
-      httpx_url.port.go(secure, host, portstr, path, String.is_empty(portstr))
-
-def httpx_url.host.go(secure: Bool, path: String, hp: String & String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  (host, portstr) = hp
-  +h1 = httpx_url.strip_host(host)
-  httpx_url.port(secure, h1, portstr, path, client_on.valid_host(h1))
-
-def httpx_url.host(secure: Bool, +hostport: String, path: String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  httpx_url.host.go(secure, path, httpx_url.split_host_port(hostport))
-
-def httpx_url.split(hp: String & String, secure: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  (hostport, path0) = hp
-  httpx_url.host(secure, hostport, httpx_url.norm_path(path0))
-
-def httpx_url.rest(+rest: String, secure: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  httpx_url.split(httpx_url.split_host_path(rest), secure)
-
-def httpx_url.http(url: String, is_http: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match is_http:
-    case True{}:
-      httpx_url.rest(x_str_drop32(url, 7), False{})
-    case False{}:
-      Fail{(400, "bad scheme")}
-
-def httpx_url.scheme(url: String, is_https: Bool, is_http: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match is_https:
-    case True{}:
-      httpx_url.rest(x_str_drop32(url, 8), True{})
-    case False{}:
-      httpx_url.http(url, is_http)
-
-def httpx_url.read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  httpx_url.scheme(url, String.starts_with(url, "https://"), String.starts_with(url, "http://"))
-
-# fetch: GET by URL (mirror https.fetch, https only). Answers the body
-# as String; fetch_bytes answers raw bytes. insecure=False{} verifies.
-# ---------------------------------------------------------------------
-
-def fetch.text(r: Result<&1, &1, U32 & String, Response>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match r:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{+resp}:
-      match resp:
-        case Response{+status, +headers, +body}:
-          IO.pure(Result<&1, &1, U32 & String, String>, Done{x_bytes_str(body)})
-
-def fetch.raw(r: Result<&1, &1, U32 & String, Response>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  match r:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{e})
-    case Done{+resp}:
-      match resp:
-        case Response{+status, +headers, +body}:
-          IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Done{body})
-
-def fetch.get(+host: String, port: U32, path: String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
-    fetch.text(r)
-
-def fetch_bytes.get(+host: String, port: U32, path: String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, "GET", path, Nil{}, Nil{}, insecure)
-    fetch.raw(r)
-
-def fetch.host(host: String, +port: U32, path: String, insecure: Bool, ok: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match ok:
-    case True{}:
-      fetch.get(host, port, path, insecure)
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad host")})
-
-def fetch_bytes.host(host: String, +port: U32, path: String, insecure: Bool, ok: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  match ok:
-    case True{}:
-      fetch_bytes.get(host, port, path, insecure)
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
-
-def fetch.url.go(secure: Bool, +host: String, port: U32, path: String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match secure:
-    case True{}:
-      fetch.host(host, port, path, insecure, client_on.valid_host(host))
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad scheme")})
-
-def fetch_bytes.url.go(secure: Bool, +host: String, port: U32, path: String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  match secure:
-    case True{}:
-      fetch_bytes.host(host, port, path, insecure, client_on.valid_host(host))
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad scheme")})
-
-def fetch.url(u: Bool & String & U32 & String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (secure, host, port, path) = u
-  fetch.url.go(secure, host, port, path, insecure)
-
-def fetch_bytes.url(u: Bool & String & U32 & String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  (secure, host, port, path) = u
-  fetch_bytes.url.go(secure, host, port, path, insecure)
-
-def fetch.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U32 & String>, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match parsed:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{u}:
-      fetch.url(u, insecure)
-
-def fetch_bytes.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U32 & String>, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  match parsed:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{e})
-    case Done{u}:
-      fetch_bytes.url(u, insecure)
-
-def fetch(+url: String) -> IO(Result<&1, &1, U32 & String, String>):
-  fetch.r(url, httpx_url.read_url(url), False{})
-
-def fetch_insecure(+url: String) -> IO(Result<&1, &1, U32 & String, String>):
-  fetch.r(url, httpx_url.read_url(url), True{})
-
-def fetch_bytes(+url: String) -> IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  fetch_bytes.r(url, httpx_url.read_url(url), False{})
-
-def fetch_bytes_insecure(+url: String) -> IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  fetch_bytes.r(url, httpx_url.read_url(url), True{})
-
-# send_request: any method with headers and a String body (mirror
-# https.send_request over client_once.dialgo); answers the response body
-# as String via fetch.text. send_request_bytes takes raw bytes in and
-# answers raw bytes via fetch.raw (mirror fetch/fetch_bytes).
-# insecure=False{} verifies.
-# ---------------------------------------------------------------------
-
-def send_request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, method, path, hs, x_str_bytes(body), insecure)
-    fetch.text(r)
-
-def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool, fit: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match fit:
-    case True{}:
-      send_request.go(host, port, path, method, hs, body, insecure)
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
-
-def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  send_request.fit(host, port, path, method, hs, body, False{}, client_on.valid.go(host, port, path))
-
-def send_request_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  send_request.fit(host, port, path, method, hs, body, True{}, client_on.valid.go(host, port, path))
-
-def send_request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-    r : Result<&1, &1, U32 & String, Response> <- client_once.dialgo(host, port, method, path, hs, body, insecure)
-    fetch.raw(r)
-
-def send_request_bytes.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  match fit:
-    case True{}:
-      send_request_bytes.go(host, port, path, method, hs, body, insecure)
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad request")})
-
-def send_request_bytes(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  send_request_bytes.fit(host, port, path, method, hs, body, False{}, client_on.valid.go(host, port, path))
-
-def send_request_bytes_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
-  send_request_bytes.fit(host, port, path, method, hs, body, True{}, client_on.valid.go(host, port, path))
-
 # Streaming download (Phase E): HEADERS/DATA to a pure handler, O(1)
 # per chunk (counts only, no body accumulation). WU per non-fin DATA
 # (best-effort, mold h2_send_wu_len); Cancel sends RST_STREAM (8) + Fail.
@@ -4400,11 +4090,13 @@ def client_stream.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +meth
   match insecure:
     case True{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
         client_stream.conn(~H, conn, host, port, method, path, hs, body)
     case False{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
         client_stream.conn(~H, conn, host, port, method, path, hs, body)
 
 def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
@@ -4434,41 +4126,38 @@ def client.stream_insecure(~H: StreamEv -> StreamOut, +host: String, +port: U32,
 
 def client.on.st_sid(+st: CliSt) -> U32:
   match st:
-    case CliSt{+sid, tab}:
+    case CliSt{+sid, tab, h2}:
       sid
 
 def client.on.st_tab(+st: CliSt) -> Tab:
   match st:
-    case CliSt{sid, +tab}:
+    case CliSt{sid, +tab, h2}:
       tab
+
+# is_h2 is the ALPN answer, kept on the connection record so the entries
+# above can dispatch: client.on/once are H2 for an H2 connection and the
+# H1 one-shot (x_h1.exch) for an H1 one (TASK-026 Phase 5, the
+# "unificar num ponto só" that the old client_once.by_proto did).
+def client.on.st_h2(+st: CliSt) -> Bool:
+  match st:
+    case CliSt{sid, tab, +h2}:
+      h2
 
 def client.on.next_sid(+sid: U32) -> U32:
   (sid + 2 : U32)
 
 def client.on.next_st(+st: CliSt, +tab: Tab) -> CliSt:
   match st:
-    case CliSt{+sid, old}:
-      CliSt{client.on.next_sid(sid), tab}
-
-def client.on.wrap_conn(conn: Result<&1, &1, U32 & String, Socket>) ->
-  Result<&1, &1, U32 & String, Socket & CliSt>:
-  match conn:
-    case Fail{e}:
-      Fail{e}
-    case Done{sock}:
-      Done{(sock, CliSt{1, x_tab.empty()})}
+    case CliSt{+sid, old, +h2}:
+      CliSt{client.on.next_sid(sid), tab, h2}
 
 def client.connect(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & CliSt>):
-  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client.on.wrap_conn(conn))
+  client.on.connect_secure(host, port)
 
 def client.connect_insecure(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & CliSt>):
-  do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client.on.wrap_conn(conn))
+  client.on.connect_insecure(host, port)
 
 def client.on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab, +st: CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
@@ -4577,17 +4266,415 @@ def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: S
       (sock0, st0) = value
       client_seq.first(sock0, st0, host, port, reqs)
 
+# The batch lane is H2 only: an H1 connection is closed with 615, which is
+# the answer the old keep_connect/alpn_go gave before the dispatch moved
+# here (client.once is the entry that also serves H1).
+def client.on.batch_st(+st: CliSt, sock: Socket, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  match st:
+    case CliSt{sid, tab, is_h2}:
+      match is_h2:
+        case True{}:
+          client_seq.conn(Done{(sock, CliSt{sid, tab, is_h2})}, host, port, reqs)
+        case False{}:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            x : Unit <- TLS.tls_close(sock)
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{(615, "alpn mismatch")})
+
+def client.on.batch(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
+    case Done{value}:
+      (sock, st) = value
+      client.on.batch_st(st, sock, host, port, reqs)
+
 def client.on(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
     conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect(host, port)
-    client_seq.conn(conn, host, port, reqs)
+    client.on.batch(conn, host, port, reqs)
 
 def client.on_insecure(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
     conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect_insecure(host, port)
-    client_seq.conn(conn, host, port, reqs)
+    client.on.batch(conn, host, port, reqs)
+
+# One-shot entries: client.once is client.on of a single request plus the
+# unwrap, with no logic of its own (TASK-026 Phase 5). The singleton is
+# safe because client_seq is already fail-closed with the close
+# (client_seq.done/first), and it is why client_once.dial/dispatched/
+# h2go/exch/sent/drained are gone instead of aliased.
+# ---------------------------------------------------------------------
+
+def client.once.go(batch: Result<&1, &1, U32 & String, List<&2, Response>>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match batch:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
+    case Done{rs}:
+      match rs:
+        case Nil{}:
+          IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(400, "empty batch")})
+        case h <> t:
+          IO.pure(Result<&1, &1, U32 & String, Response>, Done{h})
+
+def client.once.h1(req: Request, sock: Socket, +host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match req:
+    case Request{method, path, headers, body}:
+      x_h1.exch(sock, host, port, method, path, headers, body)
+
+def client.once.ready(st: CliSt, sock: Socket, +host: String, +port: U32, req: Request) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match st:
+    case CliSt{sid, tab, is_h2}:
+      match is_h2:
+        case True{}:
+          do IO<Result<&1, &1, U32 & String, Response>>:
+            batch : Result<&1, &1, U32 & String, List<&2, Response>> <- client_seq.conn(Done{(sock, CliSt{sid, tab, is_h2})}, host, port, req <> Nil{})
+            client.once.go(batch)
+        case False{}:
+          client.once.h1(req, sock, host, port)
+
+def client.once.dialed(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, req: Request) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
+    case Done{value}:
+      (sock, st) = value
+      client.once.ready(st, sock, host, port, req)
+
+def client.once(+host: String, +port: U32, req: Request) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect(host, port)
+    client.once.dialed(conn, host, port, req)
+
+def client.once_insecure(+host: String, +port: U32, req: Request) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect_insecure(host, port)
+    client.once.dialed(conn, host, port, req)
+
+def client.echo(+host: String, +port: U32, +path: String) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  client.once(host, port, Request{"GET", path, Nil{}, Nil{}})
+
+def client.echo_insecure(+host: String, +port: U32, +path: String) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  client.once_insecure(host, port, Request{"GET", path, Nil{}, Nil{}})
+
+# URL + fetch (Phase 9): read_url ported verbatim from http.bend:653-840
+# with a httpx_url prefix and no import — the chain only needs Base plus
+# the client.on.valid_host/port/path copies already living above.
+# fetch* mirrors https.bend:286-396 over client_once.dialgo (GET, Nil body);
+# http:// refuses with 400 (TLS-only, same contract as https.fetch).
+# No laws: the httpx keeps no publish surface (dono decision).
+# ---------------------------------------------------------------------
+
+def httpx_url.default_port(secure: Bool) -> U32:
+  match secure:
+    case True{}:
+      443
+    case False{}:
+      80
+
+def httpx_url.strip_host(h: String) -> String:
+  String.trim(h)
+
+def httpx_url.split_host_port.put(h: Char, t: String, host: String, port: String, rec: String & String, is_colon: Bool) -> String & String:
+  match is_colon:
+    case True{}:
+      (host, t)
+    case False{}:
+      rec
+
+def httpx_url.split_host_port.go(s: String, +host: String, +port: String) -> String & String:
+  match s:
+    case SNil{}:
+      (host, port)
+    case SCon{+h, +t}:
+      httpx_url.split_host_port.put(h, t, host, port, httpx_url.split_host_port.go(t, host ++ Char.show(h), port), Char.is_eq(h, ':'))
+
+def httpx_url.split_host_port(s: String) -> String & String:
+  httpx_url.split_host_port.go(s, SNil{}, SNil{})
+
+def httpx_url.split_host_path.put(h: Char, t: String, acc: String, rec: String & String, is_slash: Bool) -> String & String:
+  match is_slash:
+    case True{}:
+      (acc, SCon{h, t})
+    case False{}:
+      rec
+
+def httpx_url.split_host_path.go(s: String, +acc: String) -> String & String:
+  match s:
+    case SNil{}:
+      (acc, SNil{})
+    case SCon{+h, +t}:
+      httpx_url.split_host_path.put(h, t, acc, httpx_url.split_host_path.go(t, acc ++ Char.show(h)), Char.is_eq(h, '/'))
+
+def httpx_url.split_host_path(s: String) -> String & String:
+  httpx_url.split_host_path.go(s, SNil{})
+
+def httpx_url.norm_path(p: String) -> String:
+  match p:
+    case SNil{}:
+      "/"
+    case SCon{h, t}:
+      p
+
+def httpx_url.done(secure: Bool, host: String, port: U32, path: String, ok: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match ok:
+    case True{}:
+      Done{(secure, host, port, path)}
+    case False{}:
+      Fail{(400, "bad url")}
+
+def httpx_url.explicit.put(secure: Bool, host: String, +path: String, port: Maybe<&2, U32>) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match port:
+    case None{}:
+      Fail{(400, "bad port")}
+    case Some{p}:
+      +c = p
+      httpx_url.done(secure, host, c, path, Bool.and(client.on.valid_port(c), client.on.valid_path(path)))
+
+def httpx_url.explicit(secure: Bool, host: String, portstr: String, path: String) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  httpx_url.explicit.put(secure, host, path, U32.read(portstr))
+
+def httpx_url.port.go(+secure: Bool, host: String, portstr: String, +path: String, no_port: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match no_port:
+    case True{}:
+      httpx_url.done(secure, host, httpx_url.default_port(secure), path, client.on.valid_path(path))
+    case False{}:
+      httpx_url.explicit(secure, host, portstr, path)
+
+def httpx_url.port(secure: Bool, host: String, +portstr: String, path: String, host_ok: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match host_ok:
+    case False{}:
+      Fail{(400, "bad host")}
+    case True{}:
+      httpx_url.port.go(secure, host, portstr, path, String.is_empty(portstr))
+
+def httpx_url.host.go(secure: Bool, path: String, hp: String & String) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  (host, portstr) = hp
+  +h1 = httpx_url.strip_host(host)
+  httpx_url.port(secure, h1, portstr, path, client.on.valid_host(h1))
+
+def httpx_url.host(secure: Bool, +hostport: String, path: String) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  httpx_url.host.go(secure, path, httpx_url.split_host_port(hostport))
+
+def httpx_url.split(hp: String & String, secure: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  (hostport, path0) = hp
+  httpx_url.host(secure, hostport, httpx_url.norm_path(path0))
+
+def httpx_url.rest(+rest: String, secure: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  httpx_url.split(httpx_url.split_host_path(rest), secure)
+
+def httpx_url.http(url: String, is_http: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match is_http:
+    case True{}:
+      httpx_url.rest(x_str_drop32(url, 7), False{})
+    case False{}:
+      Fail{(400, "bad scheme")}
+
+def httpx_url.scheme(url: String, is_https: Bool, is_http: Bool) ->
+  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  match is_https:
+    case True{}:
+      httpx_url.rest(x_str_drop32(url, 8), True{})
+    case False{}:
+      httpx_url.http(url, is_http)
+
+def httpx_url.read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  httpx_url.scheme(url, String.starts_with(url, "https://"), String.starts_with(url, "http://"))
+
+# fetch: GET by URL (mirror https.fetch, https only). Answers the body
+# as String; fetch_bytes answers raw bytes. insecure=False{} verifies.
+# ---------------------------------------------------------------------
+
+def fetch.text(r: Result<&1, &1, U32 & String, Response>) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{+resp}:
+      match resp:
+        case Response{+status, +headers, +body}:
+          IO.pure(Result<&1, &1, U32 & String, String>, Done{x_bytes_str(body)})
+
+def fetch.raw(r: Result<&1, &1, U32 & String, Response>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{e})
+    case Done{+resp}:
+      match resp:
+        case Response{+status, +headers, +body}:
+          IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Done{body})
+
+def fetch.once(+host: String, port: U32, path: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match insecure:
+    case True{}:
+      client.once_insecure(host, port, Request{"GET", path, Nil{}, Nil{}})
+    case False{}:
+      client.once(host, port, Request{"GET", path, Nil{}, Nil{}})
+
+def fetch.get(+host: String, port: U32, path: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    r : Result<&1, &1, U32 & String, Response> <- fetch.once(host, port, path, insecure)
+    fetch.text(r)
+
+def fetch_bytes.get(+host: String, port: U32, path: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+    r : Result<&1, &1, U32 & String, Response> <- fetch.once(host, port, path, insecure)
+    fetch.raw(r)
+
+def fetch.host(host: String, +port: U32, path: String, insecure: Bool, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match ok:
+    case True{}:
+      fetch.get(host, port, path, insecure)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad host")})
+
+def fetch_bytes.host(host: String, +port: U32, path: String, insecure: Bool, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match ok:
+    case True{}:
+      fetch_bytes.get(host, port, path, insecure)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
+
+def fetch.url.go(secure: Bool, +host: String, port: U32, path: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match secure:
+    case True{}:
+      fetch.host(host, port, path, insecure, client.on.valid_host(host))
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad scheme")})
+
+def fetch_bytes.url.go(secure: Bool, +host: String, port: U32, path: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match secure:
+    case True{}:
+      fetch_bytes.host(host, port, path, insecure, client.on.valid_host(host))
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad scheme")})
+
+def fetch.url(u: Bool & String & U32 & String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  (secure, host, port, path) = u
+  fetch.url.go(secure, host, port, path, insecure)
+
+def fetch_bytes.url(u: Bool & String & U32 & String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  (secure, host, port, path) = u
+  fetch_bytes.url.go(secure, host, port, path, insecure)
+
+def fetch.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U32 & String>, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match parsed:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
+    case Done{u}:
+      fetch.url(u, insecure)
+
+def fetch_bytes.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U32 & String>, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match parsed:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{e})
+    case Done{u}:
+      fetch_bytes.url(u, insecure)
+
+def fetch(+url: String) -> IO(Result<&1, &1, U32 & String, String>):
+  fetch.r(url, httpx_url.read_url(url), False{})
+
+def fetch_insecure(+url: String) -> IO(Result<&1, &1, U32 & String, String>):
+  fetch.r(url, httpx_url.read_url(url), True{})
+
+def fetch_bytes(+url: String) -> IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  fetch_bytes.r(url, httpx_url.read_url(url), False{})
+
+def fetch_bytes_insecure(+url: String) -> IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  fetch_bytes.r(url, httpx_url.read_url(url), True{})
+
+# request: any method with headers and a String body; answers the
+# response body as String via fetch.text. request_bytes takes raw bytes
+# in and answers raw bytes via fetch.raw. Both are thin aliases over
+# client.once(_insecure) — the one-shot dial/exchange/close lives there
+# (TASK-026 Phase 6; send_request* is gone, not aliased).
+# insecure=False{} verifies.
+# ---------------------------------------------------------------------
+
+def request.once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  match insecure:
+    case True{}:
+      client.once_insecure(host, port, Request{method, path, hs, body})
+    case False{}:
+      client.once(host, port, Request{method, path, hs, body})
+
+def request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+    r : Result<&1, &1, U32 & String, Response> <- request.once(host, port, method, path, hs, body, insecure)
+    fetch.raw(r)
+
+def request_bytes.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match fit:
+    case True{}:
+      request_bytes.go(host, port, path, method, hs, body, insecure)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad request")})
+
+def request_bytes(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  request_bytes.fit(host, port, path, method, hs, body, False{}, client.on.valid.go(host, port, path))
+
+def request_bytes_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  request_bytes.fit(host, port, path, method, hs, body, True{}, client.on.valid.go(host, port, path))
+
+def request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    r : Result<&1, &1, U32 & String, Response> <- request.once(host, port, method, path, hs, x_str_bytes(body), insecure)
+    fetch.text(r)
+
+def request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool, fit: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match fit:
+    case True{}:
+      request.go(host, port, path, method, hs, body, insecure)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
+
+def request(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  request.fit(host, port, path, method, hs, body, False{}, client.on.valid.go(host, port, path))
+
+def request_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  request.fit(host, port, path, method, hs, body, True{}, client.on.valid.go(host, port, path))
 
 # Concurrent slots (Phase D): response assembly per sid. New ClSt type
 # (head is Head, not ReqHead, so St ops cannot reuse without
@@ -4955,11 +5042,13 @@ def client_conc.go(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2
   match insecure:
     case True{}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
         client_conc.conn(~H, conn, host, port, reqs, pending)
     case False{}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
         client_conc.conn(~H, conn, host, port, reqs, pending)
 
 def client_conc.fit_n(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->

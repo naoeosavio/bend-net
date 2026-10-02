@@ -1,6 +1,6 @@
 # Binance individual-symbol book ticker over WSS (task-017 API, live
 # peer). Dials the raw stream endpoint wss://stream.binance.com:9443/ws
-# with WSS.client_on (the verified path: TLS cert + hostname checked),
+# with WSS.client.on (the verified path: TLS cert + hostname checked),
 # sends one SUBSCRIBE frame for the <symbol>@bookTicker stream and
 # prints the best bid/ask of every update.
 #
@@ -159,7 +159,7 @@ law feed:
 
 def feed():
   do IO<Unit>:
-    z : Unit <- WSS.client_on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
+    z : Unit <- WSS.client.on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
     return z
 
 law main:

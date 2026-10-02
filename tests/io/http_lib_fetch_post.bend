@@ -1,7 +1,7 @@
-# lib (http_lib_fetch_post): send_request — POST carries method, headers
+# lib (http_lib_fetch_post): request — POST carries method, headers
 # and body through show_request; the echo handler answers with the
 # method glued to the request body plus the Host header, so the
-# roundtrip proves all three (HTTP/1.1 needs Host, and send_request must
+# roundtrip proves all three (HTTP/1.1 needs Host, and request must
 # inject it). A method with a space fails closed with 400 before
 # touching the net.
 import Base
@@ -147,7 +147,7 @@ def case_post(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "POST", [], "xyz")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/echo", "POST", [], "xyz")
     chk_eq(chan, "POSTxyz|127.0.0.1", r)
 
 law case_get:
@@ -158,7 +158,7 @@ def case_get(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "GET", [("X-Note", "hi")], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/echo", "GET", [("X-Note", "hi")], "")
     chk_eq(chan, "GET|127.0.0.1", r)
 
 law case_bad:
@@ -168,7 +168,7 @@ law case_bad:
 def case_bad(b):
   (l, port) = b
   do IO<U32>:
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "PO ST", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/echo", "PO ST", [], "")
     v : U32 <- chk_bad(r)
     x : Unit <- Listener.close(l)
     return v

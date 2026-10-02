@@ -1,6 +1,6 @@
 # lib (lib_mux_http1_fallback): H1 fallback of the dual client (Phase 11).
 # Server is HTTPX.server_on_http1 (offer http/1.1 only, echo); client is the
-# regular HTTPX.client_once_insecure (offers h2+http/1.1, negotiates
+# regular HTTPX.client.once_insecure (offers h2+http/1.1, negotiates
 # http/1.1, transparently takes the x_h1 lane). Golden 1 iff status 200
 # and body echoes "hello".
 import Base
@@ -35,7 +35,7 @@ def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
     IO.pure(U32, client_score(r))
 
 law server_side:

@@ -1,9 +1,9 @@
 # lib (mux_send_request): String-body requests against mini-H2 server.
 # Server is HTTPX.server_on_concurrent echoing the body; client is
-# HTTPX.send_request_insecure POST "hello" (String in, String out) plus
-# HTTPX.send_request_bytes_insecure (String in, raw bytes out).
+# HTTPX.request_insecure POST "hello" (String in, String out) plus
+# HTTPX.request_bytes_insecure (String in, raw bytes out).
 # Golden 2 iff both answered bodies are "hello". Covers the textual
-# send_request lane (mirror https.send_request) with no http2 import.
+# request lane (mirror https.request) with no http2 import.
 import Base
 import ../../lib/httpx.bend as HTTPX
 
@@ -41,8 +41,8 @@ def client_score_bytes(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, String> <- HTTPX.send_request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
-    rb : Result<&1, &1, U32 & String, List<&2, U32>> <- HTTPX.send_request_bytes_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, String> <- HTTPX.request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
+    rb : Result<&1, &1, U32 & String, List<&2, U32>> <- HTTPX.request_bytes_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, HTTPX.x_str_bytes("hello"))
     IO.pure(U32, (client_score(r) + client_score_bytes(rb) : U32))
 
 law server_side:
