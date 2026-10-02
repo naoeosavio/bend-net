@@ -51,6 +51,27 @@ dropping `rest`) would have needed fixing twice.
   (`h1_once.dial` vs `TCP.connect`), the grammar after it is one — so no
   `x_h1.tcp_one` was added.
 
+## The upgrade lane (task-028 Phases 2–3)
+
+The 101 handshake reuses the same triple, extended with two more
+templates: `~H: Request -> IO(Response)` (answers the handshake) and
+`~K: Socket -> List<&2,U32> -> IO(Unit)` (owns the socket after it).
+
+- Client: `x_h1.cli.exch.open` renders with `upgrade=True` and stops at
+  the head (`head_open` chain). Non-101 is `Fail 502`, fail-closed.
+  `h1_open`/`h1_open_insecure` dial (TLS) and return
+  `Socket & Response & rest` — or close and `Fail` (`h1_open.rewrap`
+  closes on `Fail`, since a refused handshake hands no socket over).
+- Server: `x_h1.srv.answer_open` sends the 101 (`show_resp_head`: no
+  `Content-Length`, no body) and calls `K(sock, rest)` — the socket
+  **leaves** the keep-alive machine and never comes back to phase 3
+  (returning would double-close or steal the frame bytes). Anything else
+  answers through the normal `respond` and **rejoins** the machine
+  (`rejoin` = `head` phase 3 with the leftover seed). The keep-alive
+  machine itself is untouched.
+- Handler `~K` defs take **plain binders** (`sock`, `rest`, not `+rest`):
+  the `~K:` annotation matches un-annotated shapes.
+
 See `tasks/task-028-httpx-h1-upgrade-wsm.md` (Phase 1) for the migration
 record: what was deleted, what was threaded, and the golden gate
 (`.p28/suite.base.txt` vs `.p28/suite.p1.txt`, identical).
