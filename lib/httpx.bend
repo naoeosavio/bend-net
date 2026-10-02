@@ -2556,7 +2556,7 @@ def x_send_rst(sock: Socket, +sid: U32, +code: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   x_send_frame(sock, x_t_rst(), 0, sid, x_be32(code))
 
-# Receive-side credit leaf for the server loops (mold client_on.wu_best,
+# Receive-side credit leaf for the server loops (mold client.on.wu_best,
 # buf carried): best-effort double WINDOW_UPDATE (conn 0 + stream sid);
 # a failed credit still delivers the frame, the dead socket fails next read.
 def httpx.wo(got: Socket & Got) -> Socket:
@@ -2815,7 +2815,6 @@ type CliSt is Data:
 type StreamEv is Data:
   StreamHead{head: Head}
   StreamData{chunk: List<&2, U32>, fin: Bool}
-  StreamFail{code: U32, msg: String}
 
 type StreamOut is Data:
   StreamContinue{}
@@ -2832,85 +2831,85 @@ type SrvOut is Data:
 # Local validation (same Fail 400 as https valid.go; no http import)
 # ------------------------------------------------------------------
 
-def client_on.has_crlf(+s: String) -> Bool:
+def client.on.has_crlf(+s: String) -> Bool:
   Bool.or(String.contains(s, "\r"), String.contains(s, "\n"))
 
-def client_on.nul1() -> String:
+def client.on.nul1() -> String:
   String.from_list([Chr{0}])
 
-def client_on.has_nul(s: String) -> Bool:
-  String.contains(s, client_on.nul1())
+def client.on.has_nul(s: String) -> Bool:
+  String.contains(s, client.on.nul1())
 
-def client_on.has_host_bad(+h: String) -> Bool:
+def client.on.has_host_bad(+h: String) -> Bool:
   Bool.or(String.contains(h, "/"),
     Bool.or(String.contains(h, "?"),
       Bool.or(String.contains(h, "#"), String.contains(h, "@"))))
 
-def client_on.valid_host.put4(sp: Bool) -> Bool:
+def client.on.valid_host.put4(sp: Bool) -> Bool:
   match sp:
     case True{}:
       False{}
     case False{}:
       True{}
 
-def client_on.valid_host.put3(bad: Bool, sp: Bool) -> Bool:
+def client.on.valid_host.put3(bad: Bool, sp: Bool) -> Bool:
   match bad:
     case True{}:
       False{}
     case False{}:
-      client_on.valid_host.put4(sp)
+      client.on.valid_host.put4(sp)
 
-def client_on.valid_host.put2(crlf: Bool, bad: Bool, sp: Bool) -> Bool:
+def client.on.valid_host.put2(crlf: Bool, bad: Bool, sp: Bool) -> Bool:
   match crlf:
     case True{}:
       False{}
     case False{}:
-      client_on.valid_host.put3(bad, sp)
+      client.on.valid_host.put3(bad, sp)
 
-def client_on.valid_host.put(empty: Bool, crlf: Bool, bad: Bool, sp: Bool) -> Bool:
+def client.on.valid_host.put(empty: Bool, crlf: Bool, bad: Bool, sp: Bool) -> Bool:
   match empty:
     case True{}:
       False{}
     case False{}:
-      client_on.valid_host.put2(crlf, bad, sp)
+      client.on.valid_host.put2(crlf, bad, sp)
 
-def client_on.valid_host(+h: String) -> Bool:
-  client_on.valid_host.put(String.is_empty(h), Bool.or(client_on.has_crlf(h), client_on.has_nul(h)), client_on.has_host_bad(h), String.contains(h, " "))
+def client.on.valid_host(+h: String) -> Bool:
+  client.on.valid_host.put(String.is_empty(h), Bool.or(client.on.has_crlf(h), client.on.has_nul(h)), client.on.has_host_bad(h), String.contains(h, " "))
 
-def client_on.valid_port(+p: U32) -> Bool:
+def client.on.valid_port(+p: U32) -> Bool:
   Bool.and(U32.is_ge(p, 1), U32.is_le(p, 65535))
 
-def client_on.valid_path.put3(sp: Bool) -> Bool:
+def client.on.valid_path.put3(sp: Bool) -> Bool:
   match sp:
     case True{}:
       False{}
     case False{}:
       True{}
 
-def client_on.valid_path.put2(crlf: Bool, sp: Bool) -> Bool:
+def client.on.valid_path.put2(crlf: Bool, sp: Bool) -> Bool:
   match crlf:
     case True{}:
       False{}
     case False{}:
-      client_on.valid_path.put3(sp)
+      client.on.valid_path.put3(sp)
 
-def client_on.valid_path.put(slash: Bool, crlf: Bool, sp: Bool) -> Bool:
+def client.on.valid_path.put(slash: Bool, crlf: Bool, sp: Bool) -> Bool:
   match slash:
     case True{}:
-      client_on.valid_path.put2(crlf, sp)
+      client.on.valid_path.put2(crlf, sp)
     case False{}:
       False{}
 
-def client_on.valid_path(+p: String) -> Bool:
-  client_on.valid_path.put(String.starts_with(p, "/"), Bool.or(client_on.has_crlf(p), client_on.has_nul(p)), String.contains(p, " "))
+def client.on.valid_path(+p: String) -> Bool:
+  client.on.valid_path.put(String.starts_with(p, "/"), Bool.or(client.on.has_crlf(p), client.on.has_nul(p)), String.contains(p, " "))
 
-def client_on.valid.go(+host: String, +port: U32, +path: String) -> Bool:
-  Bool.and(client_on.valid_host(host), Bool.and(client_on.valid_port(port), client_on.valid_path(path)))
+def client.on.valid.go(+host: String, +port: U32, +path: String) -> Bool:
+  Bool.and(client.on.valid_host(host), Bool.and(client.on.valid_port(port), client.on.valid_path(path)))
 
 # Authority + request block (mirror https with_authority, Hdr)
 # ---------------------------------------------------------------
 
-def client_on.drop_authority.go(+n: String, +v: String, rec: List<&2, Hdr>, is_auth: Bool) ->
+def client.on.drop_authority.go(+n: String, +v: String, rec: List<&2, Hdr>, is_auth: Bool) ->
   List<&2, Hdr>:
   match is_auth:
     case True{}:
@@ -2918,26 +2917,26 @@ def client_on.drop_authority.go(+n: String, +v: String, rec: List<&2, Hdr>, is_a
     case False{}:
       Hdr{n, v} <> rec
 
-def client_on.drop_authority(hs: List<&2, Hdr>) -> List<&2, Hdr>:
+def client.on.drop_authority(hs: List<&2, Hdr>) -> List<&2, Hdr>:
   match hs:
     case Nil{}:
       Nil{}
     case Hdr{n, v} <> t:
       +nn = n
       +vv = v
-      client_on.drop_authority.go(nn, vv, client_on.drop_authority(t), String.eq(nn, ":authority"))
+      client.on.drop_authority.go(nn, vv, client.on.drop_authority(t), String.eq(nn, ":authority"))
 
-def client_on.with_authority(+host: String, +port: U32, hs: List<&2, Hdr>) ->
+def client.on.with_authority(+host: String, +port: U32, hs: List<&2, Hdr>) ->
   List<&2, Hdr>:
-  Hdr{":authority", host ++ ":" ++ U32.show(port)} <> client_on.drop_authority(hs)
+  Hdr{":authority", host ++ ":" ++ U32.show(port)} <> client.on.drop_authority(hs)
 
-def client_on.req_hdrs(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
+def client.on.req_hdrs(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
   List<&2, Hdr>:
-  List.append(&2, Hdr, [Hdr{":method", method}, Hdr{":path", path}, Hdr{":scheme", "https"}], client_on.with_authority(host, port, hs))
+  List.append(&2, Hdr, [Hdr{":method", method}, Hdr{":path", path}, Hdr{":scheme", "https"}], client.on.with_authority(host, port, hs))
 
-def client_on.req_block(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
+def client.on.req_block(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>) ->
   List<&2, U32>:
-  x_block(client_on.req_hdrs(host, port, method, path, hs))
+  x_block(client.on.req_hdrs(host, port, method, path, hs))
 
 # Window-update + RST sends (best-effort credit, mold h2_send_wu_len)
 # -------------------------------------------------------------------
@@ -2947,30 +2946,30 @@ def client_on.req_block(+host: String, +port: U32, +method: String, +path: Strin
 # (mirror h2_cont_read; narrow single-@unsafe loop)
 # ----------------------------------------------------------
 
-def client_on.cont_end(last: Bool) -> U32:
+def client.on.cont_end(last: Bool) -> U32:
   match last:
     case True{}:
       0
     case False{}:
       1
 
-def client_on.cont_ok(+typ: U32, +sid: U32, +exp: U32) -> Bool:
+def client.on.cont_ok(+typ: U32, +sid: U32, +exp: U32) -> Bool:
   Bool.and(U32.is_eq(typ, x_t_cont()), Bool.and(U32.is_eq(sid, exp), U32.is_gt(sid, 0)))
 
-def client_on.cont_last(+flags: U32) -> Bool:
+def client.on.cont_last(+flags: U32) -> Bool:
   U32.is_eq(U32.and(flags, x_f_end_headers()), x_f_end_headers())
 
-def client_on.cont_cls(+typ: U32, +sid2: U32, +sid: U32, +flags: U32, ok: Bool) -> U32:
+def client.on.cont_cls(+typ: U32, +sid2: U32, +sid: U32, +flags: U32, ok: Bool) -> U32:
   match ok:
     case True{}:
-      client_on.cont_end(client_on.cont_last(flags))
+      client.on.cont_end(client.on.cont_last(flags))
     case False{}:
       2
 
-def client_on.cont_cls_of(+typ: U32, +sid2: U32, +sid: U32, +flags: U32) -> U32:
-  client_on.cont_cls(typ, sid2, sid, flags, client_on.cont_ok(typ, sid2, sid))
+def client.on.cont_cls_of(+typ: U32, +sid2: U32, +sid: U32, +flags: U32) -> U32:
+  client.on.cont_cls(typ, sid2, sid, flags, client.on.cont_ok(typ, sid2, sid))
 
-def client_on.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client.on.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, Cont>):
   (s, r) = sent
   match r:
@@ -2980,7 +2979,7 @@ def client_on.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
       IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s, Fail{(502, "continuation")}))
 
 @unsafe
-def client_on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & Got, +cls: U32, +frag: List<&2, U32>) ->
+def client.on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & Got, +cls: U32, +frag: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Cont>):
   match phase:
     case 0:
@@ -2991,104 +2990,104 @@ def client_on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<
             case 0:
               do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
                 got2 : Socket & Got <- x_read_frame(s0, buf)
-                client_on.cont_read(0, sid, acc, buf, got2, 0, Nil{})
+                client.on.cont_read(0, sid, acc, buf, got2, 0, Nil{})
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s0, Fail{(code, msg)}))
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ, +flags, +sid2, +payload}:
-              client_on.cont_read(1, sid, acc, buf2, (s0, GotErr{0, "next"}), client_on.cont_cls_of(typ, sid2, sid, flags), payload)
+              client.on.cont_read(1, sid, acc, buf2, (s0, GotErr{0, "next"}), client.on.cont_cls_of(typ, sid2, sid, flags), payload)
     case 1:
       (s1, g1) = prev
       match cls:
         case 0:
           IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s1, Done{Cont{List.append(&2, U32, acc, frag), buf}}))
         case 1:
-          client_on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, GotErr{0, "next"}), 0, Nil{})
+          client.on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, GotErr{0, "next"}), 0, Nil{})
         case _:
           do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s1, 0, 1)
-            client_on.cont_failed(sent)
+            client.on.cont_failed(sent)
     case _:
       (sx, gx) = prev
       IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (sx, Fail{(502, "bad phase")}))
 
-def client_on.cont_start(sock: Socket, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>) ->
+def client.on.cont_start(sock: Socket, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Cont>):
-  client_on.cont_read(0, sid, acc, buf, (sock, GotErr{0, "next"}), 0, Nil{})
+  client.on.cont_read(0, sid, acc, buf, (sock, GotErr{0, "next"}), 0, Nil{})
 
 # Single-stream drain leafs (once/keep-alive share; streaming adds WU)
 # ---------------------------------------------------------------------
 
-def client_on.again(s: Socket) -> Socket & Got:
+def client.on.again(s: Socket) -> Socket & Got:
   (s, GotOk{Frame{0, 0, 0, Nil{}}, Nil{}})
 
-def client_on.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
+def client.on.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
   (s2, r) = sent
-  client_on.again(s2)
+  client.on.again(s2)
 
-def client_on.ack(got: Socket & Got) -> IO(Socket & Got):
+def client.on.ack(got: Socket & Got) -> IO(Socket & Got):
   (s, g) = got
   do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
-    IO.pure(Socket & Got, client_on.sent(sent))
+    IO.pure(Socket & Got, client.on.sent(sent))
 
-def client_on.ack_ping(got: Socket & Got, +payload: List<&2, U32>) -> IO(Socket & Got):
+def client.on.ack_ping(got: Socket & Got, +payload: List<&2, U32>) -> IO(Socket & Got):
   (s, g) = got
   do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, payload)
-    IO.pure(Socket & Got, client_on.sent(sent))
+    IO.pure(Socket & Got, client.on.sent(sent))
 
-def client_on.resp_of(+head: Head, +body: List<&2, U32>) -> Response:
+def client.on.resp_of(+head: Head, +body: List<&2, U32>) -> Response:
   match head:
     case Head{+status, +headers}:
       Response{status, headers, body}
 
-def client_on.head_status(+head: Head) -> U32:
+def client.on.head_status(+head: Head) -> U32:
   match head:
     case Head{+status, headers}:
       status
 
-def client_on.has_head(+head: Head) -> Bool:
-  U32.is_ne(client_on.head_status(head), 0)
+def client.on.has_head(+head: Head) -> Bool:
+  U32.is_ne(client.on.head_status(head), 0)
 
-def client_on.mine_go(+cls: U32, is_stream: Bool, is_mine: Bool) -> U32:
+def client.on.mine_go(+cls: U32, is_stream: Bool, is_mine: Bool) -> U32:
   match is_stream is_mine:
     case True{} False{}:
       0
     case _ _:
       cls
 
-def client_on.mine_cls(+cls: U32, +sid2: U32, +exp: U32) -> U32:
-  client_on.mine_go(cls, U32.is_eq(cls, 6), U32.is_eq(sid2, exp))
+def client.on.mine_cls(+cls: U32, +sid2: U32, +exp: U32) -> U32:
+  client.on.mine_go(cls, U32.is_eq(cls, 6), U32.is_eq(sid2, exp))
 
 # Upload cap removed (item 2): the flow sender slices DATA to peer windows
 # (server gives WU per DATA). Bodies any size go through; the H1 lane keeps
 # its own fail-closed 16KB server cap (subset decision, untouched).
-def client_on.body_ok(+body: List<&2, U32>) -> Bool:
+def client.on.body_ok(+body: List<&2, U32>) -> Bool:
   True{}
 
-def client_on.head_flags(is_empty: Bool) -> U32:
+def client.on.head_flags(is_empty: Bool) -> U32:
   match is_empty:
     case True{}:
       (x_f_end_headers() + x_f_end_stream() : U32)
     case False{}:
       x_f_end_headers()
 
-def client_on.fail(got: Socket & Got, +tab: Tab, +code: U32, +msg: String) ->
+def client.on.fail(got: Socket & Got, +tab: Tab, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Fail{(code, msg)}, tab))
 
-def client_on.done(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>) ->
+def client.on.done(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
-  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client_on.resp_of(head, x_cat(body))}, tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client.on.resp_of(head, x_cat(body))}, tab))
 
-def client_on.done_data(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>, +payload: List<&2, U32>) ->
+def client.on.done_data(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&2, U32>, +payload: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (s, g) = got
-  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client_on.resp_of(head, x_cat(x_rev_push(payload, body)))}, tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client.on.resp_of(head, x_cat(x_rev_push(payload, body)))}, tab))
 
 # Single-stream response drain (once shape; keep-alive threads tab/sid
 # outside). Phases: 0 read, 1 decompose, 2 conn dispatch, 3 stream
@@ -3099,14 +3098,14 @@ def client_on.done_data(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&
 # ---------------------------------------------------------------------
 
 @unsafe
-def client_on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +body: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
+def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +body: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
         got2 : Socket & Got <- x_read_frame(s0, buf)
-        client_on.drain(1, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+        client.on.drain(1, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 1:
       (s1, g1) = got
       match g1:
@@ -3115,72 +3114,72 @@ def client_on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              client_on.drain(2, (s1, GotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
+              client.on.drain(2, (s1, GotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client.on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
     case 2:
       match cls:
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
-            got2 : Socket & Got <- client_on.ack(got)
-            client_on.drain(0, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            got2 : Socket & Got <- client.on.ack(got)
+            client.on.drain(0, got2, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 4:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
-            gotp : Socket & Got <- client_on.ack_ping(got, payload)
-            client_on.drain(0, gotp, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            gotp : Socket & Got <- client.on.ack_ping(got, payload)
+            client.on.drain(0, gotp, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
-          client_on.fail(got, tab, 502, "goaway")
+          client.on.fail(got, tab, 502, "goaway")
         case 7:
-          client_on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 9:
-          client_on.fail(got, tab, 502, "bad window_update")
+          client.on.fail(got, tab, 502, "bad window_update")
         case 8:
-          client_on.fail(got, tab, 502, "continuation")
+          client.on.fail(got, tab, 502, "continuation")
         case 2:
-          client_on.fail(got, tab, 502, "rst_stream")
+          client.on.fail(got, tab, 502, "rst_stream")
         case 6:
-          client_on.drain(3, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, 4)
+          client.on.drain(3, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, 4)
         case 0:
-          client_on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case _:
-          client_on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 3:
       match typ:
         case 1:
           +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client_on.drain(4, got, buf, x_resp.tab(dr), x_resp.rh(dr), body, typ, flags, sid2, payload, cls, end, exp, httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
+          client.on.drain(4, got, buf, x_resp.tab(dr), x_resp.rh(dr), body, typ, flags, sid2, payload, cls, end, exp, httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
         case 0:
-          client_on.drain(5, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, httpxn.decide_data(client_on.has_head(head), end))
+          client.on.drain(5, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, httpxn.decide_data(client.on.has_head(head), end))
         case _:
-          client_on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 4:
       match act:
         case 0:
-          client_on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
-          client_on.done(got, tab, head, body)
+          client.on.done(got, tab, head, body)
         case 6:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
-            cres : Socket & Result<&1, &1, U32 & String, Cont> <- client_on.cont_start(httpx.wo(got), exp, payload, buf)
-            client_on.drain_conted(cres, tab, body, end, exp)
+            cres : Socket & Result<&1, &1, U32 & String, Cont> <- client.on.cont_start(httpx.wo(got), exp, payload, buf)
+            client.on.drain_conted(cres, tab, body, end, exp)
         case 5:
-          client_on.fail(got, tab, 502, "head decode")
+          client.on.fail(got, tab, 502, "head decode")
         case _:
-          client_on.fail(got, tab, 502, "head")
+          client.on.fail(got, tab, 502, "head")
     case 5:
       match act:
         case 0:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
-            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
-            client_on.drain(0, got2, buf, tab, head, x_rev_push(payload, body), 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            client.on.drain(0, got2, buf, tab, head, x_rev_push(payload, body), 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
-            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
-            client_on.done_data(got2, tab, head, body, payload)
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            client.on.done_data(got2, tab, head, body, payload)
         case 4:
-          client_on.fail(got, tab, 502, "stray data")
+          client.on.fail(got, tab, 502, "stray data")
         case _:
-          client_on.fail(got, tab, 502, "data")
+          client.on.fail(got, tab, 502, "data")
     case _:
-      client_on.fail(got, tab, 502, "bad phase")
+      client.on.fail(got, tab, 502, "bad phase")
 
 # CONTINUATION finish for drain (Phase 15 item 1): cont_start (above)
 # reassembles the header block inline-blocking (RFC 9113 section 6.10:
@@ -3191,29 +3190,29 @@ def client_on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
 # ---------------------------------------------------------------------
 
 @unsafe
-def client_on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +body: List<&2, U32>, +end: U32, +exp: U32) ->
+def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +body: List<&2, U32>, +end: U32, +exp: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (cs, cr) = cres
   match cr:
     case Fail{(fc, fm)}:
-      client_on.fail(client_on.again(cs), tab, fc, fm)
+      client.on.fail(client.on.again(cs), tab, fc, fm)
     case Done{+mc}:
       match mc:
         case Cont{+block, +rest}:
           +dr2 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(block, tab)
-          client_on.drain(4, client_on.again(cs), rest, x_resp.tab(dr2), x_resp.rh(dr2), body, 1, 4, exp, Nil{}, 0, end, exp, httpxn.head_act(0, x_resp.ok(dr2), end))
+          client.on.drain(4, client.on.again(cs), rest, x_resp.tab(dr2), x_resp.rh(dr2), body, 1, 4, exp, Nil{}, 0, end, exp, httpxn.head_act(0, x_resp.ok(dr2), end))
 
 # Dial + preface (ALPN h2 required; non-H2 closes fail-closed 615)
 # ---------------------------------------------------------------
 
-def client_on.preface_bytes() -> List<&2, U32>:
+def client.on.preface_bytes() -> List<&2, U32>:
   List.append(&2, U32, x_preface(), x_frame_write(x_t_settings(), 0, 0, x_settings_initial_pay()))
 
-def client_on.send_preface(sock: Socket) ->
+def client.on.send_preface(sock: Socket) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  TLS.tls_send_bytes(sock, client_on.preface_bytes())
+  TLS.tls_send_bytes(sock, client.on.preface_bytes())
 
-def client_on.prefaced(pre: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client.on.prefaced(pre: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   (sock, r) = pre
   match r:
@@ -3224,47 +3223,47 @@ def client_on.prefaced(pre: Socket & Result<&1, &1, U32 & String, Unit>) ->
     case Done{u}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
 
-def client_on.alpn_go(sock: Socket, is_h2: Bool) ->
+def client.on.alpn_go(sock: Socket, is_h2: Bool) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match is_h2:
     case True{}:
       do IO<Result<&1, &1, U32 & String, Socket>>:
-        pre : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_preface(sock)
-        client_on.prefaced(pre)
+        pre : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_preface(sock)
+        client.on.prefaced(pre)
     case False{}:
       do IO<Result<&1, &1, U32 & String, Socket>>:
         x : Unit <- TLS.tls_close(sock)
         IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{(615, "alpn mismatch")})
 
-def client_on.alpn_conn(conn: Result<&1, &1, U32 & String, Socket & String>) ->
+def client.on.alpn_conn(conn: Result<&1, &1, U32 & String, Socket & String>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
     case Done{value}:
       (sock, protocol) = value
-      client_on.alpn_go(sock, TLS.tls_alpn_is_h2(protocol))
+      client.on.alpn_go(sock, TLS.tls_alpn_is_h2(protocol))
 
-def client_on.connect_secure(+host: String, +port: U32) ->
+def client.on.connect_secure(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   do IO<Result<&1, &1, U32 & String, Socket>>:
     conn : Result<&1, &1, U32 & String, Socket & String> <- TLS.tls_connect_any(host, port)
-    client_on.alpn_conn(conn)
+    client.on.alpn_conn(conn)
 
-def client_on.connect_insecure(+host: String, +port: U32) ->
+def client.on.connect_insecure(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   do IO<Result<&1, &1, U32 & String, Socket>>:
     conn : Result<&1, &1, U32 & String, Socket & String> <- TLS.tls_connect_any_insecure(host, port)
-    client_on.alpn_conn(conn)
+    client.on.alpn_conn(conn)
 
 # Request send (HEADERS + one DATA; upload cap 16KB checked by caller)
 # --------------------------------------------------------------------
 
-def client_on.send_req_head(sock: Socket, +sid: U32, +block: List<&2, U32>, is_empty: Bool) ->
+def client.on.send_req_head(sock: Socket, +sid: U32, +block: List<&2, U32>, is_empty: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  x_send_frame(sock, x_t_headers(), client_on.head_flags(is_empty), sid, block)
+  x_send_frame(sock, x_t_headers(), client.on.head_flags(is_empty), sid, block)
 
-def client_on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
+def client.on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   (sock, r) = sent
   match r:
@@ -3277,47 +3276,12 @@ def client_on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +
         case False{}:
           x_send_data_start(sock, sid, body)
 
-def client_on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   +empty = List.is_empty(&2, U32, body)
   do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req_head(sock, sid, client_on.req_block(host, port, method, path, hs), empty)
-    client_on.send_req_body(sent, sid, body, empty)
-
-# Once (dial, one exchange sid 1, close). Insecure twin for loopback.
-# ------------------------------------------------------------------
-
-def client_once.drained(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  (s, r, t) = drained
-  match r:
-    case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{+resp}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- TLS.tls_close(s)
-        IO.pure(Result<&1, &1, U32 & String, Response>, Done{resp})
-
-def client_once.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  (sock, r) = sent
-  match r:
-    case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{u}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client_on.drain(0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, 1, 4)
-        client_once.drained(drained)
-
-def client_once.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  do IO<Result<&1, &1, U32 & String, Response>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, 1, host, port, method, path, hs, body)
-    client_once.sent(sent)
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req_head(sock, sid, client.on.req_block(host, port, method, path, hs), empty)
+    client.on.send_req_body(sent, sid, body, empty)
 
 # H1 lane, ported patterns (Phase 11): http.bend is the base that works,
 # so its shapes come over verbatim (window scan, recurse-in-args with
@@ -3332,7 +3296,7 @@ def x_h1.eq_ci(a: String, b: String) -> Bool:
   String.eq(String.to_lower(a), String.to_lower(b))
 
 def x_h1.bad_char(+s: String) -> Bool:
-  Bool.or(client_on.has_crlf(s), client_on.has_nul(s))
+  Bool.or(client.on.has_crlf(s), client.on.has_nul(s))
 
 def x_h1.forbidden(+name: String) -> Bool:
   Bool.or(String.starts_with(name, ":"),
@@ -3814,11 +3778,11 @@ def h1_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: L
 
 def h1_once(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
-  h1_once.fit(host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
+  h1_once.fit(host, port, method, path, hs, body, False{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
-  h1_once.fit(host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
+  h1_once.fit(host, port, method, path, hs, body, True{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 # Dual-dial dispatch for once/fetch: h2 → preface+exchange (existing
 # path, byte-identical); http/1.1 → H1 lane on the same socket (this
@@ -4182,14 +4146,14 @@ def send_request_bytes_insecure(+host: String, +port: U32, +path: String, +metho
 # (best-effort, mold h2_send_wu_len); Cancel sends RST_STREAM (8) + Fail.
 # ---------------------------------------------------------------------
 
-def client_on.is_cont(+out: StreamOut) -> Bool:
+def client.on.is_cont(+out: StreamOut) -> Bool:
   match out:
     case StreamContinue{}:
       True{}
     case StreamCancel{}:
       False{}
 
-def client_on.stream_act(is_cont: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
+def client.on.stream_act(is_cont: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
   match is_cont need ok end:
     case False{} _ _ _:
       7
@@ -4202,7 +4166,7 @@ def client_on.stream_act(is_cont: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
     case _ _ _ _:
       0
 
-def client_on.sdata_act(is_cont: Bool, has: Bool, +end: U32) -> U32:
+def client.on.sdata_act(is_cont: Bool, has: Bool, +end: U32) -> U32:
   match is_cont has end:
     case False{} _ _:
       7
@@ -4213,29 +4177,29 @@ def client_on.sdata_act(is_cont: Bool, has: Bool, +end: U32) -> U32:
     case _ _ _:
       0
 
-def client_on.sfail(got: Socket & Got, +code: U32, +msg: String) ->
+def client.on.sfail(got: Socket & Got, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Fail{(code, msg)}))
 
-def client_on.sdone(got: Socket & Got, +total: U32, +fins: U32) ->
+def client.on.sdone(got: Socket & Got, +total: U32, +fins: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Done{(total, fins)}))
 
-def client_on.cancel_done(rst: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client.on.cancel_done(rst: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s2, r2) = rst
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s2, Fail{(8, "cancelled")}))
 
-def client_on.cancelled(got: Socket & Got, +sid: U32) ->
+def client.on.cancelled(got: Socket & Got, +sid: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
   do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
     rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s, sid, 8)
-    client_on.cancel_done(rst)
+    client.on.cancel_done(rst)
 
-def client_on.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) ->
+def client.on.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) ->
   Socket & Got:
   (s, r) = sent
   match r:
@@ -4244,22 +4208,22 @@ def client_on.wu_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: Li
     case Done{u}:
       (s, GotOk{Frame{0, 0, 0, Nil{}}, buf})
 
-def client_on.wu_blest(got: Socket & Got, buf: List<&2, U32>, +sid: U32, +inc: U32) -> IO(Socket & Got):
+def client.on.wu_blest(got: Socket & Got, buf: List<&2, U32>, +sid: U32, +inc: U32) -> IO(Socket & Got):
   (s, g) = got
   do IO<Socket & Got>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_wu_len(s, sid, inc)
-    IO.pure(Socket & Got, client_on.wu_kept(sent, buf))
+    IO.pure(Socket & Got, client.on.wu_kept(sent, buf))
 
 # CONTINUATION inline leaves for sdrop (Phase 15 item 2): fresh Err-next
 # pair to (re)enter the cont-read phase, and GOAWAY-fail mapping for a
-# bad CONT frame (mirror client_on.cont_failed, sdrop result shape).
+# bad CONT frame (mirror client.on.cont_failed, sdrop result shape).
 # Pure leaves above the loop (callee-above-caller, no ~H inside).
 # ---------------------------------------------------------------------
 
-def client_on.sdrop_next(s: Socket) -> Socket & Got:
+def client.on.sdrop_next(s: Socket) -> Socket & Got:
   (s, GotErr{0, "next"})
 
-def client_on.sdrop_sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client.on.sdrop_sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, r) = sent
   match r:
@@ -4269,14 +4233,14 @@ def client_on.sdrop_sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) 
       IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s, Fail{(502, "continuation")}))
 
 @unsafe
-def client_on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
+def client.on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +head: Head, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +exp: U32, act: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
         got2 : Socket & Got <- x_read_frame(s0, buf)
-        client_on.sdrop(~H, 1, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+        client.on.sdrop(~H, 1, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 1:
       (s1, g1) = got
       match g1:
@@ -4285,33 +4249,33 @@ def client_on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              client_on.sdrop(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, head, total, fins, typ2, flags2, sid22, payload2, client_on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
+              client.on.sdrop(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, head, total, fins, typ2, flags2, sid22, payload2, client.on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
     case 2:
       match cls:
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & Got <- client_on.ack(got)
-            client_on.sdrop(~H, 0, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            got2 : Socket & Got <- client.on.ack(got)
+            client.on.sdrop(~H, 0, got2, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 4:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            gotp : Socket & Got <- client_on.ack_ping(got, payload)
-            client_on.sdrop(~H, 0, gotp, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            gotp : Socket & Got <- client.on.ack_ping(got, payload)
+            client.on.sdrop(~H, 0, gotp, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
-          client_on.sfail(got, 502, "goaway")
+          client.on.sfail(got, 502, "goaway")
         case 7:
-          client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 9:
-          client_on.sfail(got, 502, "bad window_update")
+          client.on.sfail(got, 502, "bad window_update")
         case 8:
-          client_on.sfail(got, 502, "continuation")
+          client.on.sfail(got, 502, "continuation")
         case 2:
-          client_on.sfail(got, 502, "rst_stream")
+          client.on.sfail(got, 502, "rst_stream")
         case 6:
-          client_on.sdrop(~H, 3, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, 4)
+          client.on.sdrop(~H, 3, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, 4)
         case 0:
-          client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case _:
-          client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 3:
       match typ:
         case 1:
@@ -4321,43 +4285,43 @@ def client_on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
           +ok : Bool = x_resp.ok(dr)
           +need : U32 = httpxn.need_u(typ, flags)
           +out : StreamOut = H(StreamHead{nh})
-          client_on.sdrop(~H, 4, got, buf, nt, nh, total, fins, typ, flags, sid2, payload, cls, end, exp, client_on.stream_act(client_on.is_cont(out), need, ok, end))
+          client.on.sdrop(~H, 4, got, buf, nt, nh, total, fins, typ, flags, sid2, payload, cls, end, exp, client.on.stream_act(client.on.is_cont(out), need, ok, end))
         case 0:
           +fin : Bool = U32.is_eq(end, 1)
           +out0 : StreamOut = H(StreamData{payload, fin})
-          client_on.sdrop(~H, 5, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, client_on.sdata_act(client_on.is_cont(out0), client_on.has_head(head), end))
+          client.on.sdrop(~H, 5, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, client.on.sdata_act(client.on.is_cont(out0), client.on.has_head(head), end))
         case _:
-          client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
     case 4:
       match act:
         case 0:
-          client_on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+          client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
-          client_on.sdone(got, total, (fins + 1 : U32))
+          client.on.sdone(got, total, (fins + 1 : U32))
         case 6:
-          client_on.sdrop(~H, 6, client_on.sdrop_next(httpx.wo(got)), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
+          client.on.sdrop(~H, 6, client.on.sdrop_next(httpx.wo(got)), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
         case 5:
-          client_on.sfail(got, 502, "head decode")
+          client.on.sfail(got, 502, "head decode")
         case 7:
-          client_on.cancelled(got, sid2)
+          client.on.cancelled(got, sid2)
         case _:
-          client_on.sfail(got, 502, "head")
+          client.on.sfail(got, 502, "head")
     case 5:
       match act:
         case 0:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
-            client_on.sdrop(~H, 0, got2, buf, tab, head, (total + x_len32(payload) : U32), fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            client.on.sdrop(~H, 0, got2, buf, tab, head, (total + x_len32(payload) : U32), fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
-            got2 : Socket & Got <- client_on.wu_blest(got, buf, sid2, x_len32(payload))
-            client_on.sdone(got2, (total + x_len32(payload) : U32), (fins + 1 : U32))
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            client.on.sdone(got2, (total + x_len32(payload) : U32), (fins + 1 : U32))
         case 4:
-          client_on.sfail(got, 502, "stray data")
+          client.on.sfail(got, 502, "stray data")
         case 7:
-          client_on.cancelled(got, sid2)
+          client.on.cancelled(got, sid2)
         case _:
-          client_on.sfail(got, 502, "data")
+          client.on.sfail(got, 502, "data")
     case 6:
       (s6, g6) = got
       match g6:
@@ -4366,27 +4330,27 @@ def client_on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
             case 0:
               do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
                 got6 : Socket & Got <- x_read_frame(s6, buf)
-                client_on.sdrop(~H, 6, got6, buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
+                client.on.sdrop(~H, 6, got6, buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s6, Fail{(code6, msg6)}))
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client_on.sdrop(~H, 7, (s6, GotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, exp, flags6), end, exp, 0)
+              client.on.sdrop(~H, 7, (s6, GotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, exp, flags6), end, exp, 0)
     case 7:
       (s7, g7) = got
       match cls:
         case 0:
           +dr7 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client_on.sdrop(~H, 4, client_on.again(s7), buf, x_resp.tab(dr7), x_resp.rh(dr7), total, fins, typ, flags, sid2, Nil{}, cls, end, exp, httpxn.head_act(0, x_resp.ok(dr7), end))
+          client.on.sdrop(~H, 4, client.on.again(s7), buf, x_resp.tab(dr7), x_resp.rh(dr7), total, fins, typ, flags, sid2, Nil{}, cls, end, exp, httpxn.head_act(0, x_resp.ok(dr7), end))
         case 1:
-          client_on.sdrop(~H, 6, client_on.sdrop_next(s7), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
+          client.on.sdrop(~H, 6, client.on.sdrop_next(s7), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
         case _:
           do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s7, 0, 1)
-            client_on.sdrop_sendfail(sent)
+            client.on.sdrop_sendfail(sent)
     case _:
-      client_on.sfail(got, 502, "bad phase")
+      client.on.sfail(got, 502, "bad phase")
 
 # Streaming public (dial, one request sid 1, handler counts, close)
 # ------------------------------------------------------------------
@@ -4414,13 +4378,13 @@ def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, 
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client_on.sdrop(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client.on.sdrop(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
         client_stream.drained(drained)
 
 def client_stream.exch(~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, 1, host, port, method, path, hs, body)
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, 1, host, port, method, path, hs, body)
     client_stream.sent(~H, sent)
 
 def client_stream.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
@@ -4436,11 +4400,11 @@ def client_stream.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +meth
   match insecure:
     case True{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
         client_stream.conn(~H, conn, host, port, method, path, hs, body)
     case False{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
         client_stream.conn(~H, conn, host, port, method, path, hs, body)
 
 def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
@@ -4455,38 +4419,38 @@ def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +met
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(400, "bad request")})
 
-def client_on_stream(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.stream(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  client_stream.fit(~H, host, port, method, path, hs, body, False{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
+  client_stream.fit(~H, host, port, method, path, hs, body, False{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
-def client_on_stream_insecure(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.stream_insecure(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  client_stream.fit(~H, host, port, method, path, hs, body, True{}, client_on.valid.go(host, port, path), client_on.body_ok(body))
+  client_stream.fit(~H, host, port, method, path, hs, body, True{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 # Keep-alive (Phase C): one dial, sequential sids 1,3,5…, caller threads
 # Socket + CliSt{sid,tab} (tab persists for dyn reuse). Request never
 # closes (caller closes after last); validation fails keep sid/tab.
 # ---------------------------------------------------------------------
 
-def client_on.st_sid(+st: CliSt) -> U32:
+def client.on.st_sid(+st: CliSt) -> U32:
   match st:
     case CliSt{+sid, tab}:
       sid
 
-def client_on.st_tab(+st: CliSt) -> Tab:
+def client.on.st_tab(+st: CliSt) -> Tab:
   match st:
     case CliSt{sid, +tab}:
       tab
 
-def client_on.next_sid(+sid: U32) -> U32:
+def client.on.next_sid(+sid: U32) -> U32:
   (sid + 2 : U32)
 
-def client_on.next_st(+st: CliSt, +tab: Tab) -> CliSt:
+def client.on.next_st(+st: CliSt, +tab: Tab) -> CliSt:
   match st:
     case CliSt{+sid, old}:
-      CliSt{client_on.next_sid(sid), tab}
+      CliSt{client.on.next_sid(sid), tab}
 
-def client_on.wrap_conn(conn: Result<&1, &1, U32 & String, Socket>) ->
+def client.on.wrap_conn(conn: Result<&1, &1, U32 & String, Socket>) ->
   Result<&1, &1, U32 & String, Socket & CliSt>:
   match conn:
     case Fail{e}:
@@ -4494,28 +4458,28 @@ def client_on.wrap_conn(conn: Result<&1, &1, U32 & String, Socket>) ->
     case Done{sock}:
       Done{(sock, CliSt{1, x_tab.empty()})}
 
-def client_on.keep_connect(+host: String, +port: U32) ->
+def client.connect(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & CliSt>):
   do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client_on.wrap_conn(conn))
+    conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
+    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client.on.wrap_conn(conn))
 
-def client_on.keep_connect_insecure(+host: String, +port: U32) ->
+def client.connect_insecure(+host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & CliSt>):
   do IO<Result<&1, &1, U32 & String, Socket & CliSt>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_insecure(host, port)
-    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client_on.wrap_conn(conn))
+    conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
+    IO.pure(Result<&1, &1, U32 & String, Socket & CliSt>, client.on.wrap_conn(conn))
 
-def client_on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab, +st: CliSt) ->
+def client.on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, Response> & Tab, +st: CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   (s, r, t) = drained
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Fail{e}, client_on.next_st(st, t)))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Fail{e}, client.on.next_st(st, t)))
     case Done{+resp}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Done{resp}, client_on.next_st(st, t)))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Done{resp}, client.on.next_st(st, t)))
 
-def client_on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: CliSt) ->
+def client.on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   (sock, r) = sent
   match r:
@@ -4523,30 +4487,30 @@ def client_on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: 
       IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{e}, st))
     case Done{u}:
       do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client_on.drain(0, (sock, GotErr{0, "next"}), Nil{}, client_on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client_on.st_sid(st), 4)
-        client_on.drained_keep(drained, st)
+        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client.on.drain(0, (sock, GotErr{0, "next"}), Nil{}, client.on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client.on.st_sid(st), 4)
+        client.on.drained_keep(drained, st)
 
-def client_on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, client_on.st_sid(st), host, port, method, path, hs, body)
-    client_on.sent_keep(sent, st)
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, client.on.st_sid(st), host, port, method, path, hs, body)
+    client.on.sent_keep(sent, st)
 
-def client_on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+def client.on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          client_on.exch_keep(sock, st, host, port, method, path, hs, body)
+          client.on.exch_keep(sock, st, host, port, method, path, hs, body)
         case False{}:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(413, "req too large")}, st))
     case False{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(400, "bad request")}, st))
 
-def client_on_request(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.request(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
-  client_on.fit_keep(sock, st, host, port, method, path, hs, body, client_on.valid.go(host, port, path), client_on.body_ok(body))
+  client.on.fit_keep(sock, st, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 # Sequential batch entry (Phase 10): one dial, N requests back-to-back
 # on sids 1,3,5..., answers in request order. First Fail aborts the
@@ -4589,7 +4553,7 @@ def client_seq.done(rest: List<&2, Request>, +acc: List<&2, Response>, got: Sock
             IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
         case Done{+resp}:
           do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            got3 : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client_on_request(s2, st2, host, port, method, path, headers, body)
+            got3 : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(s2, st2, host, port, method, path, headers, body)
             client_seq.done(t, resp <> acc, got3, host, port)
 
 def client_seq.first(sock: Socket, +st: CliSt, +host: String, +port: U32, reqs: List<&2, Request>) ->
@@ -4601,7 +4565,7 @@ def client_seq.first(sock: Socket, +st: CliSt, +host: String, +port: U32, reqs: 
         IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
     case Request{+method, +path, +headers, +body} <> t:
       do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        got : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client_on_request(sock, st, host, port, method, path, headers, body)
+        got : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(sock, st, host, port, method, path, headers, body)
         client_seq.done(t, Nil{}, got, host, port)
 
 def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, reqs: List<&2, Request>) ->
@@ -4613,16 +4577,16 @@ def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: S
       (sock0, st0) = value
       client_seq.first(sock0, st0, host, port, reqs)
 
-def client_on(+host: String, +port: U32, +reqs: List<&2, Request>) ->
+def client.on(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client_on.keep_connect(host, port)
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect(host, port)
     client_seq.conn(conn, host, port, reqs)
 
-def client_on_insecure(+host: String, +port: U32, +reqs: List<&2, Request>) ->
+def client.on_insecure(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client_on.keep_connect_insecure(host, port)
+    conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect_insecure(host, port)
     client_seq.conn(conn, host, port, reqs)
 
 # Concurrent slots (Phase D): response assembly per sid. New ClSt type
@@ -4775,7 +4739,7 @@ def client_conc.valid_go(reqs: List<&2, Request>, +host: String, +port: U32, ok:
     case Nil{}:
       ok
     case Request{method, path, headers, body} <> t:
-      client_conc.valid_go(t, host, port, Bool.and(ok, Bool.and(client_on.valid.go(host, port, path), client_on.body_ok(body))))
+      client_conc.valid_go(t, host, port, Bool.and(ok, Bool.and(client.on.valid.go(host, port, path), client.on.body_ok(body))))
 
 def client_conc.valid_all(reqs: List<&2, Request>, +host: String, +port: U32) -> Bool:
   client_conc.valid_go(reqs, host, port, True{})
@@ -4792,7 +4756,7 @@ def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, req
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
     case Request{+method, +path, +headers, +body} <> t:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_on.send_req(sock, sid, host, port, method, path, headers, body)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, sid, host, port, method, path, headers, body)
         client_conc.send_all(client_conc.send_kept(sent), (sid + 2 : U32), host, port, t)
 
 # Concurrent drain leafs (sum, no tab return; connection closes after)
@@ -4854,11 +4818,11 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
       match cls:
         case 1:
           do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-            got2 : Socket & Got <- client_on.ack(got)
+            got2 : Socket & Got <- client.on.ack(got)
             client_conc.drain(~H, 0, got2, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 4:
           do IO<Socket & Result<&1, &1, U32 & String, U32>>:
-            gotp : Socket & Got <- client_on.ack_ping(got, payload)
+            gotp : Socket & Got <- client.on.ack_ping(got, payload)
             client_conc.drain(~H, 0, gotp, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 5:
           client_conc.fail(got, 502, "goaway")
@@ -4927,7 +4891,7 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client_on.cont_cls_of(typ6, sid6, sid2, flags6), end, Head{0, Nil{}}, 0)
+              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), end, Head{0, Nil{}}, 0)
     case 8:
       (s8, g8) = got
       match cls:
@@ -4991,11 +4955,11 @@ def client_conc.go(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2
   match insecure:
     case True{}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_insecure(host, port)
         client_conc.conn(~H, conn, host, port, reqs, pending)
     case False{}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- client_on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.connect_secure(host, port)
         client_conc.conn(~H, conn, host, port, reqs, pending)
 
 def client_conc.fit_n(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
@@ -5014,11 +4978,11 @@ def client_conc.fit(~H: Response -> U32, +host: String, +port: U32, +reqs: List<
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, U32>, Fail{(400, "bad request")})
 
-def client_on_concurrent(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+def client.concurrent(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, U32>):
   client_conc.fit(~H, host, port, reqs, False{}, client_conc.valid_all(reqs, host, port))
 
-def client_on_concurrent_insecure(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+def client.concurrent_insecure(~H: Response -> U32, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, U32>):
   client_conc.fit(~H, host, port, reqs, True{}, client_conc.valid_all(reqs, host, port))
 
