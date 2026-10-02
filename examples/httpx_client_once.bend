@@ -3,7 +3,7 @@
 # and POSTs "hello" via HTTPX.client.once_insecure; expects status 200 plus
 # the same echo. Prints DONE n/n (manual only — not in check.sh).
 # Usage: node examples/mux_node_echoserv.js 19893 1 &
-#        bend examples/mux_client_once.bend
+#        bend examples/httpx_client_once.bend
 import Base
 import ../lib/httpx.bend as HTTPX
 

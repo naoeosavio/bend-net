@@ -2,7 +2,7 @@
 # check.sh). GETs the Binance spot exchangeInfo feed (~5.8 MB JSON) via
 # HTTPX.client.once (secure TLS, H2 with H1 fallback) and prints the
 # status, the body length in bytes, and the first 200 bytes.
-# Usage: bend examples/mux_fetch_bulk.bend -o /tmp/opencode/fetchbulk
+# Usage: bend examples/httpx_fetch_bulk.bend -o /tmp/opencode/fetchbulk
 #        /tmp/opencode/fetchbulk
 import Base
 import ../lib/httpx.bend as HTTPX

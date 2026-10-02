@@ -1,11 +1,11 @@
 # HTTPX streaming-upload server for node interop (manual only — not in check.sh).
-# Serves HTTPX.server_on_stream forever on an ephemeral port (printed to
+# Serves HTTPX.server.stream forever on an ephemeral port (printed to
 # stdout for the peer script). The pure handler caps one chunk at 3 bytes:
 # Head asks for more, an over-cap chunk answers early 413, a small final
-# chunk echoes 200. Mirrors tests/io/mux_server_stream.bend without its
+# chunk echoes 200. Mirrors tests/io/httpx_server_stream.bend without its
 # loopback client or golden.
-# Usage: bend examples/mux_server_stream.bend -o /tmp/opencode/mux_server_stream
-#        /tmp/opencode/mux_server_stream   # prints PORT, serves until killed
+# Usage: bend examples/httpx_server_stream.bend -o /tmp/opencode/httpx_server_stream
+#        /tmp/opencode/httpx_server_stream   # prints PORT, serves until killed
 import Base
 import ../lib/httpx.bend as HTTPX
 
@@ -34,7 +34,7 @@ law server:
   IO(Unit)
 
 def server(l):
-  HTTPX.server_on_stream(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+  HTTPX.server.stream(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
 law listen_retry:
   for port: U32

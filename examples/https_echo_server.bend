@@ -21,7 +21,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPS.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 def after_listen(r: Result<&1, &1, U32 & String, Listener>) -> IO(Unit):

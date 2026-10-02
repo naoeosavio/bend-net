@@ -1,9 +1,9 @@
 # Interop client, ON version: scripted 6-step ping/pong session against
-# examples/server_on.bend (or server.js, server.bend) on
+# examples/server.on.bend (or server.js, server.bend) on
 # 127.0.0.1:19880, rewritten over WS.client.on — the client is now the
 # event-driven mirror of the server, not a hand-driven socket loop.
 # Script: 101 -> ping s1/pong+ping c1 -> pong c1/hello -> hello/echo ->
-# ping s2/pong -> close. Stateles like server_on.bend: every step is
+# ping s2/pong -> close. Stateles like server.on.bend: every step is
 # identified by (opcode, payload), so no counter threads the handler.
 # The pong s1 step answers pong ++ ping c1 in a single OutRaw (one WSOut
 # per event; a non-empty OutRaw wins over the auto-pong), mirroring the

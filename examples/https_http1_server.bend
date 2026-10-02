@@ -16,7 +16,7 @@ def h1_echo(method: String, path: String,
 
 def serve(listener: Listener) -> IO(Unit):
   do IO<Unit>:
-    result : Unit <- HTTPS.server_on_alpn(~h2_echo, ~h1_echo, listener,
+    result : Unit <- HTTPS.server.on_alpn(~h2_echo, ~h1_echo, listener,
       "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return result
 

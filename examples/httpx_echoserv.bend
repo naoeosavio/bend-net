@@ -1,8 +1,8 @@
 # HTTPX echo server for node interop (manual only — not in check.sh).
-# Serves HTTPX.server_on_concurrent forever on an ephemeral port (printed
+# Serves HTTPX.server.concurrent forever on an ephemeral port (printed
 # to stdout for the peer script). No H2 import: pure mini-H2 server.
-# Usage: bend examples/mux_echoserv.bend -o /tmp/opencode/mux_echoserv
-#        /tmp/opencode/mux_echoserv   # prints PORT, serves until killed
+# Usage: bend examples/httpx_echoserv.bend -o /tmp/opencode/httpx_echoserv
+#        /tmp/opencode/httpx_echoserv   # prints PORT, serves until killed
 import Base
 import ../lib/httpx.bend as HTTPX
 
@@ -16,7 +16,7 @@ law server:
   IO(Unit)
 
 def server(l):
-  HTTPX.server_on_concurrent(~echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+  HTTPX.server.concurrent(~echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
 law listen_retry:
   for port: U32

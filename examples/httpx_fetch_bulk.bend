@@ -5,7 +5,7 @@
 # 200 bytes. NOTE: run the compiled binary, NOT interp — interp stack-
 # overflows on multi-MB bodies (deep x_len32 walk + O(n^2) drain
 # accumulation over ~5.8M list nodes).
-# Usage: bend examples/mux_fetch_bulk.bend -o /tmp/opencode/fetchbulk
+# Usage: bend examples/httpx_fetch_bulk.bend -o /tmp/opencode/fetchbulk
 #        /tmp/opencode/fetchbulk
 import Base
 import ../lib/httpx.bend as HTTPX

@@ -1,7 +1,7 @@
 # Saturation + bench driver for lib/https.bend and lib/wss.bend.
 # Bend<->Bend loopback over ephemeral ports (no fixed-port clashes with
-# the 19892/19893 echo peers). The HTTPS server is HTTPS.server_on and
-# the WSS server is WSS.server_on (both IO.spawn per connection, so the
+# the 19892/19893 echo peers). The HTTPS server is HTTPS.server.on and
+# the WSS server is WSS.server.on (both IO.spawn per connection, so the
 # N clients below overlap); each client is a single-shot insecure
 # exchange (send_request_insecure / client_echo_insecure) against
 # 127.0.0.1 with the test PEMs.
@@ -72,7 +72,7 @@ law https_server:
 
 def https_server(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPS.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law wss_server:
@@ -81,7 +81,7 @@ law wss_server:
 
 def wss_server(l):
   do IO<String>:
-    x : Unit <- WSS.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- WSS.server.on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law client_https:

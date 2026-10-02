@@ -4,7 +4,7 @@
 # HTTPX.request_insecure (String in, String out); expects the same
 # echo back. Prints DONE n/n (manual only — not in check.sh).
 # Usage: node examples/mux_node_echoserv.js 19893 1 &
-#        bend examples/mux_send_request.bend
+#        bend examples/httpx_request.bend
 import Base
 import ../lib/httpx.bend as HTTPX
 

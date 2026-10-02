@@ -1,4 +1,4 @@
-# Mirror of server.bend as a WS.server_on handler: scripted 6-step
+# Mirror of server.bend as a WS.server.on handler: scripted 6-step
 # ping/pong session on 127.0.0.1:19880 for examples/cliente.bend
 # (or cliente_on.bend).
 # Script: EvOpen(HS) -> pong s1 -> ping c1/pong -> hello/echo+ping s2 ->
@@ -8,7 +8,7 @@
 # present with no FAIL); a failed check prints FAIL and closes early.
 # The hello step answers echo ++ ping s2 in a single OutRaw (one WSOut
 # per event). Run one server at a time (fixed port).
-# Run: bend examples/server_on.bend
+# Run: bend examples/server.on.bend
 import Base
 import ../lib/ws.bend as WS
 
@@ -172,7 +172,7 @@ law serve:
 
 def serve(l):
   do IO<Unit>:
-    z : Unit <- WS.server_on(~h.serve, l)
+    z : Unit <- WS.server.on(~h.serve, l)
     return z
 
 law bound:
