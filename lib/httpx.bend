@@ -3674,10 +3674,14 @@ def x_h1.no_body(+method: String, +status: U32) -> Bool:
 
 # H1 client exchange (fallback lane): render, send, head/body fuel loops,
 # close. Matches go forward in param order per branch (checker rule).
+# Transport is three templates (~recv/~send/~close), instantiated per
+# lane at the public entries: TLS (tls_recv/send_bytes + tls_close) or
+# TCP (TCPB.recv/send_bytes + Socket.close). The grammar is identical —
+# that is what let the x_h1p.* mirror die in Phase 1.
 # ---------------------------------------------------------------------
 
 @unsafe
-def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, Hdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, Hdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
@@ -3690,8 +3694,8 @@ def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, 
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Done{Response{code, hs, x_take32(cl, rest)}}))
             case False{}:
               do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
-                x_h1.cli.bd(1, r, f, False{}, code, hs, rest, cl)
+                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+                x_h1.cli.bd(~recv, ~send, ~close, 1, r, f, False{}, code, hs, rest, cl)
     case 1:
       (s1, r1) = got
       match r1:
@@ -3703,12 +3707,12 @@ def x_h1.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, 
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +rest2 = List.append(&2, U32, rest, part)
-              x_h1.cli.bd(0, (s1, Done{Nil{}}), fuel, x_has_at_least(cl, rest2), code, hs, rest2, cl)
+              x_h1.cli.bd(~recv, ~send, ~close, 0, (s1, Done{Nil{}}), fuel, x_has_at_least(cl, rest2), code, hs, rest2, cl)
     case _:
       (s9, r9) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
 
-def x_h1.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, Hdr>, nbody: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.hd2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, Hdr>, nbody: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match nbody:
     case True{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Done{Response{code, hs, Nil{}}}))
@@ -3718,29 +3722,29 @@ def x_h1.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(502, "chunked refused")}))
         case False{}:
           +clc = x_h1.cl_of(hs)
-          x_h1.cli.bd(0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
+          x_h1.cli.bd(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
 
-def x_h1.cli.hd(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.hd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match hsres:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+hs}:
-      x_h1.cli.hd2(sock, rest, fuel, code, hs, nbody, x_h1.is_chunked(hs))
+      x_h1.cli.hd2(~recv, ~send, ~close, sock, rest, fuel, code, hs, nbody, x_h1.is_chunked(hs))
 
-def x_h1.cli.coded(sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.coded(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match coderes:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+code}:
-      x_h1.cli.hd(sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
+      x_h1.cli.hd(~recv, ~send, ~close, sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
 
-def x_h1.cli.parsed(s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
   +rest = x_h1.split_rest(x_h1.split(acc2))
-  x_h1.cli.coded(s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+  x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
 
 @unsafe
-def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
@@ -3749,8 +3753,8 @@ def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2
           IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
         case 1n+f:
           do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
-            x_h1.cli.head(1, r, acc, f, method, False{})
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.cli.head(~recv, ~send, ~close, 1, r, acc, f, method, False{})
     case 1:
       (s1, r1) = got
       match r1:
@@ -3762,52 +3766,52 @@ def x_h1.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.cli.head(2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
     case 2:
       (s2, r2) = got
       match found:
         case False{}:
-          x_h1.cli.head(0, (s2, Done{Nil{}}), acc, fuel, method, False{})
+          x_h1.cli.head(~recv, ~send, ~close, 0, (s2, Done{Nil{}}), acc, fuel, method, False{})
         case True{}:
-          x_h1.cli.parsed(s2, acc, fuel, method)
+          x_h1.cli.parsed(~recv, ~send, ~close, s2, acc, fuel, method)
     case _:
       (s9, r9) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
 
-def x_h1.exch.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.exch.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   (sock, r) = sent
   match r:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{u}:
-      x_h1.cli.head(0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
+      x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
 
-def x_h1.exch.send(sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.exch.send(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match rendered:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{+bytes}:
       do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, bytes)
-        x_h1.exch.sent(sent, method)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.exch.sent(~recv, ~send, ~close, sent, method)
 
-def x_h1.exch.done(out: Socket & Result<&1, &1, U32 & String, Response>) -> IO(Result<&1, &1, U32 & String, Response>):
+def x_h1.exch.done(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), out: Socket & Result<&1, &1, U32 & String, Response>) -> IO(Result<&1, &1, U32 & String, Response>):
   (s, r) = out
   match r:
     case Fail{e}:
       do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- TLS.tls_close(s)
+        x : Unit <- close(s)
         IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{+resp}:
       do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- TLS.tls_close(s)
+        x : Unit <- close(s)
         IO.pure(Result<&1, &1, U32 & String, Response>, Done{resp})
 
-def x_h1.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def x_h1.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
   do IO<Result<&1, &1, U32 & String, Response>>:
-    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
-    x_h1.exch.done(out)
+    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.exch.send(~recv, ~send, ~close, sock, x_h1.render_req(method, path, host, port, hs, body), method)
+    x_h1.exch.done(~recv, ~send, ~close, out)
 
 # The exchange that does NOT close: one request out, one response read
 # back, socket handed over. x_h1.exch.send already behaves that way
@@ -3815,13 +3819,13 @@ def x_h1.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: S
 # named entry for the sequential batch lane, and it validates like the
 # H2 keep-alive path (client.on.fit_keep) so both lanes fail with the
 # same 400/413 before any byte leaves.
-def x_h1.cli.exch.fit(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+def x_h1.cli.exch.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Response>):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
+          x_h1.exch.send(~recv, ~send, ~close, sock, x_h1.render_req(method, path, host, port, hs, body), method)
         case False{}:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
             (sock, Fail{(413, "req too large")}))
@@ -3829,173 +3833,9 @@ def x_h1.cli.exch.fit(sock: Socket, +host: String, +port: U32, +method: String, 
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
         (sock, Fail{(400, "bad request")}))
 
-def x_h1.cli.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def x_h1.cli.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response>):
-  x_h1.cli.exch.fit(sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
-
-# H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
-# ---------------------------------------------------------------------
-
-# Plaintext H1 lane (http://): the same grammar as x_h1.cli/x_h1.exch, over
-# Base's TCP.connect and the raw byte twins of lib/tcp.bend instead of TLS.
-# This is a deliberate mirror and not a transport-template refactor: the
-# TLS lane is covered by 26 loopback tests and stays untouched (TASK-026
-# Phase 5b, decision (b)).
-# ---------------------------------------------------------------------
-
-@unsafe
-def x_h1p.cli.bd(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, Hdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match phase:
-    case 0:
-      (s0, r0) = got
-      match fuel:
-        case 0n:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
-        case 1n+f:
-          match enough:
-            case True{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Done{Response{code, hs, x_take32(cl, rest)}}))
-            case False{}:
-              do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCPB.recv_bytes(s0, 16384)
-                x_h1p.cli.bd(1, r, f, False{}, code, hs, rest, cl)
-    case 1:
-      (s1, r1) = got
-      match r1:
-        case Fail{e}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{e}))
-        case Done{+part}:
-          match part:
-            case Nil{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
-            case h <> t:
-              +rest2 = List.append(&2, U32, rest, part)
-              x_h1p.cli.bd(0, (s1, Done{Nil{}}), fuel, x_has_at_least(cl, rest2), code, hs, rest2, cl)
-    case _:
-      (s9, r9) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
-
-def x_h1p.cli.hd2(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, Hdr>, nbody: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match nbody:
-    case True{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Done{Response{code, hs, Nil{}}}))
-    case False{}:
-      match chunked:
-        case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(502, "chunked refused")}))
-        case False{}:
-          +clc = x_h1.cl_of(hs)
-          x_h1p.cli.bd(0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
-
-def x_h1p.cli.hd(sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match hsres:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
-    case Done{+hs}:
-      x_h1p.cli.hd2(sock, rest, fuel, code, hs, nbody, x_h1.is_chunked(hs))
-
-def x_h1p.cli.coded(sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match coderes:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
-    case Done{+code}:
-      x_h1p.cli.hd(sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
-
-def x_h1p.cli.parsed(s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
-  +rest = x_h1.split_rest(x_h1.split(acc2))
-  x_h1p.cli.coded(s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
-
-@unsafe
-def x_h1p.cli.head(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match phase:
-    case 0:
-      (s0, r0) = got
-      match fuel:
-        case 0n:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
-        case 1n+f:
-          do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCPB.recv_bytes(s0, 16384)
-            x_h1p.cli.head(1, r, acc, f, method, False{})
-    case 1:
-      (s1, r1) = got
-      match r1:
-        case Fail{e}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{e}))
-        case Done{+part}:
-          match part:
-            case Nil{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
-            case h <> t:
-              +acc2 = List.append(&2, U32, acc, part)
-              x_h1p.cli.head(2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
-    case 2:
-      (s2, r2) = got
-      match found:
-        case False{}:
-          x_h1p.cli.head(0, (s2, Done{Nil{}}), acc, fuel, method, False{})
-        case True{}:
-          x_h1p.cli.parsed(s2, acc, fuel, method)
-    case _:
-      (s9, r9) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
-
-def x_h1p.exch.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  (sock, r) = sent
-  match r:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
-    case Done{u}:
-      x_h1p.cli.head(0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
-
-def x_h1p.exch.send(sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match rendered:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
-    case Done{+bytes}:
-      do IO<Socket & Result<&1, &1, U32 & String, Response>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCPB.send_bytes(sock, bytes)
-        x_h1p.exch.sent(sent, method)
-
-def x_h1p.exch.done(out: Socket & Result<&1, &1, U32 & String, Response>) -> IO(Result<&1, &1, U32 & String, Response>):
-  (s, r) = out
-  match r:
-    case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- Socket.close(s)
-        IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{+resp}:
-      do IO<Result<&1, &1, U32 & String, Response>>:
-        x : Unit <- Socket.close(s)
-        IO.pure(Result<&1, &1, U32 & String, Response>, Done{resp})
-
-def x_h1p.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  do IO<Result<&1, &1, U32 & String, Response>>:
-    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1p.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
-    x_h1p.exch.done(out)
-
-# Mirror of x_h1.cli.exch: the plaintext exchange that does not close.
-# There is no plaintext batch lane in this build (no client.connect over
-# TCP), so this is symmetry for the lane's own callers, not a new entry.
-def x_h1p.cli.exch.fit(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Response>):
-  match fit:
-    case True{}:
-      match ok:
-        case True{}:
-          x_h1p.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
-        case False{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
-            (sock, Fail{(413, "req too large")}))
-    case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
-        (sock, Fail{(400, "bad request")}))
-
-def x_h1p.cli.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Response>):
-  x_h1p.cli.exch.fit(sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+  x_h1.cli.exch.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 # H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
 # ---------------------------------------------------------------------
@@ -4007,13 +3847,16 @@ def h1_once.dial(+host: String, +port: U32, insecure: Bool) -> IO(Result<&1, &1,
     case False{}:
       TLS.tls_connect_noalpn(host, port)
 
-def h1_once.conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+# Post-dial runner shared by both dials: the TLS one-shot (h1_once.dial)
+# and the plaintext one (TCP.connect in fetch.plain). The triple picks
+# the lane; the grammar after the dial is one.
+def h1_once.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{sock}:
-      x_h1.exch(sock, host, port, method, path, hs, body)
+      x_h1.exch(~recv, ~send, ~close, sock, host, port, method, path, hs, body)
 
 def h1_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, Response>):
@@ -4023,7 +3866,7 @@ def h1_once.fit(+host: String, +port: U32, +method: String, +path: String, hs: L
         case True{}:
           do IO<Result<&1, &1, U32 & String, Response>>:
             conn : Result<&1, &1, U32 & String, Socket> <- h1_once.dial(host, port, insecure)
-            h1_once.conn(conn, host, port, method, path, hs, body)
+            h1_once.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, method, path, hs, body)
         case False{}:
           IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(413, "req too large")})
     case False{}:
@@ -4036,24 +3879,6 @@ def h1_once(+host: String, +port: U32, +method: String, +path: String, hs: List<
 def h1_once_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, Response>):
   h1_once.fit(host, port, method, path, hs, body, True{}, client.on.valid.go(host, port, path), client.on.body_ok(body))
-
-# The plaintext one-shot: dial over Base's TCP.connect and run the same
-# grammar as h1_once — no ALPN, no TLS, one exchange, close.
-# ---------------------------------------------------------------------
-
-def x_h1p.conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match conn:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{sock}:
-      x_h1p.exch(sock, host, port, method, path, hs, body)
-
-def x_h1p.one(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  do IO<Result<&1, &1, U32 & String, Response>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
-    x_h1p.conn(conn, host, port, method, path, hs, body)
 
 # Dual-dial dispatch for once/fetch: h2 → preface+exchange (existing
 # path, byte-identical); http/1.1 → H1 lane on the same socket (this
@@ -4439,7 +4264,7 @@ def client.on.h1_keep_st(out: Socket & Result<&1, &1, U32 & String, Response>, +
 def client.on.h1_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(sock, host, port, method, path, hs, body)
+    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, hs, body)
     client.on.h1_keep_st(out, st)
 
 # One keep-alive request, both ALPN answers (TASK-027 Phase 3): h2 keeps
@@ -4550,7 +4375,7 @@ def client_seq.h1.go(rest: List<&2, Request>, +acc: List<&2, Response>, got: Soc
             IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
         case Done{+resp}:
           do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            got3 : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(s2, host, port, method, path, headers, body)
+            got3 : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, s2, host, port, method, path, headers, body)
             client_seq.h1.go(t, resp <> acc, got3, host, port)
 
 def client_seq.h1(sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>) ->
@@ -4562,7 +4387,7 @@ def client_seq.h1(sock: Socket, +host: String, +port: U32, reqs: List<&2, Reques
         IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
     case Request{+method, +path, +headers, +body} <> t:
       do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        got : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(sock, host, port, method, path, headers, body)
+        got : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
         client_seq.h1.go(t, Nil{}, got, host, port)
 
 # The batch lane serves both ALPN answers now: h2 keeps the sid/HPACK
@@ -4622,7 +4447,7 @@ def client.once.h1(req: Request, sock: Socket, +host: String, +port: U32) ->
   IO(Result<&1, &1, U32 & String, Response>):
   match req:
     case Request{method, path, headers, body}:
-      x_h1.exch(sock, host, port, method, path, headers, body)
+      x_h1.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
 
 def client.once.ready(st: CliSt, sock: Socket, +host: String, +port: U32, req: Request) ->
   IO(Result<&1, &1, U32 & String, Response>):
@@ -4859,22 +4684,24 @@ def fetch_bytes.host(host: String, +port: U32, path: String, insecure: Bool, ok:
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
 
-def fetch.plain(host: String, +port: U32, path: String, ok: Bool) ->
+def fetch.plain(+host: String, +port: U32, path: String, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   match ok:
     case True{}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        r : Result<&1, &1, U32 & String, Response> <- x_h1p.one(host, port, "GET", path, Nil{}, Nil{})
+        conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.text(r)
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad host")})
 
-def fetch_bytes.plain(host: String, +port: U32, path: String, ok: Bool) ->
+def fetch_bytes.plain(+host: String, +port: U32, path: String, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   match ok:
     case True{}:
       do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-        r : Result<&1, &1, U32 & String, Response> <- x_h1p.one(host, port, "GET", path, Nil{}, Nil{})
+        conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.raw(r)
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
@@ -6058,7 +5885,7 @@ def x_h1.srv.stop(s: Socket, e: U32 & String) ->
   IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
     (s, Fail{(code, msg)}))
 
-def x_h1.srv.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
+def x_h1.srv.sent_keep(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s2, r2) = sent
   match r2:
@@ -6072,27 +5899,27 @@ def x_h1.srv.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: 
         case False{}:
           x_h1.srv.stop(s2, (0, "close"))
 
-def x_h1.srv.respond(sock: Socket, +resp: Response, keep: Bool, +rest: List<&2, U32>) ->
+def x_h1.srv.respond(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +resp: Response, keep: Bool, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match resp:
     case Response{+status, +headers, +body}:
       do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, x_h1.show_resp(status, headers, body))
-        x_h1.srv.sent_keep(sent, keep, rest)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, x_h1.show_resp(status, headers, body))
+        x_h1.srv.sent_keep(~recv, ~send, ~close, sent, keep, rest)
 
-def x_h1.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request, keep: Bool, +rest: List<&2, U32>) ->
+def x_h1.srv.answer(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request, keep: Bool, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s, r) = got
   do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
     resp : Response <- H(req)
-    x_h1.srv.respond(s, resp, keep, rest)
+    x_h1.srv.respond(~recv, ~send, ~close, s, resp, keep, rest)
 
-def x_h1.srv.recv(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+def x_h1.srv.recv(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s0, r0) = got
-  TLS.tls_recv_bytes(s0, 16384)
+  recv(s0, 16384)
 
 @unsafe
-def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
+def x_h1.srv.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match phase:
     case 0:
@@ -6102,11 +5929,11 @@ def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1
         case 1n+f:
           match enough:
             case True{}:
-              x_h1.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), x_drop32(cl, have))
+              x_h1.srv.answer(~recv, ~send, ~close, ~H, got, Request{m, p, hs, x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), x_drop32(cl, have))
             case False{}:
               do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(got)
-                x_h1.srv.bd(~H, 1, r, m, p, hs, have, f, cl, False{})
+                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(~recv, ~send, ~close, got)
+                x_h1.srv.bd(~recv, ~send, ~close, ~H, 1, r, m, p, hs, have, f, cl, False{})
     case 1:
       (s1, r1) = got
       match r1:
@@ -6118,32 +5945,32 @@ def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1
               x_h1.srv.stop(s1, (400, "eof"))
             case h <> t:
               +have2 = List.append(&2, U32, have, part)
-              x_h1.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
+              x_h1.srv.bd(~recv, ~send, ~close, ~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
     case _:
       (s9, r9) = got
       x_h1.srv.stop(s9, (502, "bad phase"))
 
-def x_h1.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
+def x_h1.srv.cl(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match big:
     case True{}:
-      x_h1.srv.respond(s, Response{413, Nil{}, Nil{}}, False{}, Nil{})
+      x_h1.srv.respond(~recv, ~send, ~close, s, Response{413, Nil{}, Nil{}}, False{}, Nil{})
     case False{}:
-      x_h1.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
+      x_h1.srv.bd(~recv, ~send, ~close, ~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
-def x_h1.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
+def x_h1.srv.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match needs:
     case False{}:
-      x_h1.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
+      x_h1.srv.answer(~recv, ~send, ~close, ~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
     case True{}:
       match chunked:
         case True{}:
-          x_h1.srv.respond(s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
+          x_h1.srv.respond(~recv, ~send, ~close, s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
         case False{}:
-          x_h1.srv.cl(~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
+          x_h1.srv.cl(~recv, ~send, ~close, ~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
+def x_h1.srv.ruled(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match joinres:
     case Fail{e}:
@@ -6151,42 +5978,42 @@ def x_h1.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>
     case Done{+rh}:
       match rh:
         case ReqHead{+m, +p, +hs}:
-          x_h1.srv.go(~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+          x_h1.srv.go(~recv, ~send, ~close, ~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
-def x_h1.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
+def x_h1.srv.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
   +rest = x_h1.split_rest(x_h1.split(acc))
-  x_h1.srv.ruled(~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+  x_h1.srv.ruled(~recv, ~send, ~close, ~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
 
 @unsafe
-def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
+def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
   match phase:
     case 0:
       (s0, r0) = got
       match fuel:
         case 0n:
-          TLS.tls_close(s0)
+          close(s0)
         case 1n+f:
           do IO<Unit>:
-            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
-            x_h1.srv.head(~H, 1, r, acc, f, False{})
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.srv.head(~recv, ~send, ~close, ~H, 1, r, acc, f, False{})
     case 1:
       (s1, r1) = got
       match r1:
         case Fail{e}:
-          TLS.tls_close(s1)
+          close(s1)
         case Done{+part}:
           match part:
             case Nil{}:
-              TLS.tls_close(s1)
+              close(s1)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.srv.head(~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split_found(x_h1.split(acc2)))
     case 2:
       match found:
         case False{}:
-          x_h1.srv.head(~H, 0, got, acc, fuel, False{})
+          x_h1.srv.head(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{})
         case True{}:
           # The answer path hands the socket back: Done{rest} keeps the
           # connection (phase 3 re-seeds from the leftover), Fail{e}
@@ -6195,8 +6022,8 @@ def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<
           # head fuel budget restarts per request, or a long-lived
           # connection would starve after 64 of them.
           do IO<Unit>:
-            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.parsed(~H, got, acc, fuel)
-            x_h1.srv.head(~H, 3, out, Nil{}, 64n, False{})
+            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.parsed(~recv, ~send, ~close, ~H, got, acc, fuel)
+            x_h1.srv.head(~recv, ~send, ~close, ~H, 3, out, Nil{}, 64n, False{})
     case 3:
       # Keep-alive re-entry: never reads here, only decides. An empty
       # seed (nothing was buffered past the request) goes back to the
@@ -6206,243 +6033,47 @@ def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<
       (s3, r3) = got
       match r3:
         case Fail{e}:
-          TLS.tls_close(s3)
+          close(s3)
         case Done{+seed}:
           match seed:
             case Nil{}:
-              x_h1.srv.head(~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
             case h <> t:
-              x_h1.srv.head(~H, 1, (s3, Done{seed}), acc, fuel, False{})
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 1, (s3, Done{seed}), acc, fuel, False{})
     case _:
       (s9, r9) = got
-      TLS.tls_close(s9)
+      close(s9)
 
-# Plaintext H1 server lane (http://): the same grammar as x_h1.srv, over
-# Base's TCP.accept and the raw byte twins of lib/tcp.bend instead of TLS.
-# Mirror, not a transport template — same decision as the client lane.
-# ---------------------------------------------------------------------
+def x_h1.serve_start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
+  x_h1.srv.head(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
 
-def x_h1p.srv.needs_body(+m: String) -> Bool:
-  Bool.not(Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD")))
+def h1_spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
+  x_h1.serve_start(~recv, ~send, ~close, ~H, sock)
 
-def x_h1p.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
-  (s, r) = got
-  s
-
-# Mirror of x_h1.srv's outcome pair: read_next keeps the connection,
-# stop ends it (e is the send/read error, a terminal answer, or
-# (0, "close") for a peer that asked for close). See the TLS lane for
-# why the loop lives in the head machine instead of a mutual recursion.
-def x_h1p.srv.read_next(s: Socket, +rest: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
-    (s, Done{rest}))
-
-def x_h1p.srv.stop(s: Socket, e: U32 & String) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  (code, msg) = e
-  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
-    (s, Fail{(code, msg)}))
-
-def x_h1p.srv.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  (s2, r2) = sent
-  match r2:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
-        (s2, Fail{e}))
-    case Done{u}:
-      match keep:
-        case True{}:
-          x_h1p.srv.read_next(s2, rest)
-        case False{}:
-          x_h1p.srv.stop(s2, (0, "close"))
-
-def x_h1p.srv.respond(sock: Socket, +resp: Response, keep: Bool, +rest: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  match resp:
-    case Response{+status, +headers, +body}:
-      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCPB.send_bytes(sock, x_h1.show_resp(status, headers, body))
-        x_h1p.srv.sent_keep(sent, keep, rest)
-
-def x_h1p.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request, keep: Bool, +rest: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  (s, r) = got
-  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-    resp : Response <- H(req)
-    x_h1p.srv.respond(s, resp, keep, rest)
-
-def x_h1p.srv.recv(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  (s0, r0) = got
-  TCPB.recv_bytes(s0, 16384)
-
-@unsafe
-def x_h1p.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  match phase:
-    case 0:
-      match fuel:
-        case 0n:
-          x_h1p.srv.stop(x_h1p.srv.sock_of(got), (413, "request too long"))
-        case 1n+f:
-          match enough:
-            case True{}:
-              x_h1p.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), x_drop32(cl, have))
-            case False{}:
-              do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
-                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1p.srv.recv(got)
-                x_h1p.srv.bd(~H, 1, r, m, p, hs, have, f, cl, False{})
-    case 1:
-      (s1, r1) = got
-      match r1:
-        case Fail{e}:
-          x_h1p.srv.stop(s1, e)
-        case Done{+part}:
-          match part:
-            case Nil{}:
-              x_h1p.srv.stop(s1, (400, "eof"))
-            case h <> t:
-              +have2 = List.append(&2, U32, have, part)
-              x_h1p.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
-    case _:
-      (s9, r9) = got
-      x_h1p.srv.stop(s9, (502, "bad phase"))
-
-def x_h1p.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  match big:
-    case True{}:
-      x_h1p.srv.respond(s, Response{413, Nil{}, Nil{}}, False{}, Nil{})
-    case False{}:
-      x_h1p.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
-
-def x_h1p.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  match needs:
-    case False{}:
-      x_h1p.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
-    case True{}:
-      match chunked:
-        case True{}:
-          x_h1p.srv.respond(s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
-        case False{}:
-          x_h1p.srv.cl(~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
-
-def x_h1p.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  match joinres:
-    case Fail{e}:
-      x_h1p.srv.stop(s1, e)
-    case Done{+rh}:
-      match rh:
-        case ReqHead{+m, +p, +hs}:
-          x_h1p.srv.go(~H, s1, m, p, hs, rest, fuel, x_h1p.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
-
-def x_h1p.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
-  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  +rest = x_h1.split_rest(x_h1.split(acc))
-  x_h1p.srv.ruled(~H, x_h1p.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
-
-@unsafe
-def x_h1p.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
-  match phase:
-    case 0:
-      (s0, r0) = got
-      match fuel:
-        case 0n:
-          Socket.close(s0)
-        case 1n+f:
-          do IO<Unit>:
-            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCPB.recv_bytes(s0, 16384)
-            x_h1p.srv.head(~H, 1, r, acc, f, False{})
-    case 1:
-      (s1, r1) = got
-      match r1:
-        case Fail{e}:
-          Socket.close(s1)
-        case Done{+part}:
-          match part:
-            case Nil{}:
-              Socket.close(s1)
-            case h <> t:
-              +acc2 = List.append(&2, U32, acc, part)
-              x_h1p.srv.head(~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split_found(x_h1.split(acc2)))
-    case 2:
-      match found:
-        case False{}:
-          x_h1p.srv.head(~H, 0, got, acc, fuel, False{})
-        case True{}:
-          # Same keep-alive hand-back as the TLS lane: Done{rest} keeps
-          # the connection, Fail{e} stops it, and each request gets a
-          # fresh head fuel budget.
-          do IO<Unit>:
-            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1p.srv.parsed(~H, got, acc, fuel)
-            x_h1p.srv.head(~H, 3, out, Nil{}, 64n, False{})
-    case 3:
-      (s3, r3) = got
-      match r3:
-        case Fail{e}:
-          Socket.close(s3)
-        case Done{+seed}:
-          match seed:
-            case Nil{}:
-              x_h1p.srv.head(~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
-            case h <> t:
-              x_h1p.srv.head(~H, 1, (s3, Done{seed}), acc, fuel, False{})
-    case _:
-      (s9, r9) = got
-      Socket.close(s9)
-
-def x_h1.serve_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
-  x_h1.srv.head(~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
-
-def h1_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
-  x_h1.serve_start(~H, sock)
-
-def h1_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
+def h1_spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, h1_spawn.go(~H, sock))
+    x : Unit <- IO.spawn(Unit, h1_spawn.go(~recv, ~send, ~close, ~H, sock))
     return l
 
-def h1_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def h1_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
     case Fail{e}:
       IO.pure(Listener, l)
     case Done{sock}:
-      h1_spawn(~H, sock, l)
-
-def h1p_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
-  x_h1p.srv.head(~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
-
-def h1p_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
-  IO(Listener):
-  do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, h1p_spawn.go(~H, sock))
-    return l
-
-def h1p_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
-  IO(Listener):
-  (l, r) = m
-  match r:
-    case Fail{e}:
-      IO.pure(Listener, l)
-    case Done{sock}:
-      h1p_spawn(~H, sock, l)
+      h1_spawn(~recv, ~send, ~close, ~H, sock, l)
 
 # Plaintext H1 server (http://): no cert/key, TCP.listen owns the listener,
 # and the accept comes from Base's TCP.accept. One connection at a time,
-# like server.on_h1 (the H1 lane is one-shot per connection).
+# each serving N requests over keep-alive like server.on_h1.
 @unsafe
 def server.on_h1_plain(~H: Request -> IO(Response), listener: Listener) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
-    next : Listener <- h1p_conn(~H, m)
+    next : Listener <- h1_conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, m)
     z : Unit <- server.on_h1_plain(~H, next)
     return z
 
@@ -6454,7 +6085,7 @@ def httpxa_alpn_go(~H: Request -> IO(Response), is_h2: Bool, listener: Listener,
     case True{}:
       seq_spawn(~H, sock, listener)
     case False{}:
-      h1_spawn(~H, sock, listener)
+      h1_spawn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, sock, listener)
 
 def httpxa_alpn_conn(~H: Request -> IO(Response), accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
@@ -6485,7 +6116,7 @@ def server.on_h1(~H: Request -> IO(Response), listener: Listener, +cert: String,
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <-
       TLS.tls_accept_http1(listener, cert, key)
-    next : Listener <- h1_conn(~H, accepted)
+    next : Listener <- h1_conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, accepted)
     z : Unit <- server.on_h1(~H, next, cert, key)
     return z
 
@@ -6498,5 +6129,5 @@ def server.once_h1(~H: Request -> IO(Response), listener: Listener, +cert: Strin
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <-
       TLS.tls_accept_http1(listener, cert, key)
-    next : Listener <- h1_conn(~H, accepted)
+    next : Listener <- h1_conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, accepted)
     return Unit{}
