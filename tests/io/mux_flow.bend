@@ -50,8 +50,6 @@ def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
       HTTPX.StreamContinue{}
     case HTTPX.StreamData{chunk, fin}:
       HTTPX.StreamContinue{}
-    case HTTPX.StreamFail{code, msg}:
-      HTTPX.StreamContinue{}
 
 def counts2(counts: U32 & U32) -> U32 & Bool:
   (total, fins) = counts
@@ -70,7 +68,7 @@ def client_score_counts(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client_on_stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, mux_flow.body())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, mux_flow.body())
     IO.pure(U32, client_score_counts(r))
 
 law server_side:

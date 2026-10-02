@@ -10,7 +10,7 @@
 # PADDED/PRIORITY strip. IO half is a loopback where a canned raw peer paces
 # the answer: the head block in 128-byte pieces and the body as four 512B
 # DATA frames, one TLS record (so one read) each, all small enough for the
-# interpreter, and the real client HTTPX.client_once_insecure must assemble the
+# interpreter, and the real client HTTPX.client.once_insecure must assemble the
 # whole 2048-byte body. Ported from h2_frame_read.bend (same peer shape, same
 # 2048B assertion) when the http2.bend codec was retired.
 import Base

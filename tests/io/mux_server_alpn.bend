@@ -1,6 +1,6 @@
 # lib (lib_mux_server_alpn): ALPN split of the sequential server (Phase 11).
 # Server is HTTPX.server_on_alpn with one handler for both lanes; client one
-# is HTTPX.client_once_insecure (negotiates h2, H2 lane) and client two is
+# is HTTPX.client.once_insecure (negotiates h2, H2 lane) and client two is
 # HTTPX.h1_once_insecure (no-ALPN dial, negotiates http/1.1, H1 lane). Both
 # POST "hello" and expect the 200 echo. Golden 2.
 import Base
@@ -35,7 +35,7 @@ def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 def client_h2(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
     IO.pure(U32, client_score(r))
 
 def client_h1(+port: U32) -> IO(U32):

@@ -1,5 +1,5 @@
 # lib (lib_mux_client_seq): sequential batch entry against mini-H2 server.
-# Server echoes bodies; client is HTTPX.client_on_insecure with 3 requests
+# Server echoes bodies; client is HTTPX.client.on_insecure with 3 requests
 # ("hello-0/1/2") on one dial (sids 1,3,5), answers back in request
 # order. Golden 3 (one per echo body, order-insensitive sum like the
 # concurrent golden).
@@ -45,7 +45,7 @@ def client_score(r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) -> U
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <- HTTPX.client_on_insecure("127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <- HTTPX.client.on_insecure("127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 law server_side:

@@ -1,6 +1,6 @@
 # lib (lib_mux_client_stream): streaming download against mini-H2 server.
 # Server is HTTPX.server_on_concurrent echoing the body; client is
-# HTTPX.client_on_stream_insecure POST "hello" with a pure Continue
+# HTTPX.client.stream_insecure POST "hello" with a pure Continue
 # handler (no body accumulation, O(1) per chunk). Golden 1 iff total
 # bytes 5 and fins 1 (one HEADERS + one DATA with END_STREAM).
 import Base
@@ -24,8 +24,6 @@ def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
       HTTPX.StreamContinue{}
     case HTTPX.StreamData{chunk, fin}:
       HTTPX.StreamContinue{}
-    case HTTPX.StreamFail{code, msg}:
-      HTTPX.StreamContinue{}
 
 def client_score_counts(counts: U32 & U32) -> U32:
   (total, fins) = counts
@@ -40,7 +38,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client_on_stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     IO.pure(U32, client_score(r))
 
 law server_side:

@@ -1,6 +1,6 @@
 # HTTPX bulk fetch against a real-world HTTPS API (manual only — not in
 # check.sh). GETs the Binance spot exchangeInfo feed (~5.8 MB JSON) via
-# HTTPX.client_once (secure TLS, H2 with H1 fallback) and prints the
+# HTTPX.client.once (secure TLS, H2 with H1 fallback) and prints the
 # status, the body length in bytes, and the first 200 bytes.
 # Usage: bend examples/mux_fetch_bulk.bend -o /tmp/opencode/fetchbulk
 #        /tmp/opencode/fetchbulk
@@ -35,5 +35,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     _ : Unit <- IO.print("STEP dial api.binance.com:443")
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once("api.binance.com", 443, "GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{})
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once("api.binance.com", 443, HTTPX.Request{"GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{}})
     report(r)

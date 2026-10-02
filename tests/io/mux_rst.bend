@@ -85,13 +85,13 @@ def v_wu_reserved_bit() -> U32:
 # is the one it opened, so a multiplexed RST of a sibling stays invisible.
 
 def v_mine_rst() -> U32:
-  b2u(U32.is_eq(HTTPX.client_on.mine_cls(HTTPX.x_classify(HTTPX.Frame{3, 0, 1, [0, 0, 0, 8]}), 1, 1), 2))
+  b2u(U32.is_eq(HTTPX.client.on.mine_cls(HTTPX.x_classify(HTTPX.Frame{3, 0, 1, [0, 0, 0, 8]}), 1, 1), 2))
 
 def v_mine_data() -> U32:
-  b2u(U32.is_eq(HTTPX.client_on.mine_cls(HTTPX.x_classify(HTTPX.Frame{0, 1, 1, [104, 105]}), 1, 1), 6))
+  b2u(U32.is_eq(HTTPX.client.on.mine_cls(HTTPX.x_classify(HTTPX.Frame{0, 1, 1, [104, 105]}), 1, 1), 6))
 
 def v_foreign_data() -> U32:
-  b2u(U32.is_eq(HTTPX.client_on.mine_cls(HTTPX.x_classify(HTTPX.Frame{0, 1, 3, [104, 105]}), 3, 1), 0))
+  b2u(U32.is_eq(HTTPX.client.on.mine_cls(HTTPX.x_classify(HTTPX.Frame{0, 1, 3, [104, 105]}), 3, 1), 0))
 
 # Wire shapes: RST_STREAM carries the 4-byte error code, GOAWAY the last-sid
 # then the code (RFC 9113 section 6.8 / 6.9).

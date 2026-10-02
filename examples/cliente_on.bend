@@ -1,6 +1,6 @@
 # Interop client, ON version: scripted 6-step ping/pong session against
 # examples/server_on.bend (or server.js, server.bend) on
-# 127.0.0.1:19880, rewritten over WS.client_on — the client is now the
+# 127.0.0.1:19880, rewritten over WS.client.on — the client is now the
 # event-driven mirror of the server, not a hand-driven socket loop.
 # Script: 101 -> ping s1/pong+ping c1 -> pong c1/hello -> hello/echo ->
 # ping s2/pong -> close. Stateles like server_on.bend: every step is
@@ -187,6 +187,6 @@ law main:
 
 def main():
   do IO<U32>:
-    done : Unit <- WS.client_on(~h.cl, "127.0.0.1", 19880, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    done : Unit <- WS.client.on(~h.cl, "127.0.0.1", 19880, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
     z : Unit <- IO.die(Unit, 0, "")
     return 0

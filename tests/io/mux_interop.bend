@@ -273,8 +273,8 @@ def client.send1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h3: List<&2
 
 def client.fire(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(sock, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, HTTPX.client_on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}))
-    client.send1(sent1, HTTPX.client_on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTPX.client_on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTPX.client_on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), body1(), body2(), body1(), body2())
+    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(sock, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}))
+    client.send1(sent1, HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), body1(), body2(), body1(), body2())
 
 def client_conn(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32):
   match conn:
@@ -289,7 +289,7 @@ law client:
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client_on.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client.on.connect_insecure("127.0.0.1", port)
     client_conn(conn, port)
 
 law server_side:

@@ -1,6 +1,6 @@
 # lib (lib_mux_client_once): mini-H2 client_once against mini-H2 server.
 # Server is HTTPX.server_on_concurrent echoing the body; client is
-# HTTPX.client_once_insecure POST "hello" (literal HPACK, single DATA).
+# HTTPX.client.once_insecure POST "hello" (literal HPACK, single DATA).
 # Golden 1 iff status 200 and body echoes "hello". Covers the
 # bend-to-bend once path with the standalone codec only (no http2).
 import Base
@@ -35,7 +35,7 @@ def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
     IO.pure(U32, client_score(r))
 
 law server_side:

@@ -2,8 +2,8 @@
 # peer (mold mux_interop, inverted: server raw, client real). Server reads
 # the client preface + SETTINGS/HEADERS/DATA, then answers with HEADERS
 # (sid 1, no END_HEADERS) + CONT (END_HEADERS) + DATA (END_STREAM "hello").
-# Client is HTTPX.client_once_insecure POST "hello". Golden 1 iff status 200
-# and body echoes "hello" — proves client_on.drain reassembles CONT.
+# Client is HTTPX.client.once_insecure POST "hello". Golden 1 iff status 200
+# and body echoes "hello" — proves client.on.drain reassembles CONT.
 # Pre-fix behavior: Fail 502 "fragmented".
 import Base
 import ../../lib/tcp.bend as TCP
@@ -46,7 +46,7 @@ def client_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, hello_bytes()})
     IO.pure(U32, client_score(r))
 
 # Raw server: preface (magic 24 via tls_recv_bytes) + SETTINGS send, then

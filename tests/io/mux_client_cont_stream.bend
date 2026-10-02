@@ -1,9 +1,9 @@
 # lib (mux_client_cont_stream): fragmented response HEADERS against the
 # streaming client (mold mux_client_cont: server raw, client real).
 # Server answers HEADERS (sid 1, no END_HEADERS) + CONT (END_HEADERS) +
-# DATA (END_STREAM "hello"). Client is HTTPX.client_on_stream_insecure
+# DATA (END_STREAM "hello"). Client is HTTPX.client.stream_insecure
 # POST "hello" with a pure Continue handler. Golden 1 iff total bytes 5
-# and fins 1 — proves client_on.sdrop reassembles CONT without
+# and fins 1 — proves client.on.sdrop reassembles CONT without
 # re-delivering StreamHead (phase 7 rejoins phase 4 handler-free).
 # Pre-fix behavior: Fail 502 "fragmented".
 import Base
@@ -36,8 +36,6 @@ def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
       HTTPX.StreamContinue{}
     case HTTPX.StreamData{chunk, fin}:
       HTTPX.StreamContinue{}
-    case HTTPX.StreamFail{code, msg}:
-      HTTPX.StreamContinue{}
 
 def client_score_counts(counts: U32 & U32) -> U32:
   (total, fins) = counts
@@ -52,7 +50,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client_on_stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
     IO.pure(U32, client_score(r))
 
 # Raw server: preface (magic 24 via tls_recv_bytes) + SETTINGS send, then

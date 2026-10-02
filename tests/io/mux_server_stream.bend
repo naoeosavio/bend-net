@@ -2,7 +2,7 @@
 # Server streams SrvReqHead/SrvReqData to a pure per-chunk-cap handler (cap 3):
 # Head -> Continue; Data chunk>3 -> RespondEarly 413 (drop, free, skip
 # rest via stray-skip); Data <=3 with fin -> RespondEarly echo 200.
-# Client is mini keep-alive (HTTPX.client_on keep_connect + request, sids
+# Client is mini keep-alive (HTTPX.client.on keep_connect + request, sids
 # 1,3, no http2 import, fast check): POST "hi" (2B, echo 200) then POST
 # "hello" (5B>3, early 413). Golden 2 (1+1). Multi-chunk skip-rest
 # (20KB, 2 DATA, second skipped) is the same stray-skip path with rest.
@@ -66,7 +66,7 @@ def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliS
   (sock1, r1, st1) = got
   do IO<U32>:
     +s1 : U32 = score_echo(r1)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
     req2(got2, s1, port)
 
 def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
@@ -76,12 +76,12 @@ def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client_on_request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi"))
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:

@@ -1,6 +1,6 @@
 # HTTPX once client for node:http2 interop (examples/mux_node_echoserv.js).
 # Dials 127.0.0.1:19893 (the node H2-only echo server) with insecure TLS
-# and POSTs "hello" via HTTPX.client_once_insecure; expects status 200 plus
+# and POSTs "hello" via HTTPX.client.once_insecure; expects status 200 plus
 # the same echo. Prints DONE n/n (manual only — not in check.sh).
 # Usage: node examples/mux_node_echoserv.js 19893 1 &
 #        bend examples/mux_client_once.bend
@@ -53,5 +53,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     p : Unit <- IO.print("STEP dial")
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client_once_insecure("127.0.0.1", 19893, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", 19893, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
     report(r)

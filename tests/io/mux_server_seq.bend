@@ -54,7 +54,7 @@ def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client_on.keep_connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:

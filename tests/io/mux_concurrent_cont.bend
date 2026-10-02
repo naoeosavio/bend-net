@@ -15,7 +15,7 @@ def hi_bytes() -> List<&2, U32>:
   HTTPX.x_str_bytes("hi")
 
 def req_block(+port: U32) -> List<&2, U32>:
-  HTTPX.client_on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+  HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
 
 def frag_first(+port: U32) -> List<&2, U32>:
   HTTPX.x_take32(10, req_block(port))
@@ -257,7 +257,7 @@ law client:
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client_on.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket> <- HTTPX.client.on.connect_insecure("127.0.0.1", port)
     client_conn(conn, port)
 
 law server_side:

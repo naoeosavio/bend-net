@@ -39,7 +39,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client_on_concurrent_insecure(~h, "127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 law server_side:
