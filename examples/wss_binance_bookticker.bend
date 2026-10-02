@@ -159,7 +159,7 @@ law feed:
 
 def feed():
   do IO<Unit>:
-    z : Unit <- WSS.client.on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
+    z : Unit <- WSS.client_on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
     return z
 
 law main:

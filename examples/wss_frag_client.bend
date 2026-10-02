@@ -71,6 +71,6 @@ law main:
 
 def main():
   do IO<U32>:
-    done : Unit <- WSS.client.on_insecure(~h.cl, "127.0.0.1", 19894, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    done : Unit <- WSS.client_on_insecure(~h.cl, "127.0.0.1", 19894, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
     z : Unit <- IO.die(Unit, 0, "")
     return 0

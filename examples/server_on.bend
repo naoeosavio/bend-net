@@ -172,7 +172,7 @@ law serve:
 
 def serve(l):
   do IO<Unit>:
-    z : Unit <- WS.server.on(~h.serve, l)
+    z : Unit <- WS.server_on(~h.serve, l)
     return z
 
 law bound:

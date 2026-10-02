@@ -129,7 +129,7 @@ def main_go(r):
     case Done{l}:
       do IO<U32>:
         w : Unit <- IO.print("LISTEN 19893")
-        z : Unit <- WSS.server.on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+        z : Unit <- WSS.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
         return 0
 
 law main:
