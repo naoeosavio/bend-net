@@ -18,8 +18,9 @@
 # still answers exactly 1 and keeps accepting. C) a raw request carrying
 # "connection: close" (render_req can never emit it) must be answered 200
 # and then the server must really close — the next read sees EOF. D) the
-# plaintext mirror, the same three-on-one-connection shape through
-# x_h1p, because x_h1p.srv is a copy and needs its own proof. E) the same
+# plaintext instance of the same lane, the same three-on-one-connection
+# shape over TCP (x_h1 with the TCP triple), because the transport is now
+# instantiated per lane. E) the same
 # batch through the unified client API: client.on_insecure dials once,
 # client.on.batch_st takes the is_h2=False branch into the new H1
 # sequential lane (it used to close with Fail 615) and the three requests
@@ -167,7 +168,7 @@ def batch_next(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
     out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.exch.send(sock, req_bytes(port, next), "POST")
+      HTTPX.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, next), "POST")
     batch_step(out, port, next, more, acc)
 
 @unsafe
@@ -187,7 +188,7 @@ def batch_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
     case Done{sock}:
       do IO<U32>:
         out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-          HTTPX.x_h1.exch.send(sock, req_bytes(port, "hello-0"), "POST")
+          HTTPX.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, "hello-0"), "POST")
         batch_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def batch_side(l: Listener) -> IO(U32):
@@ -263,7 +264,7 @@ def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
       IO.pure(Socket & Result<&1, &1, U32 & String, HTTPX.Response>,
         (s, Fail{e}))
     case Done{u}:
-      HTTPX.x_h1.cli.head(0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{})
+      HTTPX.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{})
 
 def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans: U32) ->
   IO(U32):
@@ -303,10 +304,11 @@ def run_close(b: Listener & U32) -> IO(U32):
       TLS.tls_connect_noalpn_insecure("127.0.0.1", port)
     close_dial(conn, port)
 
-# Scenario D: the plaintext mirror. The same three-requests-one-connection
-# shape over Base's TCP through x_h1p.exch.send. x_h1p.srv is a copy of
-# the TLS machine, not a shared template, so its keep-alive needs its own
-# proof — a divergence would leave this at 1 instead of 3.
+# Scenario D: the plaintext instance of the shared lane. The same
+# three-requests-one-connection shape over Base's TCP through
+# x_h1.exch.send with the TCP triple — one grammar, two transports, so
+# this proves the TCP instantiation keeps alive instead of a copy
+# needing its own proof. A divergence would leave this at 1 instead of 3.
 def plain_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +want: String, +sum: U32) ->
   IO(U32):
   (sock, r) = got
@@ -322,7 +324,7 @@ def plain_next(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
     out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1p.exch.send(sock, req_bytes(port, next), "POST")
+      HTTPX.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, next), "POST")
     plain_step(out, port, next, more, acc)
 
 @unsafe
@@ -342,7 +344,7 @@ def plain_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
     case Done{sock}:
       do IO<U32>:
         out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-          HTTPX.x_h1p.exch.send(sock, req_bytes(port, "hello-0"), "POST")
+          HTTPX.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, "hello-0"), "POST")
         plain_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def plain_side(l: Listener) -> IO(U32):

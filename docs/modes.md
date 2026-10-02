@@ -23,8 +23,8 @@ response, with IO allowed (DB, upstream fetch, file reads):
 | `client.concurrent[_insecure]` | `client_conc.drain` (slots) | pipelined N, scored |
 | `fetch[_bytes][_insecure]`, `request[_bytes][_insecure]` | `client.once` | URL / text conveniences |
 | `h1_once[_insecure]` | `x_h1.exch` | H1 one-shot (TLS) |
-| `fetch[_bytes]_insecure("http://…")` | `x_h1p.exch` | the same one-shot over plain TCP, no TLS |
-| `server.on_h1_plain` / `server.echo_h1_plain` | `x_h1p.srv.head` (phase 3 loops) | the same keep-alive H1 server over `TCP.accept`, no cert/key |
+| `fetch[_bytes]_insecure("http://…")` | `x_h1.exch` (TCP triple) | the same one-shot over plain TCP, no TLS |
+| `server.on_h1_plain` / `server.echo_h1_plain` | `x_h1.srv.head` (TCP triple, phase 3 loops) | the same keep-alive H1 server over `TCP.accept`, no cert/key |
 
 ## Mode 2 — streaming (events)
 
