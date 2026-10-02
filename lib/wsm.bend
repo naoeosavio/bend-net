@@ -20,9 +20,10 @@
 # names, so the [mig] is a requalification, not a redesign: WSMessage
 # (WSText / WSBin), WSOut (answers), WSIn (one read), WSEv (lifecycle),
 # WsStep (loop carrier), MsgAcc (fragment reassembly), WSMask (client
-# key). WSFrameSplit (NeedMore / FrameGot / FrameBad) is the one extra
-# the old tree already had: the incremental framing answer the TLS lane
-# needs (no recv_frame effect — split in user land, both lanes here).
+# key). The incremental framing answer is HTTPX.UnitOut itself (Got /
+# NeedMore / End / Bad) — httpx.bend's own TASK-026 mirror of
+# CT.UnitOut, shared instead of redeclared: one question, one shape,
+# the same answer the H1 chunked decoder gives.
 #
 # Discipline (same as lib/httpx.bend): callee above caller; match
 # scrutinees are params or pattern-bound vars; self-recursion only,
@@ -79,16 +80,6 @@ type WsStep is Data:
   StepEv{ev: WSEv}
   StepFrag{acc: MsgAcc}
   StepOut{out: WSOut}
-
-# Incremental framing answer (user-land split, both lanes): NeedMore
-# carries the real missing count while the bytes fall short; FrameGot
-# carries the whole frame plus the exact rest once complete; FrameBad
-# refuses an invalid header with code and message.
-
-type WSFrameSplit is Data:
-  NeedMore{missing: U32}
-  FrameGot{frame: List<&2, U32>, rest: List<&2, U32>}
-  FrameBad{code: U32, msg: String}
 
 # Client masking key (RFC 6455 section 5.3): every client frame needs a
 # fresh unpredictable key, never a constant. IO.random_u32 reads the
@@ -553,7 +544,7 @@ def wsm_client_ok_sub(+status: U32, hs: List<&2, HTTPX.Hdr>, +want: String, +off
 # Ported from the old lane and adapted: WST.* gone (own types above),
 # H1.h1_encode/decode is wsm_utf8_encode/decode, SHA1.bytes_of_word is
 # HTTPX.x_be32, SHA1.word_of4 is wsm_word_of4, UTILS.len_upto is
-# HTTPX.x_len_upto, and the split answer is the local WSFrameSplit.
+# HTTPX.x_len_upto, and the split answer is HTTPX.UnitOut.
 # ---------------------------------------------------------------------
 
 def wsm_op_text() -> U32:
@@ -1118,13 +1109,18 @@ def wsm_read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, B
 # payload) under the same rules as wsm_read_frame (RSV/opcode/control
 # and the 16MB cap); short headers Fail "short ...", invalid ones
 # Fail 400/413. wsm_frame_split(bs) never fails soft data: it answers
-# WSFrameSplit with NeedMore and the real missing count while the bytes
-# fall short, FrameGot with the frame plus the exact rest once complete,
-# FrameBad on invalid headers. The unmasked twins serve the client side,
-# like wsm_read_frame_unmasked. A partial frame is never materialized:
-# the slice is built only in the arm that hands it over, and header
+# HTTPX.UnitOut with NeedMore and the real missing count while the bytes
+# fall short, Got with the frame plus the exact rest once complete, Bad
+# on invalid headers. The unmasked twins serve the client side, like
+# wsm_read_frame_unmasked. A partial frame is never materialized: the
+# slice is built only in the arm that hands it over, and header
 # completeness is measured with x_len_upto (never past 10 bytes — the
-# largest a frame header can be).
+# largest a frame header can have). Got carries fin False on purpose: a
+# WebSocket frame is not a message and does not end one — reassembly is
+# the loop's job, above this — so the protocol-neutral fin of the shared
+# outcome has no value to carry here (same convention as the new tree).
+# End has no producer in this lane (a frame stream has no terminator);
+# the fill answers it fail-closed, like a bad header).
 
 def wsm_frame_need_done(ok: Bool, code: U32, +total: U32) -> Result<&1, &1, U32 & String, U32>:
   match ok:
@@ -1254,42 +1250,38 @@ def wsm_frame_hdr_go(hd: List<&2, U32>, have: U32) -> U32:
         case b1 <> _:
           wsm_frame_hdr.put(have, (2 + wsm_frame_hdr.ext(b1) : U32))
 
-def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> WSFrameSplit:
+def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> HTTPX.UnitOut:
   match eq:
     case True{}:
-      # fin is not carried here: a WebSocket frame is not a message and
-      # does not end one — reassembly is the loop's job, above this — so
-      # the outcome has no fin to carry. FIN is b0 of the unit and the
-      # frame readers read it there.
-      FrameGot{List.take(&2, U32, bs, U32.to_nat(total)), List.drop(&2, U32, bs, U32.to_nat(total))}
+      HTTPX.Got{List.take(&2, U32, bs, U32.to_nat(total)), False{}, List.drop(&2, U32, bs, U32.to_nat(total))}
     case False{}:
-      NeedMore{missing}
+      HTTPX.NeedMore{missing, bs}
 
-def wsm_frame_split_got(+bs: List<&2, U32>, +total: U32) -> WSFrameSplit:
+def wsm_frame_split_got(+bs: List<&2, U32>, +total: U32) -> HTTPX.UnitOut:
   +got = HTTPX.x_len_upto(total, bs)
   wsm_frame_got_go(bs, total, U32.is_eq(got, total), U32.sub(total, got))
 
-def wsm_frame_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) -> WSFrameSplit:
+def wsm_frame_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) -> HTTPX.UnitOut:
   match need:
     case Fail{(c, e)}:
-      FrameBad{c, e}
+      HTTPX.Bad{c, e}
     case Done{total}:
       wsm_frame_split_got(bs, total)
 
-def wsm_frame_split_hd(+bs: List<&2, U32>, unmasked_ok: Bool, missing: U32) -> WSFrameSplit:
+def wsm_frame_split_hd(+bs: List<&2, U32>, unmasked_ok: Bool, missing: U32) -> HTTPX.UnitOut:
   match missing:
     case 0:
       wsm_frame_split_res(bs, wsm_frame_need_go(bs, unmasked_ok))
     case _:
-      NeedMore{missing}
+      HTTPX.NeedMore{missing, bs}
 
-def wsm_frame_split_go(+bs: List<&2, U32>, unmasked_ok: Bool) -> WSFrameSplit:
+def wsm_frame_split_go(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
   wsm_frame_split_hd(bs, unmasked_ok, wsm_frame_hdr_go(bs, HTTPX.x_len_upto(10, bs)))
 
-def wsm_frame_split(bs: List<&2, U32>) -> WSFrameSplit:
+def wsm_frame_split(bs: List<&2, U32>) -> HTTPX.UnitOut:
   wsm_frame_split_go(bs, False{})
 
-def wsm_frame_split_unmasked(bs: List<&2, U32>) -> WSFrameSplit:
+def wsm_frame_split_unmasked(bs: List<&2, U32>) -> HTTPX.UnitOut:
   wsm_frame_split_go(bs, True{})
 
 def wsm_show_b0(fin: Bool, +op: U32) -> U32:
@@ -1494,7 +1486,7 @@ def wsm_split_got(s: Socket, +frame: List<&2, U32>, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, (s, Done{(frame, rest)}))
 
-def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> WSFrameSplit:
+def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
   match unmasked_ok:
     case True{}:
       wsm_frame_split_unmasked(buf)
@@ -1502,7 +1494,7 @@ def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> WSFrameSplit:
       wsm_frame_split(buf)
 
 @unsafe
-def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +unmasked_ok: Bool, +sp: WSFrameSplit) ->
+def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +unmasked_ok: Bool, +sp: HTTPX.UnitOut) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   match st:
     case 0:
@@ -1520,13 +1512,15 @@ def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
     case 1:
       (s2, r2) = m
       match sp:
-        case NeedMore{missing}:
+        case HTTPX.NeedMore{missing, rest}:
           do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>>:
             m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s2, 8192)
             wsm_fill(~recv, 0, m2, buf, unmasked_ok, sp)
-        case FrameGot{frame, rest}:
-          wsm_split_got(s2, frame, rest)
-        case FrameBad{code, msg}:
+        case HTTPX.Got{unit, fin, rest}:
+          wsm_split_got(s2, unit, rest)
+        case HTTPX.End{rest}:
+          wsm_split_fail(s2, 400, "impossible")
+        case HTTPX.Bad{code, msg}:
           wsm_split_fail(s2, code, msg)
     case _:
       (s2, r2) = m
