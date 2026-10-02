@@ -1,4 +1,4 @@
-# httpx (lib_httpx_h1_keepalive): H1 keep-alive, phases 1-2.
+# httpx (lib_httpx_h1_keepalive): H1 keep-alive, phases 1-3.
 #
 # Phase 1 — the pure close policy. x_h1.conn_close is the H1 server's only
 # closure signal: HTTP/1.1 keeps the connection alive unless the request
@@ -19,9 +19,16 @@
 # "connection: close" (render_req can never emit it) must be answered 200
 # and then the server must really close — the next read sees EOF. D) the
 # plaintext mirror, the same three-on-one-connection shape through
-# x_h1p, because x_h1p.srv is a copy and needs its own proof.
-# Golden 9 = 1 (vectors) + 3 (reuse) + 1 (one-shot) + 1 (close) + 3
-# (plaintext reuse).
+# x_h1p, because x_h1p.srv is a copy and needs its own proof. E) the same
+# batch through the unified client API: client.on_insecure dials once,
+# client.on.batch_st takes the is_h2=False branch into the new H1
+# sequential lane (it used to close with Fail 615) and the three requests
+# ride that one socket against a single-accept server. F) the keep-alive
+# single-request entry (client.request) on an H1 CliSt: two calls on the
+# same socket, in order — before Phase 3 it wrote H2 frames onto the
+# HTTP/1.1 socket.
+# Golden 14 = 1 (vectors) + 3 (reuse) + 1 (one-shot) + 1 (close) + 3
+# (plaintext reuse) + 3 (client-API batch) + 2 (client.request).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -350,6 +357,103 @@ def run_plain(b: Listener & U32) -> IO(U32):
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
     plain_run(conn, port)
 
+# Scenario E: the same batch through the unified client API. client.on
+# dials once (ALPN http/1.1 against the server's offer=3) and
+# client.on.batch_st sends is_h2=False down the H1 sequential lane — the
+# branch that used to close the socket with Fail 615. The server is
+# once_h1 (ONE accept), so 3 responses can only come out if all three
+# requests rode that one connection.
+def resp_body_is(+want: String, resp: HTTPX.Response) -> U32:
+  match resp:
+    case HTTPX.Response{+status, +headers, +body}:
+      b2u(Bool.and(U32.is_eq(status, 200),
+        U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
+
+def batch_score_go(wants: List<String>, rs: List<&2, HTTPX.Response>, +sum: U32) ->
+  U32:
+  match wants:
+    case Nil{}:
+      match rs:
+        case Nil{}:
+          sum
+        case h <> t:
+          0
+    case +w <> ws:
+      match rs:
+        case Nil{}:
+          0
+        case +r <> rt:
+          batch_score_go(ws, rt, (sum + resp_body_is(w, r) : U32))
+
+def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) ->
+  U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+rs}:
+      batch_score_go(wants, rs, 0)
+
+def batch_reqs() -> List<&2, HTTPX.Request>:
+  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")},
+   HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")},
+   HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")}]
+
+def api_batch(+port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <-
+      HTTPX.client.on_insecure("127.0.0.1", port, batch_reqs())
+    IO.pure(U32, batch_score(["hello-0", "hello-1", "hello-2"], r))
+
+def run_api(b: Listener & U32) -> IO(U32):
+  (l, port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, batch_side(l))
+    api_batch(port)
+
+# Scenario F: the keep-alive single-request entry (client.request) on an
+# H1 connection. client.connect_insecure hands back the CliSt; two calls
+# on that same socket must answer in request order and thread the state.
+# The server is once_h1 (ONE accept), so a second dial would hang. Before
+# Phase 3 this path wrote H2 frames onto the HTTP/1.1 socket.
+def keep_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +sum: U32) ->
+  IO(U32):
+  (s2, r2, st2) = got
+  +acc : U32 = (sum + score_echo("hello-1", r2) : U32)
+  do IO<U32>:
+    x : Unit <- TLS.tls_close(s2)
+    IO.pure(U32, acc)
+
+def keep_step(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) ->
+  IO(U32):
+  (s1, r1, st1) = got
+  +a : U32 = score_echo("hello-0", r1)
+  do IO<U32>:
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+      HTTPX.client.request(s1, st1, "127.0.0.1", port, "POST", "/echo", Nil{},
+        HTTPX.x_str_bytes("hello-1"))
+    keep_end(got2, a)
+
+def keep_run(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) ->
+  IO(U32):
+  match conn:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{value}:
+      (sock, st) = value
+      do IO<U32>:
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+          HTTPX.client.request(sock, st, "127.0.0.1", port, "POST", "/echo",
+            Nil{}, HTTPX.x_str_bytes("hello-0"))
+        keep_step(got1, port)
+
+def run_keep(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, batch_side(l))
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <-
+      HTTPX.client.connect_insecure("127.0.0.1", port)
+    keep_run(conn, port)
+
 law listen_retry:
   for port: U32
   for r: Result<&1, &1, (U32 & String), Listener>
@@ -392,9 +496,13 @@ def main():
     +close : U32 <- run_close(b3)
     b4 : Listener & U32 <- listen_any(32n, 18515)
     +plain : U32 <- run_plain(b4)
-    +total : U32 = (pure + batch + once + close + plain : U32)
+    b5 : Listener & U32 <- listen_any(32n, 18516)
+    +api : U32 <- run_api(b5)
+    b6 : Listener & U32 <- listen_any(32n, 18517)
+    +keep : U32 <- run_keep(b6)
+    +total : U32 = (pure + batch + once + close + plain + api + keep : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|9
+#|14

@@ -3232,9 +3232,9 @@ def client.on.alpn_go(sock: Socket, is_h2: Bool) ->
         pre : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_preface(sock)
         client.on.prefaced(pre)
     case False{}:
-      # H1 connection: no preface, the socket goes straight to the H1 lane
-      # (x_h1.exch); client.on refuses it with 615 because the batch lane
-      # only speaks H2, and client.once dispatches to the H1 one-shot.
+      # H1 connection: no preface, the socket goes straight to the H1 lane.
+      # client.on (batch), client.request and client.once all dispatch on
+      # the CliSt's is_h2 now, so the socket is handed over as it is.
       IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
 
 def client.on.alpn_conn(conn: Result<&1, &1, U32 & String, Socket & String>) ->
@@ -3269,7 +3269,7 @@ def client.on.connected_go(conn: Result<&1, &1, U32 & String, Socket & String>) 
 # The streaming and concurrent lanes are H2-only: they need the H2 slot
 # machinery, so an H1 connection is closed with 615 — the answer the old
 # H2-strict connect gave — instead of being handed to a lane that cannot
-# speak it. Only client.once dispatches to the H1 one-shot.
+# speak it. client.on, client.request and client.once dispatch to H1.
 def client.on.h2_only(conn: Result<&1, &1, U32 & String, Socket & CliSt>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match conn:
@@ -3805,6 +3805,30 @@ def x_h1.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: S
     out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
     x_h1.exch.done(out)
 
+# The exchange that does NOT close: one request out, one response read
+# back, socket handed over. x_h1.exch.send already behaves that way
+# (x_h1.exch is the one-shot wrapper that closes at the end); this is the
+# named entry for the sequential batch lane, and it validates like the
+# H2 keep-alive path (client.on.fit_keep) so both lanes fail with the
+# same 400/413 before any byte leaves.
+def x_h1.cli.exch.fit(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response>):
+  match fit:
+    case True{}:
+      match ok:
+        case True{}:
+          x_h1.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
+        case False{}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
+            (sock, Fail{(413, "req too large")}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
+        (sock, Fail{(400, "bad request")}))
+
+def x_h1.cli.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response>):
+  x_h1.cli.exch.fit(sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+
 # H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
 # ---------------------------------------------------------------------
 
@@ -3947,6 +3971,27 @@ def x_h1p.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: 
   do IO<Result<&1, &1, U32 & String, Response>>:
     out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1p.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
     x_h1p.exch.done(out)
+
+# Mirror of x_h1.cli.exch: the plaintext exchange that does not close.
+# There is no plaintext batch lane in this build (no client.connect over
+# TCP), so this is symmetry for the lane's own callers, not a new entry.
+def x_h1p.cli.exch.fit(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response>):
+  match fit:
+    case True{}:
+      match ok:
+        case True{}:
+          x_h1p.exch.send(sock, x_h1.render_req(method, path, host, port, hs, body), method)
+        case False{}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
+            (sock, Fail{(413, "req too large")}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>,
+        (sock, Fail{(400, "bad request")}))
+
+def x_h1p.cli.exch(sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response>):
+  x_h1p.cli.exch.fit(sock, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
 
 # H1 once (no-ALPN dial, WSS-style): single-shot over the H1 lane.
 # ---------------------------------------------------------------------
@@ -4377,9 +4422,35 @@ def client.on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +met
     case False{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(400, "bad request")}, st))
 
+# H1 leg of the keep-alive single request: the exchange that never closes,
+# with the CliSt threaded back unchanged so the caller loop is the same
+# shape as the H2 one. H1 has no sids and no HPACK table, so sid/tab just
+# ride along.
+def client.on.h1_keep_st(out: Socket & Result<&1, &1, U32 & String, Response>, +st: CliSt) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
+  (s, r) = out
+  IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt,
+    (s, r, st))
+
+def client.on.h1_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
+  do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
+    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(sock, host, port, method, path, hs, body)
+    client.on.h1_keep_st(out, st)
+
+# One keep-alive request, both ALPN answers (TASK-027 Phase 3): h2 keeps
+# the sid/HPACK exchange, http/1.1 takes the H1 exchange. Before this an
+# H1 CliSt from client.connect* was handed to the H2 sender, which wrote
+# H2 frames onto an HTTP/1.1 socket.
 def client.request(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
-  client.on.fit_keep(sock, st, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+  match st:
+    case CliSt{sid, tab, is_h2}:
+      match is_h2:
+        case True{}:
+          client.on.fit_keep(sock, CliSt{sid, tab, is_h2}, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+        case False{}:
+          client.on.h1_keep(sock, st, host, port, method, path, hs, body)
 
 # Sequential batch entry (Phase 10): one dial, N requests back-to-back
 # on sids 1,3,5..., answers in request order. First Fail aborts the
@@ -4446,9 +4517,53 @@ def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: S
       (sock0, st0) = value
       client_seq.first(sock0, st0, host, port, reqs)
 
-# The batch lane is H2 only: an H1 connection is closed with 615, which is
-# the answer the old keep_connect/alpn_go gave before the dispatch moved
-# here (client.once is the entry that also serves H1).
+# H1 sequential batch (TASK-027 Phase 3): the same contract as the H2 lane
+# above — one dial, answers in request order, first Fail closes and aborts
+# fail-closed — over x_h1.cli.exch, which never closes. H1 has no sids and
+# no HPACK table, so the only state threaded is the socket; the shape and
+# the close sites mirror client_seq.done/first exactly.
+@unsafe
+def client_seq.h1.go(rest: List<&2, Request>, +acc: List<&2, Response>, got: Socket & Result<&1, &1, U32 & String, Response>, +host: String, +port: U32) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  match rest:
+    case Nil{}:
+      (s0, r0) = got
+      match r0:
+        case Fail{e}:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            x : Unit <- TLS.tls_close(s0)
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
+        case Done{+resp}:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            x : Unit <- TLS.tls_close(s0)
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{client_seq.rev(resp <> acc)})
+    case Request{+method, +path, +headers, +body} <> t:
+      (s2, r2) = got
+      match r2:
+        case Fail{e}:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            x : Unit <- TLS.tls_close(s2)
+            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
+        case Done{+resp}:
+          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+            got3 : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(s2, host, port, method, path, headers, body)
+            client_seq.h1.go(t, resp <> acc, got3, host, port)
+
+def client_seq.h1(sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+  match reqs:
+    case Nil{}:
+      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+        x : Unit <- TLS.tls_close(sock)
+        IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
+    case Request{+method, +path, +headers, +body} <> t:
+      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+        got : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(sock, host, port, method, path, headers, body)
+        client_seq.h1.go(t, Nil{}, got, host, port)
+
+# The batch lane serves both ALPN answers now: h2 keeps the sid/HPACK
+# lane, http/1.1 takes the H1 sequential lane on the same socket (the
+# Fail 615 that used to close H1 here is gone — TASK-027 Phase 3).
 def client.on.batch_st(+st: CliSt, sock: Socket, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   match st:
@@ -4457,9 +4572,7 @@ def client.on.batch_st(+st: CliSt, sock: Socket, +host: String, +port: U32, +req
         case True{}:
           client_seq.conn(Done{(sock, CliSt{sid, tab, is_h2})}, host, port, reqs)
         case False{}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(sock)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{(615, "alpn mismatch")})
+          client_seq.h1(sock, host, port, reqs)
 
 def client.on.batch(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
