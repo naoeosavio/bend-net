@@ -3349,6 +3349,20 @@ def x_h1.forbidden(+name: String) -> Bool:
           Bool.or(x_h1.eq_ci(name, "transfer-encoding"),
             Bool.or(x_h1.eq_ci(name, "upgrade"), x_h1.eq_ci(name, "keep-alive")))))))
 
+# Keep-alive policy: the H1 server closes only when the request says so.
+# "connection: close" is the one signal — HTTP/1.1 keeps the connection
+# alive by default, and the client codec never renders the header
+# (x_h1.forbidden skips it), so a peer that sends it means it.
+def x_h1.conn_close.go(hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.conn_close.go(t, Bool.or(acc, Bool.and(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(v, "close"))))
+
+def x_h1.conn_close(hs: List<&2, Hdr>) -> Bool:
+  x_h1.conn_close.go(hs, False{})
+
 def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) -> List<&2, U32>:
   match skip:
     case True{}:
@@ -5895,94 +5909,131 @@ def server.echo(l: Listener, +cert: String, +key: String) ->
 def x_h1.srv.needs_body(+m: String) -> Bool:
   Bool.not(Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD")))
 
-def x_h1.srv.sent_close(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
-  (s2, r2) = sent
-  TLS.tls_close(s2)
+def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
+  (s, r) = got
+  s
 
-def x_h1.srv.respond(sock: Socket, +resp: Response) -> IO(Unit):
+# The answer path never closes the socket: it hands it back to the head
+# machine in the very pair type the read phases use, so phase 3 is the
+# single place that decides reuse vs close.
+#   read_next(s, rest) -> Done{rest}: the answer is out, read the next
+#     request, seeded with the bytes already read past this one.
+#   stop(s, e)         -> Fail{e}: this connection ends here. e is the
+#     send/read error, or (413/502, ...) for a terminal answer, or
+#     (0, "close") for a peer that asked for close.
+# Fail already means "stop" in phases 1 and 3, so no second outcome type
+# is invented. The loop cannot be a mutual recursion (respond -> head ->
+# parsed -> ... -> respond): Bend only sees defs already defined, so the
+# head machine is the one def allowed to loop and the answer path ends by
+# returning to it.
+def x_h1.srv.read_next(s: Socket, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Done{rest}))
+
+def x_h1.srv.stop(s: Socket, e: U32 & String) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (code, msg) = e
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Fail{(code, msg)}))
+
+def x_h1.srv.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s2, r2) = sent
+  match r2:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+        (s2, Fail{e}))
+    case Done{u}:
+      match keep:
+        case True{}:
+          x_h1.srv.read_next(s2, rest)
+        case False{}:
+          x_h1.srv.stop(s2, (0, "close"))
+
+def x_h1.srv.respond(sock: Socket, +resp: Response, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match resp:
     case Response{+status, +headers, +body}:
-      do IO<Unit>:
+      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, x_h1.show_resp(status, headers, body))
-        x_h1.srv.sent_close(sent)
+        x_h1.srv.sent_keep(sent, keep, rest)
 
-def x_h1.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request) -> IO(Unit):
+def x_h1.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s, r) = got
-  do IO<Unit>:
+  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
     resp : Response <- H(req)
-    x_h1.srv.respond(s, resp)
-
-def x_h1.srv.fail_close(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
-  (s0, r0) = got
-  TLS.tls_close(s0)
+    x_h1.srv.respond(s, resp, keep, rest)
 
 def x_h1.srv.recv(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s0, r0) = got
   TLS.tls_recv_bytes(s0, 16384)
 
 @unsafe
-def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
+def x_h1.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match phase:
     case 0:
       match fuel:
         case 0n:
-          x_h1.srv.fail_close(got)
+          x_h1.srv.stop(x_h1.srv.sock_of(got), (413, "request too long"))
         case 1n+f:
           match enough:
             case True{}:
-              x_h1.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)})
+              x_h1.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), x_drop32(cl, have))
             case False{}:
-              do IO<Unit>:
+              do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
                 r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(got)
                 x_h1.srv.bd(~H, 1, r, m, p, hs, have, f, cl, False{})
     case 1:
       (s1, r1) = got
       match r1:
         case Fail{e}:
-          TLS.tls_close(s1)
+          x_h1.srv.stop(s1, e)
         case Done{+part}:
           match part:
             case Nil{}:
-              TLS.tls_close(s1)
+              x_h1.srv.stop(s1, (400, "eof"))
             case h <> t:
               +have2 = List.append(&2, U32, have, part)
               x_h1.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
     case _:
       (s9, r9) = got
-      TLS.tls_close(s9)
+      x_h1.srv.stop(s9, (502, "bad phase"))
 
-def x_h1.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) -> IO(Unit):
+def x_h1.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match big:
     case True{}:
-      x_h1.srv.respond(s, Response{413, Nil{}, Nil{}})
+      x_h1.srv.respond(s, Response{413, Nil{}, Nil{}}, False{}, Nil{})
     case False{}:
       x_h1.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
-def x_h1.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
+def x_h1.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match needs:
     case False{}:
-      x_h1.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}})
+      x_h1.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
     case True{}:
       match chunked:
         case True{}:
-          x_h1.srv.respond(s, Response{502, Nil{}, Nil{}})
+          x_h1.srv.respond(s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
         case False{}:
           x_h1.srv.cl(~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) -> IO(Unit):
+def x_h1.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match joinres:
     case Fail{e}:
-      TLS.tls_close(s1)
+      x_h1.srv.stop(s1, e)
     case Done{+rh}:
       match rh:
         case ReqHead{+m, +p, +hs}:
           x_h1.srv.go(~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
-def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
-  (s, r) = got
-  s
-
-def x_h1.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
+def x_h1.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
   +rest = x_h1.split_rest(x_h1.split(acc))
   x_h1.srv.ruled(~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
@@ -6016,7 +6067,31 @@ def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<
         case False{}:
           x_h1.srv.head(~H, 0, got, acc, fuel, False{})
         case True{}:
-          x_h1.srv.parsed(~H, got, acc, fuel)
+          # The answer path hands the socket back: Done{rest} keeps the
+          # connection (phase 3 re-seeds from the leftover), Fail{e}
+          # stops it (phase 3 closes). acc restarts empty — the bytes
+          # just answered are not part of the next request — and the
+          # head fuel budget restarts per request, or a long-lived
+          # connection would starve after 64 of them.
+          do IO<Unit>:
+            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.parsed(~H, got, acc, fuel)
+            x_h1.srv.head(~H, 3, out, Nil{}, 64n, False{})
+    case 3:
+      # Keep-alive re-entry: never reads here, only decides. An empty
+      # seed (nothing was buffered past the request) goes back to the
+      # socket; a non-empty one is the next request's first bytes, so it
+      # enters the accumulate phase exactly like a fresh recv would —
+      # pipelined requests lose nothing.
+      (s3, r3) = got
+      match r3:
+        case Fail{e}:
+          TLS.tls_close(s3)
+        case Done{+seed}:
+          match seed:
+            case Nil{}:
+              x_h1.srv.head(~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
+            case h <> t:
+              x_h1.srv.head(~H, 1, (s3, Done{seed}), acc, fuel, False{})
     case _:
       (s9, r9) = got
       TLS.tls_close(s9)
@@ -6029,94 +6104,122 @@ def x_h1.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result<
 def x_h1p.srv.needs_body(+m: String) -> Bool:
   Bool.not(Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD")))
 
-def x_h1p.srv.sent_close(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
-  (s2, r2) = sent
-  Socket.close(s2)
+def x_h1p.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
+  (s, r) = got
+  s
 
-def x_h1p.srv.respond(sock: Socket, +resp: Response) -> IO(Unit):
+# Mirror of x_h1.srv's outcome pair: read_next keeps the connection,
+# stop ends it (e is the send/read error, a terminal answer, or
+# (0, "close") for a peer that asked for close). See the TLS lane for
+# why the loop lives in the head machine instead of a mutual recursion.
+def x_h1p.srv.read_next(s: Socket, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Done{rest}))
+
+def x_h1p.srv.stop(s: Socket, e: U32 & String) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (code, msg) = e
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Fail{(code, msg)}))
+
+def x_h1p.srv.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s2, r2) = sent
+  match r2:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+        (s2, Fail{e}))
+    case Done{u}:
+      match keep:
+        case True{}:
+          x_h1p.srv.read_next(s2, rest)
+        case False{}:
+          x_h1p.srv.stop(s2, (0, "close"))
+
+def x_h1p.srv.respond(sock: Socket, +resp: Response, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match resp:
     case Response{+status, +headers, +body}:
-      do IO<Unit>:
+      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCPB.send_bytes(sock, x_h1.show_resp(status, headers, body))
-        x_h1p.srv.sent_close(sent)
+        x_h1p.srv.sent_keep(sent, keep, rest)
 
-def x_h1p.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request) -> IO(Unit):
+def x_h1p.srv.answer(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: Request, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s, r) = got
-  do IO<Unit>:
+  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
     resp : Response <- H(req)
-    x_h1p.srv.respond(s, resp)
-
-def x_h1p.srv.fail_close(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
-  (s0, r0) = got
-  Socket.close(s0)
+    x_h1p.srv.respond(s, resp, keep, rest)
 
 def x_h1p.srv.recv(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s0, r0) = got
   TCPB.recv_bytes(s0, 16384)
 
 @unsafe
-def x_h1p.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
+def x_h1p.srv.bd(~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match phase:
     case 0:
       match fuel:
         case 0n:
-          x_h1p.srv.fail_close(got)
+          x_h1p.srv.stop(x_h1p.srv.sock_of(got), (413, "request too long"))
         case 1n+f:
           match enough:
             case True{}:
-              x_h1p.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)})
+              x_h1p.srv.answer(~H, got, Request{m, p, hs, x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), x_drop32(cl, have))
             case False{}:
-              do IO<Unit>:
+              do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
                 r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1p.srv.recv(got)
                 x_h1p.srv.bd(~H, 1, r, m, p, hs, have, f, cl, False{})
     case 1:
       (s1, r1) = got
       match r1:
         case Fail{e}:
-          Socket.close(s1)
+          x_h1p.srv.stop(s1, e)
         case Done{+part}:
           match part:
             case Nil{}:
-              Socket.close(s1)
+              x_h1p.srv.stop(s1, (400, "eof"))
             case h <> t:
               +have2 = List.append(&2, U32, have, part)
               x_h1p.srv.bd(~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, x_has_at_least(cl, have2))
     case _:
       (s9, r9) = got
-      Socket.close(s9)
+      x_h1p.srv.stop(s9, (502, "bad phase"))
 
-def x_h1p.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) -> IO(Unit):
+def x_h1p.srv.cl(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match big:
     case True{}:
-      x_h1p.srv.respond(s, Response{413, Nil{}, Nil{}})
+      x_h1p.srv.respond(s, Response{413, Nil{}, Nil{}}, False{}, Nil{})
     case False{}:
       x_h1p.srv.bd(~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
-def x_h1p.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
+def x_h1p.srv.go(~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match needs:
     case False{}:
-      x_h1p.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}})
+      x_h1p.srv.answer(~H, (s, Done{Nil{}}), Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
     case True{}:
       match chunked:
         case True{}:
-          x_h1p.srv.respond(s, Response{502, Nil{}, Nil{}})
+          x_h1p.srv.respond(s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
         case False{}:
           x_h1p.srv.cl(~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1p.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) -> IO(Unit):
+def x_h1p.srv.ruled(~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match joinres:
     case Fail{e}:
-      Socket.close(s1)
+      x_h1p.srv.stop(s1, e)
     case Done{+rh}:
       match rh:
         case ReqHead{+m, +p, +hs}:
           x_h1p.srv.go(~H, s1, m, p, hs, rest, fuel, x_h1p.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
-def x_h1p.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
-  (s, r) = got
-  s
-
-def x_h1p.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
+def x_h1p.srv.parsed(~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
   +rest = x_h1.split_rest(x_h1.split(acc))
   x_h1p.srv.ruled(~H, x_h1p.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
@@ -6150,7 +6253,23 @@ def x_h1p.srv.head(~H: Request -> IO(Response), phase: U32, got: Socket & Result
         case False{}:
           x_h1p.srv.head(~H, 0, got, acc, fuel, False{})
         case True{}:
-          x_h1p.srv.parsed(~H, got, acc, fuel)
+          # Same keep-alive hand-back as the TLS lane: Done{rest} keeps
+          # the connection, Fail{e} stops it, and each request gets a
+          # fresh head fuel budget.
+          do IO<Unit>:
+            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1p.srv.parsed(~H, got, acc, fuel)
+            x_h1p.srv.head(~H, 3, out, Nil{}, 64n, False{})
+    case 3:
+      (s3, r3) = got
+      match r3:
+        case Fail{e}:
+          Socket.close(s3)
+        case Done{+seed}:
+          match seed:
+            case Nil{}:
+              x_h1p.srv.head(~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
+            case h <> t:
+              x_h1p.srv.head(~H, 1, (s3, Done{seed}), acc, fuel, False{})
     case _:
       (s9, r9) = got
       Socket.close(s9)
@@ -6248,3 +6367,15 @@ def server.on_h1(~H: Request -> IO(Response), listener: Listener, +cert: String,
     next : Listener <- h1_conn(~H, accepted)
     z : Unit <- server.on_h1(~H, next, cert, key)
     return z
+
+# The H1 pair of server.once: one accept (http/1.1 only) and the connection
+# lane, without the recursion. With a single accept, a client batch can only
+# close its golden if every request came over the same connection — which is
+# what tests/io/httpx_h1_keepalive uses to prove the reuse.
+def server.once_h1(~H: Request -> IO(Response), listener: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    accepted : Listener & Result<&1, &1, U32 & String, Socket> <-
+      TLS.tls_accept_http1(listener, cert, key)
+    next : Listener <- h1_conn(~H, accepted)
+    return Unit{}
