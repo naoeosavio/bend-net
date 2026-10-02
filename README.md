@@ -264,16 +264,16 @@ Architecture (the two delivery modes, why streaming handlers are pure):
 | Function | Description |
 |---|---|
 | `server.on(~H, l, cert, key)` / `server.on_alpn` | Sequential generic server (one stream at a time; pipelined HEADERS gets `RST_STREAM` 7) / ALPN split with one handler for both lanes |
-| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: no chunked, `Content-Length` framing, one-shot connections) |
-| `server.on_h1_plain(~H, l)` / `server.echo_h1_plain(l)` | The same H1 server over plain TCP (`TCP.listen`/`accept`), no cert/key — the `http://` peer |
-| `server.once(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants |
+| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: no chunked, `Content-Length` framing, **keep-alive** — the server answers and reads the next request on the same connection until `connection: close`, EOF or a terminal 413/502) |
+| `server.on_h1_plain(~H, l)` / `server.echo_h1_plain(l)` | The same keep-alive H1 server over plain TCP (`TCP.listen`/`accept`), no cert/key — the `http://` peer |
+| `server.once(~H, l, cert, key)` / `server.once_h1(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants; `once_h1` is the `http/1.1` pair |
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
 | `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming: `SrvReqHead`/`SrvReqData` events to a pure `~H`, `Continue` buffers, `RespondEarly` answers without draining |
 | `client.once(_insecure)(host, port, Request)` | One-shot: `client.on` of a single request plus the unwrap (H1 connections dispatch to the H1 lane) |
-| `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests (sids 1, 3, 5, ...), answers in order; first `Fail` aborts; H2-only |
+| `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
-| `client.connect(_insecure)(host, port)` | The threaded primitive: hands back `Socket & CliSt{sid, tab, is_h2}`; `client.request(sock, st, ...)` does one exchange on it |
+| `client.connect(_insecure)(host, port)` | The threaded primitive: hands back `Socket & CliSt{sid, tab, is_h2}`; `client.request(sock, st, ...)` does one exchange on it (the h2 frame exchange or `x_h1.cli.exch`, per `is_h2`) |
 | `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
 | `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); `StreamCancel` sends `RST_STREAM` |
 | `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
@@ -308,6 +308,7 @@ bend tests/io/httpx_http1_fallback.bend   # 1 (dual client vs H1 server)
 bend tests/io/httpx_server_alpn.bend      # 2 (ALPN split, H2 + H1 clients)
 bend tests/io/httpx_echo_once.bend        # 2 (server.once + server.echo, client.once/echo)
 bend tests/io/httpx_plain_h1.bend         # 2 (http:// end to end over server.on_h1_plain)
+bend tests/io/httpx_h1_keepalive.bend     # 14 (close policy, H1 reuse on one connection, client batch)
 bend tests/io/httpx_flow.bend             # 1 (25 KB up+down through pump v2 + WU credit)
 bend tests/io/httpx_client_cont.bend      # 1 (fragmented HEADERS+CONT vs once drain)
 bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
@@ -596,15 +597,19 @@ bend tests/io/httpx_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once
 bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
 bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
+bend tests/io/httpx_h1_keepalive.bend         # 14 (H1 close policy + reuse + client batch)
 
 bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
 bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
 bend tests/io/core_read_url.bend          # 1 (core URL vectors + valid_* gates)
 ```
 
-Each file ends with a `#|` line holding the expected output — that is the
-PASS/FAIL gate. A file with no `main` (like `lib/package.bend`) instead prints
-`All terms check.`; the echo server's `@unsafe` annotation is expected.
+Each file ends with a `#|` line holding the expected output. That line is the
+golden, but `bend` itself does not compare it: a test that prints something
+else still exits 0, so capture stdout and diff it (as `.p26/suite.sh` does)
+instead of trusting the exit status alone. A file with no `main` (like
+`lib/package.bend`) instead prints `All terms check.`; the echo server's
+`@unsafe` annotation is expected.
 JS and C lanes:
 
 ```sh

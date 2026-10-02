@@ -17,14 +17,14 @@ response, with IO allowed (DB, upstream fetch, file reads):
 |---|---|---|
 | `server.concurrent[_alpn]` | `httpx` (slots + interleaving) | N streams, any completion order |
 | `server.on[_alpn]` / `server.on_h2` | `httpx_seq` | one stream at a time (ALPN split with one `~H` for both lanes) |
-| `server.on_h1` | `x_h1.srv.head/bd` | H1 one-shot |
+| `server.on_h1` / `server.once_h1` | `x_h1.srv.head` (phase 3 loops) | H1 keep-alive: answer, then read the next request on the same connection (`connection: close`, EOF, 413 and 502 close it) |
 | `client.once[_insecure]` | `client_seq` (one request) or `x_h1.exch` on an H1 connection | 1 dial, stream 1, full `Response` |
-| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client_seq` | 1 dial, sids 1,3,5… (batch is H2-only; H1 gets 615) |
+| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client_seq` on h2 / `client_seq.h1` on http/1.1 | 1 dial, answers in order: sids 1,3,5… and the HPACK table on h2; the one socket reused sequentially on H1 |
 | `client.concurrent[_insecure]` | `client_conc.drain` (slots) | pipelined N, scored |
 | `fetch[_bytes][_insecure]`, `request[_bytes][_insecure]` | `client.once` | URL / text conveniences |
 | `h1_once[_insecure]` | `x_h1.exch` | H1 one-shot (TLS) |
 | `fetch[_bytes]_insecure("http://…")` | `x_h1p.exch` | the same one-shot over plain TCP, no TLS |
-| `server.on_h1_plain` / `server.echo_h1_plain` | `x_h1p.srv.head/bd` | the same H1 server over `TCP.accept`, no cert/key |
+| `server.on_h1_plain` / `server.echo_h1_plain` | `x_h1p.srv.head` (phase 3 loops) | the same keep-alive H1 server over `TCP.accept`, no cert/key |
 
 ## Mode 2 — streaming (events)
 

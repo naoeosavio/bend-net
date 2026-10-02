@@ -3332,7 +3332,11 @@ def client.on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +meth
 # natively, so no pairs converters and no encode/decode layer are needed.
 # Subset, fail-closed: no chunked (→502), client requires Content-Length
 # (missing →502, never hangs on keep-alive), server treats missing CL as
-# empty body, one-shot connections (answer + close, no H1 keep-alive).
+# empty body. Keep-alive on both ends since TASK-027: the server answers
+# and loops back to read (x_h1.srv.head phase 3), the client reuses the
+# socket for N requests in order (x_h1.cli.exch / client_seq.h1). Closing
+# is by "connection: close", EOF, or a terminal 413/502; no Connection
+# header is ever emitted, so the one-shot bytes are unchanged.
 # ---------------------------------------------------------------------
 
 def x_h1.eq_ci(a: String, b: String) -> Bool:
@@ -6014,9 +6018,13 @@ def server.echo(l: Listener, +cert: String, +key: String) ->
   server.on(echo_body, l, cert, key)
 
 
-# H1 serve (Phase 11): one-shot per connection (answer + close, no H1
-# keep-alive — mirror https_http1 http1_serve). Handlers speak Request /
-# Response natively, so server.on_alpn takes ONE handler for both lanes.
+# H1 serve (Phase 11), keep-alive since TASK-027: the connection lane is
+# one state machine (x_h1.srv.head) whose phase 3 decides reuse vs close,
+# fed back by the answer path as a (socket, outcome) pair — Bend has no
+# forward references, so the loop cannot be a mutual recursion. Closing is
+# by "connection: close" (x_h1.conn_close), EOF, or a terminal 413/502.
+# Handlers speak Request / Response natively, so server.on_alpn takes ONE
+# handler for both lanes.
 # ---------------------------------------------------------------------
 
 def x_h1.srv.needs_body(+m: String) -> Bool:
