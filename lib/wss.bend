@@ -1,5 +1,9 @@
 # WebSocket Secure (RFC 6455 over TLS) for Bend.
 #
+# SUPERSEDED (task-028 Phase 5): use lib/wsm.bend (import as WSM), the
+# unified ws:// + wss:// implementation built on the httpx H1 upgrade
+# lane. This file stays for the old callers during migration.
+#
 # Import as: import ./wss.bend as WSS (from lib) or
 # import ../../lib/wss.bend as WSS (from tests/io).
 # Reuses the pure codec and event types from ./ws.bend (WS) and the

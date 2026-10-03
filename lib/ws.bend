@@ -1,5 +1,9 @@
 # WebSocket RFC 6455 full-duplex in Bend.
 #
+# SUPERSEDED (task-028 Phase 5): use lib/wsm.bend (import as WSM), the
+# unified ws:// + wss:// implementation built on the httpx H1 upgrade
+# lane. This file stays for the old callers during migration.
+#
 # Import as: import ./ws.bend as WS (from lib) or
 # import ../../lib/ws.bend as WS (from tests/io).
 # Reuses Base, HTTP, SHA1, B64 and the byte effects in lib/tcp.bend

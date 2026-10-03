@@ -11,8 +11,9 @@ the TLS effects in `lib/effs/` (OpenSSL via dlopen — no link flags).
 ```text
 lib/package.bend          # package entry (publish this file)
 lib/http.bend             # HTTP/1.1 library (~2350 lines, imports Base only)
-lib/ws.bend               # WebSocket server + client (text/binary, control)
-lib/wss.bend              # WebSocket Secure: WS over TLS (client + server)
+lib/wsm.bend              # WebSocket (WSM): ws:// + wss://, one implementation
+lib/ws.bend               # WebSocket server + client (SUPERSEDED by wsm.bend)
+lib/wss.bend              # WebSocket Secure: WS over TLS (SUPERSEDED by wsm.bend)
 lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
 lib/b64.bend              # base64, for the handshake accept
 lib/static.bend           # static-file handler on top of HTTP
@@ -37,6 +38,7 @@ tests/io/h2_loopback.bend       # IO: HTTP/2 echo over TLS (Bend↔Bend)
 tests/io/https_*.bend         # HTTPS facade: fetch, streams, server_on, mux
 tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
 tests/io/wss_*.bend           # WSS loopback, server_on, client_on over TLS
+tests/io/wsm_*.bend           # WSM loopback, upgrade rest, pure surface, compat
 tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
 examples/                 # runnable interop programs (not published)
 tasks/                    # engineering log (decisions, discoveries, checklists)
@@ -318,75 +320,82 @@ bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx_
 bend tests/io/httpx_request.bend     # 2 (String + bytes bodies vs mini server)
 ```
 
-## WebSocket
+## WebSocket (WSM)
 
-`lib/ws.bend` (import as `WS`) is an RFC 6455 server and client:
-handshake, frame codec, text/binary messages, ping/pong/close, masked
-clients and unmasked server frames. The codec is pure; IO rides the
-byte effects above. Fragmented messages (`1/2` then `0*` until `FIN=1`)
-are reassembled in both directions; a close payload, a close reason and
-a text payload are validated (see `## WSS` for the close state). Client
-frames are masked with a key drawn from the host entropy pool
-(`IO.random_u32`), never a constant.
+`lib/wsm.bend` (import as `WSM`) is **one** RFC 6455 implementation for
+both schemes. The handshake rides the H1 upgrade lane of
+`lib/httpx.bend` (the `101` detaches the socket: `h1_open` on the client,
+`on_h1_open` on the server) and the frames ride `lib/tls.bend` /
+`lib/tcp.bend` directly once the socket is handed over. Nothing in the
+module imports `ws.bend`, `wss.bend` or `http.bend`: the codec (frames,
+mask, close, ping/pong, fragments, UTF-8) and the handshake live in the
+module. `lib/ws.bend` and `lib/wss.bend` are **superseded** — they stay
+for old callers only, and the whole loop/handshake/split existed twice
+there (once over `TCP.*`, once over `TLS.*`), which is the cost this
+module removes.
+
+**Lanes are picked by name.** TLS keeps the short name, cleartext gets
+`_plain`, and `_insecure` always means "does not verify" — never "no
+TLS".
+
+| TLS (`wss://`) | Cleartext (`ws://`) |
+|---|---|
+| `server_on(~H, l, cert, key)` | `server_on_plain(~H, l)` |
+| `server_on_sub(~H, wanted, l, cert, key)` | `server_on_sub_plain(~H, wanted, l)` |
+| `serve_once(sock)` | `serve_once_plain(sock)` |
+| `client_on(~H, host, port, path, key)` | `client_on_plain(~H, host, port, path, key)` |
+| `client_on_insecure(...)` | — (cleartext never verifies) |
+| `client_on_sub(~H, host, port, path, key, protos)` / `client_on_sub_insecure(...)` | `client_on_sub_plain(...)` |
+| `client_echo(host, port, path, key, msg)` / `client_echo_insecure(...)` | `client_echo_plain(...)` |
+
+The `cert`/`key` pair exists **only** on the TLS server entries: the
+`_plain` twins take no certificate at all, because cleartext is reached
+by name, not by a flag. The same for verification on the client: the
+`_insecure` suffix is the only way to skip it. `~H` is the same handler
+in both lanes: `WSEv -> IO(WSOut)`, one step per frame, one `EvOpen`
+after the handshake.
 
 Handshake (pure):
 
 | Function | Description |
 |---|---|
-| `accept_of` | `Sec-WebSocket-Accept` = base64(SHA1(key ++ GUID)) |
-| `handshake` | Validate a raw request and build the `101` response, or `Fail 400` |
-| `client_request` | Build the client upgrade request for host/path/key |
+| `wsm_accept_of` | `Sec-WebSocket-Accept` = base64(SHA1(key ++ GUID)) |
+| `wsm_validate` / `wsm_validate_sub` | Validate parsed headers (GET, `Upgrade`, `Connection`, `Version`, `Key`) and pick a subprotocol |
+| `wsm_accept_hdrs` / `_sub` | The `101` headers as `HTTPX.Hdr` (the lane renders the head) |
+| `wsm_client_request` / `_sub` | The client upgrade request as `HTTPX.Request` (the lane injects the `Host`, always `host:port`) |
+| `wsm_client_ok` / `_sub` | Validate the `101` plus the echoed `Accept` (and the picked subprotocol) |
+| `wsm_handshake` / `_sub`, `wsm_show_101` / `_sub`, `wsm_client_head` / `_sub` | Text surface over the same rules, for callers that speak the head as `String` |
 
 Frame codec (pure, bytes are `List<&2, U32>`):
 
 | Function | Description |
 |---|---|
-| `read_frame` / `read_frame_unmasked` | Parse one frame into `fin & op & payload`, masked / unmasked |
-| `show_frame` / `show_masked` | Render an unmasked frame / a client-masked frame |
-| `frame_need` / `frame_split` | Length-prefix size, and incremental split into `FrameGot{frame, rest}` / `NeedMore{missing}` / `FrameBad` |
-| `unmask` | XOR a payload with the four mask bytes |
+| `wsm_read_frame` / `wsm_read_frame_unmasked` | Parse one frame into `fin & op & payload`; masked / unmasked |
+| `wsm_show_frame` / `wsm_show_masked` (`_key`, `_random`) | Render an unmasked frame / a client-masked frame |
+| `wsm_frame_need` / `wsm_frame_split` (+ `_unmasked`) | Length-prefix size, and incremental split into `HTTPX.UnitOut` (`Got` / `NeedMore` / `Bad` / `End`); a partial frame is never materialized |
+| `wsm_unmask` | XOR a payload with the four mask bytes |
+| `wsm_utf8_encode` / `_decode` / `_ok` | The `WSText` lane (RFC 3629, strict) |
 
 Messages and events: `WSMessage` is `WSText{text}` or `WSBin{data}`;
 `WSOut` is `OutMsg` / `OutOp` / `OutRaw`; `WSIn` is `InMsg` / `InOp`;
 `WSEv` is the lifecycle event (`EvOpen`, `EvMsg`, `EvPing`, `EvPong`,
-`EvClose`, `EvError`).
+`EvClose`, `EvError`); `WsStep` and `MsgAcc` are loop internals, `WSMask`
+the client key. The names mirror `lib/websocket/type.bend`, so the move
+between the two trees is a requalification, not a redesign.
 
-IO:
-
-| Function | Description |
-|---|---|
-| `send_msg` / `send_op` / `send` | Send a message / an opcode+payload / a `WSOut` |
-| `recv_msg` / `recv_op` / `recv` | Single-shot raw read (one `recv_bytes`); a read may split or glue frames |
-| `recv_msg_framed` / `recv_op_framed` / `recv_in_framed` | One frame per call, the rest threaded back (`*_client_framed` for the client side) |
-| `serve_once` | **test-only**: server echo of one connection |
-| `ws_serve` | Server accept loop (unsafe) |
-| `server_on(~H, l)` | Event-driven server: `~H` maps `WSEv` to `IO(WSOut)`, one step per frame |
-| `client_on(~H, host, port, path, key)` | Event-driven client, same `WSEv`/`WSOut` API, sends masked |
-| `client_echo(host, port, path, key, msg)` | **test-only**: connect, handshake, send, read the echo |
-| `mask_key()` | `IO` draw of a fresh 32-bit masking key (2 × `IO.random_u32`); `show_masked_random` / `client_out_bytes_random` are the IO wrappers |
-| `show_masked(fin, op, payload, k0, k1, k2, k3)` | Masked frame with an explicit key (tests pin a fixed key on purpose) |
-
-## WSS
-
-`lib/wss.bend` (import as `WSS`) is WebSocket Secure: the same RFC 6455
-API as `lib/ws.bend`, riding `lib/tls.bend`. Types (`WSEv`, `WSOut`,
-`WSMessage`) come from `WS` — import both. The client dials with
-`tls_connect_noalpn[_insecure]` (ALPN none: WSS is HTTP/1.1 Upgrade,
-not h2); the server accepts with `tls_accept`. Every path closes via
-`TLS.tls_close` (never `Socket.close`).
+IO — the template defs take the transport as `~recv` / `~send`, and the
+instances pin one lane (never an `is_tls` flag):
 
 | Function | Description |
 |---|---|
-| `serve_once(sock)` | **test-only**: single-shot server echo over one TLS socket |
-| `server_on(~H, l, cert, key)` | Event-driven server: TLS accept loop, `IO.spawn` per connection, same `~H` as `WS.server_on` |
-| `server_on_sub(~H, l, cert, key, protos)` | Same, negotiating `Sec-WebSocket-Protocol` (selects the first of the client's offer that the server lists) |
-| `client_on(~H, host, port, path, key)` / `client_on_insecure` | Event-driven client over no-ALPN TLS, masked sends |
-| `client_on_sub(~H, host, port, path, key, protos)` / `client_on_sub_insecure` | Same, offering subprotocols and requiring the echoed one |
-| `client_echo(...)` / `client_echo_insecure(...)` | **test-only**: single-shot connect + handshake + one frame + echo |
-
-`verify` is a `Bool` on every `client_on*` entry, like the rest of the
-API. A failed `tls_accept` hands the listener back instead of aborting
-the accept loop.
+| `wsm_recv_frame(~recv, s, buf, unmasked_ok)` | One frame per call; the rest threads back as the next `buf` |
+| `wsm_recv_in(~recv, s, buf, unmasked_ok)` | One read as `WSIn` (`InMsg` for data, `InOp` for control/fragmented) |
+| `wsm_send_open(~send, is_client, s, out)` | One `WSOut`; the socket stays open, the loop owns the close |
+| `wsm_send_bytes(~send, m)` | Ship a framed-bytes result verbatim |
+| `send_msg_plain` / `send_op_plain` / `send_msg_tls` / `send_op_tls` | Masked client send, one line per lane |
+| `wsm_ship_plain` / `wsm_ship_tls` | Send-and-close, the shape the old `ws.send_bytes` had |
+| `recv_op[_client]_framed_plain`, `recv_msg[_client]_framed_plain`, `send_open_{op,msg,bytes}_plain`, `recv_bytes_plain` | The retired `lib/ws.bend` vocabulary, one line each over the templates (compat for importers) |
+| `client_scan_len`, `ws_host_port` | Pure compat helpers: the head length up to the CRLFCRLF terminator, and the **retired** `Host` rule (default port omitted — the wire always renders `host:port`) |
 
 **Close state (2026-09-25, task-020):** the close handshake is
 complete. An empty close payload reports `1005` to the application but
@@ -402,11 +411,15 @@ Fail codes surface unchanged: WS `400`/`413`, DNS `601-605`, TLS
 `611-616`.
 
 ```sh
-bend tests/io/wss_loopback.bend    # 111
-bend tests/io/wss_server_on.bend   # 1
-bend tests/io/wss_client_on.bend   # 1111
-bend tests/io/ws_close.bend        # 10
-bend tests/io/ws_fragments.bend    # 9
+bend tests/io/wsm_loopback.bend     # 3   (plain + TLS session + one-shot TLS)
+bend tests/io/wsm_upgrade_rest.bend # 3   (head+frame in one write)
+bend tests/io/wsm_surface.bend      # 29  (pure text surface + UTF-8)
+bend tests/io/wsm_compat.bend       # 9   (the _plain compat instances)
+bend tests/io/wss_loopback.bend     # 111
+bend tests/io/wss_server_on.bend    # 1
+bend tests/io/wss_client_on.bend    # 1111
+bend tests/io/ws_close.bend         # 10
+bend tests/io/ws_fragments.bend     # 9
 bend tests/io/ws_handshake_sub.bend # 12
 
 bend examples/wss_binance_bookticker.bend | head   # live public peer
@@ -578,6 +591,10 @@ bend tests/io/ws_fragments.bend       # 9
 bend tests/io/ws_handshake_sub.bend   # 12
 bend tests/io/ws_mask.bend            # 19
 bend tests/io/wss_client_coalesce.bend # 1
+bend tests/io/wsm_loopback.bend       # 3   (plain + TLS session + one-shot TLS)
+bend tests/io/wsm_upgrade_rest.bend   # 3   (101 + first frame in one write)
+bend tests/io/wsm_surface.bend        # 29  (pure text surface + UTF-8)
+bend tests/io/wsm_compat.bend         # 9   (the _plain compat instances)
 bend tests/io/httpx_miniunit.bend           # 1
 bend tests/io/httpx_client.bend             # 1
 bend tests/io/httpx_interop.bend            # 1
@@ -598,6 +615,8 @@ bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, n
 bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
 bend tests/io/httpx_h1_keepalive.bend         # 14 (H1 close policy + reuse + client batch)
+bend tests/io/httpx_h1_upgrade.bend           # 7 (101 detaches the socket: server + client)
+bend tests/io/httpx_h1_upgrade_client.bend    # 7 (renderer + raw peer + 200 -> 502)
 
 bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
 bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
@@ -619,12 +638,13 @@ bend tests/io/http_lib_pure.bend -o /tmp/purebin && /tmp/purebin
 
 ## Note on the byte effects and `lib/tcp.bend` / `lib/dns.bend`
 
-`lib/ws.bend` imports `./tcp.bend as TCP` and calls `TCP.send_bytes` /
-`TCP.recv_bytes` / `TCP.recv_frame`; `lib/http.bend` imports
-`./dns.bend as DNS` and calls `DNS.resolve`. Keeping the effects in the
-package (rather than in `Base`) is what makes the bundle self-contained:
-a hub consumer with a stock Base can `import 0x<hash>/lib/ws.bend as WS`
-and compile.
+`lib/wsm.bend` and `lib/ws.bend` import `./tcp.bend as TCPB` / `as TCP`
+and call `TCP.send_bytes` / `TCP.recv_bytes` / `TCP.recv_frame`;
+`lib/http.bend` imports `./dns.bend as DNS` and calls `DNS.resolve`.
+Keeping the effects in the package (rather than in `Base`) is what makes
+the bundle self-contained: a hub consumer with a stock Base can
+`import 0x<hash>/lib/wsm.bend as WSM` (or the superseded
+`0x<hash>/lib/ws.bend as WS`) and compile.
 
 The effect host symbols are the defs' local names — `send_bytes_run`,
 `recv_bytes_run`, `recv_frame_run`, and the JS functions `send_bytes`,

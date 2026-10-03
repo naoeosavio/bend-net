@@ -75,3 +75,15 @@ templates: `~H: Request -> IO(Response)` (answers the handshake) and
 See `tasks/task-028-httpx-h1-upgrade-wsm.md` (Phase 1) for the migration
 record: what was deleted, what was threaded, and the golden gate
 (`.p28/suite.base.txt` vs `.p28/suite.p1.txt`, identical).
+
+## Who consumes the upgrade lane
+
+`lib/wsm.bend` (the one WebSocket implementation, `ws://` + `wss://`) is
+the only caller of the upgrade lane: the client side goes through
+`h1_open[_insecure]` (TLS) and `x_h1.cli.exch.open` + `TCP.connect`
+(cleartext), the server side through `on_h1_open` / `on_h1_open_plain`,
+whose `~K` runs the frame loop on the socket the lane handed over. The
+WSM's own surface — the `_plain` / TLS name map, the compat instances and
+the name/type contract with the new tree (`lib/websocket/main.bend`) — is
+documented in `README.md` (`## WebSocket (WSM)`) and in the task file
+(Phase 6).
