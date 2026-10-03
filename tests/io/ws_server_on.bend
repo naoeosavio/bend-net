@@ -1,4 +1,4 @@
-# lib (ws_server_on): WS.server_on — the generic persistent server.
+# lib (ws_server_on): WSM.server_on_plain — the generic persistent server.
 # Pure: opcode consts, out_* builders, ping_reply/close_answer policy
 # (explicit OutOp wins, non-empty OutRaw wins too — it may glue the pong
 # with the next frame; OutRaw{[]} and OutMsg fall back to the auto-pong).
@@ -7,7 +7,7 @@
 # masked frames and reads unmasked replies with buf threaded step by
 # step. Scores pure*10000 + echo1*1000 + pong*100 + echo2*10 + close.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -41,28 +41,28 @@ def eq_list(xs, ys):
           (b2u(U32.is_eq(h1, h2)) * eq_list(t1, t2) : U32)
 
 law is_outop:
-  for w: WS.WSOut
+  for w: WSM.WSOut
   for want_op: U32
   for +want: List<&2, U32>
   U32
 
 def is_outop(w, want_op, want):
   match w:
-    case WS.OutMsg{msg}:
+    case WSM.OutMsg{msg}:
       0
-    case WS.OutOp{op, pay}:
+    case WSM.OutOp{op, pay}:
       b2u(Bool.and(U32.is_eq(op, want_op), U32.is_eq(eq_list(pay, want), 1)))
-    case WS.OutRaw{bs}:
+    case WSM.OutRaw{bs}:
       0
 
 law is_outraw:
-  for w: WS.WSOut
+  for w: WSM.WSOut
   for +want: List<&2, U32>
   U32
 
 def is_outraw(w, want):
   match w:
-    case WS.OutRaw{bs}:
+    case WSM.OutRaw{bs}:
       b2u(U32.is_eq(eq_list(bs, want), 1))
     case _:
       0
@@ -71,25 +71,25 @@ law chk_ops:
   U32
 
 def chk_ops():
-  b2u(U32.is_eq((b2u(U32.is_eq(WS.op_text(), 1)) + b2u(U32.is_eq(WS.op_bin(), 2)) + b2u(U32.is_eq(WS.op_close(), 8)) + b2u(U32.is_eq(WS.op_ping(), 9)) + b2u(U32.is_eq(WS.op_pong(), 10)) : U32), 5))
+  b2u(U32.is_eq((b2u(U32.is_eq(WSM.wsm_op_text(), 1)) + b2u(U32.is_eq(WSM.wsm_op_bin(), 2)) + b2u(U32.is_eq(WSM.wsm_op_close(), 8)) + b2u(U32.is_eq(WSM.wsm_op_ping(), 9)) + b2u(U32.is_eq(WSM.wsm_op_pong(), 10)) : U32), 5))
 
 law chk_build:
   U32
 
 def chk_build():
-  (is_outop(WS.out_pong([7]), 10, [7]) * is_outop(WS.out_close([5]), 8, [5]) : U32)
+  (is_outop(WSM.wsm_out_pong([7]), 10, [7]) * is_outop(WSM.wsm_out_close([5]), 8, [5]) : U32)
 
 law chk_ping:
   U32
 
 def chk_ping():
-  (is_outop(WS.ping_reply([1], WS.OutOp{5, [2]}), 5, [2]) * is_outop(WS.ping_reply([1], WS.OutMsg{WS.WSText{"x"}}), 10, [1]) * is_outop(WS.ping_reply([1], WS.OutRaw{[]}), 10, [1]) * is_outraw(WS.ping_reply([1], WS.OutRaw{[9]}), [9]) : U32)
+  (is_outop(WSM.wsm_ping_reply([1], WSM.OutOp{5, [2]}), 5, [2]) * is_outop(WSM.wsm_ping_reply([1], WSM.OutMsg{WSM.WSText{"x"}}), 10, [1]) * is_outop(WSM.wsm_ping_reply([1], WSM.OutRaw{[]}), 10, [1]) * is_outraw(WSM.wsm_ping_reply([1], WSM.OutRaw{[9]}), [9]) : U32)
 
 law chk_close:
   U32
 
 def chk_close():
-  (is_outop(WS.close_answer([1], WS.OutOp{5, [2]}), 5, [2]) * is_outop(WS.close_answer([1], WS.OutMsg{WS.WSText{"x"}}), 8, [1]) : U32)
+  (is_outop(WSM.wsm_close_answer([1], WSM.OutOp{5, [2]}), 5, [2]) * is_outop(WSM.wsm_close_answer([1], WSM.OutMsg{WSM.WSText{"x"}}), 8, [1]) : U32)
 
 law pure:
   U32
@@ -98,27 +98,27 @@ def pure():
   b2u(U32.is_eq((chk_ops() + chk_build() + chk_ping() + chk_close() : U32), 4))
 
 law h.handle:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.handle(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSText{text}})
-        case WS.WSBin{data}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSBin{data}})
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      IO.pure(WS.WSOut, WS.out_close(pay))
-    case WS.EvError{code, msg}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
+        case WSM.WSText{text}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSText{text}})
+        case WSM.WSBin{data}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSBin{data}})
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_close(pay))
+    case WSM.EvError{code, msg}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
 
 law server_side:
   for l: Listener
@@ -126,7 +126,7 @@ law server_side:
 
 def server_side(l):
   do IO<Unit>:
-    z : Unit <- WS.server_on(~h.handle, l)
+    z : Unit <- WSM.server_on_plain(~h.handle, l)
     return z
 
 law cli.dead:
@@ -169,11 +169,11 @@ def cli.clsent(m, buf, acc):
       cli.dead(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         cli.clgot(m2, acc)
 
 law cli.t2got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for +acc: U32
   IO(U32)
 
@@ -184,12 +184,12 @@ def cli.t2got(m, acc):
       cli.dead(s, acc)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           ok = b2u(String.eq(text, "yo"))
           do IO<U32>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 8, [])
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 8, [])
             cli.clsent(sent, rest, (acc + ok * 10 : U32))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           cli.dead(s, acc)
 
 law cli.t2sent:
@@ -205,7 +205,7 @@ def cli.t2sent(m, buf, acc):
       cli.dead(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, buf)
         cli.t2got(m2, acc)
 
 law cli.pggot:
@@ -222,7 +222,7 @@ def cli.pggot(m, acc):
       (fin, op, pay) = t
       ok = b2u(Bool.and(U32.is_eq(op, 10), U32.is_eq(eq_list(pay, [1, 2]), 1)))
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_msg(s, WS.WSText{"yo"})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_msg_plain(s, WSM.WSText{"yo"})
         cli.t2sent(sent, rest, (acc + ok * 100 : U32))
 
 law cli.pgsent:
@@ -238,11 +238,11 @@ def cli.pgsent(m, buf, acc):
       cli.dead(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         cli.pggot(m2, acc)
 
 law cli.t1got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for +acc: U32
   IO(U32)
 
@@ -253,12 +253,12 @@ def cli.t1got(m, acc):
       cli.dead(s, acc)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           ok = b2u(String.eq(text, "hi"))
           do IO<U32>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 9, [1, 2])
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 9, [1, 2])
             cli.pgsent(sent, rest, (acc + ok * 1000 : U32))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           cli.dead(s, acc)
 
 law cli.t1sent:
@@ -273,7 +273,7 @@ def cli.t1sent(m, acc):
       cli.dead(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, [])
+        m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, [])
         cli.t1got(m2, acc)
 
 law cli.session:
@@ -286,7 +286,7 @@ def cli.session(ok, s, acc):
   match ok:
     case 1:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_msg(s, WS.WSText{"hi"})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_msg_plain(s, WSM.WSText{"hi"})
         cli.t1sent(sent, acc)
     case _:
       cli.dead(s, acc)
@@ -383,10 +383,10 @@ law main_go:
   IO(U32)
 
 def main_go(b):
-  (l, port) = b
+  (l, +port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
-    cli.start("127.0.0.1", port, WS.client_request("127.0.0.1", "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), (pure() * 10000 : U32))
+    cli.start("127.0.0.1", port, WSM.wsm_client_head("127.0.0.1", (port : U32), "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), (pure() * 10000 : U32))
 
 law main:
   IO(U32)

@@ -2,7 +2,7 @@
 # Unmasked text/binary roundtrips, masked frames still accepted,
 # 16-bit lengths, and msg classification on top.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -72,7 +72,7 @@ def read_fin(r):
       b2u(fin)
 
 law msg_text_ok:
-  for r: Result<&1, &1, U32 & String, WS.WSMessage>
+  for r: Result<&1, &1, U32 & String, WSM.WSMessage>
   U32
 
 def msg_text_ok(r):
@@ -81,14 +81,14 @@ def msg_text_ok(r):
       0
     case Done{m}:
       match m:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           b2u(String.eq(text, "Hi"))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           0
 
 law msg_of_res:
   for r: Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>
-  Result<&1, &1, U32 & String, WS.WSMessage>
+  Result<&1, &1, U32 & String, WSM.WSMessage>
 
 def msg_of_res(r):
   match r:
@@ -96,13 +96,13 @@ def msg_of_res(r):
       Fail{e}
     case Done{t}:
       (fin, op, pay) = t
-      WS.msg_of_frame(fin, op, pay)
+      WSM.wsm_msg_of_frame(fin, op, pay)
 
 law chk_text:
   U32
 
 def chk_text():
-  (eq_list(read_pay(WS.read_frame_unmasked([129, 2, 72, 105])), [72, 105]) + b2u(U32.is_eq(read_op(WS.read_frame_unmasked([129, 2, 72, 105])), 1)) + read_fin(WS.read_frame_unmasked([129, 2, 72, 105])) : U32)
+  (eq_list(read_pay(WSM.wsm_read_frame_unmasked([129, 2, 72, 105])), [72, 105]) + b2u(U32.is_eq(read_op(WSM.wsm_read_frame_unmasked([129, 2, 72, 105])), 1)) + read_fin(WSM.wsm_read_frame_unmasked([129, 2, 72, 105])) : U32)
 
 law chk_text_ok:
   U32
@@ -114,13 +114,13 @@ law chk_masked:
   U32
 
 def chk_masked():
-  eq_list(read_pay(WS.read_frame_unmasked([129, 130, 1, 2, 3, 4, 73, 107])), [72, 105])
+  eq_list(read_pay(WSM.wsm_read_frame_unmasked([129, 130, 1, 2, 3, 4, 73, 107])), [72, 105])
 
 law chk_msg:
   U32
 
 def chk_msg():
-  msg_text_ok(msg_of_res(WS.read_frame_unmasked([129, 2, 72, 105])))
+  msg_text_ok(msg_of_res(WSM.wsm_read_frame_unmasked([129, 2, 72, 105])))
 
 law unwrap_show:
   for r: Result<&1, &1, U32 & String, List<&2, U32>>
@@ -138,7 +138,7 @@ law chk_med:
 
 def chk_med():
   +big = List.replicate(U32, 130n, 65)
-  b2u(Nat.is_eq(List.length(&2, U32, read_pay(WS.read_frame_unmasked(unwrap_show(WS.show_frame(True{}, 2, big))))), 130n))
+  b2u(Nat.is_eq(List.length(&2, U32, read_pay(WSM.wsm_read_frame_unmasked(unwrap_show(WSM.wsm_show_frame(True{}, 2, big))))), 130n))
 
 law main:
   U32

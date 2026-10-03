@@ -2,7 +2,7 @@
 # Phase 2 of task-020: key base64-16, Connection tokenized, Host port,
 # Sec-WebSocket-Protocol offer/pick, 101 with/without proto.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -107,73 +107,73 @@ law chk_bad_key:
   U32
 
 def chk_bad_key():
-  is_fail400s(WS.handshake(bad_key_req()))
+  is_fail400s(WSM.wsm_handshake(bad_key_req()))
 
 law chk_multi_conn:
   U32
 
 def chk_multi_conn():
-  is_done(WS.handshake(multi_conn_req()))
+  is_done(WSM.wsm_handshake(multi_conn_req()))
 
 law chk_not_upgrade:
   U32
 
 def chk_not_upgrade():
-  is_fail400s(WS.handshake(not_upgrade_req()))
+  is_fail400s(WSM.wsm_handshake(not_upgrade_req()))
 
 law chk_key_ok:
   U32
 
 def chk_key_ok():
-  b2u(WS.ws_key_ok(good_key()))
+  b2u(WSM.wsm_key_ok(good_key()))
 
 law chk_key_bad:
   U32
 
 def chk_key_bad():
-  b2u(Bool.not(WS.ws_key_ok("not-valid!!")))
+  b2u(Bool.not(WSM.wsm_key_ok("not-valid!!")))
 
 law chk_host_def:
   U32
 
 def chk_host_def():
-  b2u(String.eq(WS.ws_host_port("s", 80), "s"))
+  b2u(String.eq(WSM.ws_host_port("s", 80), "s"))
 
 law chk_host_port:
   U32
 
 def chk_host_port():
-  b2u(String.eq(WS.ws_host_port("s", 8080), "s:8080"))
+  b2u(String.eq(WSM.ws_host_port("s", 8080), "s:8080"))
 
 law chk_req_proto:
   U32
 
 def chk_req_proto():
-  has_sub(WS.client_request_sub("s", 8080, "/chat", good_key(), ["p1", "p2"]), "Sec-WebSocket-Protocol: p1, p2")
+  has_sub(WSM.wsm_client_head_sub("s", 8080, "/chat", good_key(), ["p1", "p2"]), "Sec-WebSocket-Protocol: p1, p2")
 
 law chk_101_proto:
   U32
 
 def chk_101_proto():
-  resp_eq(WS.show_101_sub("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", Some{"p1"}), want_101_proto())
+  resp_eq(WSM.wsm_show_101_sub("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", Some{"p1"}), want_101_proto())
 
 law chk_101_noproto:
   U32
 
 def chk_101_noproto():
-  resp_eq(WS.show_101_sub("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", None{}), want_101())
+  resp_eq(WSM.wsm_show_101_sub("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", None{}), want_101())
 
 law chk_hs_pick:
   U32
 
 def chk_hs_pick():
-  resp_eq(WS.handshake_sub(proto_req(), ["p1"]), want_101_proto())
+  resp_eq(WSM.wsm_handshake_sub(proto_req(), ["p1"]), want_101_proto())
 
 law chk_hs_disjoint:
   U32
 
 def chk_hs_disjoint():
-  resp_eq(WS.handshake_sub(proto_req(), ["zzz"]), want_101())
+  resp_eq(WSM.wsm_handshake_sub(proto_req(), ["zzz"]), want_101())
 
 law main:
   U32

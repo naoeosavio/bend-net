@@ -1,11 +1,10 @@
-# lib (wss_client_on): WSS.client_on — generic persistent client over
+# lib (wss_client_on): WSM.client_on — generic persistent client over
 # TLS. Mirror of ws_client_on.bend: same scripted session on ONE TLS
 # connection; client prints one digit per step (open, echo hi, pong,
 # close). Golden 1111.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/ws.bend as WS
-import ../../lib/wss.bend as WSS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -43,105 +42,105 @@ def eq_list(xs, ys):
 
 law srv.msg2:
   for is_hi: Bool
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def srv.msg2(is_hi):
   match is_hi:
     case True{}:
-      IO.pure(WS.WSOut, WS.OutMsg{WS.WSText{"hi"}})
+      IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSText{"hi"}})
     case False{}:
-      IO.pure(WS.WSOut, WS.out_close([]))
+      IO.pure(WSM.WSOut, WSM.wsm_out_close([]))
 
 law h.srv:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.srv(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           +txt = text
           srv.msg2(String.eq(txt, "hi"))
-        case WS.WSBin{data}:
-          IO.pure(WS.WSOut, WS.out_close([]))
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      IO.pure(WS.WSOut, WS.out_close(pay))
-    case WS.EvError{code, msg}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
+        case WSM.WSBin{data}:
+          IO.pure(WSM.WSOut, WSM.wsm_out_close([]))
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_close(pay))
+    case WSM.EvError{code, msg}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
 
 # Client side: every step prints its digit, checks ride the payload.
 
 law cl.step:
   for ok: Bool
-  for out: WS.WSOut
-  IO(WS.WSOut)
+  for out: WSM.WSOut
+  IO(WSM.WSOut)
 
 def cl.step(ok, out):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print(Bool.pick(String, ok, "1", "0"))
     return out
 
 law cl.msg3:
   for is_yo: Bool
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.msg3(is_yo):
   match is_yo:
     case True{}:
-      cl.step(True{}, WS.OutRaw{[]})
+      cl.step(True{}, WSM.OutRaw{[]})
     case False{}:
-      cl.step(False{}, WS.out_close([]))
+      cl.step(False{}, WSM.wsm_out_close([]))
 
 law cl.msg2:
   for is_hi: Bool
   for is_yo: Bool
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.msg2(is_hi, is_yo):
   match is_hi:
     case True{}:
-      cl.step(True{}, WS.OutOp{WS.op_ping(), [1, 2]})
+      cl.step(True{}, WSM.OutOp{WSM.wsm_op_ping(), [1, 2]})
     case False{}:
       cl.msg3(is_yo)
 
 law cl.pong:
   for +pay: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.pong(pay):
   +ok = U32.is_eq(eq_list(pay, [1, 2]), 1)
-  cl.step(ok, WS.OutMsg{WS.WSText{"yo"}})
+  cl.step(ok, WSM.OutMsg{WSM.WSText{"yo"}})
 
 law h.cl:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.cl(ev):
   match ev:
-    case WS.EvOpen{}:
-      cl.step(True{}, WS.OutMsg{WS.WSText{"hi"}})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      cl.step(True{}, WSM.OutMsg{WSM.WSText{"hi"}})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           +txt = text
           cl.msg2(String.eq(txt, "hi"), String.eq(txt, "yo"))
-        case WS.WSBin{data}:
-          cl.step(False{}, WS.out_close([]))
-    case WS.EvPong{pay}:
+        case WSM.WSBin{data}:
+          cl.step(False{}, WSM.wsm_out_close([]))
+    case WSM.EvPong{pay}:
       cl.pong(pay)
-    case WS.EvClose{pay}:
-      cl.step(True{}, WS.out_close([]))
-    case WS.EvPing{pay}:
-      cl.step(False{}, WS.out_close([]))
-    case WS.EvError{code, msg}:
-      cl.step(False{}, WS.out_close([]))
+    case WSM.EvClose{pay}:
+      cl.step(True{}, WSM.wsm_out_close([]))
+    case WSM.EvPing{pay}:
+      cl.step(False{}, WSM.wsm_out_close([]))
+    case WSM.EvError{code, msg}:
+      cl.step(False{}, WSM.wsm_out_close([]))
 
 law server_side:
   for l: Listener
@@ -149,7 +148,7 @@ law server_side:
 
 def server_side(l):
   do IO<Unit>:
-    z : Unit <- WSS.server_on(~h.srv, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    z : Unit <- WSM.server_on(~h.srv, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return z
 
 law listen_retry:
@@ -188,7 +187,7 @@ def main_go(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
-    done : Unit <- WSS.client_on_insecure(~h.cl, "127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    done : Unit <- WSM.client_on_insecure(~h.cl, "127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
     z : Unit <- IO.die(Unit, 0, "")
     return 0
 

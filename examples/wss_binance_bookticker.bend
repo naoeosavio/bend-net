@@ -24,7 +24,6 @@
 # There is no JSON parser in the package, so fld pulls a field out of a
 # flat object with String.split (no nested objects, no escaped quotes).
 import Base
-# import ../lib/wsS.bend as WS
 import ../lib/wsm.bend as WSS
 
 law sub_frame:

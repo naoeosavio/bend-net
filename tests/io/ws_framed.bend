@@ -1,5 +1,7 @@
-# io (ws_framed): TCP.recv_frame isolates one WS frame per call over a
-# real loopback. The server sends "Hi" in two TCP writes (one byte,
+# io (ws_framed): the WSM compat readers isolate one WS frame per call
+# over a real loopback (recv_msg_client_framed_plain /
+# recv_op_client_framed_plain — the client side of the old ws.bend API).
+# The server sends "Hi" in two TCP writes (one byte,
 # then a sleep, then the rest: split arrival) plus a ping, "yo" and a
 # binary frame in a single write (glued arrival). The client proves
 # all four: the split "Hi" reassembles, the glued ping splits off its
@@ -12,7 +14,7 @@
 # back OUTSIDE the Result, and each tuple destructures in its own
 # helper. The listener retries upward from a base port on Fail.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -89,7 +91,7 @@ law glued:
   List<&2, U32>
 
 def glued():
-  List.append(&2, U32, unwrap(WS.show_frame(True{}, 9, [112, 51])), List.append(&2, U32, unwrap(WS.show_frame(True{}, 1, [121, 111])), unwrap(WS.show_frame(True{}, 2, bin_pay()))))
+  List.append(&2, U32, unwrap(WSM.wsm_show_frame(True{}, 9, [112, 51])), List.append(&2, U32, unwrap(WSM.wsm_show_frame(True{}, 1, [121, 111])), unwrap(WSM.wsm_show_frame(True{}, 2, bin_pay()))))
 
 law finish:
   for s: Socket
@@ -105,7 +107,7 @@ def finish(s, l, score):
     return score
 
 law bin_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for score: U32
   for l: Listener
   IO(U32)
@@ -117,9 +119,9 @@ def bin_got(m, score, l):
       finish(s, l, score)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           finish(s, l, score)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           finish(s, l, (score + eq_list(data, bin_pay()) : U32))
 
 law yo_checked:
@@ -134,13 +136,13 @@ def yo_checked(ok, s, buf, score, l):
   match ok:
     case True{}:
       do IO<U32>:
-        m4 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, buf)
+        m4 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, buf)
         bin_got(m4, (score + 1 : U32), l)
     case False{}:
       finish(s, l, score)
 
 law yo_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for score: U32
   for l: Listener
   IO(U32)
@@ -152,9 +154,9 @@ def yo_got(m, score, l):
       finish(s, l, score)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           yo_checked(String.eq(text, "yo"), s, rest, score, l)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           finish(s, l, score)
 
 law ping_checked:
@@ -169,7 +171,7 @@ def ping_checked(ok, s, rest, score, l):
   match ok:
     case True{}:
       do IO<U32>:
-        m3 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, rest)
+        m3 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, rest)
         yo_got(m3, (score + 1 : U32), l)
     case False{}:
       finish(s, l, score)
@@ -201,13 +203,13 @@ def hi_checked(ok, s, rest, score, l):
   match ok:
     case True{}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, rest)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, rest)
         ping_got(m2, (score + 1 : U32), l)
     case False{}:
       finish(s, l, score)
 
 law hi_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for score: U32
   for l: Listener
   IO(U32)
@@ -219,9 +221,9 @@ def hi_got(m, score, l):
       finish(s, l, score)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           hi_checked(String.eq(text, "Hi"), s, rest, score, l)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           finish(s, l, score)
 
 law srv_glued:
@@ -235,7 +237,7 @@ def srv_glued(m, c, l):
   do IO<U32>:
     u : Unit <- IO.pass(Unit, r)
     x : Unit <- Socket.close(a)
-    m1 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(c, [])
+    m1 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(c, [])
     hi_got(m1, 0, l)
 
 law srv_p2:
@@ -248,7 +250,7 @@ def srv_p2(m, c, l):
   (a, r) = m
   do IO<U32>:
     u : Unit <- IO.pass(Unit, r)
-    m3 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_bytes((a, Done{glued()}))
+    m3 : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_bytes_plain((a, Done{glued()}))
     srv_glued(m3, c, l)
 
 law srv_p1:
@@ -262,7 +264,7 @@ def srv_p1(m, c, l):
   do IO<U32>:
     u : Unit <- IO.pass(Unit, r)
     z : Unit <- IO.sleep(200)
-    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_bytes((a, Done{hi_part2()}))
+    m2 : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_bytes_plain((a, Done{hi_part2()}))
     srv_p2(m2, c, l)
 
 law srv_start:
@@ -273,7 +275,7 @@ law srv_start:
 
 def srv_start(a, c, l):
   do IO<U32>:
-    m1 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_bytes((a, Done{hi_part1()}))
+    m1 : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_bytes_plain((a, Done{hi_part1()}))
     srv_p1(m1, c, l)
 
 law step_accept:

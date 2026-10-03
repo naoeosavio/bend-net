@@ -1,16 +1,14 @@
 # lib (wss_client_coalesce): 101 + first frame coalesced in one TLS write.
 # The canned server reads the upgrade, then answers the 101 and an
 # unmasked "hello" text frame in a SINGLE tls_send, so both ride one
-# TLS record / TCP segment; the client (WSS.client_on_insecure) must
+# TLS record / TCP segment; the client (WSM.client_on_insecure) must
 # split head from frame exactly (task-020 phase 0 off-by-3 guard).
 # The client prints 1 on the hello echo and closes; the server answers
 # the close and shuts. Golden 1. Self-contained loopback: the Node
 # peer (examples/wss_hello_server.js) covers the manual matrix.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/ws.bend as WS
-import ../../lib/wss.bend as WSS
-import ../../lib/http.bend as HTTP
+import ../../lib/wsm.bend as WSM
 import ../../lib/tcp.bend as TCP
 
 law b2u:
@@ -43,7 +41,7 @@ law canned_all:
   List<&2, U32>
 
 def canned_all():
-  List.append(&2, U32, HTTP.encode(canned_101()), canned_hi())
+  List.append(&2, U32, WSM.wsm_utf8_encode(canned_101()), canned_hi())
 
 law close_wire:
   List<&2, U32>
@@ -133,63 +131,63 @@ def server_side(l):
 
 law cl.text_go:
   for ok: Bool
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.text_go(ok):
   match ok:
     case True{}:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("1")
-        return WS.out_close([])
+        return WSM.wsm_out_close([])
     case False{}:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("0")
-        return WS.out_close([])
+        return WSM.wsm_out_close([])
 
 law cl.text:
   for +txt: String
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.text(txt):
   cl.text_go(String.eq(txt, "hello"))
 
 law cl.bin:
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.bin():
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print("0")
-    return WS.out_close([])
+    return WSM.wsm_out_close([])
 
 law cl.err:
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.err():
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print("0")
-    return WS.out_close([])
+    return WSM.wsm_out_close([])
 
 law h.cl:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.cl(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           cl.text(text)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           cl.bin()
-    case WS.EvClose{pay}:
-      IO.pure(WS.WSOut, WS.out_close([]))
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvError{code, msg}:
+    case WSM.EvClose{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_close([]))
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvError{code, msg}:
       cl.err()
 
 law listen_retry:
@@ -228,7 +226,7 @@ def main_go(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
-    done : Unit <- WSS.client_on_insecure(~h.cl, "127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    done : Unit <- WSM.client_on_insecure(~h.cl, "127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
     z : Unit <- IO.die(Unit, 0, "")
     return 0
 

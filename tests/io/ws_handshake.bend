@@ -1,7 +1,8 @@
 # lib (ws_handshake): WS handshake golden plus fail-closed paths.
 # Golden RFC 6455 section 1.3 plus version, key and method rejects.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
+
 
 law b2u:
   for b: Bool
@@ -78,29 +79,36 @@ law want_101:
 def want_101():
   "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
 
+law chk_of:
+  for r: Result<&1, &1, U32 & String, String>
+  U32
+
+def chk_of(r):
+  resp_eq(r, want_101())
+
 law chk_good:
   U32
 
 def chk_good():
-  resp_eq(WS.handshake(good_req()), want_101())
+  chk_of(WSM.wsm_handshake(good_req()))
 
 law chk_ver:
   U32
 
 def chk_ver():
-  is_fail400s(WS.handshake(bad_ver_req()))
+  is_fail400s(WSM.wsm_handshake(bad_ver_req()))
 
 law chk_key:
   U32
 
 def chk_key():
-  is_fail400s(WS.handshake(nokey_req()))
+  is_fail400s(WSM.wsm_handshake(nokey_req()))
 
 law chk_method:
   U32
 
 def chk_method():
-  is_fail400s(WS.handshake(post_req()))
+  is_fail400s(WSM.wsm_handshake(post_req()))
 
 law main:
   U32

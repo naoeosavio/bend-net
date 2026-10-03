@@ -1,4 +1,4 @@
-# lib (ws_server_once): WS.serve_once — the single-shot server.
+# lib (ws_server_once): WSM.serve_once_plain — the single-shot server.
 # Mirror of ws_server_on.bend for the `once` API: each connection
 # answers exactly one frame and closes. Two sequential connections on
 # one listener prove it: (1) masked text "hi" -> unmasked echo + EOF,
@@ -6,7 +6,7 @@
 # double-serve; the client scores echo*1000 + eof1*100 + pong*10 + eof2
 # and multiplies by the joined server result.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -52,7 +52,7 @@ def srv.second(m):
         return 0
     case Done{sock}:
       do IO<U32>:
-        u : Unit <- WS.serve_once(sock)
+        u : Unit <- WSM.serve_once_plain(sock)
         x : Unit <- Listener.close(l)
         return 1
 
@@ -69,7 +69,7 @@ def srv.first(m):
         return 0
     case Done{sock}:
       do IO<U32>:
-        u : Unit <- WS.serve_once(sock)
+        u : Unit <- WSM.serve_once_plain(sock)
         m2 : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
         srv.second(m2)
 
@@ -119,7 +119,7 @@ def cli.pggot(m, acc):
       (fin, op, pay) = t
       ok = b2u(Bool.and(U32.is_eq(op, 10), U32.is_eq(eq_list(pay, [1, 2]), 1)))
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, rest)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, rest)
         cli.eof2(m2, (acc + ok * 10 : U32))
 
 law cli.pgsent:
@@ -135,7 +135,7 @@ def cli.pgsent(m, buf, acc):
       cli.shut(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         cli.pggot(m2, acc)
 
 law cli.session2:
@@ -148,7 +148,7 @@ def cli.session2(ok, s, acc):
   match ok:
     case 1:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 9, [1, 2])
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 9, [1, 2])
         cli.pgsent(sent, [], acc)
     case _:
       cli.shut(s, acc)
@@ -213,9 +213,9 @@ def cli.second(host, port, req, acc):
         cli.open2(conn, req_txt, acc)
 
 law cli.eof1:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for +host: String
-  for port: U32
+  for +port: U32
   for +acc: U32
   IO(U32)
 
@@ -225,12 +225,12 @@ def cli.eof1(m, host, port, acc):
     case Fail{e}:
       do IO<U32>:
         x : Unit <- Socket.close(s)
-        cli.second(host, port, WS.client_request(host, "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), (acc + 100 : U32))
+        cli.second(host, port, WSM.wsm_client_head(host, port, "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), (acc + 100 : U32))
     case Done{msg}:
       cli.shut(s, acc)
 
 law cli.e1got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for +host: String
   for port: U32
   for +acc: U32
@@ -243,12 +243,12 @@ def cli.e1got(m, host, port, acc):
       cli.shut(s, acc)
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           ok = b2u(String.eq(text, "hi"))
           do IO<U32>:
-            m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, rest)
+            m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, rest)
             cli.eof1(m2, host, port, (acc + ok * 1000 : U32))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           cli.shut(s, acc)
 
 law cli.e1sent:
@@ -265,7 +265,7 @@ def cli.e1sent(m, host, port, acc):
       cli.shut(s, acc)
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, [])
+        m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, [])
         cli.e1got(m2, host, port, acc)
 
 law cli.session:
@@ -280,7 +280,7 @@ def cli.session(ok, s, host, port, acc):
   match ok:
     case 1:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_msg(s, WS.WSText{"hi"})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_msg_plain(s, WSM.WSText{"hi"})
         cli.e1sent(sent, host, port, acc)
     case _:
       cli.shut(s, acc)
@@ -383,10 +383,10 @@ law main_go:
   IO(U32)
 
 def main_go(b):
-  (l, port) = b
+  (l, +port) = b
   do IO<U32>:
     chan : Chan(U32) <- IO.fork(U32, server_side(l))
-    acc : U32 <- cli.start("127.0.0.1", port, WS.client_request("127.0.0.1", "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), 0)
+    acc : U32 <- cli.start("127.0.0.1", port, WSM.wsm_client_head("127.0.0.1", (port : U32), "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), 0)
     j : U32 <- IO.join(U32, chan)
     +total : U32 = (acc * j : U32)
     w : Unit <- IO.print(U32.show(total))

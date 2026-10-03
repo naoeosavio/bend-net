@@ -1,9 +1,9 @@
 # lib (ws_loopback): WS echo over loopback plus static guards.
-# Server is single-shot WS.serve_once on an ephemeral port (retry like
-# tcp_loopback); client is WS.client_echo masked Hi. Static checks are
+# Server is single-shot WSM.serve_once_plain on an ephemeral port (retry like
+# tcp_loopback); client is WSM.client_echo_plain masked Hi. Static checks are
 # pure (no File) to stay under the gate timeout.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 import ../../lib/static.bend as Static
 
 law b2u:
@@ -89,7 +89,7 @@ law server_talk:
 
 def server_talk(l, sock):
   do IO<String>:
-    u : Unit <- WS.serve_once(sock)
+    u : Unit <- WSM.serve_once_plain(sock)
     x : Unit <- Listener.close(l)
     return "up"
 
@@ -134,7 +134,7 @@ def main_go(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(String) <- IO.fork(String, server_side(l))
-    r : Result<&1, &1, U32 & String, String> <- WS.client_echo("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r : Result<&1, &1, U32 & String, String> <- WSM.client_echo_plain("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     a : U32 <- chk_echo(chan, r)
     +total : U32 = (a * 100 + static_good() * 10 + static_bad() : U32)
     w : Unit <- IO.print(U32.show(total))

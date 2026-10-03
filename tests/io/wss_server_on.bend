@@ -1,10 +1,9 @@
-# lib (wss_server_on): WSS.server_on — generic persistent server over
+# lib (wss_server_on): WSM.server_on — generic persistent server over
 # TLS. The handler echoes text (OutRaw{[]} on open/ping policy like
 # WS). One client_echo_insecure drives handshake + one frame; golden 1.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/ws.bend as WS
-import ../../lib/wss.bend as WSS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -18,27 +17,27 @@ def b2u(b):
       0
 
 law h.echo:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.echo(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSText{text}})
-        case WS.WSBin{data}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSBin{data}})
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      IO.pure(WS.WSOut, WS.out_close(pay))
-    case WS.EvError{code, msg}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
+        case WSM.WSText{text}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSText{text}})
+        case WSM.WSBin{data}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSBin{data}})
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_close(pay))
+    case WSM.EvError{code, msg}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
 
 law server_side:
   for l: Listener
@@ -46,7 +45,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    z : Unit <- WSS.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    z : Unit <- WSM.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law echo_ok:
@@ -96,9 +95,9 @@ def main_go(b):
   (l, +port) = b
   do IO<U32>:
     chan : Chan(String) <- IO.fork(String, server_side(l))
-    r : Result<&1, &1, U32 & String, String> <- WSS.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r : Result<&1, &1, U32 & String, String> <- WSM.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     +a : U32 = echo_ok(r)
-    r2 : Result<&1, &1, U32 & String, String> <- WSS.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r2 : Result<&1, &1, U32 & String, String> <- WSM.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     +total : U32 = (a * echo_ok(r2) : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")

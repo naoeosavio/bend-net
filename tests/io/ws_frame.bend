@@ -1,7 +1,7 @@
 # lib (ws_frame): WS frame codec roundtrips plus fail-closed paths.
 # Text, binary, continuation, ping/pong/close; len 16/64;wiadomości.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -107,13 +107,13 @@ law chk_show:
   U32
 
 def chk_show():
-  eq_list(unwrap_show(WS.show_frame(True{}, 1, [72, 105])), [129, 2, 72, 105])
+  eq_list(unwrap_show(WSM.wsm_show_frame(True{}, 1, [72, 105])), [129, 2, 72, 105])
 
 law chk_read:
   U32
 
 def chk_read():
-  (eq_list(read_pay(WS.read_frame([129, 130, 1, 2, 3, 4, 73, 107])), [72, 105]) + b2u(U32.is_eq(read_op(WS.read_frame([129, 130, 1, 2, 3, 4, 73, 107])), 1)) + read_fin(WS.read_frame([129, 130, 1, 2, 3, 4, 73, 107])) : U32)
+  (eq_list(read_pay(WSM.wsm_read_frame([129, 130, 1, 2, 3, 4, 73, 107])), [72, 105]) + b2u(U32.is_eq(read_op(WSM.wsm_read_frame([129, 130, 1, 2, 3, 4, 73, 107])), 1)) + read_fin(WSM.wsm_read_frame([129, 130, 1, 2, 3, 4, 73, 107])) : U32)
 
 law chk_read_ok:
   U32
@@ -125,25 +125,25 @@ law chk_unmasked:
   U32
 
 def chk_unmasked():
-  is_fail400f(WS.read_frame([129, 2, 72, 105]))
+  is_fail400f(WSM.wsm_read_frame([129, 2, 72, 105]))
 
 law chk_ctrl_big:
   U32
 
 def chk_ctrl_big():
-  is_fail400f(WS.read_frame([137, 254, 0, 126, 1, 2, 3, 4, 5]))
+  is_fail400f(WSM.wsm_read_frame([137, 254, 0, 126, 1, 2, 3, 4, 5]))
 
 law chk_frag_ctrl:
   U32
 
 def chk_frag_ctrl():
-  is_fail400f(WS.read_frame([9, 130, 1, 2, 3, 4, 73, 107]))
+  is_fail400f(WSM.wsm_read_frame([9, 130, 1, 2, 3, 4, 73, 107]))
 
 law chk_cap:
   U32
 
 def chk_cap():
-  is_fail413f(WS.read_frame([130, 255, 0, 0, 0, 0, 1, 0, 0, 1, 1, 2, 3, 4, 5]))
+  is_fail413f(WSM.wsm_read_frame([130, 255, 0, 0, 0, 0, 1, 0, 0, 1, 1, 2, 3, 4, 5]))
 
 law main:
   U32

@@ -1,10 +1,10 @@
 # lib (wss_loopback): WSS echo over TLS loopback (self-signed).
-# Server is single-shot WSS.serve_once on an ephemeral port (TLS accept
-# with the test cert); client is WSS.client_echo_insecure masked Hi.
+# Server is single-shot WSM.serve_once on an ephemeral port (TLS accept
+# with the test cert); client is WSM.client_echo_insecure masked Hi.
 # Golden 111 (echo + fail-closed dial to port 0/1 via noalpn path).
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/wss.bend as WSS
+import ../../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -72,7 +72,7 @@ law server_talk:
 
 def server_talk(l, sock):
   do IO<String>:
-    u : Unit <- WSS.serve_once(sock)
+    u : Unit <- WSM.serve_once(sock)
     x : Unit <- Listener.close(l)
     return "up"
 
@@ -135,7 +135,7 @@ def main_go(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(String) <- IO.fork(String, server_side(l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem"))
-    r : Result<&1, &1, U32 & String, String> <- WSS.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r : Result<&1, &1, U32 & String, String> <- WSM.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     a : U32 <- chk_echo(chan, r)
     rb : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure("127.0.0.1", 0)
     rc : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure("127.0.0.1", 1)

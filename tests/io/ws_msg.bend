@@ -4,7 +4,7 @@
 # InOp. Net (one listener, three accepts): raw send_bytes/recv_bytes
 # plus text and binary echo. Scores 1000*pure + 100*raw + 10*text + bin.
 import Base
-import ../../lib/ws.bend as WS
+import ../../lib/wsm.bend as WSM
 import ../../lib/tcp.bend as TCP
 
 law b2u:
@@ -58,11 +58,11 @@ def read_of(mres):
     case Fail{e}:
       Fail{e}
     case Done{bs}:
-      WS.read_frame(bs)
+      WSM.wsm_read_frame(bs)
 
 law msg_of_res:
   for r: Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>
-  Result<&1, &1, U32 & String, WS.WSMessage>
+  Result<&1, &1, U32 & String, WSM.WSMessage>
 
 def msg_of_res(r):
   match r:
@@ -70,10 +70,10 @@ def msg_of_res(r):
       Fail{e}
     case Done{t}:
       (fin, op, pay) = t
-      WS.msg_of_frame(fin, op, pay)
+      WSM.wsm_msg_of_frame(fin, op, pay)
 
 law msg_text_ok:
-  for r: Result<&1, &1, U32 & String, WS.WSMessage>
+  for r: Result<&1, &1, U32 & String, WSM.WSMessage>
   U32
 
 def msg_text_ok(r):
@@ -82,13 +82,13 @@ def msg_text_ok(r):
       0
     case Done{m}:
       match m:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           b2u(String.eq(text, "Hi"))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           0
 
 law msg_bin_ok:
-  for r: Result<&1, &1, U32 & String, WS.WSMessage>
+  for r: Result<&1, &1, U32 & String, WSM.WSMessage>
   U32
 
 def msg_bin_ok(r):
@@ -97,13 +97,13 @@ def msg_bin_ok(r):
       0
     case Done{m}:
       match m:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           0
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           eq_list(data, [1, 2, 3, 250])
 
 law is_fail400m:
-  for r: Result<&1, &1, U32 & String, WS.WSMessage>
+  for r: Result<&1, &1, U32 & String, WSM.WSMessage>
   U32
 
 def is_fail400m(r):
@@ -114,82 +114,82 @@ def is_fail400m(r):
       0
 
 law inop9_ok:
-  for w: WS.WSIn
+  for w: WSM.WSIn
   U32
 
 def inop9_ok(w):
   match w:
-    case WS.InMsg{msg}:
+    case WSM.InMsg{msg}:
       0
-    case WS.InOp{fin, op, pay}:
+    case WSM.InOp{fin, op, pay}:
       b2u(Bool.and(fin, Bool.and(U32.is_eq(op, 9), U32.is_eq(eq_list(pay, [72, 105]), 1))))
 
 law chk_to_op_text:
   U32
 
 def chk_to_op_text():
-  b2u(U32.is_eq(WS.msg_to_op(WS.WSText{"Hi"}), 1))
+  b2u(U32.is_eq(WSM.wsm_msg_to_op(WSM.WSText{"Hi"}), 1))
 
 law chk_to_op_bin:
   U32
 
 def chk_to_op_bin():
-  b2u(U32.is_eq(WS.msg_to_op(WS.WSBin{[1, 2, 3, 250]}), 2))
+  b2u(U32.is_eq(WSM.wsm_msg_to_op(WSM.WSBin{[1, 2, 3, 250]}), 2))
 
 law chk_to_bytes_text:
   U32
 
 def chk_to_bytes_text():
-  eq_list(WS.msg_to_bytes(WS.WSText{"Hi"}), [72, 105])
+  eq_list(WSM.wsm_msg_to_bytes(WSM.WSText{"Hi"}), [72, 105])
 
 law chk_to_bytes_bin:
   U32
 
 def chk_to_bytes_bin():
-  eq_list(WS.msg_to_bytes(WS.WSBin{[1, 2, 3, 250]}), [1, 2, 3, 250])
+  eq_list(WSM.wsm_msg_to_bytes(WSM.WSBin{[1, 2, 3, 250]}), [1, 2, 3, 250])
 
 law chk_text:
   U32
 
 def chk_text():
-  msg_text_ok(msg_of_res(read_of(WS.show_masked(True{}, 1, [72, 105], 1, 2, 3, 4))))
+  msg_text_ok(msg_of_res(read_of(WSM.wsm_show_masked(True{}, 1, [72, 105], 1, 2, 3, 4))))
 
 law chk_bin:
   U32
 
 def chk_bin():
-  msg_bin_ok(msg_of_res(read_of(WS.show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8))))
+  msg_bin_ok(msg_of_res(read_of(WSM.wsm_show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8))))
 
 law is_frag:
-  for s: WS.WsStep
+  for s: WSM.WsStep
   U32
 
 def is_frag(s):
   match s:
-    case WS.StepFrag{acc}:
+    case WSM.StepFrag{acc}:
       1
-    case WS.StepEv{ev}:
+    case WSM.StepEv{ev}:
       0
-    case WS.StepOut{out}:
+    case WSM.StepOut{out}:
       0
 
 law chk_frag:
   U32
 
 def chk_frag():
-  is_frag(WS.frag_ev(WS.FragIdle{}, False{}, 1, [72, 105]))
+  is_frag(WSM.wsm_frag_ev(WSM.FragIdle{}, False{}, 1, [72, 105]))
 
 law chk_ping:
   U32
 
 def chk_ping():
-  inop9_ok(WS.recv_in_of(True{}, 9, [72, 105]))
+  inop9_ok(WSM.wsm_recv_in_of(True{}, 9, [72, 105]))
 
 law chk_ctrl:
   U32
 
 def chk_ctrl():
-  is_fail400m(msg_of_res(WS.read_frame([137, 130, 1, 2, 3, 4, 73, 107])))
+  is_fail400m(msg_of_res(WSM.wsm_read_frame([137, 130, 1, 2, 3, 4, 73, 107])))
 
 law pure_sum:
   U32
@@ -224,7 +224,7 @@ def srv3(m3, raw_ok):
         return raw_ok
     case Done{s3}:
       do IO<U32>:
-        u : Unit <- WS.serve_once(s3)
+        u : Unit <- WSM.serve_once_plain(s3)
         x : Unit <- Listener.close(l)
         return raw_ok
 
@@ -242,7 +242,7 @@ def srv2(m2, raw_ok):
         return raw_ok
     case Done{s2}:
       do IO<U32>:
-        u : Unit <- WS.serve_once(s2)
+        u : Unit <- WSM.serve_once_plain(s2)
         m3 : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
         srv3(m3, raw_ok)
 
@@ -279,7 +279,7 @@ def srv1(m1):
         return 0
     case Done{s1}:
       do IO<U32>:
-        m : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- WS.recv_bytes(s1)
+        m : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- WSM.recv_bytes_plain(s1)
         raw_done(m, l)
 
 law server_side:
@@ -300,7 +300,7 @@ def raw_conn(conn):
     case Fail{e}:
       IO.pure(Unit, Unit{})
     case Done{sock}:
-      WS.send_bytes((sock, Done{[129, 130, 1, 2, 3, 4, 73, 107]}))
+      WSM.wsm_ship_plain((sock, Done{[129, 130, 1, 2, 3, 4, 73, 107]}))
 
 law raw_client:
   for +host: String
@@ -432,7 +432,7 @@ law bin_frames:
   Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>
 
 def bin_frames():
-  bin_frames_put(WS.show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8), WS.show_frame(True{}, 2, [1, 2, 3, 250]))
+  bin_frames_put(WSM.wsm_show_masked(True{}, 2, [1, 2, 3, 250], 5, 6, 7, 8), WSM.wsm_show_frame(True{}, 2, [1, 2, 3, 250]))
 
 law bin_go:
   for +host: String
@@ -467,11 +467,11 @@ def bin_req_ok(host, port, req, frames):
 
 law bin_client:
   for +host: String
-  for port: U32
+  for +port: U32
   IO(U32)
 
 def bin_client(host, port):
-  bin_req_ok(host, port, WS.client_request(host, "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), bin_frames())
+  bin_req_ok(host, port, WSM.wsm_client_head(host, port, "/chat", "dGhlIHNhbXBsZSBub25jZQ=="), bin_frames())
 
 law listen_retry:
   for port: U32
@@ -510,7 +510,7 @@ def main_go(b):
   do IO<U32>:
     chan : Chan(U32) <- IO.fork(U32, server_side(l))
     u : Unit <- raw_client("127.0.0.1", port)
-    r : Result<&1, &1, U32 & String, String> <- WS.client_echo("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r : Result<&1, &1, U32 & String, String> <- WSM.client_echo_plain("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     c : U32 <- bin_client("127.0.0.1", port)
     s : U32 <- IO.join(U32, chan)
     +total : U32 = (pure() * 1000 + s * 100 + text_ok(r) * 10 + c : U32)
