@@ -1,43 +1,42 @@
 # WSS subprotocol echo server (task-020 phase 2, manual interop only).
-# Supports ["p1"] via WSS.server_on_sub on 127.0.0.1:19894 (TLS test
+# Supports ["p1"] via WSM.server_on_sub on 127.0.0.1:19894 (TLS test
 # certs). Prints LISTEN, then DONE on hello echo. Run through a built
 # binary (bend run faults on large transfers, not needed here):
 # bend examples/wss_sub_echo.bend -o /tmp/sub_echo_bin && /tmp/sub_echo_bin
 # Manual only — not in check.sh.
 import Base
-import ../lib/ws.bend as WS
-import ../lib/wss.bend as WSS
+import ../lib/wsm.bend as WSM
 import ../lib/tcp.bend as TCP
 
 law h.echo:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.echo(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           +txt = text
-          do IO<WS.WSOut>:
+          do IO<WSM.WSOut>:
             w : Unit <- IO.print("GOT " ++ txt)
-            return WS.OutMsg{WS.WSText{txt}}
-        case WS.WSBin{data}:
-          IO.pure(WS.WSOut, WS.OutMsg{msg})
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      do IO<WS.WSOut>:
+            return WSM.OutMsg{WSM.WSText{txt}}
+        case WSM.WSBin{data}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{msg})
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("DONE sub")
-        return WS.out_close([])
-    case WS.EvError{code, msg}:
-      do IO<WS.WSOut>:
+        return WSM.wsm_out_close([])
+    case WSM.EvError{code, msg}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("FAIL sub")
-        return WS.OutRaw{[]}
+        return WSM.OutRaw{[]}
 
 law main_go:
   for r: Result<&1, &1, U32 & String, Listener>
@@ -52,7 +51,7 @@ def main_go(r):
     case Done{l}:
       do IO<U32>:
         w : Unit <- IO.print("LISTEN 19894")
-        z : Unit <- WSS.server_on_sub(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem", ["p1"])
+        z : Unit <- WSM.server_on_sub(~h.echo, ["p1"], l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
         return 0
 
 law main:

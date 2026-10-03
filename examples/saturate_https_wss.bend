@@ -1,7 +1,7 @@
 # Saturation + bench driver for lib/https.bend and lib/wss.bend.
 # Bend<->Bend loopback over ephemeral ports (no fixed-port clashes with
 # the 19892/19893 echo peers). The HTTPS server is HTTPS.server_on and
-# the WSS server is WSS.server_on (both IO.spawn per connection, so the
+# the WSS server is WSM.server_on (both IO.spawn per connection, so the
 # N clients below overlap); each client is a single-shot insecure
 # exchange (send_request_insecure / client_echo_insecure) against
 # 127.0.0.1 with the test PEMs.
@@ -18,32 +18,31 @@ import Base
 import ../lib/tls.bend as TLS
 import ../lib/https.bend as HTTPS
 import ../lib/http2.bend as H2
-import ../lib/ws.bend as WS
-import ../lib/wss.bend as WSS
+import ../lib/wsm.bend as WSM
 
 def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
   match req:
     case H2.H2Request{+method, +path, +headers, +body}:
       IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
 
-def h.echo(ev: WS.WSEv) -> IO(WS.WSOut):
+def h.echo(ev: WSM.WSEv) -> IO(WSM.WSOut):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSText{text}})
-        case WS.WSBin{data}:
-          IO.pure(WS.WSOut, WS.OutMsg{WS.WSBin{data}})
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      IO.pure(WS.WSOut, WS.out_close(pay))
-    case WS.EvError{code, msg}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
+        case WSM.WSText{text}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSText{text}})
+        case WSM.WSBin{data}:
+          IO.pure(WSM.WSOut, WSM.OutMsg{WSM.WSBin{data}})
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_close(pay))
+    case WSM.EvError{code, msg}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -81,7 +80,7 @@ law wss_server:
 
 def wss_server(l):
   do IO<String>:
-    x : Unit <- WSS.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- WSM.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law client_https:
@@ -99,7 +98,7 @@ law client_wss:
 
 def client_wss(port):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, String> <- WSS.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
+    r : Result<&1, &1, U32 & String, String> <- WSM.client_echo_insecure("127.0.0.1", port, "/chat", "dGhlIHNhbXBsZSBub25jZQ==", "Hi")
     IO.pure(U32, wss_score(r))
 
 law run_https:

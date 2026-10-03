@@ -7,38 +7,37 @@
 #   /tmp/frag_echo_bin   (Ctrl-C to stop)
 # Manual only — not in check.sh.
 import Base
-import ../lib/ws.bend as WS
-import ../lib/wss.bend as WSS
+import ../lib/wsm.bend as WSM
 import ../lib/tcp.bend as TCP
 
 law h.len.go:
   for n: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.len.go(n):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print(U32.show(n))
-    return WS.OutRaw{[]}
+    return WSM.OutRaw{[]}
 
 law h.len:
   for +data: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.len(data):
   h.len.go(U32.from_nat(List.length(&2, U32, data)))
 
 law h.code.go:
   for code: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.code.go(code):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print(U32.show(code))
-    return WS.OutRaw{[]}
+    return WSM.OutRaw{[]}
 
 law h.code:
   for code: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.code(code):
   h.code.go(code)
@@ -46,12 +45,12 @@ def h.code(code):
 law h.echo2.go:
   for +data: List<&2, U32>
   for n: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.echo2.go(data, n):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print(U32.show(n))
-    return WS.OutMsg{WS.WSBin{data}}
+    return WSM.OutMsg{WSM.WSBin{data}}
 
 law h.echo2.len:
   for +data: List<&2, U32>
@@ -62,7 +61,7 @@ def h.echo2.len(data):
 
 law h.echo2:
   for +data: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.echo2(data):
   h.echo2.go(data, h.echo2.len(data))
@@ -70,12 +69,12 @@ def h.echo2(data):
 law h.echo3.go:
   for +pay: List<&2, U32>
   for n: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.echo3.go(pay, n):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print(U32.show(n))
-    return WS.out_close(pay)
+    return WSM.wsm_out_close(pay)
 
 law h.echo3.len:
   for +pay: List<&2, U32>
@@ -86,34 +85,34 @@ def h.echo3.len(pay):
 
 law h.echo3:
   for +pay: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def h.echo3(pay):
   h.echo3.go(pay, h.echo3.len(pay))
 
 law h.echo:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.echo(ev):
   match ev:
-    case WS.EvOpen{}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvMsg{msg}:
+    case WSM.EvOpen{}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
-          do IO<WS.WSOut>:
+        case WSM.WSText{text}:
+          do IO<WSM.WSOut>:
             w : Unit <- IO.print("srv-text")
-            return WS.OutMsg{msg}
-        case WS.WSBin{data}:
+            return WSM.OutMsg{msg}
+        case WSM.WSBin{data}:
           h.echo2(data)
-    case WS.EvPing{pay}:
-      IO.pure(WS.WSOut, WS.out_pong(pay))
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
+    case WSM.EvPing{pay}:
+      IO.pure(WSM.WSOut, WSM.wsm_out_pong(pay))
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
       h.echo3(pay)
-    case WS.EvError{code, msg}:
+    case WSM.EvError{code, msg}:
       h.code(code)
 
 law main_go:
@@ -129,7 +128,7 @@ def main_go(r):
     case Done{l}:
       do IO<U32>:
         w : Unit <- IO.print("LISTEN 19893")
-        z : Unit <- WSS.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+        z : Unit <- WSM.server_on(~h.echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
         return 0
 
 law main:

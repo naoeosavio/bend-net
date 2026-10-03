@@ -4,7 +4,7 @@
 # ping s2/pong -> close. Prints the score (6 when all passes).
 # Run: bend examples/cliente.bend
 import Base
-import ../lib/ws.bend as WS
+import ../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -69,7 +69,7 @@ def close_checked(ok, s, score):
   match ok:
     case True{}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 8, [])
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 8, [])
         close_shipped(sent, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -107,7 +107,7 @@ def wait_close(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         close_got(m2, score)
 
 law pong2_go:
@@ -122,7 +122,7 @@ def pong2_go(ok, s, pay, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 10, pay)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 10, pay)
         wait_close(sent, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -168,7 +168,7 @@ def echo_checked(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         ping2_got(m2, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -176,7 +176,7 @@ def echo_checked(ok, s, buf, score):
         return score
 
 law echo_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for score: U32
   IO(U32)
 
@@ -189,9 +189,9 @@ def echo_got(m, score):
         return score
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           echo_checked(String.eq(text, "hello"), s, rest, score)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           do IO<U32>:
             x : Unit <- Socket.close(s)
             return score
@@ -211,7 +211,7 @@ def hello_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_client_framed_plain(s, buf)
         echo_got(m2, score)
 
 law hello_next:
@@ -225,7 +225,7 @@ def hello_next(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_msg(s, WS.WSText{"hello"})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_msg_plain(s, WSM.WSText{"hello"})
         hello_sent(sent, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -263,7 +263,7 @@ def ping_c1_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, buf)
         pong1_got(m2, score)
 
 law pong_s1_sent:
@@ -281,7 +281,7 @@ def pong_s1_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        sent2 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 9, [99, 49])
+        sent2 : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 9, [99, 49])
         ping_c1_sent(sent2, buf, score)
 
 law s1_go:
@@ -296,7 +296,7 @@ def s1_go(ok, s, pay, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.client_send_op(s, 10, pay)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_op_plain(s, 10, pay)
         pong_s1_sent(sent, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -340,7 +340,7 @@ def session(ok, s):
   match ok:
     case True{}:
       do IO<U32>:
-        m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_client_framed(s, [])
+        m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_client_framed_plain(s, [])
         ping_s1_got(m, 1)
     case False{}:
       do IO<U32>:
@@ -408,12 +408,12 @@ def start_req(host, port, req):
 
 law start:
   for +host: String
-  for port: U32
+  for +port: U32
   for +key: String
   IO(U32)
 
 def start(host, port, key):
-  start_req(host, port, WS.client_request(host, "/chat", key))
+  start_req(host, port, WSM.wsm_client_head(host, port, "/chat", key))
 
 law main:
   IO(U32)

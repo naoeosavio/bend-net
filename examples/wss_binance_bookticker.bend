@@ -24,8 +24,8 @@
 # There is no JSON parser in the package, so fld pulls a field out of a
 # flat object with String.split (no nested objects, no escaped quotes).
 import Base
-import ../lib/ws.bend as WS
-import ../lib/wss.bend as WSS
+# import ../lib/wsS.bend as WS
+import ../lib/wsm.bend as WSS
 
 law sub_frame:
   for +sym: String
@@ -107,52 +107,52 @@ def bk.line(js):
 law h.text:
   for +text: String
   for is_ack: Bool
-  IO(WS.WSOut)
+  IO(WSS.WSOut)
 
 def h.text(text, is_ack):
   match is_ack:
     case True{}:
-      do IO<WS.WSOut>:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print("ACK " ++ text)
-        return WS.OutRaw{[]}
+        return WSS.OutRaw{[]}
     case False{}:
-      do IO<WS.WSOut>:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print(bk.line(text))
-        return WS.OutRaw{[]}
+        return WSS.OutRaw{[]}
 
 law h.btc:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSS.WSEv
+  IO(WSS.WSOut)
 
 def h.btc(ev):
   match ev:
-    case WS.EvOpen{}:
-      do IO<WS.WSOut>:
+    case WSS.EvOpen{}:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print("OPEN stream.binance.com:9443/ws")
-        return WS.OutMsg{WS.WSText{sub_frame("bnbusdt")}}
-    case WS.EvMsg{msg}:
+        return WSS.OutMsg{WSS.WSText{sub_frame("bnbusdt")}}
+    case WSS.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSS.WSText{text}:
           +t = text
           h.text(t, String.contains(t, "\"result\""))
-        case WS.WSBin{data}:
-          do IO<WS.WSOut>:
+        case WSS.WSBin{data}:
+          do IO<WSS.WSOut>:
             w : Unit <- IO.print("BIN " ++ U32.show(U32.from_nat(List.length(&2, U32, data))))
-            return WS.out_close([])
-    case WS.EvPing{pay}:
-      do IO<WS.WSOut>:
+            return WSS.wsm_out_close([])
+    case WSS.EvPing{pay}:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print("PING -> pong")
-        return WS.out_pong(pay)
-    case WS.EvPong{pay}:
-      IO.pure(WS.WSOut, WS.OutRaw{[]})
-    case WS.EvClose{pay}:
-      do IO<WS.WSOut>:
+        return WSS.wsm_out_pong(pay)
+    case WSS.EvPong{pay}:
+      IO.pure(WSS.WSOut, WSS.OutRaw{[]})
+    case WSS.EvClose{pay}:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print("CLOSE " ++ U32.show(U32.from_nat(List.length(&2, U32, pay))))
-        return WS.out_close([])
-    case WS.EvError{code, msg}:
-      do IO<WS.WSOut>:
+        return WSS.wsm_out_close([])
+    case WSS.EvError{code, msg}:
+      do IO<WSS.WSOut>:
         w : Unit <- IO.print("ERR " ++ U32.show(code) ++ " " ++ msg)
-        return WS.out_close([])
+        return WSS.wsm_out_close([])
 
 law feed:
   IO(Unit)
@@ -168,7 +168,7 @@ law main:
 def main():
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, feed())
-    w : Unit <- IO.sleep(15000)
+    w : Unit <- IO.sleep(150000)
     s : Unit <- IO.print("STOP")
     z : Unit <- IO.die(Unit, 0, "")
     return 0

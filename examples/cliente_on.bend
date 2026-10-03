@@ -1,6 +1,6 @@
 # Interop client, ON version: scripted 6-step ping/pong session against
 # examples/server.on.bend (or server.js, server.bend) on
-# 127.0.0.1:19880, rewritten over WS.client.on — the client is now the
+# 127.0.0.1:19880, rewritten over WSM.client.on — the client is now the
 # event-driven mirror of the server, not a hand-driven socket loop.
 # Script: 101 -> ping s1/pong+ping c1 -> pong c1/hello -> hello/echo ->
 # ping s2/pong -> close. Stateles like server.on.bend: every step is
@@ -12,7 +12,7 @@
 # failed check prints FAIL and closes early.
 # Run: bend examples/cliente_on.bend
 import Base
-import ../lib/ws.bend as WS
+import ../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -63,123 +63,123 @@ law pong_ping:
 # entropy pool (RFC 6455 section 5.3), so this is an IO step.
 def pong_ping():
   do IO<List<&2, U32>>:
-    a : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.client_out_bytes_random(WS.out_pong([115, 49]))
-    b : Result<&1, &1, U32 & String, List<&2, U32>> <- WS.client_out_bytes_random(WS.OutOp{WS.op_ping(), [99, 49]})
+    a : Result<&1, &1, U32 & String, List<&2, U32>> <- WSM.wsm_client_out_bytes_random(WSM.wsm_out_pong([115, 49]))
+    b : Result<&1, &1, U32 & String, List<&2, U32>> <- WSM.wsm_client_out_bytes_random(WSM.OutOp{WSM.wsm_op_ping(), [99, 49]})
     return List.append(&2, U32, unwrap(a), unwrap(b))
 
 law cl.hs:
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.hs():
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print("OK HS")
-    return WS.OutRaw{[]}
+    return WSM.OutRaw{[]}
 
 law cl.pong1:
   for ok: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.pong1(ok):
   match ok:
     case 1:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("OK PONG_C1")
-        return WS.OutMsg{WS.WSText{"hello"}}
+        return WSM.OutMsg{WSM.WSText{"hello"}}
     case _:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("FAIL PONG")
-        return WS.out_close([])
+        return WSM.wsm_out_close([])
 
 law cl.pong2:
   for ok: U32
   for +pp: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.pong2(ok, pp):
   match ok:
     case 1:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("OK PONG_S2")
-        return WS.out_pong(pp)
+        return WSM.wsm_out_pong(pp)
     case _:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("FAIL PING")
-        return WS.out_close([])
+        return WSM.wsm_out_close([])
 
 law cl.ping1:
   for s1: U32
   for s2: U32
   for +pp: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.ping1(s1, s2, pp):
   match s1:
     case 1:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         pp2 : List<&2, U32> <- pong_ping()
         w : Unit <- IO.print("OK PONG_S1")
-        return WS.OutRaw{pp2}
+        return WSM.OutRaw{pp2}
     case _:
       cl.pong2(s2, pp)
 
 law cl.text:
   for ok: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.text(ok):
   match ok:
     case 1:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("OK ECHO")
-        return WS.OutRaw{[]}
+        return WSM.OutRaw{[]}
     case _:
-      do IO<WS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("FAIL TEXT")
-        return WS.out_close([])
+        return WSM.wsm_out_close([])
 
 law cl.close:
   for +pay: List<&2, U32>
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.close(pay):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print("OK CLOSE")
     d : Unit <- IO.print("DONE 6/6")
-    return WS.out_close(pay)
+    return WSM.wsm_out_close(pay)
 
 law cl.err:
   for code: U32
-  IO(WS.WSOut)
+  IO(WSM.WSOut)
 
 def cl.err(code):
-  do IO<WS.WSOut>:
+  do IO<WSM.WSOut>:
     w : Unit <- IO.print("FAIL EV")
-    return WS.OutRaw{[]}
+    return WSM.OutRaw{[]}
 
 law h.cl:
-  for ev: WS.WSEv
-  IO(WS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.cl(ev):
   match ev:
-    case WS.EvOpen{}:
+    case WSM.EvOpen{}:
       cl.hs()
-    case WS.EvMsg{msg}:
+    case WSM.EvMsg{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           cl.text(b2u(String.eq(text, "hello")))
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           cl.text(0)
-    case WS.EvPing{pay}:
+    case WSM.EvPing{pay}:
       +pp = pay
       cl.ping1(eq_list(pp, [115, 49]), eq_list(pp, [115, 50]), pp)
-    case WS.EvPong{pay}:
+    case WSM.EvPong{pay}:
       +pp = pay
       cl.pong1(eq_list(pp, [99, 49]))
-    case WS.EvClose{pay}:
+    case WSM.EvClose{pay}:
       +pp = pay
       cl.close(pp)
-    case WS.EvError{code, msg}:
+    case WSM.EvError{code, msg}:
       cl.err(code)
 
 law main:
@@ -187,6 +187,6 @@ law main:
 
 def main():
   do IO<U32>:
-    done : Unit <- WS.client_on(~h.cl, "127.0.0.1", 19880, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    done : Unit <- WSM.client_on_plain(~h.cl, "127.0.0.1", 19880, "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
     z : Unit <- IO.die(Unit, 0, "")
     return 0

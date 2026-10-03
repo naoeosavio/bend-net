@@ -5,7 +5,7 @@
 # Run one server at a time (fixed port).
 # Run: bend examples/server.bend
 import Base
-import ../lib/ws.bend as WS
+import ../lib/wsm.bend as WSM
 
 law b2u:
   for b: Bool
@@ -97,7 +97,7 @@ def close_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_framed_plain(s, buf)
         close_got(m2, score)
 
 law pong2_checked:
@@ -111,7 +111,7 @@ def pong2_checked(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_op(s, 8, [])
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_op_plain(s, 8, [])
         close_sent(sent, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -149,7 +149,7 @@ def ping_s2_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_framed_plain(s, buf)
         pong_s2_got(m2, score)
 
 law echo_done:
@@ -167,7 +167,7 @@ def echo_done(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        p : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_op(s, 9, [115, 50])
+        p : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_op_plain(s, 9, [115, 50])
         ping_s2_sent(p, buf, score)
 
 law text_checked:
@@ -181,7 +181,7 @@ def text_checked(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        e1 : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_msg(s, WS.WSText{"hello"})
+        e1 : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_msg_plain(s, WSM.WSText{"hello"})
         echo_done(e1, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -189,7 +189,7 @@ def text_checked(ok, s, buf, score):
         return score
 
 law text_got:
-  for m: Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32>
+  for m: Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32>
   for score: U32
   IO(U32)
 
@@ -202,9 +202,9 @@ def text_got(m, score):
         return score
     case Done{msg}:
       match msg:
-        case WS.WSText{text}:
+        case WSM.WSText{text}:
           text_checked(String.eq(text, "hello"), s, rest, score)
-        case WS.WSBin{data}:
+        case WSM.WSBin{data}:
           do IO<U32>:
             x : Unit <- Socket.close(s)
             return score
@@ -224,7 +224,7 @@ def pong_c1_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, WS.WSMessage> & List<&2, U32> <- WS.recv_msg_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, WSM.WSMessage> & List<&2, U32> <- WSM.recv_msg_framed_plain(s, buf)
         text_got(m2, score)
 
 law ping_c1_checked:
@@ -238,7 +238,7 @@ def ping_c1_checked(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        p : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_op(s, 10, [99, 49])
+        p : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_op_plain(s, 10, [99, 49])
         pong_c1_sent(p, buf, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -272,7 +272,7 @@ def pong_s1_checked(ok, s, buf, score):
   match ok:
     case True{}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_framed_plain(s, buf)
         ping_c1_got(m2, (score + 1 : U32))
     case False{}:
       do IO<U32>:
@@ -310,7 +310,7 @@ def ping_s1_sent(m, buf, score):
         return score
     case Done{u}:
       do IO<U32>:
-        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WS.recv_op_framed(s, buf)
+        m2 : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- WSM.recv_op_framed_plain(s, buf)
         pong_s1_got(m2, score)
 
 law reply_sent:
@@ -327,7 +327,7 @@ def reply_sent(m, score):
         return score
     case Done{u}:
       do IO<U32>:
-        p : Socket & Result<&1, &1, U32 & String, Unit> <- WS.send_open_op(s, 9, [115, 49])
+        p : Socket & Result<&1, &1, U32 & String, Unit> <- WSM.send_open_op_plain(s, 9, [115, 49])
         ping_s1_sent(p, [], score)
 
 law reply_101:
@@ -358,7 +358,7 @@ def hs_got(m):
         x : Unit <- Socket.close(s)
         return 0
     case Done{req}:
-      reply_101(WS.handshake(req), s)
+      reply_101(WSM.wsm_handshake(req), s)
 
 law accepted:
   for m1: Listener & Result<&1, &1, U32 & String, Socket>
