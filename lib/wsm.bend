@@ -36,7 +36,8 @@ import ./sha1.bend as SHA1
 import ./b64.bend as B64
 
 # Messages: WSText is UTF-8 String on the wire via wsm_utf8_encode /
-# wsm_utf8_decode; WSBin is raw bytes. Controls (8/9/10) and fragmented
+# wsm_utf8_decode (this module's text lane, TASK-028 Phase 5.9);
+# WSBin is raw bytes. Controls (8/9/10) and fragmented
 # frames (FIN=False) stay outside WSMessage and Fail{400} on the msg
 # path; the generic recv reports them as InOp.
 
@@ -90,36 +91,16 @@ type WsStep is Data:
 type WSMask is Data:
   WSMask{k0: U32, k1: U32, k2: U32, k3: U32}
 
-# Small pure helpers (the ones the old tree spread over HTTP/UTILS/CORE;
-# each is a few lines, so they live here instead of growing imports).
-# ---------------------------------------------------------------------
-
-def wsm_eq_ci(a: String, b: String) -> Bool:
-  String.eq(String.to_lower(a), String.to_lower(b))
-
-def wsm_has_crlf.go(cs: List<&2, Char>) -> Bool:
-  match cs:
-    case Nil{}:
-      False{}
-    case Chr{+code} <> t:
-      Bool.or(Bool.or(U32.is_eq(code, 13), U32.is_eq(code, 10)), wsm_has_crlf.go(t))
-
-def wsm_has_crlf(+s: String) -> Bool:
-  wsm_has_crlf.go(String.to_list(s))
-
-# Big-endian word from four bytes (the one helper the old codec took
-# from SHA1.bytes_of_word's twin word_of4; httpx only kept the
-# constructor x_be32, so the projection lives here).
-def wsm_word_of4(+b0: U32, +b1: U32, +b2: U32, +b3: U32) -> U32:
-  (b0 * 16777216 + b1 * 65536 + b2 * 256 + b3 : U32)
-
-# UTF-8 (RFC 6455 section 5.6: text frames and close reasons must be
-# valid UTF-8). Encode is the h1_encode family (range-dispatched, no
-# literal tables); decode walks the same need/min/code discipline as
-# the wsm_utf8_ok validator below, so on validated input it emits
-# exactly what H1.h1_decode emits — and it only ever runs on validated
-# input (frag_text checks first). x_str_bytes is NOT enough: it emits
-# raw code points, which breaks every non-ASCII text.
+# UTF-8 (RFC 3629): WSText on the wire. The H1 byte helpers in httpx
+# (x_str_bytes/x_bytes_str) are ASCII-only (raw code points, one byte
+# each) and feed the H1 renderers, so the real encoding lives here:
+# range-dispatched with no literal tables, plus the need/min/code
+# decoder that mirrors the validator below. Back in this module by the
+# owner's call (TASK-028 Phase 5.9, reversing Phase 5.5): UTF-8 here is
+# the WS text lane and this module is its only consumer today; the tree
+# still carries the other copies (h1_encode/h1_decode in
+# lib/web/http/main.bend, utf8_* in lib/ws.bend and
+# lib/websocket/ws.bend) until the trees converge.
 # ---------------------------------------------------------------------
 
 def wsm_utf8_encode.go2(+code: U32) -> List<&2, U32>:
@@ -261,6 +242,30 @@ def wsm_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) ->
 
 def wsm_utf8_decode(bs: List<&2, U32>) -> String:
   wsm_utf8_decode.go(bs, 0, 0, 0)
+
+# Small pure helpers (the ones the old tree spread over HTTP/UTILS/CORE;
+# each is a few lines, so they live here instead of growing imports).
+# ---------------------------------------------------------------------
+
+def wsm_eq_ci(a: String, b: String) -> Bool:
+  String.eq(String.to_lower(a), String.to_lower(b))
+
+def wsm_has_crlf.go(cs: List<&2, Char>) -> Bool:
+  match cs:
+    case Nil{}:
+      False{}
+    case Chr{+code} <> t:
+      Bool.or(Bool.or(U32.is_eq(code, 13), U32.is_eq(code, 10)), wsm_has_crlf.go(t))
+
+def wsm_has_crlf(+s: String) -> Bool:
+  wsm_has_crlf.go(String.to_list(s))
+
+# Big-endian word from four bytes (the one helper the old codec took
+# from SHA1.bytes_of_word's twin word_of4; httpx only kept the
+# constructor x_be32, so the projection lives here).
+def wsm_word_of4(+b0: U32, +b1: U32, +b2: U32, +b3: U32) -> U32:
+  (b0 * 16777216 + b1 * 65536 + b2 * 256 + b3 : U32)
+
 
 # Handshake (pure): key validation, Upgrade/Connection/Version scan,
 # Sec-WebSocket-Accept, and the client request — over httpx.Request /
@@ -498,6 +503,142 @@ def wsm_client_req_sub.go(+path: String, +key: String, +protos: List<&2, String>
 def wsm_client_request_sub(+path: String, +key: String, +protos: List<&2, String>) -> Result<&1, &1, U32 & String, HTTPX.Request>:
   wsm_client_req_sub.go(path, key, protos, Bool.or(wsm_bad_req(path, key), wsm_protos_bad(protos)))
 
+# Text entry points (pure, TASK-028 Phase 5.5): head text in, head text
+# out. They exist for the tests, examples and the old ws.bend API that
+# speak the handshake as String — NOT because the lane needs them: the
+# lanes use the Hdr/Request defs above. Composition, not fork: the raw
+# head is parsed by the H1 lane (x_h1.split -> head_lines ->
+# req_tok/parse_hs) and the 101 is rendered by the H1 lane
+# (x_h1.show_resp_head), so the tree still has one parser and one
+# renderer. The client side is the same: wsm_client_head renders through
+# x_h1.render_req.go with upgrade=True.
+#
+# NOT here, on purpose: host_port (the lane renders the Host, always
+# host:port — a second formatter would be a second source of truth) and
+# scan_len (the lane splits the head and hands the caller the rest; a
+# WSM-side rescan would invite the take/drop reconstruction that the
+# upgrade lane deleted).
+# ---------------------------------------------------------------------
+
+def wsm_text_parse_req(tok: Result<&1, &1, U32 & String, String & String & String & Bool>, hs: Result<&1, &1, U32 & String, List<&2, HTTPX.Hdr>>) ->
+  Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>:
+  match tok:
+    case Fail{e}:
+      Fail{e}
+    case Done{quad}:
+      (m, p, v, ok) = quad
+      match hs:
+        case Fail{e2}:
+          Fail{e2}
+        case Done{headers}:
+          Bool.pick(Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>, ok, Done{(m, headers)}, Fail{(400, "bad request line")})
+
+def wsm_text_hs_of(raw: String) -> Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>:
+  split = HTTPX.x_h1.split(HTTPX.x_str_bytes(raw))
+  head = HTTPX.x_h1.split_head(split)
+  +lines = HTTPX.x_h1.head_lines(head)
+  wsm_text_parse_req(HTTPX.x_h1.req_tok(String.split(HTTPX.x_h1.first_line(lines), ' ')), HTTPX.x_h1.parse_hs(HTTPX.x_h1.rest_lines(lines)))
+
+def wsm_text_validate.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{pair}:
+      (m, hs) = pair
+      wsm_validate(m, hs)
+
+def wsm_text_validate(raw: String) -> Result<&1, &1, U32 & String, String>:
+  wsm_text_validate.go(wsm_text_hs_of(raw))
+
+def wsm_text_validate_sub.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>, +wanted: List<&2, String>) ->
+  Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{pair}:
+      (m, hs) = pair
+      wsm_validate_sub(m, hs, wanted)
+
+def wsm_text_validate_sub(raw: String, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
+  wsm_text_validate_sub.go(wsm_text_hs_of(raw), wanted)
+
+def wsm_text_accept(+accept: String) -> List<&2, U32>:
+  HTTPX.x_h1.show_resp_head(101, wsm_accept_hdrs(accept))
+
+def wsm_text_accept_sub(pick: Maybe<&2, String>, +accept: String) -> List<&2, U32>:
+  match pick:
+    case Some{p}:
+      HTTPX.x_h1.show_resp_head(101, wsm_accept_hdrs_sub(accept, p))
+    case None{}:
+      wsm_text_accept(accept)
+
+# The rendered head is never empty (status line alone is longer), so the
+# guard is a fail-closed shape, not a size check.
+def wsm_text_str(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
+  match bs:
+    case Nil{}:
+      Fail{(400, "no response")}
+    case b <> t:
+      Done{HTTPX.x_bytes_str(bs)}
+
+def wsm_text_key.go(r: Result<&1, &1, U32 & String, String>) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{key}:
+      wsm_text_str(wsm_text_accept(wsm_accept_of(key)))
+
+def wsm_text_key_sub.go(r: Result<&1, &1, U32 & String, String & Maybe<&2, String>>) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{pair}:
+      (key, pick) = pair
+      wsm_text_str(wsm_text_accept_sub(pick, wsm_accept_of(key)))
+
+# show_101* render an accept the CALLER computed (that is the point: a
+# test pins a known key/accept pair and reads back the exact 101 head).
+# The handshake* family below derives it from the request's own
+# Sec-WebSocket-Key instead. Keeping the two apart is the whole fix for
+# "show_101_sub silently ignores the accept it was given".
+def wsm_show_101(+accept: String) -> Result<&1, &1, U32 & String, String>:
+  wsm_text_str(wsm_text_accept(accept))
+
+def wsm_show_101_sub(+accept: String, proto: Maybe<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  wsm_text_str(wsm_text_accept_sub(proto, accept))
+
+def wsm_handshake(raw: String) -> Result<&1, &1, U32 & String, String>:
+  wsm_text_key.go(wsm_text_validate(raw))
+
+def wsm_handshake_sub(raw: String, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  wsm_text_key_sub.go(wsm_text_validate_sub(raw, wanted))
+
+def wsm_client_head.render_bytes(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{bs}:
+      Done{HTTPX.x_bytes_str(bs)}
+
+def wsm_client_head.render(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, HTTPX.Hdr>, +body: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, String>:
+  wsm_client_head.render_bytes(HTTPX.x_h1.render_req.go(True{}, False{}, method, path, host, port, hs, body))
+
+def wsm_client_head.go(r: Result<&1, &1, U32 & String, HTTPX.Request>, +host: String, +port: U32) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{req}:
+      match req:
+        case HTTPX.Request{method, path, headers, body}:
+          wsm_client_head.render(method, path, host, port, headers, body)
+
+def wsm_client_head(+host: String, +port: U32, +path: String, +key: String) -> Result<&1, &1, U32 & String, String>:
+  wsm_client_head.go(wsm_client_request(path, key), host, port)
+
+def wsm_client_head_sub(+host: String, +port: U32, +path: String, +key: String, +protos: List<&2, String>) -> Result<&1, &1, U32 & String, String>:
+  wsm_client_head.go(wsm_client_request_sub(path, key, protos), host, port)
+
 # Client-side 101 validation over the lane's parsed Response: status 101
 # plus the Accept echoing accept_of(key) (plus the subprotocol pick for
 # _sub). Fail-closed, like the old client_ok_of over head text.
@@ -538,6 +679,27 @@ def wsm_client_check_go(hs: List<&2, HTTPX.Hdr>, +want: String, +offered: List<&
 
 def wsm_client_ok_sub(+status: U32, hs: List<&2, HTTPX.Hdr>, +want: String, +offered: List<&2, String>) -> Bool:
   Bool.and(U32.is_eq(status, 101), wsm_client_check_go(hs, want, offered, False{}, "", False{}))
+
+# Pure compatibility defs (TASK-028 Phase 5.7): names the retired
+# lib/ws.bend exposed and the importers still call. They are callers'
+# vocabulary, not lane internals — each one reuses the def that owns the
+# rule instead of reimplementing it.
+
+# Head length up to and including the CRLFCRLF terminator. Reuse: the H1
+# split owns the scan (and the found-at-the-end fix of TASK-026 Phase
+# 7b); a second scanner here is what the upgrade lane deleted.
+def client_scan_len(bs: List<&2, U32>) -> U32:
+  U32.from_nat(List.length(&2, U32, HTTPX.x_h1.split_head(HTTPX.x_h1.split(bs))))
+
+# Host header of the RETIRED lane: the default port (80/443) is omitted.
+# The WSM wire always renders host:port (the H1 renderer owns the Host,
+# pinned by httpx_h1_upgrade_client with Host: h:80), so this formatter
+# is caller vocabulary only — do not use it to build a WSM request.
+def ws_host_port_go(+host: String, +port: U32, is_def: Bool) -> String:
+  Bool.pick(String, is_def, host, host ++ ":" ++ U32.show(port))
+
+def ws_host_port(+host: String, +port: U32) -> String:
+  ws_host_port_go(host, port, Bool.or(U32.is_eq(port, 80), U32.is_eq(port, 443)))
 
 # Frame codec (pure): parse and render both ways, mask, message layer,
 # strict UTF-8, close-code rules, fragment reassembly, incremental split.
@@ -1478,6 +1640,76 @@ def wsm_send_open(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U
     case False{}:
       wsm_send_bytes(~send, (s, wsm_out_bytes(out)))
 
+# Transport instances (TASK-028 Phase 5.5). The template defs above are
+# the real abstraction: the lane is picked at the call site, once, and
+# the codec never mentions it. These instances exist so a caller holding
+# a raw socket (tests, examples, a scripted peer) does not repeat the
+# ~TCPB / ~TLS pair on every send. One instance per lane, never an
+# is_wss Bool flag: a Bool would (a) be illegal in the comptime slots the
+# lane itself uses (the ~H of on_h1_open), (b) move the ws/wss fork from
+# compile time to runtime, and (c) collide with the _insecure (no
+# verify) / _plain (cleartext) naming rule.
+#
+# Dialect note that shapes the shape: a ~ param cannot be mentioned inside
+# a do IO<...> block, and an IO(...) expression cannot be handed to a
+# runtime binder. So each instance spells its own close once instead of
+# forwarding a template through the IO edge.
+
+def wsm_ship_sock(m: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket:
+  (s, r) = m
+  s
+
+# send-and-close, the shape ws.send_bytes had: hand it the framed bytes
+# (Done/Fail from a builder) and it ships them and drops the socket.
+def wsm_ship_plain(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      Socket.close(s)
+    case Done{bs}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCPB.send_bytes(s, bs)
+        Socket.close(wsm_ship_sock(sent))
+
+def wsm_ship_tls(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      TLS.tls_close(s)
+    case Done{bs}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(s, bs)
+        TLS.tls_close(wsm_ship_sock(sent))
+
+# Masked client sends (RFC 6455 section 5.3: the key comes from the host
+# entropy pool, never a constant).
+def send_msg_plain(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TCPB.send_bytes, True{}, s, OutMsg{msg})
+
+def send_op_plain(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TCPB.send_bytes, True{}, s, OutOp{op, pay})
+
+def send_msg_tls(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TLS.tls_send_bytes, True{}, s, OutMsg{msg})
+
+def send_op_tls(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TLS.tls_send_bytes, True{}, s, OutOp{op, pay})
+
+# Unmasked "open" sends (server side of a session): the socket stays
+# open, the loop owns the close. Same one-line shape as send_msg_plain /
+# send_op_plain above, with is_client=False instead of a flag.
+def send_open_op_plain(s: Socket, +op: U32, +pay: List<&2, U32>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TCPB.send_bytes, False{}, s, OutOp{op, pay})
+
+def send_open_msg_plain(s: Socket, +msg: WSMessage) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_open(~TCPB.send_bytes, False{}, s, OutMsg{msg})
+
+# Ship a framed-bytes result (Done/Fail from a builder) verbatim, socket
+# open — the shape the retired send_open_bytes had.
+def send_open_bytes_plain(m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  wsm_send_bytes(~TCPB.send_bytes, m)
+
 def wsm_split_fail(s: Socket, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, (s, Fail{(code, msg)}))
@@ -1568,6 +1800,60 @@ def wsm_recv_in(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
   do IO<Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>>:
     m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- wsm_recv_frame(~recv, s, buf, unmasked_ok)
     wsm_recv_in_got(m)
+
+# Message-level read: like wsm_recv_in, but a control or fragmented frame
+# is a Fail (400) instead of an InOp, which is what the retired
+# recv_msg_* framed defs answered. wsm_msg_of_frame owns the rule. The
+# Result gets its own def: Bend refuses a match on a computed scrutinee.
+def wsm_recv_msg_done(s: Socket, p: Result<&1, &1, U32 & String, WSMessage>, rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  match p:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{msg}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Done{msg}, rest))
+
+def wsm_recv_msg_got(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  (s, r, rest) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>, (s, Fail{e}, []))
+    case Done{t}:
+      (fin, op, pay) = t
+      wsm_recv_msg_done(s, wsm_msg_of_frame(fin, op, pay), rest)
+
+def wsm_recv_msg(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), s: Socket, +buf: List<&2, U32>, +unmasked_ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  do IO<Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>>:
+    m : Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32> <- wsm_recv_frame(~recv, s, buf, unmasked_ok)
+    wsm_recv_msg_got(m)
+
+# Compatibility instances (TASK-028 Phase 5.7): the per-side sugar the
+# retired lib/ws.bend exposed, so an importer migrates by rename instead
+# of rewriting each call site. One line each over wsm_recv_frame /
+# wsm_recv_msg; the _plain suffix is the lane, like send_msg_plain.
+# unmasked_ok=True means the peer is the client (server frames ride
+# unmasked), False means the masked side.
+def recv_op_framed_plain(s: Socket, buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  wsm_recv_frame(~TCPB.recv_bytes, s, buf, False{})
+
+def recv_op_client_framed_plain(s: Socket, buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>):
+  wsm_recv_frame(~TCPB.recv_bytes, s, buf, True{})
+
+def recv_msg_framed_plain(s: Socket, buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  wsm_recv_msg(~TCPB.recv_bytes, s, buf, False{})
+
+def recv_msg_client_framed_plain(s: Socket, buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, WSMessage> & List<&2, U32>):
+  wsm_recv_msg(~TCPB.recv_bytes, s, buf, True{})
+
+# Raw byte read, the shape the retired recv_bytes had (8192 like the lane).
+def recv_bytes_plain(s: Socket) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  TCPB.recv_bytes(s, 8192)
 
 def wsm_recv_after(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), m: Socket & Result<&1, &1, U32 & String, Unit>, +buf: List<&2, U32>, +is_client: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32>):
@@ -1797,7 +2083,7 @@ def server_on(~H: WSEv -> IO(WSOut), l: Listener, +cert: String, +key: String) -
   HTTPX.server.on_h1_open(~wsm_srv_h, sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), l, cert, key)
 
 @unsafe
-def server_on_sub(~H: WSEv -> IO(WSOut), l: Listener, +cert: String, +key: String, +wanted: List<&2, String>) -> IO(Unit):
+def server_on_sub(~H: WSEv -> IO(WSOut), ~wanted: List<&2, String>, l: Listener, +cert: String, +key: String) -> IO(Unit):
   HTTPX.server.on_h1_open(req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), l, cert, key)
 
 @unsafe
@@ -1805,7 +2091,7 @@ def server_on_plain(~H: WSEv -> IO(WSOut), l: Listener) -> IO(Unit):
   HTTPX.server.on_h1_open_plain(~wsm_srv_h, sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), l)
 
 @unsafe
-def server_on_sub_plain(~H: WSEv -> IO(WSOut), l: Listener, +wanted: List<&2, String>) -> IO(Unit):
+def server_on_sub_plain(~H: WSEv -> IO(WSOut), ~wanted: List<&2, String>, l: Listener) -> IO(Unit):
   HTTPX.server.on_h1_open_plain(req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), l)
 
 # Session clients: dial, upgrade over the H1 lane, validate 101 + Accept,
