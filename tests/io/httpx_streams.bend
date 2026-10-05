@@ -1,12 +1,11 @@
-# lib (lib_https_streams): two sequential streams on one HTTPS
-# connection. The server serves via HTTPS.serve_start (multi-stream
+# lib (lib_httpx_streams): two sequential streams on one HTTPS
+# connection. The server serves via HTTPX.server.on (multi-stream
 # sequential loop); the client connects once and POSTs body1 on sid 1
-# then body2 on sid 3 over the same TLS connection, checking both
-# echoes and statuses. Golden 1.
+# then body2 on sid 3 over the same TLS connection, one client.request per
+# request, checking both echoes and statuses. Golden 1.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/https.bend as HTTPS
-import ../../lib/http2.bend as H2
+import ../../lib/httpx.bend as HTTPX
 
 def body1() -> List<&2, U32>:
   [104, 101, 108, 108, 111]
@@ -14,10 +13,10 @@ def body1() -> List<&2, U32>:
 def body2() -> List<&2, U32>:
   [119, 111, 114, 108, 100, 33]
 
-def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
+def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -42,42 +41,14 @@ def bytes_eq(a: List<&2, U32>, b: List<&2, U32>) -> U32:
     case _ _:
       0
 
-law server_down:
-  for l: Listener
-  for e: U32 & String
-  IO(String)
-
-def server_down(l, e):
-  do IO<String>:
-    x : Unit <- Listener.close(l)
-    return "down"
-
-def server_close(l: Listener) -> IO(String):
-  do IO<String>:
-    y : Unit <- Listener.close(l)
-    return "up"
-
-def server_served(l: Listener, sock: Socket) -> IO(String):
-  do IO<String>:
-    x : Unit <- HTTPS.serve_start(~h2_echo, sock)
-    server_close(l)
-
-def server_conn(m: Listener & Result<&1, &1, (U32 & String), Socket>) -> IO(String):
-  (l, r) = m
-  match r:
-    case Fail{e}:
-      server_down(l, e)
-    case Done{sock}:
-      server_served(l, sock)
-
 law server_side:
   for l: Listener
   IO(String)
 
 def server_side(l):
   do IO<String>:
-    m : Listener & Result<&1, &1, (U32 & String), Socket> <- TLS.tls_accept(l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
-    server_conn(m)
+    x : Unit <- HTTPX.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    return "up"
 
 def client_score2(sock: Socket, body: List<&2, U32>, st_ok: U32, acc: U32) -> IO(U32):
   do IO<U32>:
@@ -85,8 +56,8 @@ def client_score2(sock: Socket, body: List<&2, U32>, st_ok: U32, acc: U32) -> IO
     +eq : U32 = bytes_eq(body, body2())
     return (st_ok * eq * acc : U32)
 
-def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), H2.H2Response>) -> IO(U32):
-  (s2, r) = got
+def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt) -> IO(U32):
+  (s2, r, st2) = got
   match r:
     case Fail{e}:
       do IO<U32>:
@@ -94,11 +65,13 @@ def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), H2.H2Res
         return 0
     case Done{+resp}:
       match resp:
-        case H2.H2Response{+status, +headers, +body}:
+        case HTTPX.Response{+status, +headers, +body}:
           client_score2(s2, body, b2u(U32.is_eq(status, 200)), acc)
 
-def client_second(acc: U32, got: Socket & Result<&1, &1, (U32 & String), H2.H2Response>) -> IO(U32):
-  (s2, r) = got
+# The port is threaded, never hardcoded: listen_any retries upwards from the
+# base, and client.request renders :authority from it.
+def client_second(acc: U32, +port: U32, got: Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt) -> IO(U32):
+  (s2, r, st2) = got
   match r:
     case Fail{e}:
       do IO<U32>:
@@ -106,29 +79,32 @@ def client_second(acc: U32, got: Socket & Result<&1, &1, (U32 & String), H2.H2Re
         return 0
     case Done{+resp}:
       match resp:
-        case H2.H2Response{+status, +headers, +body}:
+        case HTTPX.Response{+status, +headers, +body}:
           do IO<U32>:
             +ok1 : U32 = (b2u(U32.is_eq(status, 200)) * bytes_eq(body, body1()) : U32)
-            got2 : Socket & Result<&1, &1, (U32 & String), H2.H2Response> <- H2.h2_request(s2, 3, "POST", "/echo", Nil{}, body2())
+            got2 : Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt <-
+              HTTPX.client.request(s2, st2, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, body2()})
             client_done2((acc * ok1 : U32), got2)
 
-def client_conn(conn: Result<&1, &1, (U32 & String), Socket>) -> IO(U32):
+def client_conn(conn: Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
-    case Done{sock}:
+    case Done{value}:
+      (sock, st) = value
       do IO<U32>:
-        got : Socket & Result<&1, &1, (U32 & String), H2.H2Response> <- H2.h2_request(sock, 1, "POST", "/echo", Nil{}, body1())
-        client_second(1, got)
+        got : Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt <-
+          HTTPX.client.request(sock, st, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, body1()})
+        client_second(1, port, got)
 
 law client:
-  for port: U32
+  for +port: U32
   IO(U32)
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, (U32 & String), Socket> <- H2.h2_connect_insecure("127.0.0.1", port)
-    client_conn(conn)
+    conn : Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    client_conn(conn, port)
 
 law listen_retry:
   for port: U32
@@ -167,9 +143,12 @@ def main_go(b):
   do IO<U32>:
     chan : Chan(String) <- IO.fork(String, server_side(l))
     +a : U32 <- client(port)
-    s : String <- IO.join(String, chan)
     +total : U32 = (a : U32)
     w : Unit <- IO.print(U32.show(total))
+    # No IO.join here: HTTPX.server.on is an unbounded accept loop, so it never
+    # returns -- joining would block forever. Exit while the server is still
+    # parked in accept (the httpx idiom, same as tests/io/httpx_server_seq.bend).
+    z : Unit <- IO.die(Unit, 0, "")
     return total
 
 law main:

@@ -1,5 +1,5 @@
-# lib (lib_https_mux): truly interleaved streams on one HTTPS
-# connection against HTTPS.server_on_concurrent's mux. The client
+# lib (lib_httpx_mux): truly interleaved streams on one HTTPS
+# connection against HTTPX.server.concurrent's mux. The client
 # pipelines HEADERS(1,3,5,7) then DATA(7,5,3,1,END) raw — four open
 # streams at once, completed in reverse (crossed) order; the server
 # must answer all four while all are open (a sequential server would
@@ -9,8 +9,7 @@
 # any arrival order. Golden 1.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/https.bend as HTTPS
-import ../../lib/http2.bend as H2
+import ../../lib/httpx.bend as HTTPX
 
 def body1() -> List<&2, U32>:
   [104, 101, 108, 108, 111]
@@ -18,10 +17,10 @@ def body1() -> List<&2, U32>:
 def body2() -> List<&2, U32>:
   [119, 111, 114, 108, 100, 33]
 
-def mux_ok(req: H2.H2Request) -> IO(H2.H2Response):
+def mux_ok(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, Nil{}})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, Nil{}})
 
 # Client collect: gather HEADERS for sids 1, 3, 5 and 7 (handler
 # answers 200 with empty bodies, so no DATA is ever read). Score is 1
@@ -40,26 +39,22 @@ def coll.score_go(eq: Bool) -> U32:
 def coll.score(+n: U32) -> U32:
   coll.score_go(U32.is_eq(n, 4))
 
-def coll.hd_ok(dec: Result<&1, &1, U32 & String, H2.H2Head>) -> Bool:
-  match dec:
-    case Fail{e}:
-      False{}
-    case Done{h}:
-      True{}
+# HTTPX.x_resp.decode returns Result<..., Head & Tab> where the legacy
+# H2.h2_head.of(H2.h2_head.decode(...)) unwrapped it to Result<..., Head>.
+# Keeping the Result in the signature and letting x_resp.ok / x_resp.rh do the
+# unwrap is the same shape the old hd_ok / head_of had.
+def coll.hd_ok(dec: Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab>) -> Bool:
+  HTTPX.x_resp.ok(dec)
 
-def coll.head_of(dec: Result<&1, &1, U32 & String, H2.H2Head>) -> H2.H2Head:
-  match dec:
-    case Fail{e}:
-      H2.H2Head{0, Nil{}}
-    case Done{+h}:
-      h
+def coll.head_of(dec: Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab>) -> HTTPX.Head:
+  HTTPX.x_resp.rh(dec)
 
-def coll.is200(+h: H2.H2Head) -> Bool:
+def coll.is200(+h: HTTPX.Head) -> Bool:
   match h:
-    case H2.H2Head{status, headers}:
+    case HTTPX.Head{status, headers}:
       U32.is_eq(status, 200)
 
-def coll.hit(ok: Bool, +h: H2.H2Head, +e: U32) -> Bool:
+def coll.hit(ok: Bool, +h: HTTPX.Head, +e: U32) -> Bool:
   match ok e:
     case True{} 1:
       coll.is200(h)
@@ -76,21 +71,21 @@ def coll.bump(hit: Bool, +n: U32) -> U32:
 def coll.fin4(+n: U32) -> Bool:
   U32.is_ge(n, 4)
 
-def coll.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H2.H2Got:
+def coll.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
   (s2, r) = sent
   match r:
     case Fail{e}:
-      (s2, H2.H2GotErr{616, "tls io"})
+      (s2, HTTPX.GotErr{616, "tls io"})
     case Done{u}:
-      (s2, H2.H2GotErr{0, "next"})
+      (s2, HTTPX.GotErr{0, "next"})
 
-def coll.ack(got: Socket & H2.H2Got) -> IO(Socket & H2.H2Got):
+def coll.ack(got: Socket & HTTPX.Got) -> IO(Socket & HTTPX.Got):
   (s, g) = got
-  do IO<Socket & H2.H2Got>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s, H2.h2_t_settings(), H2.h2_f_ack(), 0, Nil{})
-    IO.pure(Socket & H2.H2Got, coll.acked(sent))
+  do IO<Socket & HTTPX.Got>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_settings(), HTTPX.x_f_ack(), 0, Nil{})
+    IO.pure(Socket & HTTPX.Got, coll.acked(sent))
 
-def coll.done_got(got: Socket & H2.H2Got, +n: U32) -> Socket & U32:
+def coll.done_got(got: Socket & HTTPX.Got, +n: U32) -> Socket & U32:
   (s, g) = got
   (s, coll.score(n))
 
@@ -110,7 +105,7 @@ def coll.setact(+typ: U32, +flags: U32) -> U32:
       0
 
 @unsafe
-def coll(phase: U32, got: Socket & H2.H2Got, +n: U32, fin: Bool, +buf: List<&2, U32>, typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +h: H2.H2Head, +okH: Bool, +e01: U32) ->
+def coll(phase: U32, got: Socket & HTTPX.Got, +n: U32, fin: Bool, +buf: List<&2, U32>, typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +h: HTTPX.Head, +okH: Bool, +e01: U32) ->
   IO(Socket & U32):
   match phase:
     case 0:
@@ -118,38 +113,42 @@ def coll(phase: U32, got: Socket & H2.H2Got, +n: U32, fin: Bool, +buf: List<&2, 
         case True{}:
           IO.pure(Socket & U32, coll.done_got(got, n))
         case False{}:
-          coll(1, got, n, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+          coll(1, got, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 1:
       (s1, g1) = got
       match g1:
-        case H2.H2GotErr{code, msg}:
+        case HTTPX.GotErr{code, msg}:
           match code:
             case 0:
               do IO<Socket & U32>:
-                got2 : Socket & H2.H2Got <- H2.h2_read_frame(s1, buf)
-                coll(1, got2, n, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+                got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s1, buf)
+                coll(1, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
             case _:
               IO.pure(Socket & U32, (s1, coll.score(n)))
-        case H2.H2GotOk{+frame, +buf2}:
+        case HTTPX.GotOk{+frame, +buf2}:
           match frame:
-            case H2.H2Frame{+typ2, +flags2, +sid22, +payload2}:
-              coll(2, (s1, H2.H2GotOk{frame, buf2}), n, fin, buf2, coll.setact(typ2, flags2), flags2, sid22, payload2, H2.H2Head{0, Nil{}}, False{}, 0)
+            case HTTPX.Frame{+typ2, +flags2, +sid22, +payload2}:
+              coll(2, (s1, HTTPX.GotOk{frame, buf2}), n, fin, buf2, coll.setact(typ2, flags2), flags2, sid22, payload2, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 2:
       (s2, g2) = got
       match typ:
         case 1:
           do IO<Socket & U32>:
-            got2 : Socket & H2.H2Got <- coll.ack(got)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- coll.ack(got)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
         case 2:
-          coll(4, got, n, fin, buf, typ, flags, sid2, payload, coll.head_of(H2.h2_head.of(H2.h2_head.decode(payload, H2.hp_empty()))), coll.hd_ok(H2.h2_head.of(H2.h2_head.decode(payload, H2.hp_empty()))), U32.and(flags, H2.h2_f_end_stream()))
+          +dec : Result<&1, &1, U32 & String, HTTPX.Head & HTTPX.Tab> =
+            HTTPX.x_resp.decode(payload, HTTPX.x_tab.empty())
+          coll(4, got, n, fin, buf, typ, flags, sid2, payload,
+            coll.head_of(dec), coll.hd_ok(dec),
+            U32.and(flags, HTTPX.x_f_end_stream()))
         case _:
           do IO<Socket & U32>:
-            got2 : Socket & H2.H2Got <- H2.h2_read_frame(s2, buf)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s2, buf)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 4:
       +n2 = coll.bump(coll.hit(okH, h, e01), n)
-      coll(5, got, n2, coll.fin4(n2), buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+      coll(5, got, n2, coll.fin4(n2), buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case 5:
       (s5, g5) = got
       match fin:
@@ -157,8 +156,8 @@ def coll(phase: U32, got: Socket & H2.H2Got, +n: U32, fin: Bool, +buf: List<&2, 
           IO.pure(Socket & U32, coll.done_got(got, n))
         case False{}:
           do IO<Socket & U32>:
-            got2 : Socket & H2.H2Got <- H2.h2_read_frame(s5, buf)
-            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s5, buf)
+            coll(0, got2, n, fin, buf, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     case _:
       IO.pure(Socket & U32, coll.done_got(got, n))
 
@@ -170,8 +169,8 @@ def client.collect.done(done: Socket & U32) -> IO(U32):
 
 def client.collect(sock: Socket) -> IO(U32):
   do IO<U32>:
-    got : Socket & H2.H2Got <- H2.h2_read_frame(sock, Nil{})
-    done : Socket & U32 <- coll(0, got, 0, False{}, Nil{}, 0, 0, 0, Nil{}, H2.H2Head{0, Nil{}}, False{}, 0)
+    got : Socket & HTTPX.Got <- HTTPX.x_read_frame(sock, Nil{})
+    done : Socket & U32 <- coll(0, got, 0, False{}, Nil{}, 0, 0, 0, Nil{}, HTTPX.Head{0, Nil{}}, False{}, 0)
     client.collect.done(done)
 
 # Raw pipelined sends: HEADERS(1) HEADERS(3) HEADERS(5) HEADERS(7)
@@ -197,7 +196,7 @@ def client.send7(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent8 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s3, H2.h2_t_data(), H2.h2_f_end_stream(), 1, d1)
+        sent8 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s3, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 1, d1)
         client.send8(sent8)
 
 def client.send6(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2, U32>, +d3: List<&2, U32>) -> IO(U32):
@@ -209,7 +208,7 @@ def client.send6(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent7 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s2, H2.h2_t_data(), H2.h2_f_end_stream(), 3, d3)
+        sent7 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s2, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 3, d3)
         client.send7(sent7, d1)
 
 def client.send5(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2, U32>, +d3: List<&2, U32>, +d5: List<&2, U32>) -> IO(U32):
@@ -221,7 +220,7 @@ def client.send5(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent6 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s5, H2.h2_t_data(), H2.h2_f_end_stream(), 5, d5)
+        sent6 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s5, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 5, d5)
         client.send6(sent6, d1, d3)
 
 def client.send4(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2, U32>, +d3: List<&2, U32>, +d5: List<&2, U32>, +d7: List<&2, U32>) -> IO(U32):
@@ -233,7 +232,7 @@ def client.send4(sent: Socket & Result<&1, &1, U32 & String, Unit>, +d1: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent5 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s6, H2.h2_t_data(), H2.h2_f_end_stream(), 7, d7)
+        sent5 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s6, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 7, d7)
         client.send5(sent5, d1, d3, d5)
 
 def client.send3(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h7: List<&2, U32>, +d1: List<&2, U32>, +d3: List<&2, U32>, +d5: List<&2, U32>, +d7: List<&2, U32>) -> IO(U32):
@@ -245,7 +244,7 @@ def client.send3(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h7: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent4 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s7, H2.h2_t_headers(), H2.h2_f_end_headers(), 7, h7)
+        sent4 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s7, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 7, h7)
         client.send4(sent4, d1, d3, d5, d7)
 
 def client.send2(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h5: List<&2, U32>, +h7: List<&2, U32>, +d1: List<&2, U32>, +d3: List<&2, U32>, +d5: List<&2, U32>, +d7: List<&2, U32>) -> IO(U32):
@@ -257,7 +256,7 @@ def client.send2(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h5: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent3 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s8, H2.h2_t_headers(), H2.h2_f_end_headers(), 5, h5)
+        sent3 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s8, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 5, h5)
         client.send3(sent3, h7, d1, d3, d5, d7)
 
 def client.send1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h3: List<&2, U32>, +h5: List<&2, U32>, +h7: List<&2, U32>, +d1: List<&2, U32>, +d3: List<&2, U32>, +d5: List<&2, U32>, +d7: List<&2, U32>) -> IO(U32):
@@ -269,29 +268,38 @@ def client.send1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h3: List<&2
         IO.pure(U32, 0)
     case Done{u}:
       do IO<U32>:
-        sent2 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(s1, H2.h2_t_headers(), H2.h2_f_end_headers(), 3, h3)
+        sent2 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s1, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 3, h3)
         client.send2(sent2, h5, h7, d1, d3, d5, d7)
 
-def client.fire(sock: Socket) -> IO(U32):
+def client.fire(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- H2.h2_send_frame(sock, H2.h2_t_headers(), H2.h2_f_end_headers(), 1, H2.h2_request.head("POST", "/echo", Nil{}))
-    client.send1(sent1, H2.h2_request.head("POST", "/echo", Nil{}), H2.h2_request.head("POST", "/echo", Nil{}), H2.h2_request.head("POST", "/echo", Nil{}), body1(), body2(), body1(), body2())
+    # The legacy H2.h2_request.head(method, path, hs) rendered :method, :path
+    # and :scheme but no :authority. HTTPX.client.on.req_block is the same
+    # renderer plus the :authority it derives from the host and port -- which
+    # is why the port is threaded in here.
+    h1 : List<&2, U32> = HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h3 : List<&2, U32> = HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h5 : List<&2, U32> = HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h7 : List<&2, U32> = HTTPX.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(sock, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, h1)
+    client.send1(sent1, h3, h5, h7, body1(), body2(), body1(), body2())
 
-def client_conn(conn: Result<&1, &1, (U32 & String), Socket>) -> IO(U32):
+def client_conn(conn: Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
-    case Done{sock}:
-      client.fire(sock)
+    case Done{value}:
+      (sock, st) = value
+      client.fire(sock, port)
 
 law client:
-  for port: U32
+  for +port: U32
   IO(U32)
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, (U32 & String), Socket> <- H2.h2_connect_insecure("127.0.0.1", port)
-    client_conn(conn)
+    conn : Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    client_conn(conn, port)
 
 law server_side:
   for l: Listener
@@ -299,7 +307,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on_concurrent(~mux_ok, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.concurrent(~mux_ok, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

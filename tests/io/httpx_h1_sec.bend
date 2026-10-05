@@ -1,4 +1,4 @@
-# lib (lib_http_sec): the fail-closed surface of lib/http.bend. Every
+# lib (lib_httpx_h1_sec): the fail-closed surface of lib/http.bend. Every
 # injection, oversize and malformed input below must Fail with the
 # coded status; a missing header answers its default.
 import Base

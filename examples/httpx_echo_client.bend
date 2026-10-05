@@ -3,10 +3,9 @@
 # POSTs "hello"; expects the echo. Prints DONE n/n (manual only —
 # not in check.sh). If the Node server HPACK-encodes huffman, Bend
 # answers 502 huffman refused (documented limitation).
-#   bend examples/https_echo_client.bend
+#   bend examples/httpx_echo_client.bend
 import Base
-import ../lib/https.bend as HTTPS
-import ../lib/http2.bend as H2
+import ../lib/httpx.bend as HTTPX
 
 def report_fail(label: String, c: U32, e: String) -> IO(Unit):
   do IO<Unit>:
@@ -35,5 +34,5 @@ def report(r: Result<&1, &1, U32 & String, String>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     p : Unit <- IO.print("STEP dial")
-    r : Result<&1, &1, U32 & String, String> <- HTTPS.send_request_insecure("127.0.0.1", 19892, "/echo", "POST", Nil{}, "hello")
+    r : Result<&1, &1, U32 & String, String> <- HTTPX.request_insecure("127.0.0.1", 19892, "/echo", "POST", Nil{}, "hello")
     report(r)

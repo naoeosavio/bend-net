@@ -1,4 +1,4 @@
-// Node port of examples/https_real.bend: the same live-site smoke
+// Node port of examples/httpx_real.bend: the same live-site smoke
 // against the same four targets, over TLS+HTTP/2 with node:http2.
 // Manual smoke only (like the .bend twin) — never runs in check.sh:
 // it needs a working resolver and the public internet.
@@ -8,7 +8,7 @@
 // HPACK block is huffman-coded, split over CONTINUATION or bigger than
 // 16384. Node has the full codec, so the very same requests here must
 // answer DONE — a FAIL below is a host/transport problem, not a
-// protocol gap on our side. Bend:  bend examples/https_real.bend
+// protocol gap on our side. Bend:  bend examples/httpx_real.bend
 // Node:   node examples/https_real.js
 //
 // Compared to the .bend output, this port:
@@ -94,7 +94,7 @@ function take_body(chunks) {
 }
 
 // One target, one fresh connection — the Node twin of the single-shot
-// HTTPS.fetch/send_request. Never hangs: a guard answers on timeout.
+// HTTPX.fetch/request. Never hangs: a guard answers on timeout.
 function run_target(target) {
   return new Promise((resolve) => {
     const client = connect(`https://${target.host}:${HTTPS_PORT}/`);

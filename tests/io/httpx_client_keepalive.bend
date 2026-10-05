@@ -1,7 +1,8 @@
 # lib (lib_httpx_client_keepalive): keep-alive sequential on one TLS+H2
 # connection against HTTPX.server.concurrent. Client connects once
-# (insecure) then POSTs 3 bodies ("hello-0/1/2") on sids 1,3,5,
-# threading (sock, sid, tab) via CliSt. Golden 3 (sum of three 1s).
+# (insecure) then POSTs 3 bodies ("hello-0/1/2") on sids 1,3,5, one
+# client.request per request, threading (sock, sid, tab) via CliSt. Golden 3
+# (sum of three 1s).
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
@@ -42,14 +43,16 @@ def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliS
   (sock2, r2, st2) = got
   do IO<U32>:
     +s12 : U32 = (s1 + score_one("hello-1", r2) : U32)
-    got3 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock2, st2, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2"))
+    got3 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+      HTTPX.client.request(sock2, st2, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")})
     req3(got3, s12)
 
 def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
   (sock1, r1, st1) = got
   do IO<U32>:
     +s1 : U32 = score_one("hello-0", r1)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock1, st1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1"))
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+      HTTPX.client.request(sock1, st1, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")})
     req2(got2, s1, port)
 
 def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
@@ -59,7 +62,8 @@ def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0"))
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+          HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")})
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):

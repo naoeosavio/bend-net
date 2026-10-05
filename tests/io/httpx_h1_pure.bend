@@ -1,4 +1,4 @@
-# lib (lib_http_pure): the pure layer of lib/http.bend -- url parsing,
+# lib (lib_httpx_h1_pure): the pure layer of lib/http.bend -- url parsing,
 # case-insensitive header lookup, request/response roundtrips, the
 # keep-alive decision, chunked decoding and the Bytes UTF-8 roundtrip.
 # Request bodies are Strings here (not U32 lengths); lengths ride the

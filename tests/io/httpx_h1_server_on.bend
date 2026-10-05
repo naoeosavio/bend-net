@@ -1,4 +1,4 @@
-# lib (http_lib_server_on): server_on — the generic keep-alive server.
+# lib (lib_httpx_h1_server_on): server_on — the generic keep-alive server.
 # One connection serves GET /a, then POST /b with a body, then a
 # Connection: close request; the client reads each response on the same
 # socket and confirms the server closed after the third.

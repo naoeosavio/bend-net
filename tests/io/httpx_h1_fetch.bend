@@ -1,4 +1,4 @@
-# lib (lib_http_fetch): HTTP.fetch over loopback plus the fail-closed
+# lib (lib_httpx_h1_fetch): HTTP.fetch over loopback plus the fail-closed
 # paths. The server is lib's echo handler on an ephemeral port (found
 # by retry, as in tcp_loopback); the client fetches /echo and must
 # read back the empty body. Port 0 dies in validation (400) and

@@ -1,17 +1,16 @@
-# lib (lib_https_server_on): the generic keep-alive HTTPS server.
+# lib (lib_httpx_server_on): the generic keep-alive HTTPS server.
 # server_on accepts on a TLS listener with IO.spawn per connection and
 # serves n sequential streams per connection (like HTTP.server_on but
 # over HTTP/2). Two clients connect one after the other, each POSTing
 # "hello"; both must echo. Golden 1.
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/https.bend as HTTPS
-import ../../lib/http2.bend as H2
+import ../../lib/httpx.bend as HTTPX
 
-def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
+def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 law server_side:
   for l: Listener
@@ -19,7 +18,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 def client_two(r1: U32, r2: U32) -> U32:
@@ -44,8 +43,8 @@ law client:
 
 def client(port):
   do IO<U32>:
-    r1 : Result<&1, &1, (U32 & String), String> <- HTTPS.send_request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
-    r2 : Result<&1, &1, (U32 & String), String> <- HTTPS.send_request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "world")
+    r1 : Result<&1, &1, (U32 & String), String> <- HTTPX.request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
+    r2 : Result<&1, &1, (U32 & String), String> <- HTTPX.request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "world")
     IO.pure(U32, (client_score(r1) * client_score(r2) : U32))
 
 def listen_retry(port: U32, r: Result<&1, &1, (U32 & String), Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):

@@ -1,9 +1,7 @@
-# lib (http_lib_fetch_head): responses with no content by spec — HEAD
-# (RFC 9110 9.3.2: the head may carry the GET's Content-Length but the
-# body is zero bytes) and 204 (RFC 9112 6.4) — return Done{""} instead
-# of tripping the CL 413 check, while GET keeps failing closed when the
-# Content-Length is short of the bytes that arrived. Each case is a raw
-# one-shot server on an ephemeral port.
+# lib (lib_httpx_h1_fetch_cl): fetch framing — Content-Length cuts exactly
+# CL bytes, Transfer-Encoding: chunked decodes via unchunk, and a CL
+# longer than what arrived (the 64KB cap or early close) fails closed
+# with 413. Each case is a raw one-shot server on an ephemeral port.
 import Base
 import ../../lib/http.bend as HTTP
 
@@ -137,13 +135,13 @@ def chk_eq(chan, want, r):
     case Done{body}:
       chk_sync_eq(chan, body, want)
 
-law chk_code:
+law chk_413:
   for chan: Chan(Unit)
   for code: U32
   for r: Result<&1, &1, (U32 & String), String>
   IO(U32)
 
-def chk_code(chan, code, r):
+def chk_413(chan, code, r):
   match r:
     case Fail{(c, e)}:
       do IO<U32>:
@@ -154,77 +152,51 @@ def chk_code(chan, code, r):
         x : Unit <- IO.join(Unit, chan)
         return 0
 
-law case_head:
+law case_cl:
   for b: Listener & U32
   IO(U32)
 
-def case_head(b):
-  (l, port) = b
-  do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "HEAD", [], "")
-    chk_eq(chan, SNil{}, r)
-
-law case_head_chunked:
-  for b: Listener & U32
-  IO(U32)
-
-def case_head_chunked(b):
-  (l, port) = b
-  do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "HEAD", [], "")
-    chk_eq(chan, SNil{}, r)
-
-law case_204:
-  for b: Listener & U32
-  IO(U32)
-
-def case_204(b):
-  (l, port) = b
-  do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 204 No Content\r\nContent-Length: 7\r\nConnection: close\r\n\r\nignored"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
-    chk_eq(chan, SNil{}, r)
-
-law case_get_ok:
-  for b: Listener & U32
-  IO(U32)
-
-def case_get_ok(b):
+def case_cl(b):
   (l, port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
     chk_eq(chan, "hello", r)
 
-law case_get_413:
+law case_chunked:
   for b: Listener & U32
   IO(U32)
 
-def case_get_413(b):
+def case_chunked(b):
   (l, port) = b
   do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.request("127.0.0.1", port, "/", "GET", [], "")
-    chk_code(chan, 413, r)
+    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n3\r\n wo\r\n0\r\n\r\n"))
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
+    chk_eq(chan, "hello wo", r)
+
+law case_413:
+  for b: Listener & U32
+  IO(U32)
+
+def case_413(b):
+  (l, port) = b
+  do IO<U32>:
+    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\nsmall"))
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
+    chk_413(chan, 413, r)
 
 law main_go:
   for b1: Listener & U32
   for b2: Listener & U32
   for b3: Listener & U32
-  for b4: Listener & U32
-  for b5: Listener & U32
   IO(U32)
 
-def main_go(b1, b2, b3, b4, b5):
+def main_go(b1, b2, b3):
   do IO<U32>:
-    a : U32 <- case_head(b1)
-    c : U32 <- case_head_chunked(b2)
-    d : U32 <- case_204(b3)
-    e : U32 <- case_get_ok(b4)
-    f : U32 <- case_get_413(b5)
-    +total : U32 = (a * 10000 + c * 1000 + d * 100 + e * 10 + f : U32)
+    a : U32 <- case_cl(b1)
+    c : U32 <- case_chunked(b2)
+    d : U32 <- case_413(b3)
+    +total : U32 = (a * 100 + c * 10 + d : U32)
     w : Unit <- IO.print(U32.show(total))
     return total
 
@@ -233,11 +205,9 @@ law main:
 
 def main():
   do IO<U32>:
-    b1 : Listener & U32 <- listen_any(32n, 21687)
-    b2 : Listener & U32 <- listen_any(32n, 21687)
-    b3 : Listener & U32 <- listen_any(32n, 21687)
-    b4 : Listener & U32 <- listen_any(32n, 21687)
-    b5 : Listener & U32 <- listen_any(32n, 21687)
-    main_go(b1, b2, b3, b4, b5)
+    b1 : Listener & U32 <- listen_any(32n, 19587)
+    b2 : Listener & U32 <- listen_any(32n, 19587)
+    b3 : Listener & U32 <- listen_any(32n, 19587)
+    main_go(b1, b2, b3)
 
-#|11111
+#|111

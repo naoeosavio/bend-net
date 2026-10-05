@@ -2,7 +2,7 @@
 # checks. Every case is hermetic: the quad and localhost lanes answer
 # inside the pure layer, and each bad host fails 601 BEFORE the
 # effect — no name ever leaves the machine here. The twins' real
-# resolution is proven by the manual example (examples/http_real.bend).
+# resolution is proven by the manual example (examples/httpx_h1_real.bend).
 import Base
 import ../../lib/dns.bend as DNS
 

@@ -1,6 +1,6 @@
 # lib (lib_httpx_interop): truly interleaved streams on one TLS+H2
 # connection against HTTPX.server.concurrent (lib/httpx.bend standalone).
-# Same wire as tests/io/https_mux.bend but with the httpx's OWN mini-H2
+# Same wire as tests/io/httpx_mux.bend but with the httpx's OWN mini-H2
 # client (no http2 import): pipelines HEADERS(1,3,5,7) then
 # DATA(7,5,3,1,END) raw via HTTPX.x_send_frame — four open streams at
 # once, completed in reverse (crossed) order; the server must answer

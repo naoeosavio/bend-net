@@ -1,18 +1,17 @@
-# lib (lib_https_many_streams): twenty clients at once against
-# HTTPS.server_on without fuel. The server runs the unbounded accept +
+# lib (lib_httpx_many_streams): twenty clients at once against
+# HTTPX.server.on without fuel. The server runs the unbounded accept +
 # stream loop; each client is a single-shot insecure POST "hello"
-# (same shape as tests/io/https_server_on.bend). Golden 1 iff all 20
+# (same shape as tests/io/httpx_server_on.bend). Golden 1 iff all 20
 # echoed. Client fan-out reuses the fork/join Nat recursion from
-# examples/saturate_https_wss.bend (single self-recursive def).
+# examples/wsm_saturate.bend (single self-recursive def).
 import Base
 import ../../lib/tls.bend as TLS
-import ../../lib/https.bend as HTTPS
-import ../../lib/http2.bend as H2
+import ../../lib/httpx.bend as HTTPX
 
-def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
+def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -34,7 +33,7 @@ law client_one:
 
 def client_one(port):
   do IO<U32>:
-    r : Result<&1, &1, (U32 & String), String> <- HTTPS.send_request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
+    r : Result<&1, &1, (U32 & String), String> <- HTTPX.request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
     IO.pure(U32, client_score(r))
 
 law run:
@@ -60,7 +59,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

@@ -1,5 +1,5 @@
 # Real-site smoke test for lib/httpx.bend: live pages BY NAME over
-# TLS+HTTP/2. Manual smoke only (like http_real.bend) — never runs in
+# TLS+HTTP/2. Manual smoke only (like httpx_h1_real.bend) — never runs in
 # the check.sh gate: it needs a working resolver and the public peer
 # must speak the same HPACK subset.
 #
@@ -18,9 +18,8 @@
 #   www.cloudflare.com   OK (~1.3 MB body head, plain fetch)
 #   info.cern.ch         OK len=646 (H1 lane)
 #
-#   bend examples/https_real.bend
+#   bend examples/httpx_real.bend
 import Base
-# import ../lib/http2.bend as H2
 import ../lib/httpx.bend as HTTPX
 
 def emit(label: String, r: Result<&1, &1, U32 & String, String>) -> IO(Unit):

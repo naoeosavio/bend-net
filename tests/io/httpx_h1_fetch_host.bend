@@ -1,4 +1,4 @@
-# lib (http_lib_fetch_host): HTTP.fetch over loopback BY NAME. The
+# lib (lib_httpx_h1_fetch_host): HTTP.fetch over loopback BY NAME. The
 # server answers the Host header it received; fetching
 # http://localhost:PORT/echo must read back "localhost" (and the
 # literal-IP fetch "127.0.0.1"), proving the invariant: DNS resolve

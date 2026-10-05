@@ -1,7 +1,9 @@
-# lib (http_lib_fetch_cl): fetch framing — Content-Length cuts exactly
-# CL bytes, Transfer-Encoding: chunked decodes via unchunk, and a CL
-# longer than what arrived (the 64KB cap or early close) fails closed
-# with 413. Each case is a raw one-shot server on an ephemeral port.
+# lib (lib_httpx_h1_fetch_post): request — POST carries method, headers
+# and body through show_request; the echo handler answers with the
+# method glued to the request body plus the Host header, so the
+# roundtrip proves all three (HTTP/1.1 needs Host, and request must
+# inject it). A method with a space fails closed with 400 before
+# touching the net.
 import Base
 import ../../lib/http.bend as HTTP
 
@@ -44,63 +46,54 @@ def listen_any(tries, port):
         r : Result<&1, &1, (U32 & String), Listener> <- TCP.listen(port)
         listen_retry(port, r, rest)
 
-law raw_sent:
-  for sent: Socket & Result<&1, &1, (U32 & String), Unit>
+law echo.handler:
+  for req: String & String & List<&1, (String & String)> & String
+  IO(U32 & List<&1, (String & String)> & String)
+
+def echo.handler(req):
+  (m, p, hs, b) = req
+  IO.pure(U32 & List<&1, (String & String)> & String, (200, [], m ++ b ++ "|" ++ HTTP.get_header("", "Host", hs)))
+
+law server_down:
   for l: Listener
   IO(Unit)
 
-def raw_sent(sent, l):
-  (s2, r2) = sent
+def server_down(l):
   do IO<Unit>:
-    x : Unit <- Socket.close(s2)
-    y : Unit <- Listener.close(l)
+    x : Unit <- Listener.close(l)
     return x
 
-law server_drain:
-  for m: Socket & Result<&1, &1, (U32 & String), String>
-  for l: Listener
-  for text: String
-  IO(Unit)
-
-def server_drain(m, l, text):
-  (s, r) = m
-  do IO<Unit>:
-    sent : Socket & Result<&1, &1, (U32 & String), Unit> <- TCP.send(s, text)
-    raw_sent(sent, l)
-
-law server_raw:
+law server_talk:
   for l: Listener
   for sock: Socket
-  for text: String
   IO(Unit)
 
-def server_raw(l, sock, text):
+def server_talk(l, sock):
   do IO<Unit>:
-    got : Socket & Result<&1, &1, (U32 & String), String> <- TCP.recv(sock, 8192)
-    server_drain(got, l, text)
+    u : Unit <- HTTP.serve_once(sock, echo.handler)
+    x : Unit <- Listener.close(l)
+    return x
 
 law server_conn:
   for m: Listener & Result<&1, &1, (U32 & String), Socket>
-  for text: String
   IO(Unit)
 
-def server_conn(m, text):
+def server_conn(m):
   (l, r) = m
   match r:
     case Fail{e}:
-      Listener.close(l)
+      server_down(l)
     case Done{sock}:
-      server_raw(l, sock, text)
+      server_talk(l, sock)
 
 law server_side:
   for l: Listener
-  for text: String
   IO(Unit)
 
-def server_side(l, text):
+def server_side(l):
   do IO<Unit>:
     m : Listener & Result<&1, &1, (U32 & String), Socket> <- TCP.accept(l)
-    server_conn(m, text)
+    server_conn(m)
 
 law chk_sync0:
   for chan: Chan(Unit)
@@ -135,55 +128,50 @@ def chk_eq(chan, want, r):
     case Done{body}:
       chk_sync_eq(chan, body, want)
 
-law chk_413:
-  for chan: Chan(Unit)
-  for code: U32
+law chk_bad:
   for r: Result<&1, &1, (U32 & String), String>
   IO(U32)
 
-def chk_413(chan, code, r):
+def chk_bad(r):
   match r:
     case Fail{(c, e)}:
-      do IO<U32>:
-        x : Unit <- IO.join(Unit, chan)
-        return b2u(U32.is_eq(c, code))
+      IO.pure(U32, b2u(U32.is_eq(c, 400)))
     case Done{body}:
-      do IO<U32>:
-        x : Unit <- IO.join(Unit, chan)
-        return 0
+      IO.pure(U32, 0)
 
-law case_cl:
+law case_post:
   for b: Listener & U32
   IO(U32)
 
-def case_cl(b):
+def case_post(b):
   (l, port) = b
   do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
-    chk_eq(chan, "hello", r)
+    chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "POST", [], "xyz")
+    chk_eq(chan, "POSTxyz|127.0.0.1", r)
 
-law case_chunked:
+law case_get:
   for b: Listener & U32
   IO(U32)
 
-def case_chunked(b):
+def case_get(b):
   (l, port) = b
   do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n3\r\n wo\r\n0\r\n\r\n"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
-    chk_eq(chan, "hello wo", r)
+    chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "GET", [("X-Note", "hi")], "")
+    chk_eq(chan, "GET|127.0.0.1", r)
 
-law case_413:
+law case_bad:
   for b: Listener & U32
   IO(U32)
 
-def case_413(b):
+def case_bad(b):
   (l, port) = b
   do IO<U32>:
-    chan : Chan(Unit) <- IO.fork(Unit, server_side(l, "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\nsmall"))
-    r : Result<&1, &1, (U32 & String), String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/")
-    chk_413(chan, 413, r)
+    r : Result<&1, &1, (U32 & String), String> <- HTTP.send_request("127.0.0.1", port, "/echo", "PO ST", [], "")
+    v : U32 <- chk_bad(r)
+    x : Unit <- Listener.close(l)
+    return v
 
 law main_go:
   for b1: Listener & U32
@@ -193,9 +181,9 @@ law main_go:
 
 def main_go(b1, b2, b3):
   do IO<U32>:
-    a : U32 <- case_cl(b1)
-    c : U32 <- case_chunked(b2)
-    d : U32 <- case_413(b3)
+    a : U32 <- case_post(b1)
+    c : U32 <- case_get(b2)
+    d : U32 <- case_bad(b3)
     +total : U32 = (a * 100 + c * 10 + d : U32)
     w : Unit <- IO.print(U32.show(total))
     return total

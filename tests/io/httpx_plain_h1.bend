@@ -1,8 +1,11 @@
 # httpx (lib_httpx_plain_h1): the plaintext H1 lane ends to end. A
 # `http://` URL is only served when the caller says insecure, and the
 # server side is server.on_h1_plain (TCP.listen/accept, no cert/key).
-# Two requests over the same server: fetch_insecure (String body) and
-# fetch_bytes_insecure (raw bytes). Golden 2.
+# Four requests over the same server, covering both ways into the lane:
+# fetch(_bytes)_insecure (GET by URL) and request(_bytes)_plain (any method),
+# each once by NAME ("localhost", which the dial must resolve) and once by
+# dotted quad (which answers itself). The name cases are the regression guard
+# for plain.dial: TCP.connect on a name is EINVAL 22. Golden 4.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
@@ -36,13 +39,25 @@ def bytes_ok(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
 def client_text(port: U32) -> IO(U32):
   do IO<U32>:
     r : Result<&1, &1, U32 & String, String> <-
-      HTTPX.fetch_insecure("http://127.0.0.1:" ++ U32.show(port) ++ "/hello")
+      HTTPX.fetch_insecure("http://localhost:" ++ U32.show(port) ++ "/hello")
     IO.pure(U32, text_ok(r))
 
 def client_bytes(port: U32) -> IO(U32):
   do IO<U32>:
     r : Result<&1, &1, U32 & String, List<&2, U32>> <-
       HTTPX.fetch_bytes_insecure("http://127.0.0.1:" ++ U32.show(port) ++ "/hello")
+    IO.pure(U32, bytes_ok(r))
+
+def client_post(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, String> <-
+      HTTPX.request_plain("localhost", port, "/hello", "POST", Nil{}, "hi")
+    IO.pure(U32, text_ok(r))
+
+def client_post_bytes(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, List<&2, U32>> <-
+      HTTPX.request_bytes_plain("127.0.0.1", port, "/hello", "POST", Nil{}, HTTPX.x_str_bytes("hi"))
     IO.pure(U32, bytes_ok(r))
 
 law plain_side:
@@ -92,7 +107,9 @@ def main_go(b):
     chan : Chan(String) <- IO.fork(String, plain_side(l))
     +a : U32 <- client_text(port)
     +c : U32 <- client_bytes(port)
-    +total : U32 = (a + c : U32)
+    +d : U32 <- client_post(port)
+    +e : U32 <- client_post_bytes(port)
+    +total : U32 = (a + c + d + e : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
@@ -106,4 +123,4 @@ def main():
     x : U32 <- main_go(b)
     return x
 
-#|2
+#|4
