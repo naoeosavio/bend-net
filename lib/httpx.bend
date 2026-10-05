@@ -17,7 +17,9 @@
 # No flow-credit sends, no padding/priority parsing, no client.
 #
 # Stack: TLS (accept) -> mini-H2 below -> httpx slots. Allowed imports:
-# Base + ./tls.bend only. No https/http/https_http1/ws/wss/http2.
+# Base + ./tls.bend + ./tcp.bend + ./dns.bend (the byte lanes; dns is needed
+# by the plaintext dial, which resolves the name the TLS lane resolves for
+# it). No https/http/https_http1/ws/wss/http2.
 #
 # Discipline (same as lib/https.bend): callee above caller; match
 # scrutinees are params or pattern-bound vars; self-recursion only
@@ -29,6 +31,7 @@
 import Base
 import ./tls.bend as TLS
 import ./tcp.bend as TCPB
+import ./dns.bend as DNS
 
 # Bytes
 # -----
@@ -4835,12 +4838,31 @@ def fetch_bytes.host(host: String, +port: U32, path: String, insecure: Bool, ok:
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
 
+# Plaintext dial: resolve first, then connect to the IPv4. TCP.connect wants
+# the dotted quad -- handing it the NAME is EINVAL 22 -- while the name still
+# rides the Host header (h1_once.conn takes host and socket separately). A
+# resolve failure fails with the DNS code (601-605) before any socket exists,
+# so no handle can leak. Mirror of http.bend's fetch.dial, lost when this lane
+# was inlined here.
+def plain.dial.asked(port: U32, r: Result<&1, &1, U32 & String, String>) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
+    case Done{ip}:
+      TCP.connect(ip, port)
+
+def plain.dial(+host: String, port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
+  do IO<Result<&1, &1, U32 & String, Socket>>:
+    r : Result<&1, &1, U32 & String, String> <- DNS.resolve(host)
+    plain.dial.asked(port, r)
+
 def fetch.plain(+host: String, +port: U32, path: String, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   match ok:
     case True{}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
         r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.text(r)
     case False{}:
@@ -4851,7 +4873,7 @@ def fetch_bytes.plain(+host: String, +port: U32, path: String, ok: Bool) ->
   match ok:
     case True{}:
       do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
-        conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
         r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.raw(r)
     case False{}:
@@ -4937,6 +4959,17 @@ def request.once(+host: String, +port: U32, +method: String, +path: String, hs: 
     case False{}:
       client.once(host, port, Request{method, path, hs, body})
 
+# request.plain: any method with headers and a raw body over the PLAINTEXT H1
+# lane (no TLS at all) -- the sibling of request.once, which always speaks TLS.
+# fetch(_bytes)_insecure("http://...") is the GET-only route into this lane;
+# this is the route for every other method, and the public entries are
+# request_plain / request_bytes_plain. Dial, one exchange and close, all here.
+def request.plain(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Response>):
+  do IO<Result<&1, &1, U32 & String, Response>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
+    h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
+
 def request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
@@ -4958,6 +4991,37 @@ def request_bytes(+host: String, +port: U32, +path: String, +method: String, hs:
 def request_bytes_insecure(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   request_bytes.fit(host, port, path, method, hs, body, True{}, client.on.valid.go(host, port, path))
+
+# The plaintext twins of request_bytes / request: same contract, no TLS, so
+# there is no insecure flag to thread (which is why there is no .go split --
+# the .fit def gates and does the work).
+def request_bytes_plain.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match fit:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        r : Result<&1, &1, U32 & String, Response> <- request.plain(host, port, method, path, hs, body)
+        fetch.raw(r)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad request")})
+
+def request_bytes_plain(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  request_bytes_plain.fit(host, port, path, method, hs, body, client.on.valid.go(host, port, path))
+
+def request_plain.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, fit: Bool) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match fit:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, String>>:
+        r : Result<&1, &1, U32 & String, Response> <- request.plain(host, port, method, path, hs, x_str_bytes(body))
+        fetch.text(r)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
+
+def request_plain(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  request_plain.fit(host, port, path, method, hs, body, client.on.valid.go(host, port, path))
 
 def request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
