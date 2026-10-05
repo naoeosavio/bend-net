@@ -4458,19 +4458,21 @@ def client.on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: 
         drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client.on.drain(0, (sock, GotErr{0, "next"}), Nil{}, client.on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client.on.st_sid(st), 4)
         client.on.drained_keep(drained, st)
 
-def client.on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req: Request) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
-  do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, client.on.st_sid(st), host, port, method, path, hs, body)
-    client.on.sent_keep(sent, st)
+  match req:
+    case Request{method, path, headers, body}:
+      do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, client.on.st_sid(st), host, port, method, path, headers, body)
+        client.on.sent_keep(sent, st)
 
-def client.on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+def client.on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req: Request, fit: Bool, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          client.on.exch_keep(sock, st, host, port, method, path, hs, body)
+          client.on.exch_keep(sock, st, host, port, req)
         case False{}:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{(413, "req too large")}, st))
     case False{}:
@@ -4486,33 +4488,37 @@ def client.on.h1_keep_st(out: Socket & Result<&1, &1, U32 & String, Response>, +
   IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt,
     (s, r, st))
 
-def client.on.h1_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+def client.on.h1_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req: Request) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
-  do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-    out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, hs, body)
-    client.on.h1_keep_st(out, st)
+  match req:
+    case Request{method, path, headers, body}:
+      do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
+        out : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
+        client.on.h1_keep_st(out, st)
 
-# One keep-alive request, both ALPN answers (TASK-027 Phase 3): h2 keeps
-# the sid/HPACK exchange, http/1.1 takes the H1 exchange. Before this an
-# H1 CliSt from client.connect* was handed to the H2 sender, which wrote
-# H2 frames onto an HTTP/1.1 socket.
-def client.request(sock: Socket, +st: CliSt, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+# H2 arm of the client exchange: the request is destructured here (once)
+# because the gate needs :path, and req itself rides on to fit_keep.
+def client.on.h2_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, +req: Request) ->
+  IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
+  match req:
+    case Request{method, path, headers, body}:
+      client.on.fit_keep(sock, st, host, port, req, client.on.valid.go(host, port, path), client.on.body_ok(body))
+
+# The client exchange, both ALPN answers (TASK-031): ONE request on the
+# connection the caller already owns, and it never closes -- the caller closes
+# (client.on / client.once do) or calls again for the next request, threading
+# the socket and the state. N requests are that loop at the call site; the
+# returned CliSt carries the advanced sid and the HPACK table the next response
+# decodes against.
+def client.request(sock: Socket, +st: CliSt, +host: String, +port: U32, +req: Request) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
   match st:
     case CliSt{sid, tab, is_h2}:
       match is_h2:
         case True{}:
-          client.on.fit_keep(sock, CliSt{sid, tab, is_h2}, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+          client.on.h2_keep(sock, CliSt{sid, tab, is_h2}, host, port, req)
         case False{}:
-          client.on.h1_keep(sock, st, host, port, method, path, hs, body)
-
-# Sequential batch entry (Phase 10): one dial, N requests back-to-back
-# on sids 1,3,5..., answers in request order. First Fail aborts the
-# batch fail-closed (socket closed, Fail out). Single self-recursive
-# def would need mutual step/done, so done dispatches inline (same
-# phased-loop discipline as drain/sdrop). CliSt/Request/Response are
-# Data: stale binds drop freely, Socket always closes or threads.
-# ---------------------------------------------------------------------
+          client.on.h1_keep(sock, st, host, port, req)
 
 def client_seq.rev.go(+xs: List<&2, Response>, acc: List<&2, Response>) -> List<&2, Response>:
   match xs:
@@ -4524,167 +4530,85 @@ def client_seq.rev.go(+xs: List<&2, Response>, acc: List<&2, Response>) -> List<
 def client_seq.rev(+xs: List<&2, Response>) -> List<&2, Response>:
   client_seq.rev.go(xs, Nil{})
 
-def client_seq.done(rest: List<&2, Request>, +acc: List<&2, Response>, got: Socket & Result<&1, &1, U32 & String, Response> & CliSt, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+# Sequential batch over a connection the caller already owns: N requests, one
+# client.request each, answers in request order, socket and state handed back.
+# Nothing closes here -- client.on / client.once close what they dialed. The
+# first Fail aborts with the socket still handed back, so the caller can always
+# close it. One loop serves both ALPN answers, because client.request
+# dispatches; H1 has no sid or HPACK table, so the CliSt just rides along.
+def client_seq.keep.go(rest: List<&2, Request>, +acc: List<&2, Response>, got: Socket & Result<&1, &1, U32 & String, Response> & CliSt, +host: String, +port: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt):
   match rest:
     case Nil{}:
       (s0, r0, st0) = got
       match r0:
         case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
+          IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt, (s0, Fail{e}, st0))
         case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{client_seq.rev(resp <> acc)})
-    case Request{+method, +path, +headers, +body} <> t:
+          IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt, (s0, Done{client_seq.rev(resp <> acc)}, st0))
+    case req <> t:
       (s2, r2, st2) = got
       match r2:
         case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s2)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
+          IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt, (s2, Fail{e}, st2))
         case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            got3 : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(s2, st2, host, port, method, path, headers, body)
-            client_seq.done(t, resp <> acc, got3, host, port)
+          do IO<Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt>:
+            got3 : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(s2, st2, host, port, req)
+            client_seq.keep.go(t, resp <> acc, got3, host, port)
 
-def client_seq.first(sock: Socket, +st: CliSt, +host: String, +port: U32, reqs: List<&2, Request>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
+def client_seq.keep(sock: Socket, +st: CliSt, +host: String, +port: U32, reqs: List<&2, Request>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt):
   match reqs:
     case Nil{}:
-      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
-    case Request{+method, +path, +headers, +body} <> t:
-      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        got : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(sock, st, host, port, method, path, headers, body)
-        client_seq.done(t, Nil{}, got, host, port)
+      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt, (sock, Done{Nil{}}, st))
+    case req <> t:
+      do IO<Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt>:
+        got : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(sock, st, host, port, req)
+        client_seq.keep.go(t, Nil{}, got, host, port)
 
-def client_seq.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, reqs: List<&2, Request>) ->
+# Close the socket and drop the state: what the dialing entries end with,
+# because they own the connection they opened.
+def client.on.closed(out: Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
-  match conn:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
-    case Done{value}:
-      (sock0, st0) = value
-      client_seq.first(sock0, st0, host, port, reqs)
+  (s, r, st) = out
+  do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+    x : Unit <- TLS.tls_close(s)
+    IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, r)
 
-# H1 sequential batch (TASK-027 Phase 3): the same contract as the H2 lane
-# above — one dial, answers in request order, first Fail closes and aborts
-# fail-closed — over x_h1.cli.exch, which never closes. H1 has no sids and
-# no HPACK table, so the only state threaded is the socket; the shape and
-# the close sites mirror client_seq.done/first exactly.
-@unsafe
-def client_seq.h1.go(rest: List<&2, Request>, +acc: List<&2, Response>, got: Socket & Result<&1, &1, U32 & String, Response>, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
-  match rest:
-    case Nil{}:
-      (s0, r0) = got
-      match r0:
-        case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
-        case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s0)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{client_seq.rev(resp <> acc)})
-    case Request{+method, +path, +headers, +body} <> t:
-      (s2, r2) = got
-      match r2:
-        case Fail{e}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            x : Unit <- TLS.tls_close(s2)
-            IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
-        case Done{+resp}:
-          do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-            got3 : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, s2, host, port, method, path, headers, body)
-            client_seq.h1.go(t, resp <> acc, got3, host, port)
-
-def client_seq.h1(sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
-  match reqs:
-    case Nil{}:
-      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        x : Unit <- TLS.tls_close(sock)
-        IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Done{Nil{}})
-    case Request{+method, +path, +headers, +body} <> t:
-      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
-        got : Socket & Result<&1, &1, U32 & String, Response> <- x_h1.cli.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
-        client_seq.h1.go(t, Nil{}, got, host, port)
-
-# The batch lane serves both ALPN answers now: h2 keeps the sid/HPACK
-# lane, http/1.1 takes the H1 sequential lane on the same socket (the
-# Fail 615 that used to close H1 here is gone — TASK-027 Phase 3).
-def client.on.batch_st(+st: CliSt, sock: Socket, +host: String, +port: U32, +reqs: List<&2, Request>) ->
-  IO(Result<&1, &1, U32 & String, List<&2, Response>>):
-  match st:
-    case CliSt{sid, tab, is_h2}:
-      match is_h2:
-        case True{}:
-          client_seq.conn(Done{(sock, CliSt{sid, tab, is_h2})}, host, port, reqs)
-        case False{}:
-          client_seq.h1(sock, host, port, reqs)
-
-def client.on.batch(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+def client.on.conn(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, Response>>, Fail{e})
     case Done{value}:
       (sock, st) = value
-      client.on.batch_st(st, sock, host, port, reqs)
+      do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
+        out : Socket & Result<&1, &1, U32 & String, List<&2, Response>> & CliSt <- client_seq.keep(sock, st, host, port, reqs)
+        client.on.closed(out)
 
 def client.on(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
     conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect(host, port)
-    client.on.batch(conn, host, port, reqs)
+    client.on.conn(conn, host, port, reqs)
 
 def client.on_insecure(+host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, List<&2, Response>>):
   do IO<Result<&1, &1, U32 & String, List<&2, Response>>>:
     conn : Result<&1, &1, U32 & String, Socket & CliSt> <- client.connect_insecure(host, port)
-    client.on.batch(conn, host, port, reqs)
+    client.on.conn(conn, host, port, reqs)
 
-# One-shot entries: client.once is client.on of a single request plus the
-# unwrap, with no logic of its own (TASK-026 Phase 5). The singleton is
-# safe because client_seq is already fail-closed with the close
-# (client_seq.done/first), and it is why client_once.dial/dispatched/
-# h2go/exch/sent/drained are gone instead of aliased.
+# One-shot entries: dial, one client.request, close. No list to unwrap -- the
+# exchange answers a single Response, and client.request dispatches both ALPN
+# answers, so the H1 leg needs nothing of its own.
 # ---------------------------------------------------------------------
 
-def client.once.go(batch: Result<&1, &1, U32 & String, List<&2, Response>>) ->
+def client.once.closed(out: Socket & Result<&1, &1, U32 & String, Response> & CliSt) ->
   IO(Result<&1, &1, U32 & String, Response>):
-  match batch:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
-    case Done{rs}:
-      match rs:
-        case Nil{}:
-          IO.pure(Result<&1, &1, U32 & String, Response>, Fail{(400, "empty batch")})
-        case h <> t:
-          IO.pure(Result<&1, &1, U32 & String, Response>, Done{h})
-
-def client.once.h1(req: Request, sock: Socket, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match req:
-    case Request{method, path, headers, body}:
-      x_h1.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
-
-def client.once.ready(st: CliSt, sock: Socket, +host: String, +port: U32, req: Request) ->
-  IO(Result<&1, &1, U32 & String, Response>):
-  match st:
-    case CliSt{sid, tab, is_h2}:
-      match is_h2:
-        case True{}:
-          do IO<Result<&1, &1, U32 & String, Response>>:
-            batch : Result<&1, &1, U32 & String, List<&2, Response>> <- client_seq.conn(Done{(sock, CliSt{sid, tab, is_h2})}, host, port, req <> Nil{})
-            client.once.go(batch)
-        case False{}:
-          client.once.h1(req, sock, host, port)
+  (s, r, st) = out
+  do IO<Result<&1, &1, U32 & String, Response>>:
+    x : Unit <- TLS.tls_close(s)
+    IO.pure(Result<&1, &1, U32 & String, Response>, r)
 
 def client.once.dialed(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, req: Request) ->
   IO(Result<&1, &1, U32 & String, Response>):
@@ -4693,7 +4617,9 @@ def client.once.dialed(conn: Result<&1, &1, U32 & String, Socket & CliSt>, +host
       IO.pure(Result<&1, &1, U32 & String, Response>, Fail{e})
     case Done{value}:
       (sock, st) = value
-      client.once.ready(st, sock, host, port, req)
+      do IO<Result<&1, &1, U32 & String, Response>>:
+        out : Socket & Result<&1, &1, U32 & String, Response> & CliSt <- client.request(sock, st, host, port, req)
+        client.once.closed(out)
 
 def client.once(+host: String, +port: U32, req: Request) ->
   IO(Result<&1, &1, U32 & String, Response>):
