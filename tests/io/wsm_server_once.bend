@@ -1,5 +1,5 @@
-# lib (ws_server_once): WSM.serve_once_plain — the single-shot server.
-# Mirror of ws_server_on.bend for the `once` API: each connection
+# lib (wsm_server_once): WSM.serve_once_plain — the single-shot server.
+# Mirror of wsm_server_on_plain.bend for the `once` API: each connection
 # answers exactly one frame and closes. Two sequential connections on
 # one listener prove it: (1) masked text "hi" -> unmasked echo + EOF,
 # (2) masked ping [1,2] -> pong + EOF. The server returns 1 on a clean

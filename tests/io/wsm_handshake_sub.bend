@@ -1,4 +1,4 @@
-# lib (ws_handshake_sub): WS subprotocol + strict handshake golden.
+# lib (wsm_handshake_sub): WS subprotocol + strict handshake golden.
 # Phase 2 of task-020: key base64-16, Connection tokenized, Host port,
 # Sec-WebSocket-Protocol offer/pick, 101 with/without proto.
 import Base

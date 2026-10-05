@@ -1,4 +1,4 @@
-# io (ws_framed): the WSM compat readers isolate one WS frame per call
+# io (wsm_framed): the WSM compat readers isolate one WS frame per call
 # over a real loopback (recv_msg_client_framed_plain /
 # recv_op_client_framed_plain — the client side of the old ws.bend API).
 # The server sends "Hi" in two TCP writes (one byte,

@@ -1,5 +1,5 @@
-# lib (ws_client_on): WSM.client_on_plain — the generic persistent client.
-# Mirror of ws_server_on.bend: the same scripted session, driven by the
+# lib (wsm_client_on_plain): WSM.client_on_plain — the generic persistent client.
+# Mirror of wsm_server_on_plain.bend: the same scripted session, driven by the
 # client_on handler instead of the wire. One server_on handler serves
 # the whole script on ONE connection (echo "hi", close on "yo"); the
 # client handler checks each event it receives and prints one digit per

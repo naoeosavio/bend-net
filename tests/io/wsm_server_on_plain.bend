@@ -1,4 +1,4 @@
-# lib (ws_server_on): WSM.server_on_plain — the generic persistent server.
+# lib (wsm_server_on_plain): WSM.server_on_plain — the generic persistent server.
 # Pure: opcode consts, out_* builders, ping_reply/close_answer policy
 # (explicit OutOp wins, non-empty OutRaw wins too — it may glue the pong
 # with the next frame; OutRaw{[]} and OutMsg fall back to the auto-pong).

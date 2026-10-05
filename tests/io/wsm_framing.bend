@@ -1,4 +1,4 @@
-# lib (ws_framing): incremental WS frame split without IO.
+# lib (wsm_framing): incremental WS frame split without IO.
 # frame_need totals (small/masked/med), glued frames splitting into
 # frame plus exact rest, halves rejoining, short inputs asking for
 # more, invalid headers refused, and the unmasked client twins.

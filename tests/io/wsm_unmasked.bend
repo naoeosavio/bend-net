@@ -1,4 +1,4 @@
-# lib (ws_unmasked): server-frame parse without mask (interop).
+# lib (wsm_unmasked): server-frame parse without mask (interop).
 # Unmasked text/binary roundtrips, masked frames still accepted,
 # 16-bit lengths, and msg classification on top.
 import Base

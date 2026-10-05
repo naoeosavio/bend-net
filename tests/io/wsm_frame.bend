@@ -1,4 +1,4 @@
-# lib (ws_frame): WS frame codec roundtrips plus fail-closed paths.
+# lib (wsm_frame): WS frame codec roundtrips plus fail-closed paths.
 # Text, binary, continuation, ping/pong/close; len 16/64;wiadomości.
 import Base
 import ../../lib/wsm.bend as WSM

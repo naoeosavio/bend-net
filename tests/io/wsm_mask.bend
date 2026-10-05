@@ -1,4 +1,4 @@
-# lib (lib_ws_mask): Phase 7 client masking key + one-shot echo policy.
+# lib (lib_wsm_mask): Phase 7 client masking key + one-shot echo policy.
 # RFC 6455 section 5.3 asks every client frame for a masking key from a
 # strong entropy source; the library used the constant 1,2,3,4 on all
 # eight client send paths. The key now rides IO.random_u32 (getrandom /

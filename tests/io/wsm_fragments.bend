@@ -1,4 +1,4 @@
-# lib (ws_fragments): fragment reassembly golden (task-020 phase 1).
+# lib (wsm_fragments): fragment reassembly golden (task-020 phase 1).
 # Text/binary stitched over 2-3 fragments, ping interleaved mid-message,
 # orphan continuation and mixed-opcode rejects, FIN=0 control reject,
 # strict UTF-8 reject. Golden is the sum of the nine checks below.

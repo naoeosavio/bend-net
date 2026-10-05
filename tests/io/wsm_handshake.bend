@@ -1,4 +1,4 @@
-# lib (ws_handshake): WS handshake golden plus fail-closed paths.
+# lib (wsm_handshake): WS handshake golden plus fail-closed paths.
 # Golden RFC 6455 section 1.3 plus version, key and method rejects.
 import Base
 import ../../lib/wsm.bend as WSM

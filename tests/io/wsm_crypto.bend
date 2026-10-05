@@ -1,4 +1,4 @@
-# lib (ws_crypto): SHA-1 FIPS vectors plus base64 roundtrips.
+# lib (wsm_crypto): SHA-1 FIPS vectors plus base64 roundtrips.
 # Pure crypto only, no net. Each check below must be 1.
 import Base
 import ../../lib/sha1.bend as SHA1

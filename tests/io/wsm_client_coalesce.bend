@@ -1,4 +1,4 @@
-# lib (wss_client_coalesce): 101 + first frame coalesced in one TLS write.
+# lib (wsm_client_coalesce): 101 + first frame coalesced in one TLS write.
 # The canned server reads the upgrade, then answers the 101 and an
 # unmasked "hello" text frame in a SINGLE tls_send, so both ride one
 # TLS record / TCP segment; the client (WSM.client_on_insecure) must

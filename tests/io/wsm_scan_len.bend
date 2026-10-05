@@ -1,4 +1,4 @@
-# lib (ws_scan_len): client_scan_len head-split golden (task-020 phase 0).
+# lib (wsm_scan_len): client_scan_len head-split golden (task-020 phase 0).
 # Guards the off-by-3 fix: scan_len must answer the head length including
 # the \r\n\r\n terminator, so take/drop split a coalesced 101 + frame
 # segment exactly. Golden is the sum of the five checks below.

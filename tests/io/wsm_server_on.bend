@@ -1,4 +1,4 @@
-# lib (wss_server_on): WSM.server_on — generic persistent server over
+# lib (wsm_server_on): WSM.server_on — generic persistent server over
 # TLS. The handler echoes text (OutRaw{[]} on open/ping policy like
 # WS). One client_echo_insecure drives handshake + one frame; golden 1.
 import Base

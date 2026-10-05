@@ -1,4 +1,4 @@
-# lib (wss_loopback): WSS echo over TLS loopback (self-signed).
+# lib (wsm_loopback_tls): WSS echo over TLS loopback (self-signed).
 # Server is single-shot WSM.serve_once on an ephemeral port (TLS accept
 # with the test cert); client is WSM.client_echo_insecure masked Hi.
 # Golden 111 (echo + fail-closed dial to port 0/1 via noalpn path).

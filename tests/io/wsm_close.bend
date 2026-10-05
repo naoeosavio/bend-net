@@ -1,4 +1,4 @@
-# lib (ws_close): close payload validation golden (task-020 phase 1).
+# lib (wsm_close): close payload validation golden (task-020 phase 1).
 # Empty normalizes to 1005, valid codes echo, reserved codes fail 1002,
 # short payloads fail 1002, non-UTF-8 reasons fail 1007. Golden is the
 # sum of the ten checks below.

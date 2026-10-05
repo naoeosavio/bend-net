@@ -1,4 +1,4 @@
-# lib (ws_msg): WSMessage send/recv generics over loopback.
+# lib (wsm_msg): WSMessage send/recv generics over loopback.
 # Pure: text/binary roundtrips, fragment reassembly (a leading FIN=0
 # frame now stitches instead of failing), control rejects, ping as
 # InOp. Net (one listener, three accepts): raw send_bytes/recv_bytes

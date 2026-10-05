@@ -1,5 +1,5 @@
-# lib (wss_client_on): WSM.client_on — generic persistent client over
-# TLS. Mirror of ws_client_on.bend: same scripted session on ONE TLS
+# lib (wsm_client_on): WSM.client_on — generic persistent client over
+# TLS. Mirror of wsm_client_on_plain.bend: same scripted session on ONE TLS
 # connection; client prints one digit per step (open, echo hi, pong,
 # close). Golden 1111.
 import Base

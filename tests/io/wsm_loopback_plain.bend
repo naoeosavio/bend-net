@@ -1,4 +1,4 @@
-# lib (ws_loopback): WS echo over loopback plus static guards.
+# lib (wsm_loopback_plain): WS echo over loopback plus static guards.
 # Server is single-shot WSM.serve_once_plain on an ephemeral port (retry like
 # tcp_loopback); client is WSM.client_echo_plain masked Hi. Static checks are
 # pure (no File) to stay under the gate timeout.
