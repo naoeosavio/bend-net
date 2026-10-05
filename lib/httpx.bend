@@ -3334,9 +3334,9 @@ def client.on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +meth
 # (missing →502, never hangs on keep-alive), server treats missing CL as
 # empty body. Keep-alive on both ends since TASK-027: the server answers
 # and loops back to read (x_h1.srv.head phase 3), the client reuses the
-# socket for N requests in order (x_h1.cli.exch / client_seq.h1). Closing
-# is by "connection: close", EOF, or a terminal 413/502; no Connection
-# header is ever emitted, so the one-shot bytes are unchanged.
+# socket for N requests in order (x_h1.cli.exch / client_seq.h1.keep).
+# Closing is by "connection: close", EOF, or a terminal 413/502; no
+# Connection header is ever emitted, so the one-shot bytes are unchanged.
 # ---------------------------------------------------------------------
 
 def x_h1.eq_ci(a: String, b: String) -> Bool:
@@ -3344,6 +3344,39 @@ def x_h1.eq_ci(a: String, b: String) -> Bool:
 
 def x_h1.bad_char(+s: String) -> Bool:
   Bool.or(client.on.has_crlf(s), client.on.has_nul(s))
+
+# Render safety of a header FIELD (TASK-030): render_hs.go writes
+# "name: value\r\n" verbatim, so a CR/LF/NUL inside either half ends the
+# field early and the rest is read as headers the caller never asked for —
+# request splitting on the client render, response splitting on the server
+# render, one predicate for both. bad_char is the same check the request
+# line already applied to method/path/host. Note the parser cannot be the
+# source: it cuts the head on CRLF, so a parsed value never carries one —
+# the source is text the app built itself (a decoded query/path echoed
+# into a response header is the classic case).
+def x_h1.bad_hdr(+h: Hdr) -> Bool:
+  match h:
+    case Hdr{+n, +v}:
+      Bool.or(x_h1.bad_char(n), x_h1.bad_char(v))
+
+def x_h1.bad_hdrs.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case h <> t:
+      x_h1.bad_hdrs.go(t, Bool.or(acc, x_h1.bad_hdr(h)))
+
+def x_h1.bad_hdrs(hs: List<&2, Hdr>) -> Bool:
+  x_h1.bad_hdrs.go(hs, False{})
+
+# Everything the request line and the header block render, in one place:
+# the same expression was copied inline in x_h1.render_req and
+# x_h1.cli.exch.open.fit, and neither copy looked at hs.
+def x_h1.bad_req(+method: String, +path: String, +host: String, hs: List<&2, Hdr>) ->
+  Bool:
+  Bool.or(x_h1.bad_char(method),
+    Bool.or(x_h1.bad_char(path),
+      Bool.or(x_h1.bad_char(host), x_h1.bad_hdrs(hs))))
 
 def x_h1.forbidden(+name: String) -> Bool:
   Bool.or(String.starts_with(name, ":"),
@@ -3415,9 +3448,11 @@ def x_h1.render_req.go(+upgrade: Bool, bad: Bool, +method: String, +path: String
     case False{}:
       Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\n" ++ x_h1.render_cl(body, upgrade)), upgrade), x_str_bytes("\r\n")), body)}
 
-def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+# hs is + here (and only here): the header block is read twice, once by
+# bad_req and once by the render below.
+def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, +hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
-  x_h1.render_req.go(False{}, Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body)
+  x_h1.render_req.go(False{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body)
 
 def x_h1.reason(st: U32) -> String:
   match st:
@@ -3963,13 +3998,15 @@ def x_h1.exch.send_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
 # leaves) but rendered with upgrade=True and answered by the _open chain,
 # so the socket comes back live with the bytes past the head. Not closing
 # is the caller's job — that is the whole point of the triple.
-def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+# hs is + for the same reason as x_h1.render_req: bad_req and the render
+# both read the header block.
+def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, +hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          x_h1.exch.send_open(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, Bool.or(x_h1.bad_char(method), Bool.or(x_h1.bad_char(path), x_h1.bad_char(host))), method, path, host, port, hs, body), method)
+          x_h1.exch.send_open(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body), method)
         case False{}:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>,
             (sock, Fail{(413, "req too large")}))
@@ -6049,6 +6086,31 @@ def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) 
   (s, r) = got
   s
 
+# Renderability gate for a handler response (TASK-030). x_h1.show_resp and
+# x_h1.show_resp_head render the handler's headers through the same
+# x_h1.render_hs.go the client uses, verbatim, so a CR/LF/NUL in a name or
+# value would end the field early and ship the rest as response headers
+# nobody asked for — response splitting, and the classic way to get one is
+# a decoded query/path echoed into Location or Set-Cookie.
+#
+# The whole response is replaced by a bare 500 rather than dropping the
+# offending field: rendering it at all IS the injection, and silently
+# shipping a narrower response than the handler asked for hides the bug
+# that produced it. A 101 with bad headers falls into the same 500, so the
+# upgrade is refused instead of half-negotiated.
+def x_h1.srv.safe_resp.go(+status: U32, +headers: List<&2, Hdr>, +body: List<&2, U32>, bad: Bool) ->
+  Response:
+  match bad:
+    case True{}:
+      Response{500, Nil{}, Nil{}}
+    case False{}:
+      Response{status, headers, body}
+
+def x_h1.srv.safe_resp(resp: Response) -> Response:
+  match resp:
+    case Response{+status, +headers, +body}:
+      x_h1.srv.safe_resp.go(status, headers, body, x_h1.bad_hdrs(headers))
+
 # The answer path never closes the socket: it hands it back to the head
 # machine in the very pair type the read phases use, so phase 3 is the
 # single place that decides reuse vs close.
@@ -6100,7 +6162,7 @@ def x_h1.srv.answer(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Str
   (s, r) = got
   do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
     resp : Response <- H(req)
-    x_h1.srv.respond(~recv, ~send, ~close, s, resp, keep, rest)
+    x_h1.srv.respond(~recv, ~send, ~close, s, x_h1.srv.safe_resp(resp), keep, rest)
 
 def x_h1.srv.recv(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s0, r0) = got
@@ -6302,7 +6364,7 @@ def x_h1.srv.answer_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 
   (s, r) = got
   do IO<Unit>:
     resp : Response <- H(req)
-    x_h1.srv.reply_open(~recv, ~send, ~close, ~H, ~K, s, resp, keep, rest)
+    x_h1.srv.reply_open(~recv, ~send, ~close, ~H, ~K, s, x_h1.srv.safe_resp(resp), keep, rest)
 
 @unsafe
 def x_h1.srv.bd_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
