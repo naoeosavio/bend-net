@@ -2,7 +2,7 @@
 # Supports ["p1"] via WSM.server_on_sub on 127.0.0.1:19894 (TLS test
 # certs). Prints LISTEN, then DONE on hello echo. Run through a built
 # binary (bend run faults on large transfers, not needed here):
-# bend examples/wss_sub_echo.bend -o /tmp/sub_echo_bin && /tmp/sub_echo_bin
+# bend examples/wsm_sub_echo.bend -o /tmp/sub_echo_bin && /tmp/sub_echo_bin
 # Manual only — not in check.sh.
 import Base
 import ../lib/wsm.bend as WSM

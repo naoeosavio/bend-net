@@ -3,7 +3,7 @@
 # 19892), which sends "hello" inside its `connection` callback so the
 # 101 and the first frame coalesce. Expects EvOpen then EvMsg "hello",
 # prints 1 and closes. Manual only — not in check.sh (fixed port, needs
-# the JS peer running): bend examples/wss_hello_client.bend
+# the JS peer running): bend examples/wsm_hello_client.bend
 import Base
 import ../lib/wsm.bend as WSM
 

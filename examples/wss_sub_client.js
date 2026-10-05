@@ -1,5 +1,5 @@
 // TLS WebSocket subprotocol client for interop with
-// examples/wss_sub_echo.bend (Bend WSS.server_on_sub ["p1"]).
+// examples/wsm_sub_echo.bend (Bend WSM.server_on_sub ["p1"]).
 // Offers ['p1','p2'], sends "hello", expects echo, closes.
 // Prints DONE n/n (grep rule: pass = DONE present with no FAIL).
 // Manual only — not in check.sh.

@@ -3,7 +3,7 @@
 # 127.0.0.1:19894 and prints 1 when the full echo lands (0 otherwise).
 # The payload rides two 16KB chunks: `bend run` faults past ~25KB on a
 # single replicate-built list, so run this through a built binary:
-# bend examples/wss_frag_client.bend -o /tmp/frag_client_bin &&
+# bend examples/wsm_frag_client.bend -o /tmp/frag_client_bin &&
 #   /tmp/frag_client_bin
 # Manual only — not in check.sh.
 import Base

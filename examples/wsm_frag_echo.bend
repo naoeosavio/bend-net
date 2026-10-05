@@ -3,7 +3,7 @@
 # Node `ws` peer can push >16KB payloads through, forcing real
 # fragmentation on the wire. Prints each message length. Run through a
 # built binary (`bend run` faults past ~25KB single transfers):
-# bend examples/wss_frag_echo.bend -o /tmp/frag_echo_bin &&
+# bend examples/wsm_frag_echo.bend -o /tmp/frag_echo_bin &&
 #   /tmp/frag_echo_bin   (Ctrl-C to stop)
 # Manual only — not in check.sh.
 import Base

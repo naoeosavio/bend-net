@@ -1,11 +1,11 @@
 # Binance individual-symbol book ticker over WSS (task-017 API, live
 # peer). Dials the raw stream endpoint wss://stream.binance.com:9443/ws
-# with WSS.client.on (the verified path: TLS cert + hostname checked),
+# with WSM.client.on (the verified path: TLS cert + hostname checked),
 # sends one SUBSCRIBE frame for the <symbol>@bookTicker stream and
 # prints the best bid/ask of every update.
 #
-#   bend examples/wss_binance_bookticker.bend
-#   bend examples/wss_binance_bookticker.bend | head -20
+#   bend examples/wsm_binance_bookticker.bend
+#   bend examples/wsm_binance_bookticker.bend | head -20
 #
 # Manual only — never in check.sh: it needs the network and a real TLS
 # peer, and the feed is real-time (~35 BNBUSDT updates a second measured,
@@ -24,7 +24,7 @@
 # There is no JSON parser in the package, so fld pulls a field out of a
 # flat object with String.split (no nested objects, no escaped quotes).
 import Base
-import ../lib/wsm.bend as WSS
+import ../lib/wsm.bend as WSM
 
 law sub_frame:
   for +sym: String
@@ -106,59 +106,59 @@ def bk.line(js):
 law h.text:
   for +text: String
   for is_ack: Bool
-  IO(WSS.WSOut)
+  IO(WSM.WSOut)
 
 def h.text(text, is_ack):
   match is_ack:
     case True{}:
-      do IO<WSS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("ACK " ++ text)
-        return WSS.OutRaw{[]}
+        return WSM.OutRaw{[]}
     case False{}:
-      do IO<WSS.WSOut>:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print(bk.line(text))
-        return WSS.OutRaw{[]}
+        return WSM.OutRaw{[]}
 
 law h.btc:
-  for ev: WSS.WSEv
-  IO(WSS.WSOut)
+  for ev: WSM.WSEv
+  IO(WSM.WSOut)
 
 def h.btc(ev):
   match ev:
-    case WSS.EvOpen{}:
-      do IO<WSS.WSOut>:
+    case WSM.EvOpen{}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("OPEN stream.binance.com:9443/ws")
-        return WSS.OutMsg{WSS.WSText{sub_frame("bnbusdt")}}
-    case WSS.EvMsg{msg}:
+        return WSM.OutMsg{WSM.WSText{sub_frame("bnbusdt")}}
+    case WSM.EvMsg{msg}:
       match msg:
-        case WSS.WSText{text}:
+        case WSM.WSText{text}:
           +t = text
           h.text(t, String.contains(t, "\"result\""))
-        case WSS.WSBin{data}:
-          do IO<WSS.WSOut>:
+        case WSM.WSBin{data}:
+          do IO<WSM.WSOut>:
             w : Unit <- IO.print("BIN " ++ U32.show(U32.from_nat(List.length(&2, U32, data))))
-            return WSS.wsm_out_close([])
-    case WSS.EvPing{pay}:
-      do IO<WSS.WSOut>:
+            return WSM.wsm_out_close([])
+    case WSM.EvPing{pay}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("PING -> pong")
-        return WSS.wsm_out_pong(pay)
-    case WSS.EvPong{pay}:
-      IO.pure(WSS.WSOut, WSS.OutRaw{[]})
-    case WSS.EvClose{pay}:
-      do IO<WSS.WSOut>:
+        return WSM.wsm_out_pong(pay)
+    case WSM.EvPong{pay}:
+      IO.pure(WSM.WSOut, WSM.OutRaw{[]})
+    case WSM.EvClose{pay}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("CLOSE " ++ U32.show(U32.from_nat(List.length(&2, U32, pay))))
-        return WSS.wsm_out_close([])
-    case WSS.EvError{code, msg}:
-      do IO<WSS.WSOut>:
+        return WSM.wsm_out_close([])
+    case WSM.EvError{code, msg}:
+      do IO<WSM.WSOut>:
         w : Unit <- IO.print("ERR " ++ U32.show(code) ++ " " ++ msg)
-        return WSS.wsm_out_close([])
+        return WSM.wsm_out_close([])
 
 law feed:
   IO(Unit)
 
 def feed():
   do IO<Unit>:
-    z : Unit <- WSS.client_on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
+    z : Unit <- WSM.client_on(~h.btc, "stream.binance.com", 9443, "/ws", "dGhlIHNhbXBsZSBub25jZQ==")
     return z
 
 law main:

@@ -8,7 +8,7 @@
 // Needs `ws` under node: NODE_PATH=/tmp/wsport/node_modules
 // Usage: NODE_PATH=/tmp/wsport/node_modules node wss_hello_server.js [port]
 //        (default port 19892)
-// Pair with: bend examples/wss_hello_client.bend (expects "hello" -> 1)
+// Pair with: bend examples/wsm_hello_client.bend (expects "hello" -> 1)
 
 import { createRequire } from "node:module";
 import { createServer } from "node:https";

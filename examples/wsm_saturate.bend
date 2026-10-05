@@ -1,6 +1,6 @@
-# Saturation + bench driver for lib/https.bend and lib/wss.bend.
+# Saturation + bench driver for lib/https.bend and lib/wsm.bend.
 # Bend<->Bend loopback over ephemeral ports (no fixed-port clashes with
-# the 19892/19893 echo peers). The HTTPS server is HTTPS.server_on and
+# the 19892/19893 echo peers). The HTTPS server is HTTPX.server.on and
 # the WSS server is WSM.server_on (both IO.spawn per connection, so the
 # N clients below overlap); each client is a single-shot insecure
 # exchange (send_request_insecure / client_echo_insecure) against
@@ -12,18 +12,17 @@
 # `time` around the run; Bend has no clock effect).
 #
 # Manual only — never runs in check.sh (needs loopback + TLS):
-#   bend examples/saturate_https_wss.bend
-#   time bend examples/saturate_https_wss.bend
+#   bend examples/wsm_saturate.bend
+#   time bend examples/wsm_saturate.bend
 import Base
 import ../lib/tls.bend as TLS
-import ../lib/https.bend as HTTPS
-import ../lib/http2.bend as H2
 import ../lib/wsm.bend as WSM
+import ../lib/httpx.bend as HTTPX
 
-def h2_echo(req: H2.H2Request) -> IO(H2.H2Response):
+def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
   match req:
-    case H2.H2Request{+method, +path, +headers, +body}:
-      IO.pure(H2.H2Response, H2.H2Response{200, Nil{}, body})
+    case HTTPX.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
 
 def h.echo(ev: WSM.WSEv) -> IO(WSM.WSOut):
   match ev:
@@ -71,7 +70,7 @@ law https_server:
 
 def https_server(l):
   do IO<String>:
-    x : Unit <- HTTPS.server_on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTPX.server.on(~h2_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law wss_server:
@@ -89,7 +88,7 @@ law client_https:
 
 def client_https(port):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, String> <- HTTPS.send_request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
+    r : Result<&1, &1, U32 & String, String> <- HTTPX.request_insecure("127.0.0.1", port, "/echo", "POST", Nil{}, "hello")
     IO.pure(U32, https_score(r))
 
 law client_wss:
