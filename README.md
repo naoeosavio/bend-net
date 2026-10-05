@@ -22,23 +22,24 @@ lib/dns.bend              # DNS resolve: A lookup for name hosts (C + JS twins)
 lib/tls.bend              # TLS client + server effects (C + JS twins, OpenSSL)
 lib/http2.bend            # HTTP/2 codec + client/server over TLS (pure Bend)
 lib/https.bend            # HTTPS facade: fetch/send_request + server_on over TLS+DNS+H2
-lib/httpx.bend            # HTTPX isolation: server + client (Base+tls only)
+lib/https_http1.bend      # HTTP/1.1-only server module (chunked, ALPN http/1.1)
+lib/httpx.bend            # HTTPX: H1 + H2 + HTTPS in one module (Base+tls only)
 lib/effs/tcp_send_bytes.* # send List<&2, U32> over a Socket
 lib/effs/tcp_recv_bytes.* # receive bytes from a Socket
 lib/effs/tcp_recv_frame.* # isolate exactly one WS frame, rest preserved
 lib/effs/dns_resolve.*    # resolve a host to one IPv4 (getaddrinfo / UDP query)
 lib/effs/tls_*.{c,js}     # TLS connect/accept/send/recv/close (dlopen libssl)
-tests/io/http_lib_pure.bend   # pure layer: URL, headers, framing, chunked, UTF-8
-tests/io/http_lib_fetch.bend  # IO: real loopback fetch + fail-closed paths
-tests/io/http_lib_fetch_host.bend # IO: fetch by name over loopback, Host preserved
-tests/io/http_lib_sec.bend    # security: CRLF/NUL injection, oversize, bad status
+tests/io/httpx_h1_pure.bend   # pure layer: URL, headers, framing, chunked, UTF-8
+tests/io/httpx_h1_fetch.bend  # IO: real loopback fetch + fail-closed paths
+tests/io/httpx_h1_fetch_host.bend # IO: fetch by name over loopback, Host preserved
+tests/io/httpx_h1_sec.bend    # security: CRLF/NUL injection, oversize, bad status
 tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
 tests/io/tls_connect_close.bend # IO: TLS loopback echo + fail paths (611/612)
 tests/io/h2_loopback.bend       # IO: HTTP/2 echo over TLS (Bend↔Bend)
-tests/io/https_*.bend         # HTTPS facade: fetch, streams, server_on, mux
-tests/io/ws_*.bend            # WS crypto, handshake, frame, framing, message...
-tests/io/wss_*.bend           # WSS loopback, server_on, client_on over TLS
-tests/io/wsm_*.bend           # WSM loopback, upgrade rest, pure surface, compat
+tests/io/httpx_*.bend       # HTTPX: client, server, H1/H2 lanes, codec
+tests/io/httpx_h1_*.bend    # the legacy lib/http.bend lane: pure, fetch, sec
+tests/io/httpx_*_https.bend # fetch, streams, mux, H1 fallback — all on httpx
+tests/io/wsm_*.bend         # WSM: the one WebSocket — crypto, codec, both lanes
 tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
 examples/                 # runnable interop programs (not published)
 tasks/                    # engineering log (decisions, discoveries, checklists)
@@ -178,7 +179,7 @@ updates. Integer continuations past 5 bytes fail closed with `502`
 without huffman — valid HPACK every peer decodes, so Bend→Node needs
 no huffman encoder. Header blocks split across CONTINUATION and
 frames over 16384 still fail closed (`400`/`413`, backlog).
-`examples/https_real.bend` is a manual smoke against live hosts
+`examples/httpx_real.bend` is a manual smoke against live hosts
 (observed 2026-09-28: example.com GET/POST OK, cloudflare.com
 `fetch` OK on ~1.3 MB, info.cern.ch OK via H1);
 it is never part of the gate. Multi-stream keep-alive clients against
@@ -243,14 +244,14 @@ Fail codes surface unchanged: `400/413/502/503` (codec), `601-605`
   sites deliver ~1.4 KB per record) no longer answers `400 eof`.
 
 ```sh
-bend tests/io/https_fetch.bend        # 1
-bend tests/io/https_streams.bend      # 1
-bend tests/io/https_server_on.bend    # 1
-bend tests/io/https_mux.bend          # 1
-bend tests/io/https_http1_module.bend # 1
+bend tests/io/httpx_fetch_https.bend   # 1
+bend tests/io/httpx_streams.bend       # 1
+bend tests/io/httpx_server_on.bend     # 1
+bend tests/io/httpx_mux.bend           # 1
+bend tests/io/httpx_http1_module.bend  # 1
 bend tests/io/tls_alpn_dual.bend      # 1
 bend tests/io/h2_frame_read.bend      # 8
-bend examples/https_real.bend         # manual live smoke
+bend examples/httpx_real.bend         # manual live smoke
 ```
 
 ## HTTPX (isolation)
@@ -272,10 +273,10 @@ Architecture (the two delivery modes, why streaming handlers are pure):
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
 | `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming: `SrvReqHead`/`SrvReqData` events to a pure `~H`, `Continue` buffers, `RespondEarly` answers without draining |
-| `client.once(_insecure)(host, port, Request)` | One-shot: `client.on` of a single request plus the unwrap (H1 connections dispatch to the H1 lane) |
+| `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
 | `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
-| `client.connect(_insecure)(host, port)` | The threaded primitive: hands back `Socket & CliSt{sid, tab, is_h2}`; `client.request(sock, st, ...)` does one exchange on it (the h2 frame exchange or `x_h1.cli.exch`, per `is_h2`) |
+| `client.connect(_insecure)(host, port)` | Hands back `Socket & CliSt{sid, tab, is_h2}`. `client.request(sock, st, host, port, req)` is **one** exchange on it, both ALPN answers, and it **never closes**: the caller closes (`client.on`/`client.once` do) or calls again for the next request, threading the socket and the state — the returned `CliSt` carries the advanced sid and the HPACK table the next response decodes against. N requests are that loop at the call site |
 | `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
 | `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); `StreamCancel` sends `RST_STREAM` |
 | `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
@@ -291,7 +292,10 @@ non-final DATA, else >64 KB stalls); fragmented header blocks
 and on `httpx_stream` (RFC 9113 §6.10 forbids interleave mid-sequence, so
 no per-stream ledger); Huffman/dynamic-table peers decode (static 1–61,
 literal, Huffman strings, minimal dyn table), which is what `node:http2`
-needs.
+needs; H1 headers are checked at render time — a CR/LF/NUL in a name or a
+value is refused (`Fail` 400 on a request, a bare 500 on a response)
+instead of ending the field early and shipping the rest as headers nobody
+asked for.
 
 ```sh
 bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK roundtrip, ~2s)
@@ -299,18 +303,19 @@ bend tests/io/httpx_client.bend           # 1 (once vs mini server)
 bend tests/io/httpx_interop.bend          # 1 (4 crossed streams vs mini server)
 bend tests/io/httpx_client_once.bend      # 1
 bend tests/io/httpx_client_keepalive.bend # 3
+bend tests/io/httpx_client_request.bend   # 7 (4 chained + reset + H1 reuse)
 bend tests/io/httpx_client_concurrent.bend # 4
 bend tests/io/httpx_client_stream.bend    # 1
 bend tests/io/httpx_server_stream.bend    # 2
 bend tests/io/httpx_read_url.bend         # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend            # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend       # 3 (batch entry vs mini server)
-bend tests/io/httpx_server_seq.bend       # 2 (keep-alive vs sequential server)
+bend tests/io/httpx_server_seq.bend       # 2 (terminal requests vs sequential server)
 bend tests/io/httpx_http1_fallback.bend   # 1 (dual client vs H1 server)
 bend tests/io/httpx_server_alpn.bend      # 2 (ALPN split, H2 + H1 clients)
 bend tests/io/httpx_echo_once.bend        # 2 (server.once + server.echo, client.once/echo)
 bend tests/io/httpx_plain_h1.bend         # 2 (http:// end to end over server.on_h1_plain)
-bend tests/io/httpx_h1_keepalive.bend     # 14 (close policy, H1 reuse on one connection, client batch)
+bend tests/io/httpx_h1_keepalive.bend     # 14 (H1 close policy + reuse + client batch + terminal)
 bend tests/io/httpx_flow.bend             # 1 (25 KB up+down through pump v2 + WU credit)
 bend tests/io/httpx_client_cont.bend      # 1 (fragmented HEADERS+CONT vs once drain)
 bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
@@ -411,18 +416,18 @@ Fail codes surface unchanged: WS `400`/`413`, DNS `601-605`, TLS
 `611-616`.
 
 ```sh
-bend tests/io/wsm_loopback.bend     # 3   (plain + TLS session + one-shot TLS)
-bend tests/io/wsm_upgrade_rest.bend # 3   (head+frame in one write)
-bend tests/io/wsm_surface.bend      # 29  (pure text surface + UTF-8)
-bend tests/io/wsm_compat.bend       # 9   (the _plain compat instances)
-bend tests/io/wss_loopback.bend     # 111
-bend tests/io/wss_server_on.bend    # 1
-bend tests/io/wss_client_on.bend    # 1111
-bend tests/io/ws_close.bend         # 10
-bend tests/io/ws_fragments.bend     # 9
-bend tests/io/ws_handshake_sub.bend # 12
+bend tests/io/wsm_loopback.bend       # 3   (plain + TLS session + one-shot TLS)
+bend tests/io/wsm_upgrade_rest.bend   # 3   (head+frame in one write)
+bend tests/io/wsm_surface.bend        # 29  (pure text surface + UTF-8)
+bend tests/io/wsm_compat.bend         # 9   (the _plain compat instances)
+bend tests/io/wsm_loopback_tls.bend   # 111
+bend tests/io/wsm_server_on.bend      # 1
+bend tests/io/wsm_client_on.bend      # 1111
+bend tests/io/wsm_close.bend          # 10
+bend tests/io/wsm_fragments.bend      # 9
+bend tests/io/wsm_handshake_sub.bend  # 12
 
-bend examples/wss_binance_bookticker.bend | head   # live public peer
+bend examples/wsm_binance_bookticker.bend | head   # live public peer
 ```
 
 ## Helpers
@@ -506,9 +511,9 @@ Interop matrix (loopback, test PEMs; measured 2026-09-22/23 in
 | Pair | Result |
 |---|---|
 | WSS node ↔ node / bun ↔ bun / node ↔ bun / bun → node | **4/4 PASS** |
-| Bend `https_echo_client` → Node `https_server.js` | **PASS** (`DONE 3/3` / `DONE 1/1`) |
-| Node `https_client.js` → Bend `https_echo_server.bend` | **PASS** (`DONE 4/4`; was `502 huffman refused` before HPACK-full) |
-| Bend ↔ Bend HTTPS | **PASS** (golden `tests/io/https_*`, 4/4) |
+| Bend `httpx_echo_client` → Node `https_server.js` | **PASS** (`DONE 3/3` / `DONE 1/1`) |
+| Node `https_client.js` → Bend `httpx_echo_server.bend` | **PASS** (`DONE 4/4`; was `502 huffman refused` before HPACK-full) |
+| Bend ↔ Bend HTTPS | **PASS** (golden `tests/io/httpx_*_https.bend`, 4/4) |
 | HPACK vectors (RFC C.4.1/C.6.1) + dynamic-table unit | **PASS** (`tests/io/hpack_huffman.bend` 11111111, `hpack_dyntab.bend` 11111111) |
 
 ## Security policy
@@ -555,58 +560,59 @@ pasting the new line.
 ## Tests
 
 ```sh
-bend tests/io/http_lib_pure.bend      # 481441153
-bend tests/io/http_lib_sec.bend       # 15
-bend tests/io/http_lib_fetch.bend     # 111
-bend tests/io/http_lib_fetch_cl.bend  # 111
-bend tests/io/http_lib_fetch_post.bend  # 111
-bend tests/io/http_lib_fetch_head.bend  # 11111
-bend tests/io/http_lib_fetch_host.bend  # 111
-bend tests/io/http_lib_server_on.bend   # 111
+bend tests/io/httpx_h1_pure.bend        # 481441153
+bend tests/io/httpx_h1_sec.bend         # 15
+bend tests/io/httpx_h1_fetch.bend       # 111
+bend tests/io/httpx_h1_fetch_cl.bend    # 111
+bend tests/io/httpx_h1_fetch_post.bend  # 111
+bend tests/io/httpx_h1_fetch_head.bend  # 11111
+bend tests/io/httpx_h1_fetch_host.bend  # 111
+bend tests/io/httpx_h1_server_on.bend   # 111
 bend tests/io/tcp_bytes.bend          # 11
 bend tests/io/tcp_bytes_loopback.bend # 1
 bend tests/io/dns_resolve.bend        # 1111111111
 bend tests/io/tls_connect_close.bend  # 111
 bend tests/io/h2_loopback.bend        # 1
-bend tests/io/https_fetch.bend        # 1
-bend tests/io/https_streams.bend      # 1
-bend tests/io/https_server_on.bend    # 1
-bend tests/io/https_mux.bend          # 1
-bend tests/io/ws_crypto.bend          # 8
-bend tests/io/ws_handshake.bend       # 4
-bend tests/io/ws_frame.bend           # 6
-bend tests/io/ws_unmasked.bend        # 4
-bend tests/io/ws_loopback.bend        # 111
-bend tests/io/ws_msg.bend             # 1111
-bend tests/io/ws_framing.bend         # 13
-bend tests/io/ws_framed.bend          # 4
+bend tests/io/httpx_fetch_https.bend   # 1
+bend tests/io/httpx_streams.bend       # 1
+bend tests/io/httpx_server_on.bend     # 1
+bend tests/io/httpx_mux.bend           # 1
+bend tests/io/wsm_crypto.bend          # 8
+bend tests/io/wsm_handshake.bend       # 4
+bend tests/io/wsm_frame.bend           # 6
+bend tests/io/wsm_unmasked.bend        # 4
+bend tests/io/wsm_loopback_plain.bend  # 111
+bend tests/io/wsm_msg.bend             # 1111
+bend tests/io/wsm_framing.bend         # 13
+bend tests/io/wsm_framed.bend          # 4
 bend tests/io/h2_flow.bend            # 11
 bend tests/io/h2_rst.bend             # 13
 bend tests/io/hpack_continuation.bend # 30
 bend tests/io/h2_frame_read.bend      # 8
-bend tests/io/https_http1_module.bend # 1
+bend tests/io/httpx_http1_module.bend # 1
 bend tests/io/tls_alpn_dual.bend      # 1
-bend tests/io/ws_close.bend           # 10
-bend tests/io/ws_fragments.bend       # 9
-bend tests/io/ws_handshake_sub.bend   # 12
-bend tests/io/ws_mask.bend            # 19
-bend tests/io/wss_client_coalesce.bend # 1
-bend tests/io/wsm_loopback.bend       # 3   (plain + TLS session + one-shot TLS)
-bend tests/io/wsm_upgrade_rest.bend   # 3   (101 + first frame in one write)
-bend tests/io/wsm_surface.bend        # 29  (pure text surface + UTF-8)
-bend tests/io/wsm_compat.bend         # 9   (the _plain compat instances)
+bend tests/io/wsm_close.bend            # 10
+bend tests/io/wsm_fragments.bend        # 9
+bend tests/io/wsm_handshake_sub.bend    # 12
+bend tests/io/wsm_mask.bend             # 19
+bend tests/io/wsm_client_coalesce.bend  # 1
+bend tests/io/wsm_loopback.bend         # 3   (plain + TLS session + one-shot TLS)
+bend tests/io/wsm_upgrade_rest.bend     # 3   (101 + first frame in one write)
+bend tests/io/wsm_surface.bend          # 29  (pure text surface + UTF-8)
+bend tests/io/wsm_compat.bend           # 9   (the _plain compat instances)
 bend tests/io/httpx_miniunit.bend           # 1
 bend tests/io/httpx_client.bend             # 1
 bend tests/io/httpx_interop.bend            # 1
 bend tests/io/httpx_client_once.bend        # 1
 bend tests/io/httpx_client_keepalive.bend   # 3
+bend tests/io/httpx_client_request.bend     # 7   (4 chained + reset + H1 reuse)
 bend tests/io/httpx_client_concurrent.bend  # 4
 bend tests/io/httpx_client_stream.bend      # 1
 bend tests/io/httpx_server_stream.bend      # 2
 bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
-bend tests/io/httpx_server_seq.bend         # 2 (keep-alive vs sequential server)
+bend tests/io/httpx_server_seq.bend         # 2 (terminal requests vs sequential server)
 bend tests/io/httpx_http1_fallback.bend     # 1 (dual client vs H1 server)
 bend tests/io/httpx_server_alpn.bend        # 2 (ALPN split, H2 + H1 clients)
 bend tests/io/httpx_flow.bend               # 1 (25 KB up+down through pump v2 + WU credit)
@@ -614,9 +620,9 @@ bend tests/io/httpx_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once
 bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
 bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
-bend tests/io/httpx_h1_keepalive.bend         # 14 (H1 close policy + reuse + client batch)
-bend tests/io/httpx_h1_upgrade.bend           # 7 (101 detaches the socket: server + client)
-bend tests/io/httpx_h1_upgrade_client.bend    # 7 (renderer + raw peer + 200 -> 502)
+bend tests/io/httpx_h1_keepalive.bend       # 14 (H1 close policy + reuse + client batch + terminal)
+bend tests/io/httpx_h1_upgrade.bend         # 7 (101 detaches the socket: server + client)
+bend tests/io/httpx_h1_upgrade_client.bend  # 7 (renderer + raw peer + 200 -> 502)
 
 bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
 bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
@@ -632,8 +638,8 @@ instead of trusting the exit status alone. A file with no `main` (like
 JS and C lanes:
 
 ```sh
-bend tests/io/http_lib_pure.bend -o /tmp/pure.js && bun /tmp/pure.js
-bend tests/io/http_lib_pure.bend -o /tmp/purebin && /tmp/purebin
+bend tests/io/httpx_h1_pure.bend -o /tmp/pure.js && bun /tmp/pure.js
+bend tests/io/httpx_h1_pure.bend -o /tmp/purebin && /tmp/purebin
 ```
 
 ## Note on the byte effects and `lib/tcp.bend` / `lib/dns.bend`
@@ -665,7 +671,7 @@ four arguments.
 - HTTPS/WSS validation (done 2026-09-22, see `tasks/task-018-validate-https-wss.md`):
   interop WSS 4/4 + Bend→Node HTTPS PASS (Node→Bend FAIL documented:
   HPACK huffman), saturation 20/20 per lane
-  (`examples/saturate_https_wss.bend`), bench 40 exchanges in ~15.2s
+  (`examples/wsm_saturate.bend`), bench 40 exchanges in ~15.2s
   interp / ~2.3s C (~2.6 vs ~17.8 ex/s).
 - HPACK full (done 2026-09-22, see `tasks/task-019-hpack-huffman-dyntab.md`):
   huffman decode + dynamic table + table-size updates; interop HTTPS
