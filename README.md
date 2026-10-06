@@ -267,7 +267,7 @@ Architecture (the two delivery modes, why streaming handlers are pure):
 | Function | Description |
 |---|---|
 | `server.on(~H, l, cert, key)` / `server.on_alpn` | Sequential generic server (one stream at a time; pipelined HEADERS gets `RST_STREAM` 7) / ALPN split with one handler for both lanes |
-| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: no chunked, `Content-Length` framing, **keep-alive** — the server answers and reads the next request on the same connection until `connection: close`, EOF or a terminal 413/502) |
+| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: `Content-Length` **and** `Transfer-Encoding: chunked` framing, **keep-alive** — the server answers and reads the next request on the same connection until `connection: close`, EOF or a terminal 413/502) |
 | `server.on_h1_plain(~H, l)` / `server.echo_h1_plain(l)` | The same keep-alive H1 server over plain TCP (`TCP.listen`/`accept`), no cert/key — the `http://` peer |
 | `server.once(~H, l, cert, key)` / `server.once_h1(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants; `once_h1` is the `http/1.1` pair |
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
@@ -295,7 +295,19 @@ literal, Huffman strings, minimal dyn table), which is what `node:http2`
 needs; H1 headers are checked at render time — a CR/LF/NUL in a name or a
 value is refused (`Fail` 400 on a request, a bare 500 on a response)
 instead of ending the field early and shipping the rest as headers nobody
-asked for.
+asked for. The H1 lane decodes `Transfer-Encoding: chunked` in **both**
+directions (TASK-033): one step machine (`x_h1.chunk_step`, ported from
+`lib/web/http/main.bend`'s `h1_chunk_step`) feeds the client body reader
+and the two server request readers, bodies are copied in blocks instead of
+byte by byte, and the caps are the lane's own — client fuel (413
+`response too long`), server fuel (413 `request too long`) and the server's
+16384-byte body cap (413). Fail-closed: a truncated chunk, a non-hex size, a
+trailer section and bytes after the terminator are all `400` (`bad chunked`
+on the server answer, `eof` for a peer that closes mid-body), never a partial
+body read as a whole one. A hex size that does not fit the U32 counter is not
+guarded explicitly — the same as the reference machine — but it cannot become
+a silently wrong body: the measured vector answers `400`, because a wrapped
+size no longer matches the bytes that follow it.
 
 ```sh
 bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK roundtrip, ~2s)
@@ -621,6 +633,9 @@ bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, n
 bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
 bend tests/io/httpx_h1_keepalive.bend       # 14 (H1 close policy + reuse + client batch + terminal)
+bend tests/io/httpx_h1_chunk.bend           # 35 (pure chunked decoder: vectors, step, reference equivalence)
+bend tests/io/httpx_h1_fetch_chunk.bend     # 8 (chunked response end to end, truncated -> 400)
+bend tests/io/httpx_h1_server_chunk.bend    # 6 (chunked request end to end: 200, 400, 413, keep-alive, upgrade lane)
 bend tests/io/httpx_h1_upgrade.bend         # 7 (101 detaches the socket: server + client)
 bend tests/io/httpx_h1_upgrade_client.bend  # 7 (renderer + raw peer + 200 -> 502)
 

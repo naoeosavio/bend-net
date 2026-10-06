@@ -3333,12 +3333,15 @@ def client.on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +meth
 # so its shapes come over verbatim (window scan, recurse-in-args with
 # match-result-as-param, fuel loops) — but speaking Request/Response/Hdr
 # natively, so no pairs converters and no encode/decode layer are needed.
-# Subset, fail-closed: no chunked (→502), client requires Content-Length
-# (missing →502, never hangs on keep-alive), server treats missing CL as
-# empty body. Keep-alive on both ends since TASK-027: the server answers
+# Subset, fail-closed: client and server decode Transfer-Encoding: chunked
+# since TASK-033 (x_h1.chunk_step below); a malformed chunked body is 400 on
+# both ends, and everything the decoder refuses stays refused. The client
+# still requires Content-Length when the head is not chunked (missing →502,
+# never hangs on keep-alive); the server treats a missing CL as an empty
+# body. Keep-alive on both ends since TASK-027: the server answers
 # and loops back to read (x_h1.srv.head phase 3), the client reuses the
 # socket for N requests in order (x_h1.cli.exch / client_seq.h1.keep).
-# Closing is by "connection: close", EOF, or a terminal 413/502; no
+# Closing is by "connection: close", EOF, or a terminal 413/502/400; no
 # Connection header is ever emitted, so the one-shot bytes are unchanged.
 # ---------------------------------------------------------------------
 
@@ -3746,6 +3749,374 @@ def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
 def x_h1.no_body(+method: String, +status: U32) -> Bool:
   x_h1.no_body.go(String.eq(method, "HEAD"), status)
 
+# Chunked (RFC 9112 section 7.1.1): one grammar, one machine.
+# ----------------------------------------------------------
+# x_h1.chunk_step eats whatever the buffer holds and answers this file's
+# own UnitOut (Got / NeedMore / End / Bad) beside its ChunkSt, so a body
+# can arrive in pieces. Ported from lib/web/http/main.bend's h1_chunk_step
+# -- same states, same answers, same two load-bearing arms (a trailing CR
+# is NeedMore and never Bad, and it rides back in the outcome's rest
+# unconsumed) -- because this file's isolation build may not import that
+# module (Base + tls + tcp + dns only, see the header). What the grammar
+# accepts: a hex size line (either case, with an optional chunk
+# extension), the CRLF, that many bytes and the CRLF after them, then "0"
+# and the trailer-free CRLF. A trailer section is refused with 400, the
+# answer lib/web/http/main.bend gives too (tests/http/h1_stream.bend s10
+# and f4): a trailer is not chunked data, and reading it as if it were is
+# the fail-open shape this lane exists to avoid.
+#
+# The body is copied in BLOCKS, never byte by byte: the data state takes
+# min(rem, len(bs)) bytes with one slice and leaves the tail, so a whole
+# 16 KiB recv costs one arm. Measured on a synthetic 1,1 MB body (64
+# chunks of 16 KiB, whole-buffer fold, CPU time of one program): 6,3 s
+# for this step fold against 6,9 s for lib/http.bend's byte-at-a-time
+# unchunk. The decisive win is not that margin but the shape: the byte
+# machine can only answer "the whole body is here" (it has no NeedMore),
+# so an IO lane would have to re-decode the growing buffer on every recv,
+# while the step resumes from its own state and lets the lanes below
+# consume a recv per arm.
+
+type ChunkSt is Data:
+  ChunkSt{st: U32, rem: Nat, size: U32, acc: List<&2, List<&2, U32>>}
+
+# A fresh decoder: at a size line, nothing owed, no size, no partial chunk.
+def x_h1.chunk_init() -> ChunkSt:
+  ChunkSt{0, 0n, 0, Nil{}}
+
+# The chunk's bytes out of the fragment stack the data state fills (newest
+# read first, each fragment already in order). One fragment -- the whole
+# chunk in one buffer, the common case -- comes back as it is, no copy.
+def x_h1.chunk_close.go(+frags: List<&2, List<&2, U32>>, +acc: List<&2, U32>) -> List<&2, U32>:
+  match frags:
+    case Nil{}:
+      acc
+    case f <> t:
+      x_h1.chunk_close.go(t, List.append(&2, U32, f, acc))
+
+def x_h1.chunk_close(+frags: List<&2, List<&2, U32>>) -> List<&2, U32>:
+  match frags:
+    case Nil{}:
+      Nil{}
+    case f <> Nil{}:
+      f
+    case _ <> _:
+      x_h1.chunk_close.go(frags, Nil{})
+
+# The two numbers the data state cannot decide by matching -- the state to
+# continue in (3 when the read ended exactly on the chunk, 2 when more is
+# owed) and what is left of rem -- computed here because a match cannot
+# scrutinize a computed value: the decision has to arrive as a field the
+# next iteration matches. The subtraction is guarded by the comparison
+# that picks the state, so it never underflows.
+def x_h1.chunk_st_of(+want: U32, +have: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(want, have), 3, 2)
+
+def x_h1.chunk_rem_of(+want: U32, +have: U32) -> Nat:
+  U32.to_nat((want - have : U32))
+
+# One step of the grammar. Self-recursive (@unsafe) with one call per arm
+# and a buffer that shrinks on each, so a whole body parses in linear time
+# with no fuel. A Nil in the middle of a chunk is NeedMore -- the buffer
+# ran out, the state comes back untouched and the caller reads more --
+# while a byte the grammar does not allow is Bad. acc is Nil at every
+# chunk boundary, so the two size states clear it.
+@unsafe
+def x_h1.chunk_step(st: ChunkSt, +bs: List<&2, U32>) -> ChunkSt & UnitOut:
+  match st:
+    case ChunkSt{st2, rem, size, acc}:
+      match st2:
+        case 0:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case b <> rest:
+              match b:
+                case 48:
+                  x_h1.chunk_step(ChunkSt{0, 0n, 0, Nil{}}, rest)
+                case 49:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 1, Nil{}}, rest)
+                case 50:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 2, Nil{}}, rest)
+                case 51:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 3, Nil{}}, rest)
+                case 52:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 4, Nil{}}, rest)
+                case 53:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 5, Nil{}}, rest)
+                case 54:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 6, Nil{}}, rest)
+                case 55:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 7, Nil{}}, rest)
+                case 56:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 8, Nil{}}, rest)
+                case 57:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 9, Nil{}}, rest)
+                case 65:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 10, Nil{}}, rest)
+                case 66:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 11, Nil{}}, rest)
+                case 67:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 12, Nil{}}, rest)
+                case 68:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 13, Nil{}}, rest)
+                case 69:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 14, Nil{}}, rest)
+                case 70:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 15, Nil{}}, rest)
+                case 97:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 10, Nil{}}, rest)
+                case 98:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 11, Nil{}}, rest)
+                case 99:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 12, Nil{}}, rest)
+                case 100:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 13, Nil{}}, rest)
+                case 101:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 14, Nil{}}, rest)
+                case 102:
+                  x_h1.chunk_step(ChunkSt{7, 0n, 15, Nil{}}, rest)
+                case 59:
+                  x_h1.chunk_step(ChunkSt{1, 0n, 0, Nil{}}, rest)
+                case 13:
+                  match rest:
+                    case Nil{}:
+                      (ChunkSt{st2, rem, size, acc}, NeedMore{1, [13]})
+                    case 10 <> rest2:
+                      x_h1.chunk_step(ChunkSt{5, 0n, 0, Nil{}}, rest2)
+                    case _:
+                      (st, Bad{400, "bad chunked"})
+                case _:
+                  (st, Bad{400, "bad chunked"})
+        case 7:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case b <> rest:
+              match b:
+                case 48:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 0 : U32), Nil{}}, rest)
+                case 49:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 1 : U32), Nil{}}, rest)
+                case 50:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 2 : U32), Nil{}}, rest)
+                case 51:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 3 : U32), Nil{}}, rest)
+                case 52:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 4 : U32), Nil{}}, rest)
+                case 53:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 5 : U32), Nil{}}, rest)
+                case 54:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 6 : U32), Nil{}}, rest)
+                case 55:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 7 : U32), Nil{}}, rest)
+                case 56:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 8 : U32), Nil{}}, rest)
+                case 57:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 9 : U32), Nil{}}, rest)
+                case 65:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 10 : U32), Nil{}}, rest)
+                case 66:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 11 : U32), Nil{}}, rest)
+                case 67:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 12 : U32), Nil{}}, rest)
+                case 68:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 13 : U32), Nil{}}, rest)
+                case 69:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 14 : U32), Nil{}}, rest)
+                case 70:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 15 : U32), Nil{}}, rest)
+                case 97:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 10 : U32), Nil{}}, rest)
+                case 98:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 11 : U32), Nil{}}, rest)
+                case 99:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 12 : U32), Nil{}}, rest)
+                case 100:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 13 : U32), Nil{}}, rest)
+                case 101:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 14 : U32), Nil{}}, rest)
+                case 102:
+                  x_h1.chunk_step(ChunkSt{7, 0n, (size * 16 + 15 : U32), Nil{}}, rest)
+                case 59:
+                  x_h1.chunk_step(ChunkSt{1, 0n, size, Nil{}}, rest)
+                case 13:
+                  match rest:
+                    case Nil{}:
+                      (ChunkSt{st2, rem, size, acc}, NeedMore{1, [13]})
+                    case 10 <> rest2:
+                      x_h1.chunk_step(ChunkSt{2, U32.to_nat(size), 0, Nil{}}, rest2)
+                    case _:
+                      (st, Bad{400, "bad chunked"})
+                case _:
+                  (st, Bad{400, "bad chunked"})
+        case 1:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case b <> rest:
+              match b:
+                case 13:
+                  match rest:
+                    case Nil{}:
+                      (ChunkSt{st2, rem, size, acc}, NeedMore{1, [13]})
+                    case 10 <> rest2:
+                      x_h1.chunk_step(ChunkSt{2, U32.to_nat(size), 0, Nil{}}, rest2)
+                    case _:
+                      (st, Bad{400, "bad chunked"})
+                case _:
+                  x_h1.chunk_step(ChunkSt{1, 0n, size, acc}, rest)
+        case 2:
+          match rem:
+            case 0n:
+              x_h1.chunk_step(ChunkSt{3, 0n, size, acc}, bs)
+            case 1n+c:
+              match bs:
+                case Nil{}:
+                  (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+                case _ <> _:
+                  # The data phase in one arm: have is min(rem, len(bs)),
+                  # counted only up to rem, so the take is the chunk's own
+                  # slice and the read goes onto the fragment stack with
+                  # one cons. The decision "was that the whole chunk?"
+                  # rides as the STATE NUMBER (3 whole, 2 partial): the
+                  # next iteration matches the field, which is what makes
+                  # this legal Bend and not a special case. The partial
+                  # read's buffer ends at or before the chunk, so its rest
+                  # is Nil and state 2 answers NeedMore.
+                  +want = U32.from_nat(rem)
+                  +have = x_len_upto(want, bs)
+                  x_h1.chunk_step(ChunkSt{x_h1.chunk_st_of(want, have), x_h1.chunk_rem_of(want, have), size,
+                    x_take32(have, bs) <> acc}, x_drop32(have, bs))
+        case 3:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case 13 <> t:
+              x_h1.chunk_step(ChunkSt{4, 0n, size, acc}, t)
+            case _:
+              (st, Bad{400, "bad chunked"})
+        case 4:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case 10 <> t:
+              x_h1.chunk_step(ChunkSt{8, 0n, size, acc}, t)
+            case _:
+              (st, Bad{400, "bad chunked"})
+        case 8:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case 48 <> t:
+              (x_h1.chunk_init(), Got{x_h1.chunk_close(acc), True{}, bs})
+            case 13 <> t:
+              (x_h1.chunk_init(), Got{x_h1.chunk_close(acc), True{}, bs})
+            case _ <> t:
+              (x_h1.chunk_init(), Got{x_h1.chunk_close(acc), False{}, bs})
+        case 5:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case 13 <> t:
+              x_h1.chunk_step(ChunkSt{6, 0n, size, acc}, t)
+            case _:
+              (st, Bad{400, "bad chunked"})
+        case 6:
+          match bs:
+            case Nil{}:
+              (ChunkSt{st2, rem, size, acc}, NeedMore{1, Nil{}})
+            case 10 <> t:
+              match t:
+                case Nil{}:
+                  (st, End{Nil{}})
+                case _ <> t2:
+                  (st, Bad{400, "bad chunked"})
+            case _:
+              (st, Bad{400, "bad chunked"})
+        case _:
+          (st, Bad{400, "bad chunked"})
+
+# The whole-buffer fold: one body, one Result, the shape every caller above
+# already speaks. A starved step answers the failure the byte-at-a-time
+# machine gave when its buffer ran out mid-chunk (400 "bad chunked"),
+# which is also what keeps a truncated body from reading as an empty one.
+@unsafe
+def x_h1.unchunk.go(r: ChunkSt & UnitOut, acc: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  (st2, out) = r
+  match out:
+    case Got{+chunk, fin, +rest}:
+      x_h1.unchunk.go(x_h1.chunk_step(st2, rest), x_rev_push(chunk, acc))
+    case NeedMore{missing, rest}:
+      Fail{(400, "bad chunked")}
+    case End{rest}:
+      Done{x_cat(acc)}
+    case Bad{code, msg}:
+      Fail{(code, msg)}
+
+def x_h1.unchunk(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  x_h1.unchunk.go(x_h1.chunk_step(x_h1.chunk_init(), bs), Nil{})
+
+# The client's chunked body reader: the same phase+fuel shape as
+# x_h1.cli.bd, except the length is not known up front -- the step decides.
+# Got adds the chunk to a reversed body and keeps stepping, NeedMore spends
+# one recv (fuel), Bad is 400 and End is the answer. The lookahead's fin is
+# NOT the finish line: only End is, so "1\r\nA\r\n\r\n" (a bare empty line
+# standing in for the last-chunk, which the lookahead reads as "last")
+# stays 400 here, exactly like both whole-buffer decoders. The bare codes
+# are the lane's own: 413 is the fuel floor x_h1.cli.bd uses, 400 on EOF is
+# its "eof" too.
+#
+# Phase 1 exists for the same reason x_h1.cli.bd has one: the recv result is
+# a computed pair and a match cannot scrutinize a computed value, so it
+# travels here as a parameter. The pending state rides in the pair parameter
+# as well -- phase 0 hands it chunk_step(st2, Nil{}), which always answers
+# NeedMore and consumes no byte -- because that state is all phase 1 needs
+# once the new bytes are appended to the buffer.
+@unsafe
+def x_h1.cli.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, r: ChunkSt & UnitOut, fuel: Nat, rev: List<&2, U32>, buf: List<&2, U32>, +code: U32, hs: List<&2, Hdr>, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+  match phase:
+    case 0:
+      match r:
+        case (st2, out):
+          match out:
+            case Got{+chunk, fin, +rest}:
+              (sock, _r0) = got
+              x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(st2, rest), fuel, x_rev_push(chunk, rev), rest, code, hs, (sock, Done{Nil{}}))
+            case NeedMore{missing, +rest}:
+              match fuel:
+                case 0n:
+                  (sock2, _r1) = got
+                  IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock2, Fail{(413, "response too long")}))
+                case 1n+f:
+                  (sock3, _r2) = got
+                  do IO<Socket & Result<&1, &1, U32 & String, Response>>:
+                    r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock3, 16384)
+                    x_h1.cli.chunk(~recv, ~send, ~close, 1, x_h1.chunk_step(st2, Nil{}), f, rev, rest, code, hs, r1)
+            case End{rest}:
+              (sock4, _r3) = got
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock4, Done{Response{code, hs, x_cat(rev)}}))
+            case Bad{code2, msg}:
+              (sock5, _r4) = got
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock5, Fail{(code2, msg)}))
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(400, "eof")}))
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(st2, buf2), fuel, rev, buf2, code, hs, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
+
 # H1 client exchange (fallback lane): render, send, head/body fuel loops,
 # close. Matches go forward in param order per branch (checker rule).
 # Transport is three templates (~recv/~send/~close), instantiated per
@@ -3793,7 +4164,7 @@ def x_h1.cli.hd2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String
     case False{}:
       match chunked:
         case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{(502, "chunked refused")}))
+          x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, Nil{}, rest, code, hs, (sock, Done{Nil{}}))
         case False{}:
           +clc = x_h1.cl_of(hs)
           x_h1.cli.bd(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
@@ -6198,6 +6569,76 @@ def x_h1.srv.cl(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
     case False{}:
       x_h1.srv.bd(~recv, ~send, ~close, ~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
+# The server's chunked request reader: the same phase+fuel shape as
+# x_h1.srv.bd, with the decoder deciding where the body ends instead of a
+# Content-Length. Two caps, both the ones the CL path already has: the
+# decoded size (the same 16384 x_h1.srv.cl refuses with a 413 response,
+# carried as the big parameter and matched on the next iteration because a
+# match cannot scrutinize a computed value) and fuel (one recv per step,
+# floor 413 "request too long", which closes without an answer exactly
+# like x_h1.srv.bd). A chunk larger than the cap is still read before the
+# answer -- the decoder only reports a chunk when it is whole -- so the
+# memory bound in that case is the fuel floor, not the cap.
+#
+# Malformed bytes are answered 400 "bad chunked" and the connection ends:
+# task-033's fail-closed rule is that the peer is told, not just dropped
+# (the old 502 was a response too). Only End hands the request to the
+# handler; the leftover bytes past the terminator ride to x_h1.srv.answer
+# as the next request's seed, exactly like the CL path's x_drop32(cl, have).
+@unsafe
+def x_h1.srv.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), phase: U32, big: Bool, r: ChunkSt & UnitOut, fuel: Nat, +m: String, +p: String, +hs: List<&2, Hdr>, rev: List<&2, U32>, buf: List<&2, U32>, +have: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match phase:
+    case 0:
+      match big:
+        case True{}:
+          (sock, _r0) = got
+          x_h1.srv.respond(~recv, ~send, ~close, sock, Response{413, Nil{}, Nil{}}, False{}, Nil{})
+        case False{}:
+          match r:
+            case (st2, out):
+              match out:
+                case Got{+chunk, fin, +rest}:
+                  (sock2, _r1) = got
+                  +have2 = (have + x_len32(chunk) : U32)
+                  x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, U32.is_gt(have2, 16384), x_h1.chunk_step(st2, rest), fuel, m, p, hs, x_rev_push(chunk, rev), rest, have2, (sock2, Done{Nil{}}))
+                case NeedMore{missing, +rest}:
+                  match fuel:
+                    case 0n:
+                      (sock3, _r2) = got
+                      x_h1.srv.stop(sock3, (413, "request too long"))
+                    case 1n+f:
+                      (sock4, _r3) = got
+                      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+                        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock4, 16384)
+                        x_h1.srv.chunk(~recv, ~send, ~close, ~H, 1, big, r, f, m, p, hs, rev, rest, have, r1)
+                case End{rest}:
+                  (sock5, _r4) = got
+                  x_h1.srv.answer(~recv, ~send, ~close, ~H, (sock5, Done{Nil{}}), Request{m, p, hs, x_cat(rev)}, Bool.not(x_h1.conn_close(hs)), rest)
+                case Bad{code2, msg}:
+                  (sock6, _r5) = got
+                  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+                    rr : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock6, Response{400, Nil{}, Nil{}}, False{}, Nil{})
+                    x_h1.srv.stop(x_h1.srv.sock_of(rr), (400, "bad chunked"))
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  x_h1.srv.stop(sock, e)
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      x_h1.srv.stop(sock, (400, "eof"))
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, big, x_h1.chunk_step(st2, buf2), fuel, m, p, hs, rev, buf2, have, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      x_h1.srv.stop(s9, (502, "bad phase"))
+
 def x_h1.srv.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match needs:
@@ -6206,7 +6647,7 @@ def x_h1.srv.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
     case True{}:
       match chunked:
         case True{}:
-          x_h1.srv.respond(~recv, ~send, ~close, s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
+          x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, False{}, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, m, p, hs, Nil{}, rest, 0, (s, Done{Nil{}}))
         case False{}:
           x_h1.srv.cl(~recv, ~send, ~close, ~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
@@ -6396,6 +6837,70 @@ def x_h1.srv.cl_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & St
     case False{}:
       x_h1.srv.bd_open(~recv, ~send, ~close, ~H, ~K, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, x_has_at_least(cl, rest))
 
+# The upgrade lane's copy of the chunked reader: same grammar, same caps,
+# different endings. A 413 over the cap is answered and then rejoined
+# through x_h1.srv.rejoin (the CL path's x_h1.srv.cl_open does the same
+# with its 413), a malformed body is answered 400 and the connection ends,
+# and fuel exhaustion closes without an answer, which is what
+# x_h1.srv.bd_open does. End hands the request to the handler through
+# x_h1.srv.answer_open, so a chunked request reaches ~H on this lane too
+# instead of the old 502.
+@unsafe
+def x_h1.srv.chunk_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, big: Bool, r: ChunkSt & UnitOut, fuel: Nat, +m: String, +p: String, +hs: List<&2, Hdr>, rev: List<&2, U32>, buf: List<&2, U32>, +have: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Unit):
+  match phase:
+    case 0:
+      match big:
+        case True{}:
+          (sock, _r0) = got
+          do IO<Unit>:
+            rr : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock, Response{413, Nil{}, Nil{}}, False{}, Nil{})
+            x_h1.srv.rejoin(~recv, ~send, ~close, ~H, rr)
+        case False{}:
+          match r:
+            case (st2, out):
+              match out:
+                case Got{+chunk, fin, +rest}:
+                  (sock2, _r1) = got
+                  +have2 = (have + x_len32(chunk) : U32)
+                  x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, U32.is_gt(have2, 16384), x_h1.chunk_step(st2, rest), fuel, m, p, hs, x_rev_push(chunk, rev), rest, have2, (sock2, Done{Nil{}}))
+                case NeedMore{missing, +rest}:
+                  match fuel:
+                    case 0n:
+                      (sock3, _r2) = got
+                      close(sock3)
+                    case 1n+f:
+                      (sock4, _r3) = got
+                      do IO<Unit>:
+                        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock4, 16384)
+                        x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 1, big, r, f, m, p, hs, rev, rest, have, r1)
+                case End{rest}:
+                  (sock5, _r4) = got
+                  x_h1.srv.answer_open(~recv, ~send, ~close, ~H, ~K, (sock5, Done{Nil{}}), Request{m, p, hs, x_cat(rev)}, Bool.not(x_h1.conn_close(hs)), rest)
+                case Bad{code2, msg}:
+                  (sock6, _r5) = got
+                  do IO<Unit>:
+                    rr2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock6, Response{400, Nil{}, Nil{}}, False{}, Nil{})
+                    x_h1.srv.rejoin(~recv, ~send, ~close, ~H, rr2)
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  close(sock)
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      close(sock)
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, big, x_h1.chunk_step(st2, buf2), fuel, m, p, hs, rev, buf2, have, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      close(s9)
+
 def x_h1.srv.go_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s: Socket, +m: String, +p: String, +hs: List<&2, Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
   match needs:
     case False{}:
@@ -6403,9 +6908,7 @@ def x_h1.srv.go_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & St
     case True{}:
       match chunked:
         case True{}:
-          do IO<Unit>:
-            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, s, Response{502, Nil{}, Nil{}}, False{}, Nil{})
-            x_h1.srv.rejoin(~recv, ~send, ~close, ~H, out)
+          x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, False{}, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, m, p, hs, Nil{}, rest, 0, (s, Done{Nil{}}))
         case False{}:
           x_h1.srv.cl_open(~recv, ~send, ~close, ~H, ~K, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
