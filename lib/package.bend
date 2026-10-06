@@ -1,17 +1,26 @@
 # bend-net: package entry for BendHub.
 # Source: https://github.com/naoeosavio/bend-net.git
 #
-# HTTP/1.1, HTTP/2 over TLS and WebSocket (RFC 6455) for Bend, with
-# package-local DNS and TLS (client + server, ALPN h2 / http/1.1 /
-# noalpn). Pure Bend on top of the Base TCP.* kit; the native code is
-# the byte-level socket effects in ./effs/ (C + JS twins: send_bytes,
-# recv_bytes, recv_frame), the A-record resolver (dns_resolve) and the
-# TLS lane (tls_*: OpenSSL via dlopen). No compiler change.
-# Boundaries: HTTP/1.1 fetch reads at most 8 x 8192 bytes (64 KB cap);
-# HTTPS rides lib/tls.bend and speaks HTTP/2 (lib/http2.bend) with the
-# HTTP/1.1 module (lib/https_http1.bend) behind ALPN; TLS fails closed
-# with 611-616; resolution fails closed with 601-605 and never touches
-# the Host header.
+# The bundle is two complete libraries plus the leaf lanes they ride on:
+# - HTTPX (./httpx.bend) is the HTTP library: HTTP/1.1 and HTTP/2,
+#   client and server, plaintext (`http://`) and TLS (`https://`), ALPN
+#   split, streaming in both directions and the H1 `101` upgrade lane.
+# - WSM (./wsm.bend) is the WebSocket library (RFC 6455): client and
+#   server over `ws://` and `wss://`, riding the HTTPX upgrade lane.
+# The other imports are the lanes those two sit on: TLS (accept and
+# dial, ALPN), TCP (sockets), DNS (the A-record behind every dial; the
+# resolved IP is transport-only, `Host` keeps the original name), and
+# SHA1 + B64 behind `Sec-WebSocket-Accept`.
+#
+# The old per-protocol modules (http.bend, http2.bend, https.bend,
+# https_http1.bend, ws.bend, wss.bend) stay in the tree but are out of
+# this bundle: HTTPX and WSM replace them, one lib per protocol family.
+#
+# Boundaries: every lane fails closed — HTTP 400 / 413 / 502 on
+# malformed input (never a partial answer), DNS 601-605, TLS 611-616.
+# Pure Bend over the Base TCP.* kit; the native code is the byte-level
+# socket effects in ./effs/ (C + JS twins), the resolver and the TLS
+# lane (OpenSSL via dlopen). No compiler change.
 #
 # Package entry point. Publish with:
 #
@@ -20,34 +29,30 @@
 # Then import an API from its own file (imports are not transitive,
 # so the entry only marks the bundle ready):
 #
-#   import 0x<hash>/http.bend as HTTP
-#   import 0x<hash>/http2.bend as HTTP2
-#   import 0x<hash>/https.bend as HTTPS
-#   import 0x<hash>/ws.bend   as WS
-#   import 0x<hash>/wss.bend  as WSS
-#   import 0x<hash>/sha1.bend as SHA1
-#   import 0x<hash>/b64.bend  as B64
-#   import 0x<hash>/tcp.bend  as TCP
-#   import 0x<hash>/dns.bend  as DNS
-#   import 0x<hash>/tls.bend  as TLS
+#   import 0x<hash>/httpx.bend as HTTPX
+#   import 0x<hash>/wsm.bend   as WSM
+#   import 0x<hash>/sha1.bend  as SHA1
+#   import 0x<hash>/b64.bend   as B64
+#   import 0x<hash>/tcp.bend   as TCP
+#   import 0x<hash>/dns.bend   as DNS
+#   import 0x<hash>/tls.bend   as TLS
 #
 # See README.md for the full guide.
 import Base
 import ./b64.bend as B64
 import ./dns.bend as DNS
-import ./http.bend as HTTP
-import ./http2.bend as HTTP2
-import ./https.bend as HTTPS
+import ./httpx.bend as HTTPX
 import ./sha1.bend as SHA1
 import ./tcp.bend as TCP
 import ./tls.bend as TLS
-import ./ws.bend as WS
-import ./wss.bend as WSS
+import ./wsm.bend as WSM
 
-# Marks the bundle ready; the API lives in http.bend, http2.bend,
-# https.bend (+ https_http1.bend), ws.bend (with sha1.bend and b64.bend
-# for the handshake), wss.bend (WS over TLS), tcp.bend, whose byte
-# effects WS frames ride, dns.bend, whose resolve feeds the HTTP fetch
-# lane, and tls.bend, whose handshake lane feeds HTTPS and WSS.
+# Marks the bundle ready; the API lives in httpx.bend (the HTTP library:
+# H1 + H2 + HTTPS, client and server, and the upgrade lane wsm.bend
+# hands the socket to) and wsm.bend (the WebSocket library: handshake,
+# frame codec and the session loop, ws:// + wss://), over tcp.bend for
+# the sockets, dns.bend for the dial's name resolution, tls.bend for the
+# handshake on both lanes, and sha1.bend + b64.bend for the WebSocket
+# accept token.
 def Package.ready() -> Unit:
   Unit{}

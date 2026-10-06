@@ -1,13 +1,18 @@
-# WSM: the one WebSocket implementation (RFC 6455, ws:// + wss://).
+# WSM: the WebSocket library for Bend (RFC 6455, ws:// + wss://) —
+# handshake, frame codec and session loop, client and server, in one
+# file. This is the whole WebSocket surface, not a standalone server
+# next to another one: it supersedes lib/ws.bend and lib/wss.bend (still
+# in the tree, no longer imported or published).
 #
 # Import as: import ./wsm.bend as WSM (from lib) or
 # import ../../lib/wsm.bend as WSM (from tests/io and examples/).
 #
-# One module, one surface, two lanes. The handshake rides the H1 upgrade
-# lane of lib/httpx.bend (task-028 Phases 1-3: h1_open for TLS,
-# TCP.connect + cli.exch.open for cleartext, on_h1_open(+_plain) for the
-# server); frames ride tls.bend / tcp.bend directly once ~K owns the
-# socket. Nothing here imports ws.bend, wss.bend or http.bend — the codec
+# One module, one surface, two lanes, built on the HTTP library. The
+# handshake rides the H1 upgrade lane of lib/httpx.bend — the HTTP lib,
+# not a side helper (task-028 Phases 1-3: h1_open for TLS, TCP.connect +
+# cli.exch.open for cleartext, on_h1_open(+_plain) for the server);
+# frames ride tls.bend / tcp.bend directly once ~K owns the socket.
+# Nothing here imports ws.bend, wss.bend or http.bend — the codec
 # (frames, mask, close, ping/pong, fragments, UTF-8) and the handshake
 # live in this file, ported def by def and adapted to httpx.Hdr.
 #
@@ -15,6 +20,13 @@
 # x_* byte helpers); ./tls.bend as TLS and ./tcp.bend as TCPB (the two
 # transports); ./sha1.bend as SHA1 and ./b64.bend as B64 (the leaf codecs
 # behind Sec-WebSocket-Accept). No lanes, no HTTP text layer.
+#
+# Surface: `server_on` (+ `_sub`, `_plain`) and `client_on` (+ `_sub`,
+# `_plain`, `_insecure`) take one pure ~H over WSEv/WSOut; `client_echo`
+# is the disposable round trip; `serve_once` serves one accepted socket;
+# `wsm_session_open`, `wsm_recv_frame`, `wsm_recv_msg`, `wsm_send_open`
+# and `wsm_send_bytes` are the lane templates underneath them, each one
+# transport-agnostic (~recv / ~send / ~close).
 #
 # Types mirror lib/websocket/type.bend and lib/ws.bend under the same
 # names, so the [mig] is a requalification, not a redesign: WSMessage

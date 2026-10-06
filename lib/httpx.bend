@@ -1,36 +1,51 @@
-# Httpx standalone server with a mini H2 codec inside (no http2 import).
+# HTTPX: the HTTP library for Bend — HTTP/1.1 and HTTP/2, client and
+# server, plaintext and TLS, in this one file. This is the whole HTTP
+# surface, not a standalone server next to another one: it supersedes
+# lib/http.bend, lib/http2.bend, lib/https.bend and lib/https_http1.bend
+# (still in the tree, no longer imported or published).
 #
-# Isolation build: the full codec (lib/http2.bend, 4384 lines: Huffman
-# tables rebuilt per probe, dynamic HPACK table, flow credit, client
-# drain machinery) dominated httpx runtime/memory. This file serves
-# interleaved H2 streams with the smallest codec that stays wire-faithful
-# to literal (unindexed) peers:
+# What one module covers:
+# - server: H2 (`server.on`, `server.on_h2`, `server.concurrent`,
+#   `server.stream`), H1 (`server.on_h1`, keep-alive, `Transfer-Encoding:
+#   chunked` both directions), the ALPN split (`server.on_alpn`, one
+#   handler for both lanes), the plaintext `http://` pair
+#   (`server.on_h1_plain`) and the upgrade lane (`server.on_h1_open`,
+#   which hands the socket to a caller — the WebSocket library's entry).
+# - client: `client.once`, `client.on`, `client.connect` / `client.request`,
+#   `client.concurrent`, `client.stream` (download events), plus
+#   `fetch` / `fetch_bytes` by URL and `request` / `request_bytes` by
+#   host/port/method/path, and `h1_once` for the no-ALPN dial. Both ALPN
+#   answers dispatch from the one `client.request`, so the H1 leg needs
+#   nothing of its own.
+#
+# The H2 codec lives inside this file, next to the lanes that use it, and
+# keeps only what the wire needs:
 # - frames: 9-byte header parse (split-safe), preface magic, SETTINGS
 #   (fresh ack), PING (ack), GOAWAY (close), RST_STREAM (drop slot),
-#   WINDOW_UPDATE (skip when valid), CONTINUATION fragments, unknown skip.
+#   WINDOW_UPDATE (credit, both directions), CONTINUATION fragments,
+#   PADDED / PRIORITY strip (RFC 9113 6.1/6.2), unknown skip.
 # - HPACK: literal without/with indexing (new, static or dynamic name)
 #   plus full-indexed static 1-7 and dynamic refs, raw or Huffman
 #   strings, minimal dynamic table (insert + evict + resize, cap 4096).
 #   Huffman tables and dyn ops cost pay-per-use (only Huffman/indexing
 #   peers enter them; raw literal peers never do).
-# - responses: literal-only :status + headers, one DATA frame (cap 16KB).
-# No flow-credit sends, no padding/priority parsing, no client.
+# - responses: literal-only :status + headers, DATA sliced to the conn +
+#   stream windows (flow pump v2).
 #
-# Stack: TLS (accept) -> mini-H2 below -> httpx slots. Allowed imports:
-# Base + ./tls.bend + ./tcp.bend + ./dns.bend (the byte lanes; dns is needed
-# by the plaintext dial, which resolves the name the TLS lane resolves for
-# it). No https/http/https_http1/ws/wss/http2.
+# Stack: TLS (accept / dial) -> H1 + H2 below -> httpx slots. Imports:
+# Base + ./tls.bend + ./tcp.bend + ./dns.bend (the byte lanes; dns is
+# needed by the plaintext dial, which resolves the name the TLS lane
+# resolves for it). Never http/http2/https/https_http1/ws/wss.
 #
-# Discipline (same as lib/https.bend): callee above caller; match
-# scrutinees are params or pattern-bound vars; self-recursion only
-# (@unsafe for fuel-bounded decode, frame read, accept/stream loops);
-# + binders only for Data.
+# Discipline: callee above caller; match scrutinees are params or
+# pattern-bound vars; self-recursion only (@unsafe for fuel-bounded
+# decode, frame read, accept/stream loops); + binders only for Data.
 #
 # Import as: import ./httpx.bend as HTTPX (from lib) or
 # import ../../lib/httpx.bend as HTTPX (from tests/io).
 import Base
 import ./tls.bend as TLS
-import ./tcp.bend as TCPB
+import ./tcp.bend as TCP
 import ./dns.bend as DNS
 
 # Bytes
@@ -4121,7 +4136,7 @@ def x_h1.cli.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
 # close. Matches go forward in param order per branch (checker rule).
 # Transport is three templates (~recv/~send/~close), instantiated per
 # lane at the public entries: TLS (tls_recv/send_bytes + tls_close) or
-# TCP (TCPB.recv/send_bytes + Socket.close). The grammar is identical —
+# TCP (TCP.recv/send_bytes + Socket.close). The grammar is identical —
 # that is what let the x_h1p.* mirror die in Phase 1.
 # ---------------------------------------------------------------------
 
@@ -5234,7 +5249,7 @@ def fetch.plain(+host: String, +port: U32, path: String, ok: Bool) ->
     case True{}:
       do IO<Result<&1, &1, U32 & String, String>>:
         conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
-        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
+        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.text(r)
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad host")})
@@ -5245,7 +5260,7 @@ def fetch_bytes.plain(+host: String, +port: U32, path: String, ok: Bool) ->
     case True{}:
       do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
         conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
-        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
+        r : Result<&1, &1, U32 & String, Response> <- h1_once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, "GET", path, Nil{}, Nil{})
         fetch.raw(r)
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>, Fail{(400, "bad host")})
@@ -5339,7 +5354,7 @@ def request.plain(+host: String, +port: U32, +method: String, +path: String, hs:
   IO(Result<&1, &1, U32 & String, Response>):
   do IO<Result<&1, &1, U32 & String, Response>>:
     conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
-    h1_once.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
+    h1_once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
 
 def request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
@@ -6987,7 +7002,7 @@ def server.on_h1_plain(~H: Request -> IO(Response), listener: Listener) ->
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
-    next : Listener <- h1_conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, m)
+    next : Listener <- h1_conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, m)
     z : Unit <- server.on_h1_plain(~H, next)
     return z
 
@@ -7064,7 +7079,7 @@ def server.on_h1_open_plain(~H: Request -> IO(Response), ~K: Socket -> List<&2, 
   IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
-    next : Listener <- h1_open_conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, ~K, m)
+    next : Listener <- h1_open_conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, m)
     z : Unit <- server.on_h1_open_plain(~H, ~K, next)
     return z
 
