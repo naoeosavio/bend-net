@@ -13,8 +13,9 @@
 # cli.exch.open for cleartext, on_h1_open(+_plain) for the server);
 # frames ride tls.bend / tcp.bend directly once ~K owns the socket.
 # Nothing here imports ws.bend, wss.bend or http.bend — the codec
-# (frames, mask, close, ping/pong, fragments, UTF-8) and the handshake
-# live in this file, ported def by def and adapted to httpx.Hdr.
+# (frames, mask, close, ping/pong, fragments) and the handshake
+# live in this file, ported def by def and adapted to httpx.Hdr;
+# UTF-8 lives in httpx (HTTPX.x_utf8_*) with wsm_utf8_* wrappers.
 #
 # Imports: Base (prelude); ./httpx.bend as HTTPX (the upgrade lane +
 # x_* byte helpers); ./tls.bend as TLS and ./tcp.bend as TCPB (the two
@@ -40,6 +41,10 @@
 # Discipline (same as lib/httpx.bend): callee above caller; match
 # scrutinees are params or pattern-bound vars; self-recursion only,
 # with a structurally shrinking argument; + binders only for Data.
+# Streaming note: this module answers WSEv/WSOut only; the HTTP
+# streaming families (HTTPX.StreamEv/SrvEv) and CT.StreamEv/StreamOut
+# of lib/core/type.bend are different contracts kept by decision
+# (TASK-036) — do not look for them here.
 import Base
 import ./httpx.bend as HTTPX
 import ./tls.bend as TLS
@@ -103,123 +108,64 @@ type WsStep is Data:
 type WSMask is Data:
   WSMask{k0: U32, k1: U32, k2: U32, k3: U32}
 
-# UTF-8 (RFC 3629): WSText on the wire. The H1 byte helpers in httpx
-# (x_str_bytes/x_bytes_str) are ASCII-only (raw code points, one byte
-# each) and feed the H1 renderers, so the real encoding lives here:
-# range-dispatched with no literal tables, plus the need/min/code
-# decoder that mirrors the validator below. Back in this module by the
-# owner's call (TASK-028 Phase 5.9, reversing Phase 5.5): UTF-8 here is
-# the WS text lane and this module is its only consumer today; the tree
-# still carries the other copies (h1_encode/h1_decode in
-# lib/web/http/main.bend, utf8_* in lib/ws.bend and
-# lib/websocket/ws.bend) until the trees converge.
+# UTF-8 (RFC 3629): WSText on the wire. The machine lives in httpx
+# (HTTPX.x_utf8_*, TASK-036 Phase 3) — this module keeps the wsm_utf8_*
+# names as thin callers' vocabulary, one implementation, no fork.
+# The H1 byte helpers in httpx (x_str_bytes/x_bytes_str) are ASCII-only
+# (raw code points, one byte each) and feed the H1 renderers; real text
+# rides x_utf8 here and in fetch/request bodies alike.
 # ---------------------------------------------------------------------
 
 def wsm_utf8_encode.go2(+code: U32) -> List<&2, U32>:
-  b1 = (192 + U32.shrn(code, 6n) : U32)
-  b2 = (128 + U32.and(code, 63) : U32)
-  [b1, b2]
+  HTTPX.x_utf8_encode.go2(code)
 
 def wsm_utf8_encode.go3(+code: U32) -> List<&2, U32>:
-  b1 = (224 + U32.shrn(code, 12n) : U32)
-  b2 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
-  b3 = (128 + U32.and(code, 63) : U32)
-  [b1, b2, b3]
+  HTTPX.x_utf8_encode.go3(code)
 
 def wsm_utf8_encode.go4(+code: U32) -> List<&2, U32>:
-  b1 = (240 + U32.shrn(code, 18n) : U32)
-  b2 = (128 + U32.and(U32.shrn(code, 12n), 63) : U32)
-  b3 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
-  b4 = (128 + U32.and(code, 63) : U32)
-  [b1, b2, b3, b4]
+  HTTPX.x_utf8_encode.go4(code)
 
 def wsm_utf8_encode.big(code: U32, is2: Bool, is3: Bool) -> List<&2, U32>:
-  match is2 is3:
-    case True{} _:
-      wsm_utf8_encode.go2(code)
-    case False{} True{}:
-      wsm_utf8_encode.go3(code)
-    case False{} False{}:
-      wsm_utf8_encode.go4(code)
+  HTTPX.x_utf8_encode.big(code, is2, is3)
 
 def wsm_utf8_encode.small(code: U32, is1: Bool, is2: Bool, is3: Bool) -> List<&2, U32>:
-  match is1:
-    case True{}:
-      [code]
-    case False{}:
-      wsm_utf8_encode.big(code, is2, is3)
+  HTTPX.x_utf8_encode.small(code, is1, is2, is3)
 
 def wsm_utf8_encode_char(+code: U32) -> List<&2, U32>:
-  wsm_utf8_encode.small(code, U32.is_lt(code, 128), U32.is_lt(code, 2048), U32.is_lt(code, 65536))
+  HTTPX.x_utf8_encode_char(code)
 
 def wsm_utf8_encode.one(c: Char) -> List<&2, U32>:
-  match c:
-    case Chr{code}:
-      wsm_utf8_encode_char(code)
+  HTTPX.x_utf8_encode.one(c)
 
 def wsm_utf8_encode(s: String) -> List<&2, U32>:
-  match s:
-    case SNil{}:
-      Nil{}
-    case SCon{h, t}:
-      List.append(&2, U32, wsm_utf8_encode.one(h), wsm_utf8_encode(t))
+  HTTPX.x_utf8_encode(s)
 
 def wsm_utf8_is_cont(+b: U32) -> Bool:
-  Bool.and(U32.is_ge(b, 128), U32.is_le(b, 191))
+  HTTPX.x_utf8_is_cont(b)
 
 def wsm_utf8_need(+b: U32) -> U32:
-  Bool.pick(U32, U32.is_lt(b, 128), 0, Bool.pick(U32, U32.is_lt(b, 194), 9, Bool.pick(U32, U32.is_lt(b, 224), 1, Bool.pick(U32, U32.is_lt(b, 240), 2, Bool.pick(U32, U32.is_le(b, 244), 3, 9)))))
+  HTTPX.x_utf8_need(b)
 
 def wsm_utf8_min(+need: U32) -> U32:
-  match need:
-    case 1:
-      128
-    case 2:
-      2048
-    case 3:
-      65536
-    case _:
-      0
+  HTTPX.x_utf8_min(need)
 
 def wsm_utf8_mask(+need: U32) -> U32:
-  match need:
-    case 1:
-      31
-    case 2:
-      15
-    case 3:
-      7
-    case _:
-      0
+  HTTPX.x_utf8_mask(need)
 
 def wsm_utf8_code_ok(+code: U32, +min: U32) -> Bool:
-  Bool.and(U32.is_ge(code, min), Bool.and(Bool.not(Bool.and(U32.is_ge(code, 55296), U32.is_le(code, 57343))), U32.is_le(code, 1114111)))
+  HTTPX.x_utf8_code_ok(code, min)
 
 def wsm_utf8_fin2(+code2: U32, +min: U32) -> U32:
-  Bool.pick(U32, wsm_utf8_code_ok(code2, min), 0, 9)
+  HTTPX.x_utf8_fin2(code2, min)
 
 def wsm_utf8_fin(+code: U32, +min: U32, +b: U32) -> U32:
-  Bool.pick(U32, wsm_utf8_is_cont(b), wsm_utf8_fin2((code * 64 + U32.and(b, 63) : U32), min), 9)
+  HTTPX.x_utf8_fin(code, min, b)
 
 def wsm_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
-  match bs:
-    case Nil{}:
-      U32.is_zero(need)
-    case b <> t:
-      match need:
-        case 0:
-          wsm_utf8_go(t, wsm_utf8_need(b), wsm_utf8_min(wsm_utf8_need(b)), U32.and(b, wsm_utf8_mask(wsm_utf8_need(b))))
-        case 1:
-          wsm_utf8_go(t, wsm_utf8_fin(code, min, b), 0, 0)
-        case 2:
-          wsm_utf8_go(t, Bool.pick(U32, wsm_utf8_is_cont(b), 1, 9), min, (code * 64 + U32.and(b, 63) : U32))
-        case 3:
-          wsm_utf8_go(t, Bool.pick(U32, wsm_utf8_is_cont(b), 2, 9), min, (code * 64 + U32.and(b, 63) : U32))
-        case _:
-          False{}
+  HTTPX.x_utf8_go(bs, need, min, code)
 
 def wsm_utf8_ok(bs: List<&2, U32>) -> Bool:
-  wsm_utf8_go(bs, 0, 0, 0)
+  HTTPX.x_utf8_ok(bs)
 
 # need 8 is the ASCII fast path (emit the byte carried in code) and
 # need 7 is a fresh lead byte (step the machine on the carried byte) —
@@ -228,32 +174,10 @@ def wsm_utf8_ok(bs: List<&2, U32>) -> Bool:
 # not enter the multi-byte machine, which would swallow them. Every arm
 # shrinks the tail, so this stays one self-recursive def.
 def wsm_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> String:
-  match bs:
-    case Nil{}:
-      match need:
-        case 8:
-          SCon{Chr{code}, SNil{}}
-        case _:
-          SNil{}
-    case b <> t:
-      match need:
-        case 0:
-          +nb0 = Bool.pick(U32, U32.is_lt(b, 128), 8, wsm_utf8_need(b))
-          wsm_utf8_decode.go(t, nb0, wsm_utf8_min(nb0), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, wsm_utf8_mask(nb0))))
-        case 1:
-          SCon{Chr{(code * 64 + U32.and(b, 63) : U32)}, wsm_utf8_decode.go(t, 0, 0, 0)}
-        case 2:
-          wsm_utf8_decode.go(t, 1, min, (code * 64 + U32.and(b, 63) : U32))
-        case 3:
-          wsm_utf8_decode.go(t, 2, min, (code * 64 + U32.and(b, 63) : U32))
-        case 8:
-          +nb8 = Bool.pick(U32, U32.is_lt(b, 128), 8, wsm_utf8_need(b))
-          SCon{Chr{code}, wsm_utf8_decode.go(t, nb8, wsm_utf8_min(nb8), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, wsm_utf8_mask(nb8))))}
-        case _:
-          SCon{Chr{65533}, wsm_utf8_decode.go(t, 0, 0, 0)}
+  HTTPX.x_utf8_decode.go(bs, need, min, code)
 
 def wsm_utf8_decode(bs: List<&2, U32>) -> String:
-  wsm_utf8_decode.go(bs, 0, 0, 0)
+  HTTPX.x_utf8_decode(bs)
 
 # Small pure helpers (the ones the old tree spread over HTTP/UTILS/CORE;
 # each is a few lines, so they live here instead of growing imports).
@@ -699,9 +623,26 @@ def wsm_client_ok_sub(+status: U32, hs: List<&2, HTTPX.Hdr>, +want: String, +off
 
 # Head length up to and including the CRLFCRLF terminator. Reuse: the H1
 # split owns the scan (and the found-at-the-end fix of TASK-026 Phase
-# 7b); a second scanner here is what the upgrade lane deleted.
+# 7b); a second scanner here is what the upgrade lane deleted. Not-found
+# answers 0 like the retired lane (TASK-036: split_head alone would
+# answer len(buf); the found guard keeps the old contract).
+def client_scan_len.go(p: List<&2, U32> & List<&2, U32> & Bool) -> U32:
+  match p:
+    case (h, r, f):
+      match f:
+        case True{}:
+          U32.from_nat(List.length(&2, U32, h))
+        case False{}:
+          0
+
 def client_scan_len(bs: List<&2, U32>) -> U32:
-  U32.from_nat(List.length(&2, U32, HTTPX.x_h1.split_head(HTTPX.x_h1.split(bs))))
+  client_scan_len.go(HTTPX.x_h1.split(bs))
+
+# Fit twin of the length above: True iff the head terminator is present.
+# Reuse: the same H1 split (one scan, one window constant) instead of a
+# second 4-byte scanner; compat-only, no live lane calls it.
+def client_scan_fit(bs: List<&2, U32>) -> Bool:
+  HTTPX.x_h1.split_found(HTTPX.x_h1.split(bs))
 
 # Host header of the RETIRED lane: the default port (80/443) is omitted.
 # The WSM wire always renders host:port (the H1 renderer owns the Host,
@@ -716,7 +657,7 @@ def ws_host_port(+host: String, +port: U32) -> String:
 # Frame codec (pure): parse and render both ways, mask, message layer,
 # strict UTF-8, close-code rules, fragment reassembly, incremental split.
 # Ported from the old lane and adapted: WST.* gone (own types above),
-# H1.h1_encode/decode is wsm_utf8_encode/decode, SHA1.bytes_of_word is
+# H1.h1_encode/decode is HTTPX.x_utf8_encode/decode, SHA1.bytes_of_word is
 # HTTPX.x_be32, SHA1.word_of4 is wsm_word_of4, UTILS.len_upto is
 # HTTPX.x_len_upto, and the split answer is HTTPX.UnitOut.
 # ---------------------------------------------------------------------
@@ -2083,6 +2024,26 @@ def serve_once(sock: Socket) -> IO(Unit):
 
 def serve_once_plain(sock: Socket) -> IO(Unit):
   HTTPX.x_h1.srv.head_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, ~wsm_serve_once_k_plain, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+
+# Cleartext echo accept loop (TASK-036 Phase 1): one serve_once_plain per
+# accepted socket, no handler to write. Reuse: the body already exists
+# above; Fail keeps the listener alive like HTTPX.h1_conn, never dies.
+def ws_conn(m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
+  (l, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      do IO<Listener>:
+        x : Unit <- IO.spawn(Unit, serve_once_plain(sock))
+        return l
+
+@unsafe
+def ws_serve(l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    l2 : Listener <- ws_conn(m)
+    ws_serve(l2)
 
 # Session servers: the accept loop stays in the httpx upgrade lane; the
 # ~K lambdas close over the caller's ~H (curried single binders — the

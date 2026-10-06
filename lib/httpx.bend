@@ -7,13 +7,16 @@
 # What one module covers:
 # - server: H2 (`server.on`, `server.on_h2`, `server.concurrent`,
 #   `server.stream`), H1 (`server.on_h1`, keep-alive, `Transfer-Encoding:
-#   chunked` both directions), the ALPN split (`server.on_alpn`, one
-#   handler for both lanes), the plaintext `http://` pair
+#   chunked` both directions, `server.stream_plain` for streaming upload
+#   over plaintext), the ALPN split (`server.on_alpn`, one
+#   handler for both lanes; `server.stream_alpn` dispatches streaming
+#   upload to H2/H1 by ALPN), the plaintext `http://` pair
 #   (`server.on_h1_plain`) and the upgrade lane (`server.on_h1_open`,
 #   which hands the socket to a caller — the WebSocket library's entry).
 # - client: `client.once`, `client.on`, `client.connect` / `client.request`,
-#   `client.concurrent`, `client.stream` (download events), plus
-#   `fetch` / `fetch_bytes` by URL and `request` / `request_bytes` by
+#   `client.concurrent` (H2-only), `client.stream` / `client.stream_plain`
+#   (download events, ALPN-dispatched H2/H1 over TLS plus plaintext H1),
+#   plus `fetch` / `fetch_bytes` by URL and `request` / `request_bytes` by
 #   host/port/method/path, and `h1_once` for the no-ALPN dial. Both ALPN
 #   answers dispatch from the one `client.request`, so the H1 leg needs
 #   nothing of its own.
@@ -40,6 +43,12 @@
 # Discipline: callee above caller; match scrutinees are params or
 # pattern-bound vars; self-recursion only (@unsafe for fuel-bounded
 # decode, frame read, accept/stream loops); + binders only for Data.
+#
+# Surface: StreamEv/StreamOut (download) and SrvEv/SrvOut (upload) are
+# this file's own two 2-variant families; the single 3+3 CT.StreamEv /
+# CT.StreamOut of lib/core/type.bend is a different contract kept by
+# decision (TASK-036) — a ~H written against one does not compile
+# against the other.
 #
 # Import as: import ./httpx.bend as HTTPX (from lib) or
 # import ../../lib/httpx.bend as HTTPX (from tests/io).
@@ -255,6 +264,155 @@ def x_str_chunks(+bs: List<&2, U32>) -> List<&2, String>:
 def x_bytes_str(bs: List<&2, U32>) -> String:
   String.concat(List.reverse(&2, String, x_str_chunks(bs)))
 
+# UTF-8 (RFC 3629): the text lane for fetch/request bodies. The x_str_bytes
+# / x_bytes_str pair above is ASCII-only (raw code points, one byte each)
+# and stays for the wire renderers (headers, HPACK, request lines); real
+# text rides here. Ported verbatim from lib/wsm.bend's wsm_utf8_* (TASK-036
+# Phase 3) — range-dispatched, no literal tables — so the two share one
+# machine: bad sequences decode leniently (U+FFFD or dropped, never Fail),
+# exactly like the wsm message path today; the strict gate is x_utf8_ok.
+# ---------------------------------------------------------------------
+
+def x_utf8_encode.go2(+code: U32) -> List<&2, U32>:
+  b1 = (192 + U32.shrn(code, 6n) : U32)
+  b2 = (128 + U32.and(code, 63) : U32)
+  [b1, b2]
+
+def x_utf8_encode.go3(+code: U32) -> List<&2, U32>:
+  b1 = (224 + U32.shrn(code, 12n) : U32)
+  b2 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
+  b3 = (128 + U32.and(code, 63) : U32)
+  [b1, b2, b3]
+
+def x_utf8_encode.go4(+code: U32) -> List<&2, U32>:
+  b1 = (240 + U32.shrn(code, 18n) : U32)
+  b2 = (128 + U32.and(U32.shrn(code, 12n), 63) : U32)
+  b3 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
+  b4 = (128 + U32.and(code, 63) : U32)
+  [b1, b2, b3, b4]
+
+def x_utf8_encode.big(code: U32, is2: Bool, is3: Bool) -> List<&2, U32>:
+  match is2 is3:
+    case True{} _:
+      x_utf8_encode.go2(code)
+    case False{} True{}:
+      x_utf8_encode.go3(code)
+    case False{} False{}:
+      x_utf8_encode.go4(code)
+
+def x_utf8_encode.small(code: U32, is1: Bool, is2: Bool, is3: Bool) -> List<&2, U32>:
+  match is1:
+    case True{}:
+      [code]
+    case False{}:
+      x_utf8_encode.big(code, is2, is3)
+
+def x_utf8_encode_char(+code: U32) -> List<&2, U32>:
+  x_utf8_encode.small(code, U32.is_lt(code, 128), U32.is_lt(code, 2048), U32.is_lt(code, 65536))
+
+def x_utf8_encode.one(c: Char) -> List<&2, U32>:
+  match c:
+    case Chr{code}:
+      x_utf8_encode_char(code)
+
+def x_utf8_encode(s: String) -> List<&2, U32>:
+  match s:
+    case SNil{}:
+      Nil{}
+    case SCon{h, t}:
+      List.append(&2, U32, x_utf8_encode.one(h), x_utf8_encode(t))
+
+def x_utf8_is_cont(+b: U32) -> Bool:
+  Bool.and(U32.is_ge(b, 128), U32.is_le(b, 191))
+
+def x_utf8_need(+b: U32) -> U32:
+  Bool.pick(U32, U32.is_lt(b, 128), 0, Bool.pick(U32, U32.is_lt(b, 194), 9, Bool.pick(U32, U32.is_lt(b, 224), 1, Bool.pick(U32, U32.is_lt(b, 240), 2, Bool.pick(U32, U32.is_le(b, 244), 3, 9)))))
+
+def x_utf8_min(+need: U32) -> U32:
+  match need:
+    case 1:
+      128
+    case 2:
+      2048
+    case 3:
+      65536
+    case _:
+      0
+
+def x_utf8_mask(+need: U32) -> U32:
+  match need:
+    case 1:
+      31
+    case 2:
+      15
+    case 3:
+      7
+    case _:
+      0
+
+def x_utf8_code_ok(+code: U32, +min: U32) -> Bool:
+  Bool.and(U32.is_ge(code, min), Bool.and(Bool.not(Bool.and(U32.is_ge(code, 55296), U32.is_le(code, 57343))), U32.is_le(code, 1114111)))
+
+def x_utf8_fin2(+code2: U32, +min: U32) -> U32:
+  Bool.pick(U32, x_utf8_code_ok(code2, min), 0, 9)
+
+def x_utf8_fin(+code: U32, +min: U32, +b: U32) -> U32:
+  Bool.pick(U32, x_utf8_is_cont(b), x_utf8_fin2((code * 64 + U32.and(b, 63) : U32), min), 9)
+
+def x_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
+  match bs:
+    case Nil{}:
+      U32.is_zero(need)
+    case b <> t:
+      match need:
+        case 0:
+          x_utf8_go(t, x_utf8_need(b), x_utf8_min(x_utf8_need(b)), U32.and(b, x_utf8_mask(x_utf8_need(b))))
+        case 1:
+          x_utf8_go(t, x_utf8_fin(code, min, b), 0, 0)
+        case 2:
+          x_utf8_go(t, Bool.pick(U32, x_utf8_is_cont(b), 1, 9), min, (code * 64 + U32.and(b, 63) : U32))
+        case 3:
+          x_utf8_go(t, Bool.pick(U32, x_utf8_is_cont(b), 2, 9), min, (code * 64 + U32.and(b, 63) : U32))
+        case _:
+          False{}
+
+def x_utf8_ok(bs: List<&2, U32>) -> Bool:
+  x_utf8_go(bs, 0, 0, 0)
+
+# need 8 is the ASCII fast path (emit the byte carried in code) and
+# need 7 is a fresh lead byte (step the machine on the carried byte) —
+# both keep one self-recursive def with a shrinking tail.
+# need 8 is pending ASCII (emit on the next step): bytes under 128 must
+# not enter the multi-byte machine, which would swallow them. Every arm
+# shrinks the tail, so this stays one self-recursive def.
+def x_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> String:
+  match bs:
+    case Nil{}:
+      match need:
+        case 8:
+          SCon{Chr{code}, SNil{}}
+        case _:
+          SNil{}
+    case b <> t:
+      match need:
+        case 0:
+          +nb0 = Bool.pick(U32, U32.is_lt(b, 128), 8, x_utf8_need(b))
+          x_utf8_decode.go(t, nb0, x_utf8_min(nb0), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, x_utf8_mask(nb0))))
+        case 1:
+          SCon{Chr{(code * 64 + U32.and(b, 63) : U32)}, x_utf8_decode.go(t, 0, 0, 0)}
+        case 2:
+          x_utf8_decode.go(t, 1, min, (code * 64 + U32.and(b, 63) : U32))
+        case 3:
+          x_utf8_decode.go(t, 2, min, (code * 64 + U32.and(b, 63) : U32))
+        case 8:
+          +nb8 = Bool.pick(U32, U32.is_lt(b, 128), 8, x_utf8_need(b))
+          SCon{Chr{code}, x_utf8_decode.go(t, nb8, x_utf8_min(nb8), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, x_utf8_mask(nb8))))}
+        case _:
+          SCon{Chr{65533}, x_utf8_decode.go(t, 0, 0, 0)}
+
+def x_utf8_decode(bs: List<&2, U32>) -> String:
+  x_utf8_decode.go(bs, 0, 0, 0)
+
 # Consts
 # ------
 
@@ -347,6 +505,13 @@ type Response is Data:
 
 type Head is Data:
   Head{status: U32, headers: List<&2, Hdr>}
+
+# Framing decision for one H1 message (TASK-036 Phase 3): the
+# length-delimited / chunked / absent answer the lanes derive from the
+# head, carried as one value so Phase 6 handlers never re-derive it.
+# Field-for-field identical to lib/core/type.bend's CT.BodyFrame.
+type BodyFrame is Data:
+  BodyFrame{cl: U32, chunked: Bool, no_body: Bool}
 
 type St is Data:
   St{head: Maybe<&2, ReqHead>, body: List<&2, U32>, sid: U32}
@@ -2846,6 +3011,7 @@ type SrvEv is Data:
 type SrvOut is Data:
   Continue{}
   RespondEarly{resp: Response}
+  Cancel{}
 
 # Local validation (same Fail 400 as https valid.go; no http import)
 # ------------------------------------------------------------------
@@ -3284,10 +3450,11 @@ def client.on.connected_go(conn: Result<&1, &1, U32 & String, Socket & String>) 
         pre : Result<&1, &1, U32 & String, Socket> <- client.on.alpn_go(sock, is_h2)
         client.on.connected(pre, is_h2)
 
-# The streaming and concurrent lanes are H2-only: they need the H2 slot
-# machinery, so an H1 connection is closed with 615 — the answer the old
-# H2-strict connect gave — instead of being handed to a lane that cannot
-# speak it. client.on, client.request and client.once dispatch to H1.
+# The concurrent lane stays H2-only: it needs the H2 slot machinery, so
+# an H1 connection is closed with 615 — the answer the old H2-strict
+# connect gave — instead of being handed to a lane that cannot speak it.
+# client.stream dispatches below; client.on, client.request and
+# client.once dispatch to H1.
 def client.on.h2_only(conn: Result<&1, &1, U32 & String, Socket & CliSt>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match conn:
@@ -3763,6 +3930,13 @@ def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
 
 def x_h1.no_body(+method: String, +status: U32) -> Bool:
   x_h1.no_body.go(String.eq(method, "HEAD"), status)
+
+# One carrier for the three framing answers above (same shape as
+# CT.BodyFrame): length-delimited, chunked, or absent. Reuse: the folds
+# own the rules, so the lanes stop threading three params for one
+# decision; the single-pass fold is future work if ever measured.
+def x_h1.frame_of(+hs: List<&2, Hdr>, +method: String, +status: U32) -> BodyFrame:
+  BodyFrame{x_h1.cl_of(hs), x_h1.is_chunked(hs), x_h1.no_body(method, status)}
 
 # Chunked (RFC 9112 section 7.1.1): one grammar, one machine.
 # ----------------------------------------------------------
@@ -4499,7 +4673,264 @@ def h1_open_insecure(+host: String, +port: U32, +req: Request) ->
 # replaces the 615 close; keep_connect stays H2-strict).
 # ---------------------------------------------------------------------
 
-# Streaming download (Phase E): HEADERS/DATA to a pure handler, O(1)
+# H1 streaming download (Phase 6): the H1 leg of client.stream, speaking
+# StreamEv/StreamOut like the H2 sdrop lane below. One request per
+# connection, then close: the H1 answer to Cancel is close + Fail
+# (8, "cancelled") — there is no RST_STREAM on this lane. Counts only,
+# never buffers: the answer is (total bytes, chunks delivered), the same
+# pair shape the H2 lane reports as (total, fins).
+# Transport is three templates (~recv/~send/~close) like x_h1.cli.exch,
+# instantiated per lane at the entries: TLS for the ALPN dispatch in
+# client_stream, TCP for the plaintext stream_plain further below. The
+# framing cut below is shared with the upload lane (x_h1.stream.next),
+# so both lanes cut one body one way.
+# ---------------------------------------------------------------------
+
+# Field projections: Bend has no field access, so a loop carrying a
+# BodyFrame reads the three framing answers back through these.
+def x_h1.stream.frame_cl(+fr: BodyFrame) -> U32:
+  match fr:
+    case BodyFrame{+cl, chunked, no_body}:
+      cl
+
+def x_h1.stream.frame_chunked(+fr: BodyFrame) -> Bool:
+  match fr:
+    case BodyFrame{cl, +chunked, no_body}:
+      chunked
+
+def x_h1.stream.frame_nbody(+fr: BodyFrame) -> Bool:
+  match fr:
+    case BodyFrame{cl, chunked, +no_body}:
+      no_body
+
+# Length-delimited cut answering this file's own UnitOut, the same
+# vocabulary the chunked step speaks: Got carries the next piece with
+# its last-chunk flag and what is left, NeedMore carries the buffer back
+# for one more read, End is unused here (a spent length is a caller bug),
+# Bad is the overspent length the whole-buffer lane refuses too.
+def x_h1.stream.cl_go(+pending: List<&2, U32>, +cl: U32, +seen: U32, +chunk: List<&2, U32>, fin: Bool, empty: Bool) -> UnitOut:
+  match empty:
+    case True{}:
+      NeedMore{(cl - seen : U32), pending}
+    case False{}:
+      Got{chunk, fin, x_drop32(x_len32(chunk), pending)}
+
+def x_h1.stream.cl_next(+pending: List<&2, U32>, +cl: U32, +seen: U32, ok: Bool) -> UnitOut:
+  match ok:
+    case True{}:
+      +chunk = x_take32((cl - seen : U32), pending)
+      x_h1.stream.cl_go(pending, cl, seen, chunk, U32.is_eq((seen + x_len32(chunk) : U32), cl), List.is_empty(&2, U32, chunk))
+    case False{}:
+      Bad{400, "eof"}
+
+# The next chunk, whichever framing the head declared. One call so the
+# loops never match the framing and the answer at once: a chunked body
+# goes to the incremental step (which keeps its own state across reads)
+# and a length-delimited one to the cut above (whose state is the seen
+# count the caller already carries).
+def x_h1.stream.next(+chunked: Bool, +cst: ChunkSt, +pending: List<&2, U32>, +cl: U32, +seen: U32) -> ChunkSt & UnitOut:
+  match chunked:
+    case True{}:
+      x_h1.chunk_step(cst, pending)
+    case False{}:
+      (x_h1.chunk_init(), x_h1.stream.cl_next(pending, cl, seen, Bool.not(U32.is_gt(seen, cl))))
+
+# What the head answer means to this loop: 0 go read the body, 2 report
+# what was counted and close, 3 close and report (8, "cancelled").
+# Asking for more on a message with no body is a finish, not a close:
+# the client has nothing left to read.
+def x_h1.cli.stream.head_go(nbody: Bool) -> U32:
+  match nbody:
+    case True{}:
+      2
+    case False{}:
+      0
+
+def x_h1.cli.stream.head_act(+out: StreamOut, nbody: Bool) -> U32:
+  match out:
+    case StreamContinue{}:
+      x_h1.cli.stream.head_go(nbody)
+    case StreamCancel{}:
+      3
+
+# What one body chunk answer means: 0 keep going, 2 done and report,
+# 3 cancelled. Continue past the last chunk is done — there is no next
+# chunk.
+def x_h1.cli.stream.data_act(+out: StreamOut, +fin: Bool) -> U32:
+  match out:
+    case StreamContinue{}:
+      match fin:
+        case True{}:
+          2
+        case False{}:
+          0
+    case StreamCancel{}:
+      3
+
+# Close and report. Every exit goes through close, so no path leaks.
+def x_h1.cli.stream.close(~close: Socket -> IO(Unit), s: Socket, r: Result<&1, &1, U32 & String, U32 & U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    x : Unit <- close(s)
+    IO.pure(Result<&1, &1, U32 & String, U32 & U32>, r)
+
+def x_h1.cli.stream.done(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +total: U32, +chunks: U32) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Done{(total, chunks)})
+
+def x_h1.cli.stream.failed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, e: U32 & String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Fail{e})
+
+def x_h1.cli.stream.cancelled(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Fail{(8, "cancelled")})
+
+# The response head, parsed. The bytes that arrived with the head seed
+# the pending buffer in phase 3, the same way the one-shot lane does.
+def x_h1.cli.stream.headers(hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, +code: U32) -> Result<&1, &1, U32 & String, Head>:
+  match hsres:
+    case Fail{e}:
+      Fail{e}
+    case Done{+hs}:
+      Done{Head{code, hs}}
+
+def x_h1.cli.stream.built(coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>) -> Result<&1, &1, U32 & String, Head>:
+  match coderes:
+    case Fail{e}:
+      Fail{e}
+    case Done{+code}:
+      x_h1.cli.stream.headers(hsres, code)
+
+def x_h1.cli.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, Head>:
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
+  x_h1.cli.stream.built(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
+def x_h1.cli.stream.no_head() -> Result<&1, &1, U32 & String, Head>:
+  Fail{(400, "bad status")}
+
+# The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
+# the blank-line cut); 3 parses, frames through x_h1.frame_of and hands
+# the head over; 5 acts on the head answer; 6 asks the framing for the
+# next chunk; 7 delivers it and acts; 9 reads more body and 10 takes the
+# read back (a peer that closes mid-body is 400 "eof", the code the
+# one-shot lane already answers). act rides the last answer decoded to
+# a code; the response half the upload lane carries is dead here — the
+# client has nobody to hand it to.
+@unsafe
+def x_h1.cli.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: StreamEv -> StreamOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +method: String, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: ChunkSt, act: U32, out: ChunkSt & UnitOut, +total: U32, +chunks: U32, hres: Result<&1, &1, U32 & String, Head>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.cli.stream.failed(~close, got, (413, "response too long"))
+        case 1n+f:
+          do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 1, r, acc, f, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          x_h1.cli.stream.close(~close, s1, Fail{e})
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.cli.stream.close(~close, s1, Fail{(400, "eof")})
+            case h <> t:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), List.append(&2, U32, acc, part), fuel, x_h1.split_found(x_h1.split(List.append(&2, U32, acc, part))), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 2:
+      match found:
+        case True{}:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 3, got, acc, fuel, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, x_h1.cli.stream.parsed(acc))
+        case False{}:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 3:
+      match hres:
+        case Fail{e}:
+          x_h1.cli.stream.failed(~close, got, e)
+        case Done{+hd}:
+          match hd:
+            case Head{+code, +hs}:
+              +fr = x_h1.frame_of(hs, method, code)
+              +nb = x_h1.stream.frame_nbody(fr)
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nb, x_h1.stream.frame_chunked(fr), x_h1.stream.frame_cl(fr), x_h1.split_rest(x_h1.split(acc)), 0, x_h1.chunk_init(), x_h1.cli.stream.head_act(H(StreamHead{hd}), nb), (x_h1.chunk_init(), End{Nil{}}), total, chunks, x_h1.cli.stream.no_head())
+    case 5:
+      match act:
+        case 0:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 6, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, 4, x_h1.stream.next(chunked, cst, pending, cl, seen), total, chunks, hres)
+        case 3:
+          x_h1.cli.stream.cancelled(~close, got)
+        case _:
+          x_h1.cli.stream.done(~close, got, total, chunks)
+    case 6:
+      match out:
+        case (st2, o):
+          match o:
+            case Got{+chunk, +fin, +rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, (seen + x_len32(chunk) : U32), st2, x_h1.cli.stream.data_act(H(StreamData{chunk, fin}), fin), (x_h1.chunk_init(), End{Nil{}}), (total + x_len32(chunk) : U32), (chunks + 1 : U32), hres)
+            case NeedMore{missing, +rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 9, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, seen, st2, act, (x_h1.chunk_init(), End{Nil{}}), total, chunks, hres)
+            case End{+rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, seen, cst, x_h1.cli.stream.data_act(H(StreamData{Nil{}, True{}}), True{}), (x_h1.chunk_init(), End{Nil{}}), total, (chunks + 1 : U32), hres)
+            case Bad{code, msg}:
+              x_h1.cli.stream.failed(~close, got, (400, "bad chunked"))
+    case 7:
+      match act:
+        case 0:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, 0, (x_h1.chunk_init(), End{Nil{}}), total, chunks, hres)
+        case 3:
+          x_h1.cli.stream.cancelled(~close, got)
+        case _:
+          x_h1.cli.stream.done(~close, got, total, chunks)
+    case 9:
+      (s9, r9) = got
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s9, 16384)
+        x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 10, r, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, act, (x_h1.chunk_init(), End{Nil{}}), total, chunks, hres)
+    case 10:
+      (s10, r10) = got
+      match r10:
+        case Fail{e}:
+          x_h1.cli.stream.close(~close, s10, Fail{e})
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.cli.stream.close(~close, s10, Fail{(400, "eof")})
+            case h <> t:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, (s10, Done{Nil{}}), Nil{}, 0n, False{}, method, nbody, chunked, cl, List.append(&2, U32, pending, part), seen, cst, 0, (x_h1.chunk_init(), End{Nil{}}), total, chunks, hres)
+    case _:
+      x_h1.cli.stream.failed(~close, got, (502, "bad phase"))
+
+# Entry: render, send, stream, close. The socket arrives dialed — the
+# ALPN dispatch in client_stream keeps it for the H1 answer, and the
+# plaintext entry below dials it.
+def x_h1.cli.stream.sent2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (sock, r) = sent
+  match r:
+    case Fail{e}:
+      x_h1.cli.stream.close(~close, sock, Fail{e})
+    case Done{u}:
+      x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, method, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), 4, (x_h1.chunk_init(), End{Nil{}}), 0, 0, x_h1.cli.stream.no_head())
+
+def x_h1.cli.stream.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: StreamEv -> StreamOut, sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match rendered:
+    case Fail{e}:
+      x_h1.cli.stream.close(~close, sock, Fail{e})
+    case Done{+bytes}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.cli.stream.sent2(~recv, ~send, ~close, ~H, sent, method)
+
+def x_h1.cli.stream.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  x_h1.cli.stream.sent(~recv, ~send, ~close, ~H, sock, x_h1.render_req(method, path, host, port, hs, body), method)
+
+# The TLS instantiation: the ALPN dispatch hands over its socket, so no
+# dial happens here.
+def x_h1.cli.stream.tls(~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  x_h1.cli.stream.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, sock, host, port, method, path, hs, body)
+
+# Streaming download (Phase E): H2 HEADERS/DATA to a pure handler, O(1)
 # per chunk (counts only, no body accumulation). WU per non-fin DATA
 # (best-effort, mold h2_send_wu_len); Cancel sends RST_STREAM (8) + Fail.
 # ---------------------------------------------------------------------
@@ -4753,19 +5184,34 @@ def client_stream.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & Str
     case Done{sock}:
       client_stream.exch(~H, sock, host, port, method, path, hs, body)
 
+# ALPN dispatch for streaming download (Phase 6): H2 takes the slot
+# lane above, HTTP/1.1 takes the H1 lane on the same socket.
+def client_stream.dispatched(~H: StreamEv -> StreamOut, c: Result<&1, &1, U32 & String, Socket & CliSt>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match c:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{value}:
+      (sock, st) = value
+      match st:
+        case CliSt{sid, tab, is_h2}:
+          match is_h2:
+            case True{}:
+              client_stream.conn(~H, Done{sock}, host, port, method, path, hs, body)
+            case False{}:
+              x_h1.cli.stream.tls(~H, sock, host, port, method, path, hs, body)
+
 def client_stream.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   match insecure:
     case True{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
         c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
-        client_stream.conn(~H, conn, host, port, method, path, hs, body)
+        client_stream.dispatched(~H, c, host, port, method, path, hs, body)
     case False{}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
         c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
-        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
-        client_stream.conn(~H, conn, host, port, method, path, hs, body)
+        client_stream.dispatched(~H, c, host, port, method, path, hs, body)
 
 def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
@@ -5164,8 +5610,15 @@ def httpx_url.scheme(url: String, is_https: Bool, is_http: Bool) ->
 def httpx_url.read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & String & U32 & String>:
   httpx_url.scheme(url, String.starts_with(url, "https://"), String.starts_with(url, "http://"))
 
+# Top-level URL entry (TASK-036 Phase 4): the same parse without the
+# namespace walk. The namespaced def stays for existing callers.
+def read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & String & U32 & String>:
+  httpx_url.read_url(url)
+
 # fetch: GET by URL (mirror https.fetch, https only). Answers the body
 # as String; fetch_bytes answers raw bytes. insecure=False{} verifies.
+# Text decodes UTF-8 (x_utf8_decode, same machine as the WS text lane);
+# ASCII bodies decode byte-identically to the old x_bytes_str.
 # ---------------------------------------------------------------------
 
 def fetch.text(r: Result<&1, &1, U32 & String, Response>) ->
@@ -5176,7 +5629,7 @@ def fetch.text(r: Result<&1, &1, U32 & String, Response>) ->
     case Done{+resp}:
       match resp:
         case Response{+status, +headers, +body}:
-          IO.pure(Result<&1, &1, U32 & String, String>, Done{x_bytes_str(body)})
+          IO.pure(Result<&1, &1, U32 & String, String>, Done{x_utf8_decode(body)})
 
 def fetch.raw(r: Result<&1, &1, U32 & String, Response>) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
@@ -5356,6 +5809,39 @@ def request.plain(+host: String, +port: U32, +method: String, +path: String, hs:
     conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
     h1_once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
 
+# Plaintext streaming download (http://): the H1 lane over the
+# plaintext dial — the sibling of client.stream, which always speaks
+# TLS. One dial, one render, the response streamed to the handler.
+def client.stream_plain.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      x_h1.cli.stream.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, sock, host, port, method, path, hs, body)
+
+def client.stream_plain.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
+    client.stream_plain.conn(~H, conn, host, port, method, path, hs, body)
+
+def client.stream_plain.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match fit:
+    case True{}:
+      match ok:
+        case True{}:
+          client.stream_plain.go(~H, host, port, method, path, hs, body)
+        case False{}:
+          IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(413, "req too large")})
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(400, "bad request")})
+
+def client.stream_plain(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  client.stream_plain.fit(~H, host, port, method, path, hs, body, client.on.valid.go(host, port, path), client.on.body_ok(body))
+
 def request_bytes.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
@@ -5400,7 +5886,7 @@ def request_plain.fit(+host: String, +port: U32, +path: String, +method: String,
   match fit:
     case True{}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        r : Result<&1, &1, U32 & String, Response> <- request.plain(host, port, method, path, hs, x_str_bytes(body))
+        r : Result<&1, &1, U32 & String, Response> <- request.plain(host, port, method, path, hs, x_utf8_encode(body))
         fetch.text(r)
     case False{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
@@ -5412,7 +5898,7 @@ def request_plain(+host: String, +port: U32, +path: String, +method: String, hs:
 def request.go(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, String>):
   do IO<Result<&1, &1, U32 & String, String>>:
-    r : Result<&1, &1, U32 & String, Response> <- request.once(host, port, method, path, hs, x_str_bytes(body), insecure)
+    r : Result<&1, &1, U32 & String, Response> <- request.once(host, port, method, path, hs, x_utf8_encode(body), insecure)
     fetch.text(r)
 
 def request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&2, Hdr>, +body: String, insecure: Bool, fit: Bool) ->
@@ -5844,6 +6330,8 @@ def httpxs.is_more(+out: SrvOut) -> Bool:
       True{}
     case RespondEarly{resp}:
       False{}
+    case Cancel{}:
+      False{}
 
 def httpxs.out_resp(+out: SrvOut) -> Response:
   match out:
@@ -5851,6 +6339,8 @@ def httpxs.out_resp(+out: SrvOut) -> Response:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
+    case Cancel{}:
+      Response{0, Nil{}, Nil{}}
 
 def httpxs.head_act(is_more: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
   match is_more need ok end:
@@ -5886,6 +6376,8 @@ def httpxs.head_out(+out: SrvOut, +end: U32) -> U32 & Response:
           (0, Response{0, Nil{}, Nil{}})
     case RespondEarly{+resp}:
       (1, resp)
+    case Cancel{}:
+      (2, Response{0, Nil{}, Nil{}})
 
 def httpxs.data_out(+out: SrvOut, fin: Bool) -> U32 & Response:
   match out:
@@ -5897,6 +6389,8 @@ def httpxs.data_out(+out: SrvOut, fin: Bool) -> U32 & Response:
           (0, Response{0, Nil{}, Nil{}})
     case RespondEarly{+resp}:
       (1, resp)
+    case Cancel{}:
+      (2, Response{0, Nil{}, Nil{}})
 
 def httpxs.head_act_from_out(+out: SrvOut, +end: U32) -> U32:
   match out:
@@ -5908,6 +6402,8 @@ def httpxs.head_act_from_out(+out: SrvOut, +end: U32) -> U32:
           0
     case RespondEarly{resp}:
       1
+    case Cancel{}:
+      2
 
 def httpxs.head_resp_from_out(+out: SrvOut) -> Response:
   match out:
@@ -5915,6 +6411,8 @@ def httpxs.head_resp_from_out(+out: SrvOut) -> Response:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
+    case Cancel{}:
+      Response{0, Nil{}, Nil{}}
 
 def httpxs.data_act_from_out(+out: SrvOut, fin: Bool) -> U32:
   match out:
@@ -5926,6 +6424,8 @@ def httpxs.data_act_from_out(+out: SrvOut, fin: Bool) -> U32:
           0
     case RespondEarly{resp}:
       1
+    case Cancel{}:
+      2
 
 def httpxs.data_resp_from_out(+out: SrvOut) -> Response:
   match out:
@@ -5933,6 +6433,8 @@ def httpxs.data_resp_from_out(+out: SrvOut) -> Response:
       Response{0, Nil{}, Nil{}}
     case RespondEarly{+resp}:
       resp
+    case Cancel{}:
+      Response{0, Nil{}, Nil{}}
 
 def httpxs.head_act_of(~H: SrvEv -> SrvOut, ok: Bool, +need: U32, +end: U32, +nh: ReqHead, +nt: Tab, +sid: U32) -> U32:
   match ok need:
@@ -6096,7 +6598,217 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
     case _:
       httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
 
-# Streaming accept plumbing (H2-only, no H1 split; non-H2 fail-closed)
+# H1 streaming upload (Phase 6): the H1 leg of server.stream, speaking
+# SrvEv/SrvOut like the H2 httpx_stream lane above. One request per
+# connection, then close: no keep-alive, no pipelining. Backpressure is
+# the read itself — at most one recv per chunk, so a handler that stops
+# saying Continue stops the reads. Slot is 1: H1 has no stream ids, and
+# 1 is also the sid the H2 client opens with. Cancel closes without a
+# response (the answer the tree's CT.Cancel gives); RespondEarly renders
+# and closes. A malformed chunked body is 400, the code the one-shot H1
+# server answers. Transport is three templates like x_h1.srv.head.
+# ---------------------------------------------------------------------
+
+# What the head answer means: 0 go read the body, 1 respond now,
+# 2 close without responding. Asking for more on a message with no
+# body is a close — there is no chunk coming.
+def x_h1.stream.head_body(nbody: Bool, +resp: Response) -> U32 & Response:
+  match nbody:
+    case True{}:
+      (2, resp)
+    case False{}:
+      (0, resp)
+
+def x_h1.stream.head_act(+out: SrvOut, nbody: Bool) -> U32 & Response:
+  match out:
+    case Continue{}:
+      x_h1.stream.head_body(nbody, Response{0, Nil{}, Nil{}})
+    case RespondEarly{+resp}:
+      (1, resp)
+    case Cancel{}:
+      (2, Response{0, Nil{}, Nil{}})
+
+# What one body chunk answer means. Continue past the last chunk is a
+# close — there is nothing left to hand over.
+def x_h1.stream.data_act(+out: SrvOut, +fin: Bool) -> U32 & Response:
+  match out:
+    case Continue{}:
+      match fin:
+        case True{}:
+          (2, Response{0, Nil{}, Nil{}})
+        case False{}:
+          (0, Response{0, Nil{}, Nil{}})
+    case RespondEarly{+resp}:
+      (1, resp)
+    case Cancel{}:
+      (2, Response{0, Nil{}, Nil{}})
+
+# The answer path always closes: one request per connection on this
+# lane, so there is no keep-alive decision to make.
+def x_h1.stream.sent_close(~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s, r) = sent
+  close(s)
+
+def x_h1.stream.respond(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +resp: Response) -> IO(Unit):
+  (s, r) = got
+  match resp:
+    case Response{+status, +headers, +body}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(s, x_h1.show_resp(status, headers, body))
+        x_h1.stream.sent_close(~close, sent)
+
+def x_h1.stream.closed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = got
+  close(s)
+
+def x_h1.stream.bad(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  x_h1.stream.respond(~send, ~close, got, Response{400, Nil{}, Nil{}})
+
+def x_h1.stream.no_ans() -> U32 & Response:
+  (0, Response{0, Nil{}, Nil{}})
+
+def x_h1.stream.no_head() -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+  (Fail{(400, "bad request")}, Nil{})
+
+# The request head, parsed. The bytes that arrived with the head seed
+# the pending buffer — a request that arrives whole in one packet must
+# not lose its body.
+def x_h1.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
+  (x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))), x_h1.split_rest(x_h1.split(acc)))
+
+# The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
+# the blank-line cut); 3 parses, frames (GET/HEAD carry no body, like
+# the one-shot server) and hands the head over; 5 acts on the head
+# answer; 6 asks the framing for the next chunk through x_h1.stream.next
+# above; 7 delivers it and acts; 9 reads more body and 10 takes the read
+# back. ans rides the last answer as code plus the response it chose.
+@unsafe
+def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: ChunkSt, ans: U32 & Response, out: ChunkSt & UnitOut, head: Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.stream.closed(~close, got)
+        case 1n+f:
+          do IO<Unit>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.stream.go(~recv, ~send, ~close, ~H, 1, r, acc, f, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          x_h1.stream.closed(~close, got)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.stream.closed(~close, got)
+            case h <> t:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), List.append(&2, U32, acc, part), fuel, x_h1.split_found(x_h1.split(List.append(&2, U32, acc, part))), nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 2:
+      match found:
+        case True{}:
+          x_h1.stream.go(~recv, ~send, ~close, ~H, 3, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, x_h1.stream.parsed(acc))
+        case False{}:
+          x_h1.stream.go(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 3:
+      match head:
+        case (h3, p3):
+          match h3:
+            case Fail{e}:
+              x_h1.stream.closed(~close, got)
+            case Done{+rh}:
+              match rh:
+                case ReqHead{+m, +p, +hs}:
+                  +nb = Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD"))
+                  +ch = x_h1.is_chunked(hs)
+                  +clv = x_h1.cl_of(hs)
+                  x_h1.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, nb, ch, clv, p3, 0, x_h1.chunk_init(), x_h1.stream.head_act(H(SrvReqHead{1, ReqHead{m, p, hs}}), nb), (x_h1.chunk_init(), End{Nil{}}), x_h1.stream.no_head())
+    case 5:
+      match ans:
+        case (a5, resp5):
+          match a5:
+            case 0:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 6, got, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head)
+            case 1:
+              x_h1.stream.respond(~send, ~close, got, resp5)
+            case _:
+              x_h1.stream.closed(~close, got)
+    case 6:
+      match out:
+        case (st2, o):
+          match o:
+            case Got{+chunk, +fin, +rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, (seen + x_len32(chunk) : U32), st2, x_h1.stream.data_act(H(SrvReqData{1, chunk, fin}), fin), (x_h1.chunk_init(), End{Nil{}}), head)
+            case NeedMore{missing, +rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 9, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, seen, st2, ans, (x_h1.chunk_init(), End{Nil{}}), head)
+            case End{+rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, seen, cst, x_h1.stream.data_act(H(SrvReqData{1, Nil{}, True{}}), True{}), (x_h1.chunk_init(), End{Nil{}}), head)
+            case Bad{code, msg}:
+              x_h1.stream.bad(~send, ~close, got)
+    case 7:
+      match ans:
+        case (a7, resp7):
+          match a7:
+            case 0:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), End{Nil{}}), head)
+            case 1:
+              x_h1.stream.respond(~send, ~close, got, resp7)
+            case _:
+              x_h1.stream.closed(~close, got)
+    case 9:
+      (s9, r9) = got
+      do IO<Unit>:
+        r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s9, 16384)
+        x_h1.stream.go(~recv, ~send, ~close, ~H, 10, r, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, ans, (x_h1.chunk_init(), End{Nil{}}), head)
+    case 10:
+      (s10, r10) = got
+      match r10:
+        case Fail{e}:
+          x_h1.stream.closed(~close, got)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.stream.closed(~close, got)
+            case h <> t:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 5, (s10, Done{Nil{}}), Nil{}, 0n, False{}, nbody, chunked, cl, List.append(&2, U32, pending, part), seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), End{Nil{}}), head)
+    case _:
+      x_h1.stream.closed(~close, got)
+
+# Per-connection entry, the two the accept loops spawn.
+def x_h1.stream.start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
+  x_h1.stream.go(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), x_h1.stream.no_ans(), (x_h1.chunk_init(), End{Nil{}}), x_h1.stream.no_head())
+
+def x_h1.stream.spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
+  x_h1.stream.start(~recv, ~send, ~close, ~H, sock)
+
+def x_h1.stream.spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, sock: Socket, l: Listener) -> IO(Listener):
+  do IO<Listener>:
+    x : Unit <- IO.spawn(Unit, x_h1.stream.spawn.go(~recv, ~send, ~close, ~H, sock))
+    return l
+
+def x_h1.stream.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
+  (l, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      x_h1.stream.spawn(~recv, ~send, ~close, ~H, sock, l)
+
+# Plaintext H1 streaming server (http://): TCP.accept owns the listener,
+# one request per connection, then close.
+@unsafe
+def server.stream_plain(~H: SrvEv -> SrvOut, listener: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
+    next : Listener <- x_h1.stream.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, m)
+    z : Unit <- server.stream_plain(~H, next)
+    return z
+
+# Streaming accept plumbing: ALPN dispatch (H2 takes the slot lane,
+# HTTP/1.1 takes the H1 lane above); the non-ALPN server.stream stays
+# H2-only behind tls_accept, which requires H2 at the handshake.
 # ---------------------------------------------------------------------
 
 @unsafe
@@ -6156,17 +6868,12 @@ def httpxs_conn(~H: SrvEv -> SrvOut, m: Listener & Result<&1, &1, U32 & String, 
     case Done{sock}:
       httpxs_spawn(~H, sock, l)
 
-def httpxs_alpn_close(sock: Socket, l: Listener) -> IO(Listener):
-  do IO<Listener>:
-    x : Unit <- TLS.tls_close(sock)
-    return l
-
 def httpxs_alpn_go(~H: SrvEv -> SrvOut, is_h2: Bool, listener: Listener, sock: Socket) -> IO(Listener):
   match is_h2:
     case True{}:
       httpxs_spawn(~H, sock, listener)
     case False{}:
-      httpxs_alpn_close(sock, listener)
+      x_h1.stream.spawn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, sock, listener)
 
 def httpxs_alpn_conn(~H: SrvEv -> SrvOut, accepted: Listener & Result<&1, &1, U32 & String, Socket & String>) -> IO(Listener):
   (listener, result) = accepted
