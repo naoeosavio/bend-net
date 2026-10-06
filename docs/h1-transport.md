@@ -7,18 +7,22 @@ template parameters threaded through every def that touches the wire:
 
 | Template | Type | TLS instance | TCP instance |
 |---|---|---|---|
-| `~recv` | `Socket -> U32 -> IO(Socket & Result<&1,&1,U32 & String, List<&2,U32>>)` | `TLS.tls_recv_bytes` | `TCPB.recv_bytes` |
-| `~send` | `Socket -> List<&2,U32> -> IO(Socket & Result<&1,&1,U32 & String, Unit>)` | `TLS.tls_send_bytes` | `TCPB.send_bytes` |
+| `~recv` | `Socket -> U32 -> IO(Socket & Result<&1,&1,U32 & String, List<&2,U32>>)` | `TLS.tls_recv_bytes` | `TCP.recv_bytes` |
+| `~send` | `Socket -> List<&2,U32> -> IO(Socket & Result<&1,&1,U32 & String, Unit>)` | `TLS.tls_send_bytes` | `TCP.send_bytes` |
 | `~close` | `Socket -> IO(Unit)` | `TLS.tls_close` | `Socket.close` |
 
 Callers instantiate once, at the edge; everything below just forwards:
 
 | Edge | Triple |
 |---|---|
-| `h1_once.conn` (TLS one-shot), `client.once.h1`, `client.on.h1_keep`, `client_seq.h1` | TLS |
-| `h1_once.conn` (via `fetch.plain` / `fetch_bytes.plain`, after `TCP.connect`) | TCP |
+| `h1_once.conn`, `h1_open.conn` (TLS one-shot dials), `x_h1.cli.exch` (via `client.on.h1_keep`) | TLS |
+| `x_h1.cli.stream.exch` (streaming download, via `client_stream.dispatched` on the ALPN H1 answer) | TLS |
+| `x_h1.stream.spawn` (streaming upload, via the `httpxs_alpn_go` False arm) | TLS |
 | `h1_conn` (via `server.on_h1` / `server.once_h1`, via `httpxa_alpn_go`) | TLS |
+| `h1_once.conn` (via `fetch.plain` / `fetch_bytes.plain`, after `TCP.connect`) | TCP |
+| `x_h1.cli.stream.exch` (via `client.stream_plain`, after `plain.dial`) | TCP |
 | `h1_conn` (via `server.on_h1_plain`, after `TCP.accept`) | TCP |
+| `x_h1.stream.conn` (via `server.stream_plain`, after `TCP.accept`) | TCP |
 
 ## Why not two copies (like `ws.bend` / `wss.bend`)?
 
@@ -49,7 +53,33 @@ dropping `rest`) would have needed fixing twice.
   over a flag.
 - `h1_once.conn` is the shared post-dial runner: the dial differs
   (`h1_once.dial` vs `TCP.connect`), the grammar after it is one — so no
-  `x_h1.tcp_one` was added.
+  `x_h1.tcp_one` was added. `client.stream_plain` is the same split for
+  streaming download: `plain.dial`, then `x_h1.cli.stream.exch`.
+
+## The streaming lanes (task-036 phase 6)
+
+Upload (`x_h1.stream.*`, `~H: SrvEv -> SrvOut`) and download
+(`x_h1.cli.stream.*`, `~H: StreamEv -> StreamOut`) ride the same triple,
+so the TLS and plaintext instantiations share one grammar each:
+
+- Upload: `x_h1.stream.go` reads the head (16KB a turn, 64 turns, the
+  blank-line cut), frames like the one-shot server (GET/HEAD carry no
+  body), and delivers one `SrvReqData` per body piece through
+  `x_h1.stream.next` — the chunked step or the length-delimited cut
+  (`x_h1.stream.cl_next`), whichever the head declared. Slot is 1 (H1
+  has no stream ids). One request per connection, then close: no
+  keep-alive, no pipelining. `RespondEarly` renders and closes, `Cancel`
+  closes without responding, a malformed chunked body is 400.
+- Download: `x_h1.cli.stream.go` frames through `x_h1.frame_of` (read
+  back via the `x_h1.stream.frame_*` projections — Bend has no field
+  access) and counts `(total bytes, chunks)` without buffering.
+  `StreamCancel` closes and reports `Fail (8, "cancelled")` — there is
+  no RST_STREAM on this lane. A peer that closes mid-body is 400 `eof`,
+  the code the one-shot lane already answers.
+- Both lanes call `H` **once** per event (unlike the H2 upload loop,
+  which calls twice — see `docs/modes.md`) and decode to an act code
+  (`head_act` / `data_act`). The framing `out` pair is only read in
+  phase 6, so the dead hops carry a dummy — tuples are not `+`-bindable.
 
 ## The upgrade lane (task-028 Phases 2–3)
 
