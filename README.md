@@ -272,17 +272,29 @@ Architecture (the two delivery modes, why streaming handlers are pure):
 | `server.once(~H, l, cert, key)` / `server.once_h1(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants; `once_h1` is the `http/1.1` pair |
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
-| `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming: `SrvReqHead`/`SrvReqData` events to a pure `~H`, `Continue` buffers, `RespondEarly` answers without draining |
+| `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` closes without responding. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
 | `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
 | `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
 | `client.connect(_insecure)(host, port)` | Hands back `Socket & CliSt{sid, tab, is_h2}`. `client.request(sock, st, host, port, req)` is **one** exchange on it, both ALPN answers, and it **never closes**: the caller closes (`client.on`/`client.once` do) or calls again for the next request, threading the socket and the state — the returned `CliSt` carries the advanced sid and the HPACK table the next response decodes against. N requests are that loop at the call site |
 | `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
-| `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); `StreamCancel` sends `RST_STREAM` |
+| `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); dispatches H2/HTTP-1.1 by ALPN on the one socket. `StreamCancel` sends `RST_STREAM` on H2, closes with `Fail` 8 on H1. `client.stream_plain` is the plaintext `http://` peer |
 | `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
 | `request_bytes(_insecure)` | Same with raw-bytes body in and out |
-| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `httpx_url.read_url` (ported from `http.bend`, no import); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
+| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `read_url` (ported from `http.bend`, no import); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
 | `h1_once(_insecure)` | Single-shot over the H1 lane (no-ALPN dial, WSS-style) |
+
+Surface (TASK-036, kept different by decision): the `lib/core` + `lib/utils`
+toolkit (`str_bytes`, `len`, `take`, `valid_host`, `code_*`, …) stays in the
+tree — zero production callers, and HTTPX already owns the equivalents
+internally (`x_*`, `client.on.valid_*`). Only `read_url` is top-level here.
+
+Retired text lane (TASK-036 phase 7): the 4-String handler shape
+(`serve_once(sock, handler)`, `echo.body`/`echo.serve`, the 25 `h1_pair_*`
+names) is gone on purpose — its two live callers (`httpx_h1_fetch`,
+`httpx_h1_fetch_host`) now speak `Hdr` / `Request -> IO(Response)` over
+`server.on_h1_plain`. Its `501 "tls missing"` for https URLs retires with
+it (HTTPX answers `400` / dial failure).
 
 Limits (fail-closed, by design): responses are literal-only, DATA sliced
 to conn+stream windows (pump v2, no 16 KB cap); `WINDOW_UPDATE` credit
@@ -308,6 +320,26 @@ body read as a whole one. A hex size that does not fit the U32 counter is not
 guarded explicitly — the same as the reference machine — but it cannot become
 a silently wrong body: the measured vector answers `400`, because a wrapped
 size no longer matches the bytes that follow it.
+
+Streaming contract (TASK-036, kept different by decision): HTTPX speaks two
+families — download `StreamEv{StreamHead, StreamData}` /
+`StreamOut{StreamContinue, StreamCancel}` and upload `SrvEv{SrvReqHead,
+SrvReqData}` / `SrvOut{Continue, RespondEarly, Cancel}` — while `lib/core/type.bend`
+speaks one 3+3 family `CT.StreamEv{StreamReq, StreamHead, StreamData}` /
+`CT.StreamOut{Continue, RespondEarly, Cancel}` with `frame: Maybe<BodyFrame>`.
+They are **not interchangeable**: a `~H` written against one does not compile
+against the other.
+
+Streaming in HTTPX speaks both lanes (TASK-036 phase 6): `client.stream`
+and `server.stream_alpn` dispatch H2/HTTP-1.1 by ALPN on the negotiated
+socket (`server.stream` stays H2-only behind `tls_accept`, which requires
+h2 at the handshake; `client.concurrent` stays H2-only behind `h2_only`),
+and `client.stream_plain` / `server.stream_plain` are the plaintext
+`http://` peers. The H1 lanes are one request per connection, then close —
+no keep-alive, no pipelining — with backpressure by the read itself (at
+most one recv per chunk). `x_h1.frame_of` threads the framing decision
+through the download lane; the upload lane frames from the request head
+the same way the one-shot H1 server does.
 
 ```sh
 bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK roundtrip, ~2s)

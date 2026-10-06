@@ -1,11 +1,14 @@
-# lib (lib_httpx_h1_fetch_host): HTTP.fetch over loopback BY NAME. The
-# server answers the Host header it received; fetching
-# http://localhost:PORT/echo must read back "localhost" (and the
-# literal-IP fetch "127.0.0.1"), proving the invariant: DNS resolve
+# lib (lib_httpx_h1_fetch_host): HTTPX.fetch_insecure over loopback BY
+# NAME. The server answers the Host header it received; fetching
+# http://localhost:PORT/echo must read back "localhost:PORT" (and the
+# literal-IP fetch "127.0.0.1:PORT"), proving the invariant: DNS resolve
 # changes the connect IP only — virtual hosting keeps the original
-# host. Port 0 still dies in validation (400) before any dial.
+# host (the httpx Host line carries host:port). Port 0 still dies in
+# validation (400) before any dial.
+# Ported from the lib/http.bend text lane (task-036 phase 7).
 import Base
-import ../../lib/http.bend as HTTP
+import ../../lib/tcp.bend as TCP
+import ../../lib/httpx.bend as HTTPX
 
 law b2u:
   for b: Bool
@@ -41,13 +44,28 @@ def is_400(r):
     case Done{body}:
       0
 
+# Host header lookup over the contract header list (case-insensitive,
+# first hit wins, default when absent).
+law host_of:
+  for hs: List<&2, HTTPX.Hdr>
+  for dflt: String
+  String
+
+def host_of(hs, dflt):
+  match hs:
+    case Nil{}:
+      dflt
+    case HTTPX.Hdr{name, value} <> t:
+      Bool.pick(String, HTTPX.x_h1.eq_ci(name, "host"), value, host_of(t, dflt))
+
 law host_body:
-  for req: String & String & List<&1, (String & String)> & String
-  IO(U32 & List<&1, (String & String)> & String)
+  for req: HTTPX.Request
+  IO(HTTPX.Response)
 
 def host_body(req):
-  (m, p, hs, body) = req
-  IO.pure(U32 & List<&1, String & String> & String, (200, [], HTTP.get_header("", "Host", hs)))
+  match req:
+    case HTTPX.Request{method, path, headers, body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_utf8_encode(host_of(headers, ""))})
 
 law listen_retry:
   for port: U32
@@ -74,63 +92,8 @@ def listen_any(tries, port):
     case 1n+t:
       rest = listen_any(t, (port + 1 : U32))
       do IO<Listener & U32>:
-        r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(port)
+        r : Result<&1, &1, (U32 & String), Listener> <- TCP.listen(port)
         listen_retry(port, r, rest)
-
-law server_close:
-  for l: Listener
-  IO(String)
-
-def server_close(l):
-  do IO<String>:
-    x : Unit <- Listener.close(l)
-    return "down"
-
-law server_last:
-  for l: Listener
-  for sock: Socket
-  IO(String)
-
-def server_last(l, sock):
-  do IO<String>:
-    u : Unit <- HTTP.serve_once(sock, req => host_body(req))
-    x : Unit <- Listener.close(l)
-    return "down"
-
-law server_again:
-  for m: Listener & Result<&1, &1, (U32 & String), Socket>
-  IO(String)
-
-def server_again(m):
-  (l, r) = m
-  match r:
-    case Fail{e}:
-      server_close(l)
-    case Done{sock}:
-      server_last(l, sock)
-
-law server_talk:
-  for l: Listener
-  for sock: Socket
-  IO(String)
-
-def server_talk(l, sock):
-  do IO<String>:
-    u : Unit <- HTTP.serve_once(sock, req => host_body(req))
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    server_again(m)
-
-law server_conn:
-  for m: Listener & Result<&1, &1, (U32 & String), Socket>
-  IO(String)
-
-def server_conn(m):
-  (l, r) = m
-  match r:
-    case Fail{e}:
-      server_close(l)
-    case Done{sock}:
-      server_talk(l, sock)
 
 law server_side:
   for l: Listener
@@ -138,9 +101,12 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    server_conn(m)
+    x : Unit <- HTTPX.server.on_h1_plain(~host_body, l)
+    return "up"
 
+# The httpx Host line carries host:port (the renderer synthesises it),
+# so the want strings carry the port too — the invariant under test is
+# the HOST part (localhost stays localhost after resolve).
 law main_go:
   for b: Listener & U32
   IO(U32)
@@ -149,12 +115,12 @@ def main_go(b):
   (l, +port) = b
   do IO<U32>:
     chan : Chan(String) <- IO.fork(String, server_side(l))
-    r1 : Result<&1, &1, U32 & String, String> <- HTTP.fetch("http://localhost:" ++ U32.show(port) ++ "/echo")
-    r2 : Result<&1, &1, U32 & String, String> <- HTTP.fetch("http://127.0.0.1:" ++ U32.show(port) ++ "/echo")
-    r3 : Result<&1, &1, U32 & String, String> <- HTTP.fetch("http://localhost:0/")
-    s : String <- IO.join(String, chan)
-    +total : U32 = ((hit(r1, "localhost") * 100 + hit(r2, "127.0.0.1") * 10 : U32) + is_400(r3) : U32)
+    r1 : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure("http://localhost:" ++ U32.show(port) ++ "/echo")
+    r2 : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure("http://127.0.0.1:" ++ U32.show(port) ++ "/echo")
+    r3 : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure("http://localhost:0/")
+    +total : U32 = ((hit(r1, "localhost:" ++ U32.show(port)) * 100 + hit(r2, "127.0.0.1:" ++ U32.show(port)) * 10 : U32) + is_400(r3) : U32)
     w : Unit <- IO.print(U32.show(total))
+    z : Unit <- IO.die(Unit, 0, "")
     return total
 
 law main:

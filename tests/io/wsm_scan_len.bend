@@ -1,7 +1,7 @@
 # lib (wsm_scan_len): client_scan_len head-split golden (task-020 phase 0).
 # Guards the off-by-3 fix: scan_len must answer the head length including
 # the \r\n\r\n terminator, so take/drop split a coalesced 101 + frame
-# segment exactly. Golden is the sum of the five checks below.
+# segment exactly. Golden is the sum of the seven checks below.
 import Base
 import ../../lib/wsm.bend as WSM
 
@@ -96,10 +96,27 @@ def chk_mid():
   +len = WSM.client_scan_len(bs)
   (b2u(U32.is_eq(len, 5)) * eq_list(List.drop(&2, U32, bs, U32.to_nat(len)), [66]) : U32)
 
+# Not-found answers 0 like the retired lane (TASK-036 coverage for the
+# split_head-only regression: len(buf) without the found guard).
+law chk_notfound:
+  U32
+
+def chk_notfound():
+  (b2u(U32.is_eq(WSM.client_scan_len([72, 73, 13, 10]), 0))
+    * b2u(U32.is_eq(WSM.client_scan_len(Nil{}), 0)) : U32)
+
+# Fit twin answers the presence of the terminator (same split, no length).
+law chk_fit:
+  U32
+
+def chk_fit():
+  (b2u(WSM.client_scan_fit([72, 73, 13, 10, 13, 10]))
+    * b2u(Bool.not(WSM.client_scan_fit([72, 73, 13, 10]))) : U32)
+
 law main:
   U32
 
 def main():
-  (chk_short() + chk_long() + chk_take() + chk_drop() + chk_mid() : U32)
+  (chk_short() + chk_long() + chk_take() + chk_drop() + chk_mid() + chk_notfound() + chk_fit() : U32)
 
-#|5
+#|7

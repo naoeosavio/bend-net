@@ -1,7 +1,8 @@
-# lib (lib_httpx_read_url): pure vectors for httpx_url.read_url (Phase 9).
+# lib (lib_httpx_read_url): pure vectors for httpx_url.read_url (Phase 9)
+# plus the top-level read_url wrapper (task-036 phase 4).
 # No IO, no TLS: the URL layer ported from http.bend:653-840 must parse
 # exactly like the original (same splits, same defaults, same Fail 400
-# codes). Golden 1 iff all 10 vectors score (9th exercises trim).
+# codes). Golden 1 iff all 12 vectors score (9th exercises trim).
 import Base
 import ../../lib/httpx.bend as HTTPX
 
@@ -77,13 +78,19 @@ def v9() -> U32:
 def v10() -> U32:
   url_fail(HTTPX.httpx_url.read_url("https://example.com:0/"), 400)
 
+def v11() -> U32:
+  url_ok(HTTPX.read_url("https://example.com/a"), True{}, "example.com", 443, "/a")
+
+def v12() -> U32:
+  url_fail(HTTPX.read_url("ftp://example.com/"), 400)
+
 law main:
   IO(U32)
 
 def main():
   do IO<U32>:
-    +total : U32 = (v1() + v2() + v3() + v4() + v5() + v6() + v7() + v8() + v9() + v10() : U32)
-    +pass : U32 = b2u(U32.is_eq(total, 10))
+    +total : U32 = (v1() + v2() + v3() + v4() + v5() + v6() + v7() + v8() + v9() + v10() + v11() + v12() : U32)
+    +pass : U32 = b2u(U32.is_eq(total, 12))
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
     return pass
