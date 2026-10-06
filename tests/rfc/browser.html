@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RFC browser leg (manual)</title>
+<style>
+body { font-family: monospace; max-width: 70em; margin: 2em; }
+pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; }
+button { margin-right: 1em; }
+</style>
+</head>
+<body>
+<h1>RFC browser leg (manual — not gated)</h1>
+<p>
+A browser cannot open raw sockets or pick ALPN, so it is truth only for
+what it can speak: <code>fetch</code> semantics and WebSocket framing.
+Start the Bend servers first (see the ports below), open this file, and
+compare the log with the <code>OK</code>/<code>DONE</code> lines.
+</p>
+<ol>
+<li>H1: serve <code>tests/rfc/h1_oracle.js server 19881</code> or the Bend
+H1 plain server on 19881, then press Fetch.</li>
+<li>WS: serve <code>tests/rfc/ws_oracle.js server 19884</code> or the Bend
+WS plain server on 19884, then press WebSocket.</li>
+</ol>
+<p>
+<button id="fetchBtn">Run fetch leg</button>
+<button id="wsBtn">Run WebSocket leg</button>
+</p>
+<pre id="log">ready
+</pre>
+<script>
+const log = (line) => {
+  document.getElementById("log").textContent += line + "\n";
+};
+let score = 0;
+const check = (cond, name) => {
+  if (!cond) {
+    log(`FAIL ${name}`);
+    throw new Error(name);
+  }
+  score += 1;
+  log(`OK ${name}`);
+};
+
+document.getElementById("fetchBtn").addEventListener("click", async () => {
+  try {
+    let r = await fetch("http://127.0.0.1:19881/echo", {
+      method: "POST",
+      body: "hello",
+    });
+    check(r.status === 200 && (await r.text()) === "hello", "FETCH_ECHO");
+    r = await fetch("http://127.0.0.1:19881/chunk");
+    check(r.status === 200 && (await r.text()) === "Wikipedia", "FETCH_CHUNKED");
+    log(`DONE ${score}/2 fetch`);
+  } catch (err) {
+    log(`FAIL fetch leg: ${err.message}`);
+  }
+});
+
+document.getElementById("wsBtn").addEventListener("click", () => {
+  const start = score;
+  const sock = new WebSocket("ws://127.0.0.1:19884/chat", "chat");
+  // Browsers mask client frames and auto-pong, like ws_oracle client.
+  sock.binaryType = "arraybuffer";
+  sock.onopen = () => {
+    check(true, "WS_OPEN");
+    sock.send("hello");
+  };
+  sock.onmessage = (ev) => {
+    const data = typeof ev.data === "string"
+      ? ev.data
+      : new TextDecoder().decode(ev.data);
+    if (data === "hello") {
+      check(true, "WS_ECHO");
+      sock.send(new Uint8Array([1, 2, 3]));
+    } else {
+      const bytes = new Uint8Array(ev.data);
+      check(bytes.length === 3 && bytes[0] === 1, "WS_BIN_ECHO");
+      sock.close(1000, "done");
+    }
+  };
+  sock.onclose = (ev) => {
+    check(ev.code === 1000 || ev.code === 1005, "WS_CLOSE");
+    log(`DONE ${score - start}/4 ws`);
+  };
+  sock.onerror = () => log("FAIL ws leg: socket error");
+});
+</script>
+</body>
+</html>
