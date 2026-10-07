@@ -4312,10 +4312,19 @@ def x_h1.cli.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
 # lane at the public entries: TLS (tls_recv/send_bytes + tls_close) or
 # TCP (TCP.recv/send_bytes + Socket.close). The grammar is identical —
 # that is what let the x_h1p.* mirror die in Phase 1.
+#
+# The content-length body rides REVERSED (x_rev_push), like the chunked
+# lane below: per recv the work stays O(chunk) and the un-reverse happens
+# once with x_cat at the answer. Appending each part onto a growing body
+# (List.append(rest, part) + x_has_at_least) was O(n) per recv AND
+# linear-recursive, which overflowed the interp machine stack past ~48 KB
+# (same hazard x_rev_push's header documents for the H2 lane). `need` is
+# the count still missing, so the completion test is a match on a U32
+# param instead of a re-walk of the buffer.
 # ---------------------------------------------------------------------
 
 @unsafe
-def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, enough: Bool, +code: U32, +hs: List<&2, Hdr>, +rest: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, +need: U32, +code: U32, +hs: List<&2, Hdr>, +rev: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
@@ -4323,13 +4332,13 @@ def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
         case 0n:
           IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Fail{(413, "response too long")}))
         case 1n+f:
-          match enough:
-            case True{}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Done{Response{code, hs, x_take32(cl, rest)}}))
-            case False{}:
+          match need:
+            case 0:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s0, Done{Response{code, hs, x_take32(cl, x_cat(rev))}}))
+            case _:
               do IO<Socket & Result<&1, &1, U32 & String, Response>>:
                 r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
-                x_h1.cli.bd(~recv, ~send, ~close, 1, r, f, False{}, code, hs, rest, cl)
+                x_h1.cli.bd(~recv, ~send, ~close, 1, r, f, need, code, hs, rev, cl)
     case 1:
       (s1, r1) = got
       match r1:
@@ -4340,8 +4349,8 @@ def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
             case Nil{}:
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
-              +rest2 = List.append(&2, U32, rest, part)
-              x_h1.cli.bd(~recv, ~send, ~close, 0, (s1, Done{Nil{}}), fuel, x_has_at_least(cl, rest2), code, hs, rest2, cl)
+              +need2 = U32.sub(need, x_len_upto(need, part))
+              x_h1.cli.bd(~recv, ~send, ~close, 0, (s1, Done{Nil{}}), fuel, need2, code, hs, x_rev_push(part, rev), cl)
     case _:
       (s9, r9) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
@@ -4356,7 +4365,8 @@ def x_h1.cli.hd2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String
           x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, Nil{}, rest, code, hs, (sock, Done{Nil{}}))
         case False{}:
           +clc = x_h1.cl_of(hs)
-          x_h1.cli.bd(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), fuel, x_has_at_least(clc, rest), code, hs, rest, clc)
+          +need0 = U32.sub(clc, x_len_upto(clc, rest))
+          x_h1.cli.bd(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), fuel, need0, code, hs, x_cat(rest), clc)
 
 def x_h1.cli.hd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, Hdr>>, nbody: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match hsres:

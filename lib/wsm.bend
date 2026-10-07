@@ -867,7 +867,7 @@ def wsm_close_ev(+pay: List<&2, U32>) -> WSEv:
 # Control frames never reach this fold; the loops emit them at once.
 
 def wsm_frag_capped(+buf: List<&2, U32>) -> Bool:
-  U32.is_le(U32.from_nat(List.length(&2, U32, buf)), wsm_max_payload())
+  U32.is_le(HTTPX.x_len32(buf), wsm_max_payload())
 
 def wsm_frag_text.go(+buf: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, WSMessage>:
   match ok:
@@ -1020,22 +1020,30 @@ def wsm_unmask_byte(+b: U32, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32) -
     case _:
       U32.xor(b, k0)
 
-def wsm_unmask(bs: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32) -> List<&2, U32>:
+# XOR the payload with the 4-byte key, rotating the key by position. The
+# accumulator rides REVERSED (x_cat once at the end): the direct
+# cons-per-byte recursion was non-tail, so a payload past ~48 KB
+# overflowed the interp machine stack (the hazard x_rev_push's header
+# documents for the HTTP lanes).
+def wsm_unmask.go(bs: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
-      Nil{}
+      HTTPX.x_cat(acc)
     case b <> rest:
       match pos:
         case 0:
-          wsm_unmask_byte(b, k0, k1, k2, k3, 0) <> wsm_unmask(rest, k0, k1, k2, k3, 1)
+          wsm_unmask.go(rest, k0, k1, k2, k3, 1, wsm_unmask_byte(b, k0, k1, k2, k3, 0) <> acc)
         case 1:
-          wsm_unmask_byte(b, k0, k1, k2, k3, 1) <> wsm_unmask(rest, k0, k1, k2, k3, 2)
+          wsm_unmask.go(rest, k0, k1, k2, k3, 2, wsm_unmask_byte(b, k0, k1, k2, k3, 1) <> acc)
         case 2:
-          wsm_unmask_byte(b, k0, k1, k2, k3, 2) <> wsm_unmask(rest, k0, k1, k2, k3, 3)
+          wsm_unmask.go(rest, k0, k1, k2, k3, 3, wsm_unmask_byte(b, k0, k1, k2, k3, 2) <> acc)
         case 3:
-          wsm_unmask_byte(b, k0, k1, k2, k3, 3) <> wsm_unmask(rest, k0, k1, k2, k3, 0)
+          wsm_unmask.go(rest, k0, k1, k2, k3, 0, wsm_unmask_byte(b, k0, k1, k2, k3, 3) <> acc)
         case _:
-          wsm_unmask_byte(b, k0, k1, k2, k3, 0) <> wsm_unmask(rest, k0, k1, k2, k3, 1)
+          wsm_unmask.go(rest, k0, k1, k2, k3, 1, wsm_unmask_byte(b, k0, k1, k2, k3, 0) <> acc)
+
+def wsm_unmask(bs: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32) -> List<&2, U32>:
+  wsm_unmask.go(bs, k0, k1, k2, k3, pos, Nil{})
 
 def wsm_is_ctrl(op: U32) -> Bool:
   match op:
@@ -1093,9 +1101,8 @@ def wsm_payload_ok(rsv_ok: Bool, +op: U32, fin: Bool, +len: U32, len_ok: Bool, c
   Bool.and(rsv_ok, Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), Bool.and(len_ok, cap_ok))))
 
 def wsm_frame_payload(+fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, +k0: U32, +k1: U32, +k2: U32, +k3: U32, +rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
-  +taken = List.take(&2, U32, rest, U32.to_nat(len))
-  +dropped = List.drop(&2, U32, rest, U32.to_nat(len))
-  +len_ok = Bool.and(wsm_is_nil(dropped), Nat.is_eq(List.length(&2, U32, taken), U32.to_nat(len)))
+  +taken = HTTPX.x_take32(len, rest)
+  +len_ok = U32.is_eq(HTTPX.x_len32(rest), len)
   +cap_ok = U32.is_le(len, wsm_max_payload())
   +unmasked = wsm_unmask(taken, k0, k1, k2, k3, 0)
   +ok = wsm_payload_ok(rsv_ok, op, fin, len, len_ok, cap_ok)
@@ -1368,7 +1375,7 @@ def wsm_frame_hdr_go(hd: List<&2, U32>, have: U32) -> U32:
 def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> HTTPX.UnitOut:
   match eq:
     case True{}:
-      HTTPX.Got{List.take(&2, U32, bs, U32.to_nat(total)), False{}, List.drop(&2, U32, bs, U32.to_nat(total))}
+      HTTPX.Got{HTTPX.x_take32(total, bs), False{}, HTTPX.x_drop32(total, bs)}
     case False{}:
       HTTPX.NeedMore{missing, bs}
 
@@ -1430,7 +1437,7 @@ def wsm_show_go(ok: Bool, code: U32, fin: Bool, +op: U32, +payload: List<&2, U32
       Fail{(code, "bad show")}
 
 def wsm_show_frame(+fin: Bool, +op: U32, +payload: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  +len = U32.from_nat(List.length(&2, U32, payload))
+  +len = HTTPX.x_len32(payload)
   +ok = Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), U32.is_le(len, wsm_max_payload())))
   +code = Bool.pick(U32, Bool.not(U32.is_le(len, wsm_max_payload())), 413, 400)
   wsm_show_go(ok, code, fin, op, payload, len)
@@ -1458,13 +1465,13 @@ def wsm_show_masked_head.go(fin: Bool, +op: U32, +len: U32, +masked: List<&2, U3
 def wsm_show_masked.go(fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, ok: Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   match ok:
     case True{}:
-      +len = U32.from_nat(List.length(&2, U32, payload))
+      +len = HTTPX.x_len32(payload)
       Done{wsm_show_masked_head.go(fin, op, len, wsm_unmask(payload, k0, k1, k2, k3, 0), k0, k1, k2, k3, U32.is_le(len, 125), U32.is_le(len, 65535))}
     case False{}:
       Fail{(400, "bad masked")}
 
 def wsm_show_masked(+fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  +len = U32.from_nat(List.length(&2, U32, payload))
+  +len = HTTPX.x_len32(payload)
   wsm_show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), U32.is_le(len, wsm_max_payload()))))
 
 def wsm_mask_key.go(a: Result<&1, &1, U32 & String, U32>, b: Result<&1, &1, U32 & String, U32>) ->
@@ -1678,42 +1685,79 @@ def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
     case False{}:
       wsm_frame_split(buf)
 
+# Flatten the reversed chunk list (newest chunk first) into one buffer.
+# Each chunk is appended to the accumulator, so List.append copies only
+# the chunk: the loop is tail-recursive and the whole flatten is O(total).
+def wsm_cat_chunks(+cs: List<&2, List<&2, U32>>, acc: List<&2, U32>) -> List<&2, U32>:
+  match cs:
+    case Nil{}:
+      acc
+    case c <> t:
+      wsm_cat_chunks(t, List.append(&2, U32, c, acc))
+
+# Read until the frame is whole. The split answer says how many bytes are
+# missing (NeedMore{missing, rest}); instead of appending every recv onto
+# a growing buffer and re-splitting the whole thing (O(n) per recv, and
+# linear-recursive -- the interp machine stack overflowed past ~48 KB,
+# the same hazard x_rev_push's header documents), the later chunks ride
+# consed (O(1) per recv, they are lists) and the buffer is flattened and
+# split ONCE, when the missing bytes have arrived. `need` is the count
+# still missing, so the completion test is a match on a U32 param instead
+# of a re-walk of the buffer.
 @unsafe
-def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +buf: List<&2, U32>, +unmasked_ok: Bool, +sp: HTTPX.UnitOut) ->
+def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +chunks: List<&2, List<&2, U32>>, +need: U32, +unmasked_ok: Bool, +sp: HTTPX.UnitOut) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   match st:
     case 0:
-      (s2, r) = m
-      match r:
+      # Completion test on the missing-byte counter: zero flattens the
+      # pile and splits once; otherwise one more recv. It comes before
+      # the arm that consumes `need` -- the checker reads arms in order,
+      # and a match cannot scrutinize a consumed binder.
+      (s0, r0) = m
+      match need:
+        case 0:
+          +full = wsm_cat_chunks(chunks, Nil{})
+          wsm_fill(~recv, 2, (s0, Done{Nil{}}), Nil{}, 0, unmasked_ok, wsm_do_split(full, unmasked_ok))
+        case n:
+          do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>>:
+            m0 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 8192)
+            wsm_fill(~recv, 1, m0, chunks, n, unmasked_ok, sp)
+    case 1:
+      # Recv result: cons the chunk onto the pile (O(1), it is a list)
+      # and hand the new missing count back to phase 0.
+      (s2, r2) = m
+      match r2:
         case Fail{e}:
           wsm_split_fail(s2, 400, "recv")
-        case Done{bs}:
+        case Done{+bs}:
           match bs:
             case Nil{}:
               wsm_split_fail(s2, 400, "eof")
             case _ <> _:
-              +buf2 = List.append(&2, U32, buf, bs)
-              wsm_fill(~recv, 1, (s2, Done{Nil{}}), buf2, unmasked_ok, wsm_do_split(buf2, unmasked_ok))
-    case 1:
-      (s2, r2) = m
+              wsm_fill(~recv, 0, (s2, Done{Nil{}}), bs <> chunks, U32.sub(need, HTTPX.x_len_upto(need, bs)), unmasked_ok, sp)
+    case 2:
+      # Split answer: a whole frame answers now; NeedMore starts the
+      # accumulate loop with the buffer that was split as the oldest
+      # chunk (both NeedMore arms carry the whole buffer).
+      (s3, r3) = m
       match sp:
         case HTTPX.NeedMore{missing, rest}:
           do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>>:
-            m2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s2, 8192)
-            wsm_fill(~recv, 0, m2, buf, unmasked_ok, sp)
+            m3 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s3, 8192)
+            wsm_fill(~recv, 1, m3, rest <> Nil{}, missing, unmasked_ok, sp)
         case HTTPX.Got{unit, fin, rest}:
-          wsm_split_got(s2, unit, rest)
+          wsm_split_got(s3, unit, rest)
         case HTTPX.End{rest}:
-          wsm_split_fail(s2, 400, "impossible")
+          wsm_split_fail(s3, 400, "impossible")
         case HTTPX.Bad{code, msg}:
-          wsm_split_fail(s2, code, msg)
+          wsm_split_fail(s3, code, msg)
     case _:
-      (s2, r2) = m
-      wsm_split_fail(s2, 400, "bad state")
+      (s4, r4) = m
+      wsm_split_fail(s4, 400, "bad state")
 
 def wsm_split_more(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), s: Socket, +buf: List<&2, U32>, +unmasked_ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
-  wsm_fill(~recv, 1, (s, Done{Nil{}}), buf, unmasked_ok, wsm_do_split(buf, unmasked_ok))
+  wsm_fill(~recv, 2, (s, Done{Nil{}}), Nil{}, 0, unmasked_ok, wsm_do_split(buf, unmasked_ok))
 
 # One framed frame into the wire triple (fin & op & payload) plus the
 # rest past it.
