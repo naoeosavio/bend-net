@@ -5,6 +5,8 @@
 #
 # Policy: reject .., absolute paths, empty, CRLF and NUL.
 # Content-Type is minimal; missing files are Fail{404}.
+# Reads are capped AND fail closed: a file that does not fit the cap is
+# Fail{413}, never a truncated body served as a whole one.
 #
 # Discipline (user-land Bend has no Base carve-out):
 # - every callee is defined ABOVE its caller; only self-recursion.
@@ -86,40 +88,95 @@ def ctype_json(is_json: Bool, is_txt: Bool, is_js: Bool, is_css: Bool, is_html: 
 def content_type(+p: String) -> String:
   ctype_json(String.contains(p, ".json"), String.contains(p, ".txt"), String.contains(p, ".js"), String.contains(p, ".css"), Bool.or(String.contains(p, ".html"), String.contains(p, ".htm")))
 
-# File IO: open, read, close on every path (mold HTTP.fetch).
+# File IO: open, size, read, close on every path (mold HTTP.fetch).
+# Caps are named, and every read is fail closed.
 
-def read_opened(read: File & Result<&1, &1, U32 & String, String>) -> IO(Result<&1, &1, U32 & String, String>) :
+# Text read cap for safe_read: the historical 8 KB.
+def TEXT_CAP() -> U32:
+  8192
+
+# Bytes of the file at root ++ path, at most cap. 400 when is_safe
+# refuses the path, 404 when it is missing or unreadable, 413 when it
+# does not fit cap. The handle is closed on every one of those paths.
+def read_bytes.got(read: File & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   (f, r) = read
   match r:
     case Fail{e}:
-      do IO<Result<&1, &1, U32 & String, String>>:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
         x : Unit <- File.close(f)
         return Fail{(404, "not found")}
-    case Done{body}:
-      do IO<Result<&1, &1, U32 & String, String>>:
+    case Done{bs}:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
         x : Unit <- File.close(f)
-        return Done{body}
+        return Done{bs}
 
-def read_opened2(opened: Result<&1, &1, U32 & String, File>, +full: String) -> IO(Result<&1, &1, U32 & String, String>):
+# The cap decision as its own def, so the match inspects a parameter and
+# never a computed value.
+def read_bytes.fit(f: File, n: U32, is_over: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  match is_over:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        x : Unit <- File.close(f)
+        return Fail{(413, "file too large")}
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        read : File & Result<&1, &1, U32 & String, List<&2, U32>> <-
+          File.read_bytes(f, n)
+        read_bytes.got(read)
+
+def read_bytes.sized(sized: File & Result<&1, &1, U32 & String, U32>, +cap: U32) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  (f, r) = sized
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        x : Unit <- File.close(f)
+        return Fail{(404, "not found")}
+    case Done{+n}:
+      read_bytes.fit(f, n, U32.is_gt(n, cap))
+
+def read_bytes.open(opened: Result<&1, &1, U32 & String, File>, cap: U32) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   match opened:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(404, "not found")})
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>,
+        Fail{(404, "not found")})
     case Done{f}:
-      do IO<Result<&1, &1, U32 & String, String>>:
-        read : File & Result<&1, &1, U32 & String, String> <- File.read(f, 8192)
-        read_opened(read)
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        sized : File & Result<&1, &1, U32 & String, U32> <- File.size(f)
+        read_bytes.sized(sized, cap)
 
-def read_file(+root: String, +path: String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    opened : Result<&1, &1, U32 & String, File> <- File.open(root ++ path, "r")
-    read_opened2(opened, root ++ path)
-
-def safe_read.go(+root: String, +path: String, ok: Bool) -> IO(Result<&1, &1, U32 & String, String>):
+def read_bytes.go(+root: String, +path: String, cap: U32, ok: Bool) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
   match ok:
     case True{}:
-      read_file(root, path)
+      do IO<Result<&1, &1, U32 & String, List<&2, U32>>>:
+        opened : Result<&1, &1, U32 & String, File> <-
+          File.open(root ++ path, "r")
+        read_bytes.open(opened, cap)
     case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad path")})
+      IO.pure(Result<&1, &1, U32 & String, List<&2, U32>>,
+        Fail{(400, "bad path")})
 
-def safe_read(+root: String, +path: String) -> IO(Result<&1, &1, U32 & String, String>):
-  safe_read.go(root, path, is_safe(path))
+def read_bytes(+root: String, +path: String, cap: U32) ->
+  IO(Result<&1, &1, U32 & String, List<&2, U32>>):
+  read_bytes.go(root, path, cap, is_safe(path))
+
+# safe_read: the same read as text, capped at TEXT_CAP. A file past the
+# cap is 413, not a truncated String.
+def safe_read.decoded(read: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match read:
+    case Fail{(code, msg)}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(code, msg)})
+    case Done{+bs}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Done{HTTP.decode(bs)})
+
+def safe_read(+root: String, +path: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  do IO<Result<&1, &1, U32 & String, String>>:
+    read : Result<&1, &1, U32 & String, List<&2, U32>> <-
+      read_bytes(root, path, TEXT_CAP())
+    safe_read.decoded(read)
