@@ -1372,10 +1372,37 @@ def wsm_frame_hdr_go(hd: List<&2, U32>, have: U32) -> U32:
         case b1 <> _:
           wsm_frame_hdr.put(have, (2 + wsm_frame_hdr.ext(b1) : U32))
 
+# One walk answers both halves (TASK-040 derivation, from test.bend's
+# "the pair costs nothing, the rebuild costs everything"): the frame was
+# peeled by x_take32 into a reversed accumulator and the tail was found by
+# x_drop32, a second walk over the same cells — three walks plus x_cat's
+# reverse for one complete frame. Here the peel builds the reversed frame
+# and hands the untouched tail back with it, and the pair rides into its
+# consumer as a PARAMETER (a computed pair cannot be scrutinized, E1; a
+# parameter can, E2), so x_cat is the only remaining pass.
+def wsm_frame_take.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&2, U32> & List<&2, U32>:
+  match bs:
+    case Nil{}:
+      (acc, Nil{})
+    case h <> t:
+      match n:
+        case 0n:
+          (acc, h <> t)
+        case 1n+p:
+          wsm_frame_take.go(t, p, h <> acc)
+
+def wsm_frame_take(+bs: List<&2, U32>, +total: U32) -> List<&2, U32> & List<&2, U32>:
+  wsm_frame_take.go(bs, U32.to_nat(total), Nil{})
+
+def wsm_frame_take.got(p: List<&2, U32> & List<&2, U32>) -> HTTPX.UnitOut:
+  match p:
+    case (acc, rest):
+      HTTPX.Got{HTTPX.x_cat(acc), False{}, rest}
+
 def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> HTTPX.UnitOut:
   match eq:
     case True{}:
-      HTTPX.Got{HTTPX.x_take32(total, bs), False{}, HTTPX.x_drop32(total, bs)}
+      wsm_frame_take.got(wsm_frame_take(bs, total))
     case False{}:
       HTTPX.NeedMore{missing, bs}
 

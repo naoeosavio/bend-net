@@ -3717,6 +3717,27 @@ def x_h1.split_found(p: List<&2, U32> & List<&2, U32> & Bool) -> Bool:
     case (h, r, f):
       f
 
+# Boundary probe without the rebuild (TASK-040, from test.bend's finding
+# that the pair costs nothing and the rebuild costs everything): the head
+# loops only ask whether the blank line arrived, and x_h1.split answers
+# that at the price of building the reversed head on the way. Same walk
+# and same window as split.go, so x_h1.split.test(bs) equals
+# x_h1.split_found(x_h1.split(bs)) on every input.
+def x_h1.split.test.go(+bs: List<&2, U32>, found: Bool, +w: U32) -> Bool:
+  match bs:
+    case Nil{}:
+      found
+    case +b <> t:
+      match found:
+        case True{}:
+          True{}
+        case False{}:
+          +w2 = (w * 256 + b : U32)
+          x_h1.split.test.go(t, U32.is_eq(w2, 218762506), w2)
+
+def x_h1.split.test(bs: List<&2, U32>) -> Bool:
+  x_h1.split.test.go(bs, False{}, 0)
+
 def x_h1.head_lines(+head: List<&2, U32>) -> List<&2, String>:
   String.lines(x_bytes_str(head))
 
@@ -4382,10 +4403,18 @@ def x_h1.cli.coded(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
     case Done{+code}:
       x_h1.cli.hd(~recv, ~send, ~close, sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
 
+# got B (TASK-040): the split triple arrives as a parameter — a computed
+# triple cannot be scrutinized (E1), a parameter can (E2) — so head-lines
+# and rest come out of ONE x_h1.split traversal. Was split_head(split(acc2))
+# plus split_rest(split(acc2)): two walks and two reverses per head.
+def x_h1.cli.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), p: List<&2, U32> & List<&2, U32> & Bool, s1: Socket, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
 def x_h1.cli.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
-  +rest = x_h1.split_rest(x_h1.split(acc2))
-  x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+  x_h1.cli.parsed.got(~recv, ~send, ~close, x_h1.split(acc2), s1, fuel, method)
 
 @unsafe
 def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
@@ -4410,7 +4439,7 @@ def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2))
     case 2:
       (s2, r2) = got
       match found:
@@ -4510,10 +4539,16 @@ def x_h1.cli.coded_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
     case Done{+code}:
       x_h1.cli.hd_open(~recv, ~send, ~close, sock, rest, fuel, code, hsres, x_h1.no_body(method, code))
 
+# got B (TASK-040), open variant: one x_h1.split traversal for head-lines
+# and rest (see x_h1.cli.parsed.got).
+def x_h1.cli.parsed_open.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), p: List<&2, U32> & List<&2, U32> & Bool, s1: Socket, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.cli.coded_open(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
 def x_h1.cli.parsed_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc2)))
-  +rest = x_h1.split_rest(x_h1.split(acc2))
-  x_h1.cli.coded_open(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+  x_h1.cli.parsed_open.got(~recv, ~send, ~close, x_h1.split(acc2), s1, fuel, method)
 
 @unsafe
 def x_h1.cli.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>):
@@ -4538,7 +4573,7 @@ def x_h1.cli.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
               IO.pure(Socket & Result<&1, &1, U32 & String, Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.cli.head_open(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.cli.head_open(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2))
     case 2:
       (s2, r2) = got
       match found:
@@ -4848,7 +4883,8 @@ def x_h1.cli.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
             case Nil{}:
               x_h1.cli.stream.close(~close, s1, Fail{(400, "eof")})
             case h <> t:
-              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), List.append(&2, U32, acc, part), fuel, x_h1.split_found(x_h1.split(List.append(&2, U32, acc, part))), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+              +acc2 = List.append(&2, U32, acc, part)
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
     case 2:
       match found:
         case True{}:
@@ -6680,12 +6716,19 @@ def x_h1.stream.no_ans() -> U32 & Response:
 def x_h1.stream.no_head() -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
   (Fail{(400, "bad request")}, Nil{})
 
+# got B (TASK-040): one x_h1.split traversal for head-lines and rest,
+# where the pair rides in as a parameter (E1 rejects a computed variant).
+def x_h1.stream.parsed.got(p: List<&2, U32> & List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      (x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))), rest)
+
 # The request head, parsed. The bytes that arrived with the head seed
 # the pending buffer — a request that arrives whole in one packet must
 # not lose its body.
 def x_h1.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  (x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))), x_h1.split_rest(x_h1.split(acc)))
+  x_h1.stream.parsed.got(x_h1.split(acc))
 
 # The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
 # the blank-line cut); 3 parses, frames (GET/HEAD carry no body, like
@@ -6715,7 +6758,8 @@ def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
             case Nil{}:
               x_h1.stream.closed(~close, got)
             case h <> t:
-              x_h1.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), List.append(&2, U32, acc, part), fuel, x_h1.split_found(x_h1.split(List.append(&2, U32, acc, part))), nbody, chunked, cl, pending, seen, cst, ans, out, head)
+              +acc2 = List.append(&2, U32, acc, part)
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2), nbody, chunked, cl, pending, seen, cst, ans, out, head)
     case 2:
       match found:
         case True{}:
@@ -7393,11 +7437,17 @@ def x_h1.srv.ruled(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
         case ReqHead{+m, +p, +hs}:
           x_h1.srv.go(~recv, ~send, ~close, ~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
+# got B (TASK-040): one x_h1.split traversal for head-lines and rest.
+def x_h1.srv.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, p: List<&2, U32> & List<&2, U32> & Bool, fuel: Nat) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.srv.ruled(~recv, ~send, ~close, ~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+
 def x_h1.srv.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  +rest = x_h1.split_rest(x_h1.split(acc))
-  x_h1.srv.ruled(~recv, ~send, ~close, ~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+  x_h1.srv.parsed.got(~recv, ~send, ~close, ~H, got, x_h1.split(acc), fuel)
 
 @unsafe
 def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
@@ -7422,7 +7472,7 @@ def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
               close(s1)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.srv.head(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2))
     case 2:
       match found:
         case False{}:
@@ -7653,10 +7703,16 @@ def x_h1.srv.ruled_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
         case ReqHead{+m, +p, +hs}:
           x_h1.srv.go_open(~recv, ~send, ~close, ~H, ~K, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
 
+# got B (TASK-040), open variant: one x_h1.split traversal for head-lines
+# and rest (see x_h1.srv.parsed.got).
+def x_h1.srv.parsed_open.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, p: List<&2, U32> & List<&2, U32> & Bool, fuel: Nat) -> IO(Unit):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.srv.ruled_open(~recv, ~send, ~close, ~H, ~K, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+
 def x_h1.srv.parsed_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  +rest = x_h1.split_rest(x_h1.split(acc))
-  x_h1.srv.ruled_open(~recv, ~send, ~close, ~H, ~K, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+  x_h1.srv.parsed_open.got(~recv, ~send, ~close, ~H, ~K, got, x_h1.split(acc), fuel)
 
 @unsafe
 def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
@@ -7681,7 +7737,7 @@ def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
               close(s1)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split_found(x_h1.split(acc2)))
+              x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2))
     case 2:
       (s2, r2) = got
       match found:
