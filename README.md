@@ -41,7 +41,8 @@ tests/io/httpx_h1_*.bend    # the legacy lib/http.bend lane: pure, fetch, sec
 tests/io/httpx_*_https.bend # fetch, streams, mux, H1 fallback — all on httpx
 tests/io/wsm_*.bend         # WSM: the one WebSocket — crypto, codec, both lanes
 tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
-examples/                 # runnable interop programs (not published)
+examples/{wsm,wss,httpx,real}/  # runnable interop programs, by lane (not published)
+docs/site/                # this library's own site (httpx_site serves it)
 tasks/                    # engineering log (decisions, discoveries, checklists)
 ```
 
@@ -179,7 +180,7 @@ updates. Integer continuations past 5 bytes fail closed with `502`
 without huffman — valid HPACK every peer decodes, so Bend→Node needs
 no huffman encoder. Header blocks split across CONTINUATION and
 frames over 16384 still fail closed (`400`/`413`, backlog).
-`examples/httpx_real.bend` is a manual smoke against live hosts
+`examples/real/httpx_real.bend` is a manual smoke against live hosts
 (observed 2026-09-28: example.com GET/POST OK, cloudflare.com
 `fetch` OK on ~1.3 MB, info.cern.ch OK via H1);
 it is never part of the gate. Multi-stream keep-alive clients against
@@ -251,7 +252,7 @@ bend tests/io/httpx_mux.bend           # 1
 bend tests/io/httpx_http1_module.bend  # 1
 bend tests/io/tls_alpn_dual.bend      # 1
 bend tests/io/h2_frame_read.bend      # 8
-bend examples/httpx_real.bend         # manual live smoke
+bend examples/real/httpx_real.bend    # manual live smoke
 ```
 
 ## HTTPX (isolation)
@@ -367,6 +368,7 @@ bend tests/io/httpx_client_cont_conc.bend # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend  # 1 (fragmented HEADERS+CONT vs httpx loop)
 bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx_stream)
 bend tests/io/httpx_request.bend     # 2 (String + bytes bodies vs mini server)
+bend tests/io/httpx_site.bend         # 5 (docs/site/: 3 routes + 2 handler vectors)
 ```
 
 ## WebSocket (WSM)
@@ -471,7 +473,7 @@ bend tests/io/wsm_close.bend          # 10
 bend tests/io/wsm_fragments.bend      # 9
 bend tests/io/wsm_handshake_sub.bend  # 12
 
-bend examples/wsm_binance_bookticker.bend | head   # live public peer
+bend examples/wss/wsm_binance_bookticker.bend | head   # live public peer
 ```
 
 ## Helpers
@@ -480,50 +482,56 @@ bend examples/wsm_binance_bookticker.bend | head   # live public peer
 |---|---|---|
 | `lib/sha1.bend` (`SHA1`) | `sha1(bytes)` | FIPS 180-4 digest of a byte list |
 | `lib/b64.bend` (`B64`) | `encode(bytes)` / `decode(string)` | base64 over byte lists |
-| `lib/static.bend` (`Static`) | `safe_read(root, path)` | Read a file under `root`, refusing `..`, absolute paths, CRLF and NUL |
+| `lib/static.bend` (`Static`) | `read_bytes(root, path, cap)` | Read a file under `root` as raw `List<&2, U32>`; `400` bad path, `404` missing, `413` when it does not fit `cap` — never a truncated body |
+| | `safe_read(root, path)` | The same read as `String`, capped at `TEXT_CAP` (8 KB) with the same codes |
 | | `content_type(path)` | Content-Type from the file extension |
 
 ## Examples
 
-`examples/` holds runnable programs that are not part of the package:
-`http_real.bend` fetches live pages through `lib/http.bend`;
-`https_real.bend` is the HTTPS smoke (manual; example.com OK,
+`examples/` holds runnable programs that are not part of the package,
+grouped by lane: `wsm/` (the `ws://` session, five server/client pairs —
+Bend and Node, hand-driven and event-driven), `wss/` (`wss://` peers plus
+the saturate driver and the live probe), `httpx/` (`lib/httpx.bend` peers:
+mini-H2, ALPN split, the H1 lanes and the site launcher) and `real/` (live
+public hosts, by name). `examples/README.md` indexes every pair with its
+port and command; the gate only typechecks them (`check.sh --checks`).
+
+`real/https_real.js` is the HTTPS smoke (manual; example.com OK,
 cloudflare.com plain `fetch` on ~1.3 MB, info.cern.ch via H1 —
-may still `Fail` closed on other peers: HPACK subset / CONTINUATION); `server.bend` / `cliente.bend` are the
-hand-driven WS session;
-`server_on.bend` / `cliente_on.bend` are the same session over the
-`server_on` / `client_on` event API; the `.js` files are `ws` npm peers
-used for the interop matrix (WSS/HTTPS peers live alongside them).
-`saturate_https_wss.bend` is the manual load driver (20 parallel
+may still `Fail` closed on other peers: HPACK subset / CONTINUATION);
+`wss/wsm_saturate.bend` is the manual load driver (20 parallel
 clients per lane over ephemeral ports; prints `SAT`/`BENCH` lines) —
 never runs in the gate.
-`wss_binance_bookticker.bend` is the live public-peer probe: it dials
+`wss/wsm_binance_bookticker.bend` is the live public-peer probe: it dials
 `wss://stream.binance.com:9443/ws` with `client_on` (real TLS, cert
 verified), sends one `SUBSCRIBE` frame for `bnbusdt@bookTicker` and
 prints a `BOOK` line per update (symbol, best bid/ask price and size)
 until the 15 s sleep in `main` halts the run — pipe it through `head`.
 
 HTTPX interop (`lib/httpx.bend`, manual only — never in the gate):
-`httpx_echoserv.bend` serves the mini-H2 echo on an ephemeral port
+`httpx/httpx_echoserv.bend` serves the mini-H2 echo on an ephemeral port
 (printed to stdout; binary builds in <45s);
-`httpx_server_stream.bend` serves the streaming-upload cap-3 handler on
-an ephemeral port; `httpx_client_once.bend` dials a node echo server
-(`mux_node_echoserv.js 19893 1`) with `client.once_insecure` and checks
-status 200 + echo; `mux_node_client.js [port] [n]` fires N concurrent
-POSTs on one `node:http2` session (`DONE n/2N+2`);
-`mux_node_echoserv.js [port] [n]` is the H2-only echo for Bend clients;
-`mux_node_bigserv.js [port] [n]` answers 100 KB for streaming-download
-clients. Measured 2026-09-27: N=20 `DONE 42/42` under node and bun
-against the C binary server; `httpx_client_once_bulk.bend` GETs the live
-Binance `exchangeInfo` feed (~5.8 MB JSON) via `client.once` and
-prints status + length + head — measured 2026-09-28: `STATUS 200
-LEN 5851449 DONE 3/3` (build the C binary first, interp is too slow
-for multi-MB bodies).
-`httpx_fetch_bulk.bend` GETs the live
-Binance `exchangeInfo` feed (~5.8 MB JSON) via `fetch_bytes` and
-prints length + head — measured 2026-09-28: `LEN 5851449 DONE 2/2`
-(build the C binary first, interp is too slow
-for multi-MB bodies).
+`httpx/httpx_server_stream.bend` serves the streaming-upload cap-3 handler
+on an ephemeral port; `httpx/httpx_client_once.bend` dials a node echo
+server (`httpx/mux_node_echoserv.js 19893 1`) with `client.once_insecure`
+and checks status 200 + echo; `httpx/mux_node_client.js [port] [n]` fires N
+concurrent POSTs on one `node:http2` session (`DONE n/2N+2`);
+`httpx/mux_node_echoserv.js [port] [n]` is the H2-only echo for Bend
+clients; `httpx/mux_node_bigserv.js [port] [n]` answers 100 KB for
+streaming-download clients. Measured 2026-09-27: N=20 `DONE 42/42` under
+node and bun against the C binary server;
+`real/httpx_client_once_bulk.bend` GETs the live Binance `exchangeInfo`
+feed (~5.8 MB JSON) via `client.once` and prints status + length + head —
+measured 2026-09-28: `STATUS 200 LEN 5851449 DONE 3/3` (build the C binary
+first, interp is too slow for multi-MB bodies).
+`real/httpx_fetch_bulk.bend` GETs the same feed via `fetch_bytes` and
+prints length + head — measured 2026-09-28: `LEN 5851449 DONE 2/2`.
+
+`httpx/httpx_site.bend` is the library's own site: it serves `docs/site/`
+on `http://127.0.0.1:8080/` (plain H1 keep-alive) and on
+`https://127.0.0.1:8443/` (ALPN split, h2 + http/1.1, test PEMs), reading
+the files per request with `Static.read_bytes` — the runnable counterpart
+of `tests/io/httpx_site.bend`.
 
 Every WS peer runs the same scripted 6-step session on `127.0.0.1:19880`
 (`/chat`): `101 -> ping s1/pong -> ping c1/pong -> hello/echo ->
@@ -532,19 +540,20 @@ each side prints one `OK` line per step and `DONE 6/6`
 (pass = `DONE` present with no `FAIL`).
 
 ```sh
-bend examples/server.bend        # then: bend examples/cliente.bend
-bend examples/server_on.bend     # then: bend examples/cliente_on.bend
+bend examples/wsm/server.bend     # then: bend examples/wsm/cliente.bend
+bend examples/wsm/server_on.bend  # then: bend examples/wsm/cliente_on.bend
 # ws peers need `ws` resolvable under node (bun uses its builtin):
-NODE_PATH=/tmp/wsport/node_modules node examples/server.js 19880
-NODE_PATH=/tmp/wsport/node_modules node examples/client.js 19880
-bun examples/server.js 19880      # all four ws peers also run under bun
-node examples/server_native.js 19880   # no dependencies (also runs under bun)
-node examples/client_native.js 19880   # no dependencies (also runs under bun)
+NODE_PATH=/tmp/wsport/node_modules node examples/wsm/server.js 19880
+NODE_PATH=/tmp/wsport/node_modules node examples/wsm/client.js 19880
+bun examples/wsm/server.js 19880       # all four ws peers run under bun
+node examples/wsm/server_native.js 19880   # no dependencies (also bun)
+node examples/wsm/client_native.js 19880   # no dependencies (also bun)
 ```
 
-Any server talks to any client (`server.bend <-> client.js`,
-`cliente.bend <-> server.js`, `server_on.bend <-> client_native.js`,
-`cliente_on.bend <-> server_native.js`, ...). `check.sh --checks`
+Any server talks to any client (`wsm/server.bend <-> wsm/client.js`,
+`wsm/cliente.bend <-> wsm/server.js`, `wsm/server_on.bend <->
+wsm/client_native.js`, `wsm/cliente_on.bend <-> wsm/server_native.js`,
+...). `check.sh --checks`
 typechecks the `.bend` files and syntax-checks the `.js` files;
 `http_real.bend` is a manual smoke test of live sites BY NAME (it
 needs a working resolver) and never runs in the gate.
@@ -718,7 +727,7 @@ four arguments.
 - HTTPS/WSS validation (done 2026-09-22, see `tasks/task-018-validate-https-wss.md`):
   interop WSS 4/4 + Bend→Node HTTPS PASS (Node→Bend FAIL documented:
   HPACK huffman), saturation 20/20 per lane
-  (`examples/wsm_saturate.bend`), bench 40 exchanges in ~15.2s
+  (`examples/wss/wsm_saturate.bend`), bench 40 exchanges in ~15.2s
   interp / ~2.3s C (~2.6 vs ~17.8 ex/s).
 - HPACK full (done 2026-09-22, see `tasks/task-019-hpack-huffman-dyntab.md`):
   huffman decode + dynamic table + table-size updates; interop HTTPS

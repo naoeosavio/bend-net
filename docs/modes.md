@@ -81,6 +81,15 @@ without re-delivering head.
 - Need IO while deciding (DB, upstream, files)? **on/once** (`server.concurrent`, `client.once`, …).
 - Need incremental delivery (early response, O(1) chunks, no buffering)? **stream** (`server.stream[_alpn]` / `server.stream_plain`, `client.stream[_insecure]` / `client.stream_plain`), handler stays pure.
 
+Live example of both disciplines, `examples/httpx/httpx_site.bend` (manual)
+and `tests/io/httpx_site.bend` (gated): the site in `docs/site/` is served
+by the whole-response handler, which reads each file per request with
+`Static.read_bytes`. The streaming twin in the same test answers the same
+routes from **literal** pages, and that is not a shortcut — a streaming
+handler is pure, and `~H` is a *closed template* (`server.stream_plain(~mk(body), l)`
+is rejected: "body is a variable here, not comptime"), so it can neither
+read a file nor capture bytes read before the loop. See task-040 D1.
+
 If a streaming handler ever needs IO, the redesign is single-call
 (one `H` call returning an `(act, resp)` pair) plus `do`-blocks in the
 phases — feasible, but checker-risky with no use case today.
