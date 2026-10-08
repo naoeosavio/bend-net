@@ -369,7 +369,30 @@ bend tests/io/httpx_concurrent_cont.bend  # 1 (fragmented HEADERS+CONT vs httpx 
 bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx_stream)
 bend tests/io/httpx_request.bend     # 2 (String + bytes bodies vs mini server)
 bend tests/io/httpx_site.bend         # 5 (docs/site/: 3 routes + 2 handler vectors)
+bend tests/io/httpx_got_contra.bend   # 52 (got contra-proof: split arms, projections, taken)
 ```
+
+### `got`: one match, every projection
+
+A *projection* def is a thin `get`: it matches its parameter once and answers
+one field (`x_resp.rh`, `x_resp.ok`, `x_resp.tab`). A `got` answers every
+field of that one match instead. Form A, `E -> P1 & P2 & ...`, is live in
+`x_req.got` (head + ok + table), `x_tab.lookup.got` (bounds check fused with
+the fetch) and `x_h1.frame_of` (`cl_of` + `is_chunked` + `no_body` in one
+pass). Form B, `E -> E & P`, hands the structure back together with the
+projection for a caller that needs both.
+
+Validity window, measured in this tree (probes in `.scratch/gotprobe/`):
+a **computed** pair cannot be scrutinized — `(a, b) = src()` is refused with
+"a match cannot scrutinize a computed value" — while the same pair arriving
+**as a parameter** destructures normally. So the only door into a `got`
+answer is a consumer that takes it as its own parameter. `+` (dup) covers
+`Data` records and Base's `List`/`String`; a bare pair `A & B` is neither, so
+a pair that must outlive two uses is wrapped in a `Data` record (`Taken`,
+`FendTaken`) or re-derived. When a `got` would pay, measure matches and
+traversals saved against the `get` plus `+` it replaces — `test.bend` has the
+shapes: a pair costs nothing next to a rebuild, and a U32 counter beats a
+`Nat` one while a list walk dominates.
 
 ## WebSocket (WSM)
 
@@ -637,6 +660,7 @@ bend tests/io/wsm_unmasked.bend        # 4
 bend tests/io/wsm_loopback_plain.bend  # 111
 bend tests/io/wsm_msg.bend             # 1111
 bend tests/io/wsm_framing.bend         # 13
+bend tests/io/wsm_got_contra.bend      # 25 (got contra-proof: one-walk peel vs take/drop)
 bend tests/io/wsm_framed.bend          # 4
 bend tests/io/h2_flow.bend            # 11
 bend tests/io/h2_rst.bend             # 13
@@ -653,6 +677,7 @@ bend tests/io/wsm_loopback.bend         # 3   (plain + TLS session + one-shot TL
 bend tests/io/wsm_upgrade_rest.bend     # 3   (101 + first frame in one write)
 bend tests/io/wsm_surface.bend          # 29  (pure text surface + UTF-8)
 bend tests/io/wsm_compat.bend           # 9   (the _plain compat instances)
+bend tests/io/wsm_got_contra.bend           # 25 (got contra-proof: peel vs take/drop)
 bend tests/io/httpx_miniunit.bend           # 1
 bend tests/io/httpx_client.bend             # 1
 bend tests/io/httpx_interop.bend            # 1
@@ -674,6 +699,7 @@ bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, n
 bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
 bend tests/io/httpx_h1_keepalive.bend       # 14 (H1 close policy + reuse + client batch + terminal)
+bend tests/io/httpx_got_contra.bend         # 52 (got contra-proof: split arms, projections, taken)
 bend tests/io/httpx_h1_chunk.bend           # 35 (pure chunked decoder: vectors, step, reference equivalence)
 bend tests/io/httpx_h1_fetch_chunk.bend     # 8 (chunked response end to end, truncated -> 400)
 bend tests/io/httpx_h1_server_chunk.bend    # 6 (chunked request end to end: 200, 400, 413, keep-alive, upgrade lane)
