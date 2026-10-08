@@ -1,7 +1,7 @@
 # httpx (lib_httpx_h1_fetch_chunk): the H1 client lane against a chunked
 # response. Before TASK-033 the lane refused Transfer-Encoding: chunked
 # with 502 "chunked refused", and since a large slice of the web answers
-# only chunked (examples/httpx_h1_real.bend: example.com and
+# only chunked (examples/real/httpx_h1_real.bend: example.com and
 # httpforever.com), that was the whole client's reach.
 #
 # Every case is a canned raw server on its own port: accept, read the

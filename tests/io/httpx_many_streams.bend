@@ -3,7 +3,7 @@
 # stream loop; each client is a single-shot insecure POST "hello"
 # (same shape as tests/io/httpx_server_on.bend). Golden 1 iff all 20
 # echoed. Client fan-out reuses the fork/join Nat recursion from
-# examples/wsm_saturate.bend (single self-recursive def).
+# examples/wss/wsm_saturate.bend (single self-recursive def).
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX

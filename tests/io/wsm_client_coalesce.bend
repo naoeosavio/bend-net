@@ -5,7 +5,7 @@
 # split head from frame exactly (task-020 phase 0 off-by-3 guard).
 # The client prints 1 on the hello echo and closes; the server answers
 # the close and shuts. Golden 1. Self-contained loopback: the Node
-# peer (examples/wss_hello_server.js) covers the manual matrix.
+# peer (examples/wss/wss_hello_server.js) covers the manual matrix.
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/wsm.bend as WSM
