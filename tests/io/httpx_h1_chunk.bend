@@ -1,33 +1,36 @@
 # lib (lib_httpx_h1_chunk): the chunked decoder lib/httpx.bend gained for
 # its H1 lane, before any socket is involved.
 #
-# The vectors are the ones tests/http/h1_codec.bend and tests/http/h1_stream.bend
-# already fix for the reference machine (lib/web/http/main.bend) -- the
-# RFC 9112 section 7.1.1 shape, its extensions, its starved and malformed
-# bodies -- plus the limits the port is asked to keep honest, each with its
-# own vector so it is visible and not a surprise:
-# - a trailer section is refused (400), the answer the reference gives too;
+# The vectors are the ones the reference tree fixed for its chunked machine
+# (TASK-023's lib/web/http/main.bend, outside the published set since the
+# reorganisation) -- the RFC 9112 section 7.1.1 shape, its extensions, its
+# starved and malformed bodies -- plus the limits the port is asked to keep
+# honest, each with its own vector so it is visible and not a surprise:
+# - a trailer section is refused (400), the answer the shipped machine gives
+#   too (the differential group at the end pins the shared verdict);
 # - a bare empty line standing in for the last-chunk is read as "last" by the
 #   step's lookahead but refused by the fold (400), which is why the client
 #   reader closes on End and never on the lookahead's fin;
 # - a hex size that does not fit the U32 counter is refused (400);
 # - bytes after the terminator are refused (400);
 # - a chunk extension on the last-chunk line is refused (400), because the
-#   machine reads "0;<ext>" as a zero-length data chunk (reference behaviour,
-#   also fixed by tests/http/h1_stream.bend s9 for the zero-size case).
+#   machine reads "0;<ext>" as a zero-length data chunk, not as the
+#   last-chunk line (the shipped machine reads it the same way).
 #
 # The step is checked on its own, not only through the fold: a chunk split
 # across two buffers has to come back NeedMore with the first half in the
 # state and then answer Got with the whole chunk, and a body fed one byte
 # at a time has to decode to the same bytes (that is the arm the IO lanes
-# below depend on). The last group runs every vector through
-# H1.h1_unchunk as well, so the port is checked against the machine it was
-# ported from and not only against the literals above.
+# below depend on). The last group runs every vector through the decoder of
+# lib/http.bend as well: that is the machine the tree's h1_chunk_step was
+# refactored from, it is tracked and shipped, and it answers identically on
+# all 11 vectors (TASK-041). The tree itself left the published module set,
+# so it cannot be the oracle of a published test.
 #
 # Golden 35 iff all 35 checks are 1.
 import Base
 import ../../lib/httpx.bend as HTTPX
-import ../../lib/web/http/main.bend as H1
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -151,8 +154,8 @@ def chk_truncated() -> U32:
 def chk_missing_terminator() -> U32:
   fail_is(HTTPX.x_h1.unchunk(bs_of("1\r\nA\r\n")), 400)
 
-# A trailer section is not chunked data (the reference machine refuses it
-# too; tests/http/h1_stream.bend s10 and f4).
+# A trailer section is not chunked data (the shipped machine refuses it too;
+# the trailer vector at the end of this file pins the shared verdict).
 def chk_trailer() -> U32:
   fail_is(HTTPX.x_h1.unchunk(bs_of("1\r\nA\r\n0\r\nX: y\r\n\r\n")), 400)
 
@@ -176,9 +179,10 @@ def chk_wrapped_size() -> U32:
   fail_is(HTTPX.x_h1.unchunk(bs_of("FFFFFFFFFFFFFFFF\r\nAB\r\n0\r\n\r\n")), 400)
 
 # The last-chunk line may carry an extension per RFC 9112, but this machine
-# (like the reference) reads "0;<ext>" as a zero-length DATA chunk, so the
-# body needs the terminator's CRLF after it and the fold answers 400. Kept
-# as a vector so the limit is visible and not a surprise.
+# reads "0;<ext>" as a zero-length DATA chunk, so the body needs the
+# terminator's CRLF after it and the fold answers 400 (measured: the shipped
+# machine answers 400 here too -- TASK-041). Kept as a vector so the limit is
+# visible and not a surprise.
 def chk_last_chunk_extension() -> U32:
   fail_is(HTTPX.x_h1.unchunk(bs_of("0;ext=1\r\n\r\n")), 400)
 
@@ -307,9 +311,12 @@ def chk_byte_at_a_time() -> U32:
 def chk_byte_at_a_time_truncated() -> U32:
   bytes_is(feed.go(step_of(Nil{}), bs_of("4\r\nWi"), Nil{}), [254])
 
-# The fold agrees with the reference decoder of lib/web/http/main.bend on
-# the same bytes: same verdict, same body. This is the port's own check --
-# every vector above is also run through the machine it was ported from.
+# The fold agrees with the shipped reference decoder, lib/http.bend's
+# unchunk, on the same bytes: same verdict, same body. Every vector above is
+# run through both machines, so the port is checked against a second
+# implementation and not only against the literals. (The machine the port was
+# copied from, the tree's h1_chunk_step, is not in the published set; it was
+# measured to answer identically on these 11 vectors -- TASK-041.)
 def verdict(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32 & U32:
   match r:
     case Fail{e}:
@@ -324,7 +331,7 @@ def same_pair(pa: U32 & U32, pb: U32 & U32) -> U32:
   b2u(Bool.and(U32.is_eq(va, vb), U32.is_eq(ca, cb)))
 
 def same_as_ref(+v: List<&2, U32>) -> U32:
-  same_pair(verdict(HTTPX.x_h1.unchunk(v)), verdict(H1.h1_unchunk(v)))
+  same_pair(verdict(HTTPX.x_h1.unchunk(v)), verdict(HTTP.unchunk(v)))
 
 def chk_same_as_reference() -> U32:
   (same_as_ref(rfc_body())
