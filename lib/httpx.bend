@@ -2254,33 +2254,35 @@ def x_flow.ack(got: Socket & Got, buf: List<&2, U32>) -> IO(Socket & Got):
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
     IO.pure(Socket & Got, x_flow.acked(sent, buf))
 
-# Flow sends hand back a read seed: the wire bytes of the frame that
-# stopped the send (a response arriving while the body is still going),
-# so the caller's read path starts from it instead of losing the frame
-# (TASK-042 phase 2b). A send that never stopped on a frame carries the
-# empty seed. x_flow_drop is the explicit discard for the lanes with no
-# response to read -- the server's own response sender.
-def x_flow_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+# Flow sends hand back a read seed: the wire bytes of the frames the
+# sender read while it waited for credit but did not consume. It stopped
+# on its own stream's HEADERS (the response arriving while the body is
+# still going, TASK-042 phase 2b) or stashed a frame of another stream and
+# kept sending (TASK-042 phase 2e), so the caller's read path starts from
+# those bytes instead of losing the frames. A send that read nothing else
+# carries the empty seed. x_flow_drop is the explicit discard for the
+# sequential lane, which answers one request at a time by design.
+def x_flow_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +seed: List<&2, U32>) ->
   Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
   (s, r) = sent
-  (s, r, Nil{})
+  (s, r, seed)
 
 def x_flow_drop(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) ->
   Socket & Result<&1, &1, U32 & String, Unit>:
   (s, r, rest) = sent
   (s, r)
 
-def x_flow_wu_bad(got: Socket & Got) ->
+def x_flow_wu_bad(got: Socket & Got, +seed: List<&2, U32>) ->
   Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
   (s, g) = got
-  (s, Fail{(502, "bad window_update")}, Nil{})
+  (s, Fail{(502, "bad window_update")}, seed)
 
 def x_flow.pair(got: Socket & Got) -> Socket & Got:
   (s, g) = got
   (s, GotErr{0, "next"})
 
 @unsafe
-def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
+def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match phase:
     case 0:
@@ -2293,43 +2295,52 @@ def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, 
                 case Nil{}:
                   do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
                     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
-                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
+                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
                 case +b <> r:
-                  x_send_data_flow(4, (s0, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p)
+                  x_send_data_flow(4, (s0, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
             case _:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s0, Fail{(code0, msg0)}, Nil{}))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s0, Fail{(code0, msg0)}, seed))
         case GotOk{+frame0, +buf0}:
-          x_send_data_flow(0, (s0, GotErr{0, "next"}), sid, body, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p)
+          x_send_data_flow(0, (s0, GotErr{0, "next"}), sid, body, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p, seed)
     case 4:
       (s4, g4) = got
-      x_send_data_flow(5, (s4, GotErr{0, "next"}), sid, body, cw, sw, buf, cl, x_chunk_of(cw, sw, x_len32(body)), Nil{}, x_chunk_pos(x_chunk_of(cw, sw, x_len32(body))), sid2p)
+      x_send_data_flow(5, (s4, GotErr{0, "next"}), sid, body, cw, sw, buf, cl, x_chunk_of(cw, sw, x_len32(body)), Nil{}, x_chunk_pos(x_chunk_of(cw, sw, x_len32(body))), sid2p, seed)
     case 5:
       (s5, g5) = got
-      x_flow.chunker(got, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
+      x_flow.chunker(got, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
     case 6:
       (s6, g6) = got
-      x_flow.reste(got, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
+      x_flow.reste(got, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
     case 9:
       (s9, g9) = got
       match g9:
         case GotErr{code9, msg9}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s9, Fail{(code9, msg9)}, Nil{}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s9, Fail{(code9, msg9)}, seed))
         case GotOk{+frame9, +buf9}:
           match frame9:
             case Frame{+typ9, +flags9, +sid29, +payload9}:
-              x_send_data_flow(x_flow.stop_phase(typ9, sid29, sid), got, sid, body, cw, sw, buf9, x_flow.cls(typ9), ful, payload9, x_wu_ok(payload9), sid29)
+              x_send_data_flow(x_flow.route(typ9, sid29, sid, x_flow.cls(typ9)), got, sid, body, cw, sw, buf9, x_flow.cls(typ9), ful, payload9, x_wu_ok(payload9), sid29, seed)
     case 12:
       (s12, g12) = got
-      x_flow.do_act(got, sid, body, cw, sw, buf, cl, sid2p, pay2)
+      x_flow.do_act(got, sid, body, cw, sw, buf, cl, sid2p, pay2, seed)
     case 13:
       (s13, g13) = got
       match g13:
         case GotErr{code13, msg13}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(code13, msg13)}, Nil{}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(code13, msg13)}, seed))
         case GotOk{+frame13, +buf13}:
           match frame13:
             case Frame{+typ13, +flags13, +sid213, +payload13}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Done{Unit{}}, List.append(&2, U32, x_frame_write(typ13, x_f_seed(flags13), sid213, payload13), buf13)))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Done{Unit{}}, x_flow.seed_add(seed, typ13, flags13, sid213, payload13, buf13)))
+    case 14:
+      (s14, g14) = got
+      match g14:
+        case GotErr{code14, msg14}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s14, Fail{(code14, msg14)}, seed))
+        case GotOk{+frame14, +buf14}:
+          match frame14:
+            case Frame{+typ14, +flags14, +sid214, +payload14}:
+              x_send_data_flow(4, (s14, GotErr{0, "next"}), sid, body, cw, sw, Nil{}, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, buf14))
     case _:
       (s13, g13) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(502, "flow bad phase")}, Nil{}))
@@ -2347,25 +2358,33 @@ def x_f_priority() -> U32:
 def x_f_seed(+flags: U32) -> U32:
   U32.and(flags, U32.sub(255, (x_f_padded() + x_f_priority() : U32)))
 
-# A HEADERS frame for the stream this sender is feeding is the response
-# arriving while the body is still going: the send stops (phase 13) and
-# hands the frame's wire bytes back as the caller's read seed, instead of
-# dropping it and reading on (TASK-042 phase 2b). Every other frame keeps
-# the old routing (phase 12). The bool takes its own def because a match
-# cannot scrutinize a computed value.
-def x_flow.same_sid(same: Bool) -> U32:
-  match same:
-    case True{}:
+# Where the sender goes after reading a frame while it waits for credit:
+# 13 stops the send (a HEADERS for the stream it is feeding is the answer
+# arriving while the body is still going: the wire bytes go back as the
+# caller's read seed, TASK-042 phase 2b); 14 keeps sending and stashes the
+# frame (DATA or HEADERS of another stream, PRIORITY, PUSH_PROMISE — what
+# the old routing dropped, TASK-042 phase 2e); 12 is the frames the sender
+# answers itself (WINDOW_UPDATE, SETTINGS, PING, RST_STREAM, GOAWAY). The
+# bools take their own def because a match cannot scrutinize a computed
+# value.
+def x_flow.route_go(is_head: Bool, same: Bool, is_keep: Bool) -> U32:
+  match is_head same is_keep:
+    case _ _ False{}:
+      12
+    case True{} True{} _:
       13
-    case False{}:
-      12
+    case _ _ _:
+      14
 
-def x_flow.stop_phase(+typ: U32, +sid29: U32, +sid: U32) -> U32:
-  match typ:
-    case 1:
-      x_flow.same_sid(U32.is_eq(sid29, sid))
-    case _:
-      12
+def x_flow.route(+typ: U32, +sid29: U32, +sid: U32, +cls: U32) -> U32:
+  x_flow.route_go(U32.is_eq(typ, 1), U32.is_eq(sid29, sid), U32.is_eq(cls, 0))
+
+# The bytes a stopping or stashed frame adds to the caller's read seed: the
+# frame re-encoded the way the reader expects it, followed by the rest of
+# the recv (which may hold more frames). The accumulated seed comes first;
+# it holds bytes that arrived earlier on the wire.
+def x_flow.seed_add(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
+  List.append(&2, U32, seed, List.append(&2, U32, x_frame_write(typ, x_f_seed(flags), sid, payload), buf))
 
 def x_flow.cls(+typ: U32) -> U32:
   match typ:
@@ -2384,45 +2403,45 @@ def x_flow.cls(+typ: U32) -> U32:
     case _:
       0
 
-def x_flow.chunker(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32) ->
+def x_flow.chunker(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s5, g5) = got
   match ok:
     case True{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s5, x_t_data(), 0, sid, x_take32(ful, body))
-        x_send_data_flow(6, x_flow_sent(sent), sid, x_drop32(ful, body), (cw - ful : U32), (sw - ful : U32), buf, 0, 0, Nil{}, True{}, sid2p)
+        x_send_data_flow(6, x_flow_sent(sent), sid, x_drop32(ful, body), (cw - ful : U32), (sw - ful : U32), buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case False{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         got2 : Socket & Got <- x_read_frame(s5, buf)
-        x_send_data_flow(9, got2, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
+        x_send_data_flow(9, got2, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
 
-def x_flow.reste(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
+def x_flow.reste(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s6, g6) = got
   match body:
     case Nil{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
     case +b <> r:
-      x_send_data_flow(0, (s6, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
+      x_send_data_flow(0, (s6, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
 
 @unsafe
-def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>) ->
+def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>, +seed: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s, g) = got
   match cl:
     case 2:
-      x_flow.wu(got, sid, body, cw, sw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2))
+      x_flow.wu(got, sid, body, cw, sw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2), seed)
     case 4:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         got2 : Socket & Got <- x_flow.ack(got, buf)
-        x_send_data_flow(4, got2, sid, body, cw, x_settings.iw_of(pay2, sw), buf, 0, 0, Nil{}, True{}, sid2p)
+        x_send_data_flow(4, got2, sid, body, cw, x_settings.iw_of(pay2, sw), buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case 6:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)
-        x_send_data_flow(4, x_flow_sent(sent), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
+        x_send_data_flow(4, x_flow_sent(sent), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case 3:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "rst_stream")}, Nil{}))
     case 7:
@@ -2430,17 +2449,17 @@ def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, 
     case 9:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "continuation")}, Nil{}))
     case _:
-      x_send_data_flow(4, (s, GotErr{0, "next"}), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
+      x_send_data_flow(4, (s, GotErr{0, "next"}), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
 
 @unsafe
-def x_flow.wu(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool) ->
+def x_flow.wu(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool, +seed: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match ok:
     case True{}:
       +cream = x_flow_credit.go(cw, sw, sid, sid2p, inc, True{})
-      x_send_data_flow(4, x_flow.pair(got), sid, body, x_flow_cw(cream), x_flow_sw(cream), buf, 0, 0, Nil{}, True{}, sid2p)
+      x_send_data_flow(4, x_flow.pair(got), sid, body, x_flow_cw(cream), x_flow_sw(cream), buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_wu_bad(got))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_wu_bad(got, seed))
 
 def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
@@ -2448,9 +2467,9 @@ def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: 
     case True{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_data_frame(sock, sid, body)
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, Nil{}))
     case False{}:
-      x_send_data_flow(0, (sock, GotErr{0, "next"}), sid, body, x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0)
+      x_send_data_flow(0, (sock, GotErr{0, "next"}), sid, body, x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0, Nil{})
 
 def x_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
@@ -2464,42 +2483,40 @@ def x_send_resp_body(sock: Socket, +sid: U32, +body: List<&2, U32>, too_big: Boo
     case False{}:
       x_send_data_frame(sock, sid, body)
 
-# The server's response sender is a flow send too, but it has no response
-# to read: a frame that arrives while the body goes out (a pipelined
-# request, say) is dropped here exactly as the flow sender dropped it
-# before TASK-042 phase 2b. Threading it into the server loop is a
-# separate change, noted in the task file.
+# The server's response sender hands the read seed out like the client's
+# does (TASK-042 phase 2e): the flow sender stashes every frame it reads
+# while waiting for credit (a pipelined request HEADERS, the DATA of
+# another stream) instead of dropping it, and the server loop reads those
+# bytes first.
 def x_send_resp_body2(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-    out : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_data_start(sock, sid, body)
-    IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, x_flow_drop(out))
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  x_send_data_start.go(sock, sid, body, U32.is_le(x_len32(body), x_max_send()))
 
 def x_send_resp_head(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Fail{e}, Nil{}))
     case Done{u}:
       match is_empty:
         case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, Nil{}))
         case False{}:
           x_send_resp_body2(sock, sid, body)
 
 def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   hs = List.append(&2, Hdr, [Hdr{":status", U32.show(status)}], headers)
   blk = x_block(hs)
   +empty = List.is_empty(&2, U32, body)
   flags = (x_f_end_headers() + x_b2u(empty) : U32)
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_raw_frame(sock, x_t_headers(), flags, sid, blk)
     x_send_resp_head(sent, sid, body, empty)
 
 def x_send_resp(sock: Socket, +sid: U32, +resp: Response) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match resp:
     case Response{+status, +headers, +body}:
       x_send_resp.go(sock, sid, status, headers, body)
@@ -2535,6 +2552,35 @@ def httpx.close_got(got: Socket & Got) -> IO(Unit):
 def httpx.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & Got:
   (s2, r) = sent
   httpx.again(s2)
+
+# The read seed a response send hands back (TASK-042 phase 2e) rides in
+# the Got's buffer: it comes after the loop's own leftover on the wire, so
+# the two are appended in that order. A Fail keeps the GotErr (the loop
+# closes on it and the seed is moot).
+def httpx.sent_seed(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +buf: List<&2, U32>) -> Socket & Got:
+  (s2, r, seed) = sent
+  match r:
+    case Fail{(code, msg)}:
+      (s2, GotErr{code, msg})
+    case Done{u}:
+      (s2, GotOk{Frame{0, 0, 0, Nil{}}, List.append(&2, U32, buf, seed)})
+
+# The buffer a loop reads from. A leaf that hands bytes back (the response
+# sender after a stash) rides them in the Got's buffer and those bytes win;
+# a Got with an empty buffer carries nothing, so the loop's own leftover is
+# still the right place to read from (the ack/ping leaves answer with an
+# empty Got and would otherwise drop bytes already received). Every other
+# transition keeps both in sync. TASK-042 phase 2e.
+def httpx.carry(g: Got, +buf: List<&2, U32>) -> List<&2, U32>:
+  match g:
+    case GotOk{frame, +b}:
+      match b:
+        case Nil{}:
+          buf
+        case _:
+          b
+    case GotErr{code, msg}:
+      buf
 
 def httpx.ack(got: Socket & Got) -> IO(Socket & Got):
   (s, g) = got
@@ -2850,7 +2896,7 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & Got <- x_read_frame(s0, buf)
+        got2 : Socket & Got <- x_read_frame(s0, httpx.carry(g0, buf))
         httpx(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
     case 1:
       (s1, g1) = got
@@ -2905,8 +2951,8 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
           do IO<Unit>:
             req : Request = httpx.req_of(rh, Nil{})
             resp : Response <- H(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s4, sid2, resp)
-            httpx(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(s4, sid2, resp)
+            httpx(~H, 0, httpx.sent_seed(sent, buf), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 6:
           httpx(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 5:
@@ -2926,8 +2972,8 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
             +tp : Taken = httpxn.take_del(slots, sid2)
             req : Request = httpx.req_of_st(httpxn.taken_st(tp), payload)
             resp : Response <- H(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx(~H, 0, httpx.sent(sent), httpxn.taken_slots(tp), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(httpx.wo(got2), sid2, resp)
+            httpx(~H, 0, httpx.sent_seed(sent, buf), httpxn.taken_slots(tp), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
         case 4:
           httpx.close_got(got)
         case _:
@@ -6778,22 +6824,24 @@ def httpxs.wu_conn(sock: Socket, +inc: U32) ->
 # flight is credited by httpxs.wu_conn, never reset twice. end == 1 means
 # the head ended the stream and there is no body to stop.
 
-def httpxs.rst_early.go(sock: Socket, +sid: U32, +end: U32, no_body: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def httpxs.rst_early.go(sock: Socket, +sid: U32, +end: U32, no_body: Bool, +seed: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match no_body:
     case True{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, seed))
     case False{}:
-      x_send_rst(sock, sid, 8)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(sock, sid, 8)
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
 
-def httpxs.rst_early(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +end: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  (s, r) = sent
+def httpxs.rst_early(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +sid: U32, +end: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  (s, r, seed) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{e}, seed))
     case Done{u}:
-      httpxs.rst_early.go(s, sid, end, U32.is_eq(end, 1))
+      httpxs.rst_early.go(s, sid, end, U32.is_eq(end, 1), seed)
 
 def httpxs.head_act_of(~H: SrvEv -> SrvOut, ok: Bool, +need: U32, +end: U32, +nh: ReqHead, +nt: Tab, +sid: U32) -> U32:
   match ok need:
@@ -6851,7 +6899,7 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & Got <- x_read_frame(s0, buf)
+        got2 : Socket & Got <- x_read_frame(s0, httpx.carry(g0, buf))
         httpx_stream(~H, 1, got2, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 1:
       (s1, g1) = got
@@ -6903,9 +6951,9 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
           httpx_stream(~H, 0, got, httpxn.put(slots, St{Some{rh}, Nil{}, sid2}), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s4, sid2, resp)
-            rst : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.rst_early(sent, sid2, end)
-            httpx_stream(~H, 0, httpx.sent(rst), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(s4, sid2, resp)
+            rst : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- httpxs.rst_early(sent, sid2, end)
+            httpx_stream(~H, 0, httpx.sent_seed(rst, buf), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
           httpx_stream(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
@@ -6924,8 +6972,8 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
         case 1:
           do IO<Unit>:
             got2 : Socket & Got <- httpx.wu_er((sb2, gb2), buf, sid2, payload)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx_stream(~H, 0, httpx.sent(sent), httpxn.taken_slots(httpxn.take_del(slots, sid2)), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(httpx.wo(got2), sid2, resp)
+            httpx_stream(~H, 0, httpx.sent_seed(sent, buf), httpxn.taken_slots(httpxn.take_del(slots, sid2)), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 8:
           do IO<Unit>:
             wu : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.wu_conn(sb2, x_len32(payload))
@@ -7367,8 +7415,8 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
           do IO<Unit>:
             req : Request = httpx.req_of(rh, Nil{})
             resp : Response <- H(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s3, sid2, resp)
-            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(s3, sid2, resp)
+            httpx_seq(~H, 0, 4, 0, httpx.sent(x_flow_drop(sent)), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case 6:
           httpx_seq(~H, 0, 4, 0, got, buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, sid_a, body, x_cat(payload), end, 0)
         case 5:
@@ -7387,8 +7435,8 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
             got2 : Socket & Got <- httpx.wu_er(got, buf, sid2, payload)
             req : Request = httpx.req_of(rh, x_cat(x_rev_push(payload, body)))
             resp : Response <- H(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(httpx.wo(got2), sid2, resp)
+            httpx_seq(~H, 0, 4, 0, httpx.sent(x_flow_drop(sent)), buf, tab, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
         case 4:
           httpx.close_got(got)
         case _:
