@@ -4545,8 +4545,31 @@ def x_h1.cli.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
 def x_h1.cli.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   x_h1.cli.parsed.got(~recv, ~send, ~close, x_h1.split(acc2), s1, fuel, method)
 
+# Status code of the head sitting in acc (0 when the status line does not
+# parse). The 1xx check runs before the head is turned into a response, so
+# it reads the code out of the same split/parse the answer path uses
+# (TASK-042 phase 4).
+def x_h1.cli.code_of_got(r: Result<&1, &1, U32 & String, U32>) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+code}:
+      code
+
+def x_h1.status_of(+acc: List<&2, U32>) -> U32:
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
+  x_h1.cli.code_of_got(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))))
+
+# 1xx is an interim status (RFC 9110 section 15.2): any number of them may
+# precede the final response — 100 Continue (Expect), 103 Early Hints
+# (node's writeEarlyHints, CDNs) — so the head is discarded and the next
+# one parsed out of the bytes already read. 101 Switching Protocols is the
+# upgrade answer: a final head for the caller, never interim here.
+def x_h1.is_info(+code: U32) -> Bool:
+  Bool.and(Bool.and(U32.is_lt(99, code), U32.is_lt(code, 200)), U32.is_ne(code, 101))
+
 @unsafe
-def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
+def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool, info: Bool) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match phase:
     case 0:
       (s0, r0) = got
@@ -4556,7 +4579,7 @@ def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
         case 1n+f:
           do IO<Socket & Result<&1, &1, U32 & String, Response>>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
-            x_h1.cli.head(~recv, ~send, ~close, 1, r, acc, f, method, False{})
+            x_h1.cli.head(~recv, ~send, ~close, 1, r, acc, f, method, False{}, False{})
     case 1:
       (s1, r1) = got
       match r1:
@@ -4568,14 +4591,22 @@ def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
               IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2))
+              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2), False{})
     case 2:
       (s2, r2) = got
       match found:
         case False{}:
-          x_h1.cli.head(~recv, ~send, ~close, 0, (s2, Done{Nil{}}), acc, fuel, method, False{})
+          x_h1.cli.head(~recv, ~send, ~close, 0, (s2, Done{Nil{}}), acc, fuel, method, False{}, False{})
         case True{}:
-          x_h1.cli.parsed(~recv, ~send, ~close, s2, acc, fuel, method)
+          x_h1.cli.head(~recv, ~send, ~close, 4, (s2, Done{Nil{}}), acc, fuel, method, False{}, x_h1.is_info(x_h1.status_of(acc)))
+    case 4:
+      (s4, r4) = got
+      match info:
+        case True{}:
+          +rest = x_h1.split_rest(x_h1.split(acc))
+          x_h1.cli.head(~recv, ~send, ~close, 2, (s4, Done{Nil{}}), rest, fuel, method, x_h1.split.test(rest), False{})
+        case False{}:
+          x_h1.cli.parsed(~recv, ~send, ~close, s4, acc, fuel, method)
     case _:
       (s9, r9) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (s9, Fail{(502, "bad phase")}))
@@ -4586,7 +4617,7 @@ def x_h1.exch.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response>, (sock, Fail{e}))
     case Done{u}:
-      x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{})
+      x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{}, False{})
 
 def x_h1.exch.send(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, Response>):
   match rendered:

@@ -264,7 +264,7 @@ def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
       IO.pure(Socket & Result<&1, &1, U32 & String, HTTPX.Response>,
         (s, Fail{e}))
     case Done{u}:
-      HTTPX.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{})
+      HTTPX.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{})
 
 def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans: U32) ->
   IO(U32):
