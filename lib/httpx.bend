@@ -3346,6 +3346,42 @@ def client.on.done_data(got: Socket & Got, +tab: Tab, +head: Head, +body: List<&
   (s, g) = got
   IO.pure(Socket & Result<&1, &1, U32 & String, Response> & Tab, (s, Done{client.on.resp_of(head, x_cat(x_rev_push(payload, body)))}, tab))
 
+# A HEADERS block with no :status that lands after a response head is a
+# trailer (RFC 9113 section 8.1, the shape node's stream.sendTrailers
+# produces): it must not replace the head the response already stored,
+# and it must carry END_STREAM. Anything else is a real head and keeps
+# the old routing. x_resp.decode answers status 0 for a block with no
+# :status, so has_head is exactly the "no :status" test here.
+
+def httpxn.is_trailer(+old: Head, +new: Head) -> Bool:
+  Bool.and(client.on.has_head(old), Bool.not(client.on.has_head(new)))
+
+def httpxn.head_keep_go(+old: Head, +new: Head, is_trailer: Bool) -> Head:
+  match is_trailer:
+    case True{}:
+      old
+    case False{}:
+      new
+
+def httpxn.head_keep(+old: Head, +new: Head) -> Head:
+  httpxn.head_keep_go(old, new, httpxn.is_trailer(old, new))
+
+# A trailer ends the body (act 1, the stored head and body ride out); a
+# trailer without END_STREAM is a protocol error (act 5, fail closed).
+def httpxn.trailer_act(+end: U32) -> U32:
+  match end:
+    case 1:
+      1
+    case _:
+      5
+
+def httpxn.head_act2(is_trailer: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
+  match is_trailer:
+    case True{}:
+      httpxn.trailer_act(end)
+    case False{}:
+      httpxn.head_act(need, ok, end)
+
 # Single-stream response drain (once shape; keep-alive threads tab/sid
 # outside). Phases: 0 read, 1 decompose, 2 conn dispatch, 3 stream
 # dispatch (HEADERS decodes here, DATA decides here), 4 HEADERS act,
@@ -3402,7 +3438,9 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
       match typ:
         case 1:
           +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client.on.drain(4, got, buf, x_resp.tab(dr), x_resp.rh(dr), body, typ, flags, sid2, payload, cls, end, exp, httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
+          +nh : Head = x_resp.rh(dr)
+          +is_tr : Bool = httpxn.is_trailer(head, nh)
+          client.on.drain(4, got, buf, x_resp.tab(dr), httpxn.head_keep_go(head, nh, is_tr), body, typ, flags, sid2, payload, cls, end, exp, httpxn.head_act2(is_tr, httpxn.need_u(typ, flags), x_resp.ok(dr), end))
         case 0:
           client.on.drain(5, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, httpxn.decide_data(client.on.has_head(head), end))
         case _:
@@ -3416,7 +3454,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
         case 6:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
             cres : Socket & Result<&1, &1, U32 & String, Cont> <- client.on.cont_start(httpx.wo(got), exp, payload, buf)
-            client.on.drain_conted(cres, tab, body, end, exp)
+            client.on.drain_conted(cres, tab, head, body, end, exp)
         case 5:
           client.on.fail(got, tab, 502, "head decode")
         case _:
@@ -3447,7 +3485,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
 # ---------------------------------------------------------------------
 
 @unsafe
-def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +body: List<&2, U32>, +end: U32, +exp: U32) ->
+def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +head: Head, +body: List<&2, U32>, +end: U32, +exp: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (cs, cr) = cres
   match cr:
@@ -3457,7 +3495,9 @@ def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +t
       match mc:
         case Cont{+block, +rest}:
           +dr2 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(block, tab)
-          client.on.drain(4, client.on.again(cs), rest, x_resp.tab(dr2), x_resp.rh(dr2), body, 1, 4, exp, Nil{}, 0, end, exp, httpxn.head_act(0, x_resp.ok(dr2), end))
+          +nh2 : Head = x_resp.rh(dr2)
+          +is_tr2 : Bool = httpxn.is_trailer(head, nh2)
+          client.on.drain(4, client.on.again(cs), rest, x_resp.tab(dr2), httpxn.head_keep_go(head, nh2, is_tr2), body, 1, 4, exp, Nil{}, 0, end, exp, httpxn.head_act2(is_tr2, 0, x_resp.ok(dr2), end))
 
 # Dial + preface (ALPN h2 required; non-H2 closes fail-closed 615)
 # ---------------------------------------------------------------

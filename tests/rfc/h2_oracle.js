@@ -66,9 +66,38 @@ function serve() {
   });
   server.on("stream", (stream, headers) => {
     const chunks = [];
+    const wants_trailers = headers[":path"] === "/trailers";
+    let trailers_sent = false;
+    // RFC 9113 section 8.1 trailers: node sends them as a HEADERS block
+    // with no :status and END_STREAM, the shape a Bend client must not
+    // mistake for the response (TASK-042 phase 3). waitForTrailers is
+    // node's required opt-in; the listener is attached once per stream,
+    // before the body, and the flag keeps a second wantTrailers emission
+    // from throwing ERR_HTTP2_TRAILERS_ALREADY_SENT.
+    if (wants_trailers) {
+      stream.on("wantTrailers", () => {
+        if (trailers_sent) {
+          return;
+        }
+        trailers_sent = true;
+        try {
+          stream.sendTrailers({ "x-sum": String(Buffer.concat(chunks).length) });
+        } catch (err) {
+          // Node can emit wantTrailers again for a stream whose trailers
+          // are already out; the exchange already counted, so log it
+          // instead of taking the whole oracle down.
+          console.log(`OK TRAILERS already sent (${err.code})`);
+        }
+      });
+    }
     stream.on("data", (c) => chunks.push(c));
     stream.on("end", () => {
       const body = Buffer.concat(chunks);
+      if (wants_trailers) {
+        stream.respond({ ":status": 200 }, { waitForTrailers: true });
+        stream.end(body, () => counted(server, headers[":path"], body.length));
+        return;
+      }
       stream.respond({ ":status": 200, "content-length": String(body.length) });
       stream.end(body);
       counted(server, headers[":path"], body.length);
