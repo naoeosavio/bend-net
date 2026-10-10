@@ -2254,9 +2254,26 @@ def x_flow.ack(got: Socket & Got, buf: List<&2, U32>) -> IO(Socket & Got):
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
     IO.pure(Socket & Got, x_flow.acked(sent, buf))
 
-def x_flow_wu_bad(got: Socket & Got) -> Socket & Result<&1, &1, U32 & String, Unit>:
+# Flow sends hand back a read seed: the wire bytes of the frame that
+# stopped the send (a response arriving while the body is still going),
+# so the caller's read path starts from it instead of losing the frame
+# (TASK-042 phase 2b). A send that never stopped on a frame carries the
+# empty seed. x_flow_drop is the explicit discard for the lanes with no
+# response to read -- the server's own response sender.
+def x_flow_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
+  (s, r) = sent
+  (s, r, Nil{})
+
+def x_flow_drop(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) ->
+  Socket & Result<&1, &1, U32 & String, Unit>:
+  (s, r, rest) = sent
+  (s, r)
+
+def x_flow_wu_bad(got: Socket & Got) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
   (s, g) = got
-  (s, Fail{(502, "bad window_update")})
+  (s, Fail{(502, "bad window_update")}, Nil{})
 
 def x_flow.pair(got: Socket & Got) -> Socket & Got:
   (s, g) = got
@@ -2264,7 +2281,7 @@ def x_flow.pair(got: Socket & Got) -> Socket & Got:
 
 @unsafe
 def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match phase:
     case 0:
       (s0, g0) = got
@@ -2274,11 +2291,13 @@ def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, 
             case 0:
               match body:
                 case Nil{}:
-                  x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
+                  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+                    sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
+                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
                 case +b <> r:
                   x_send_data_flow(4, (s0, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p)
             case _:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s0, Fail{(code0, msg0)}))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s0, Fail{(code0, msg0)}, Nil{}))
         case GotOk{+frame0, +buf0}:
           x_send_data_flow(0, (s0, GotErr{0, "next"}), sid, body, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p)
     case 4:
@@ -2294,17 +2313,59 @@ def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, 
       (s9, g9) = got
       match g9:
         case GotErr{code9, msg9}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s9, Fail{(code9, msg9)}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s9, Fail{(code9, msg9)}, Nil{}))
         case GotOk{+frame9, +buf9}:
           match frame9:
             case Frame{+typ9, +flags9, +sid29, +payload9}:
-              x_send_data_flow(12, got, sid, body, cw, sw, buf9, x_flow.cls(typ9), ful, payload9, x_wu_ok(payload9), sid29)
+              x_send_data_flow(x_flow.stop_phase(typ9, sid29, sid), got, sid, body, cw, sw, buf9, x_flow.cls(typ9), ful, payload9, x_wu_ok(payload9), sid29)
     case 12:
       (s12, g12) = got
       x_flow.do_act(got, sid, body, cw, sw, buf, cl, sid2p, pay2)
+    case 13:
+      (s13, g13) = got
+      match g13:
+        case GotErr{code13, msg13}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(code13, msg13)}, Nil{}))
+        case GotOk{+frame13, +buf13}:
+          match frame13:
+            case Frame{+typ13, +flags13, +sid213, +payload13}:
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Done{Unit{}}, List.append(&2, U32, x_frame_write(typ13, x_f_seed(flags13), sid213, payload13), buf13)))
     case _:
       (s13, g13) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s13, Fail{(502, "flow bad phase")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(502, "flow bad phase")}, Nil{}))
+
+# PADDED (0x8) and PRIORITY (0x20): x_frame_of strips both fields out of
+# the payload but leaves the bits in the flags it answers, so a frame
+# re-encoded for the read seed must clear them -- otherwise the reader
+# would strip bytes that are no longer there.
+def x_f_padded() -> U32:
+  8
+
+def x_f_priority() -> U32:
+  32
+
+def x_f_seed(+flags: U32) -> U32:
+  U32.and(flags, U32.sub(255, (x_f_padded() + x_f_priority() : U32)))
+
+# A HEADERS frame for the stream this sender is feeding is the response
+# arriving while the body is still going: the send stops (phase 13) and
+# hands the frame's wire bytes back as the caller's read seed, instead of
+# dropping it and reading on (TASK-042 phase 2b). Every other frame keeps
+# the old routing (phase 12). The bool takes its own def because a match
+# cannot scrutinize a computed value.
+def x_flow.same_sid(same: Bool) -> U32:
+  match same:
+    case True{}:
+      13
+    case False{}:
+      12
+
+def x_flow.stop_phase(+typ: U32, +sid29: U32, +sid: U32) -> U32:
+  match typ:
+    case 1:
+      x_flow.same_sid(U32.is_eq(sid29, sid))
+    case _:
+      12
 
 def x_flow.cls(+typ: U32) -> U32:
   match typ:
@@ -2324,71 +2385,75 @@ def x_flow.cls(+typ: U32) -> U32:
       0
 
 def x_flow.chunker(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s5, g5) = got
   match ok:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s5, x_t_data(), 0, sid, x_take32(ful, body))
         x_send_data_flow(6, x_flow_sent(sent), sid, x_drop32(ful, body), (cw - ful : U32), (sw - ful : U32), buf, 0, 0, Nil{}, True{}, sid2p)
     case False{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         got2 : Socket & Got <- x_read_frame(s5, buf)
         x_send_data_flow(9, got2, sid, body, cw, sw, buf, cl, ful, pay2, ok, sid2p)
 
 def x_flow.reste(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s6, g6) = got
   match body:
     case Nil{}:
-      x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
     case +b <> r:
       x_send_data_flow(0, (s6, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
 
 @unsafe
 def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s, g) = got
   match cl:
     case 2:
       x_flow.wu(got, sid, body, cw, sw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2))
     case 4:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         got2 : Socket & Got <- x_flow.ack(got, buf)
         x_send_data_flow(4, got2, sid, body, cw, x_settings.iw_of(pay2, sw), buf, 0, 0, Nil{}, True{}, sid2p)
     case 6:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)
         x_send_data_flow(4, x_flow_sent(sent), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
     case 3:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{(502, "rst_stream")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "rst_stream")}, Nil{}))
     case 7:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{(502, "goaway")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "goaway")}, Nil{}))
     case 9:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{(502, "continuation")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "continuation")}, Nil{}))
     case _:
       x_send_data_flow(4, (s, GotErr{0, "next"}), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p)
 
 @unsafe
 def x_flow.wu(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match ok:
     case True{}:
       +cream = x_flow_credit.go(cw, sw, sid, sid2p, inc, True{})
       x_send_data_flow(4, x_flow.pair(got), sid, body, x_flow_cw(cream), x_flow_sw(cream), buf, 0, 0, Nil{}, True{}, sid2p)
     case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, x_flow_wu_bad(got))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_wu_bad(got))
 
 def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match single:
     case True{}:
-      x_send_data_frame(sock, sid, body)
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_data_frame(sock, sid, body)
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent))
     case False{}:
       x_send_data_flow(0, (sock, GotErr{0, "next"}), sid, body, x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0)
 
 def x_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   x_send_data_start.go(sock, sid, body, U32.is_le(x_len32(body), x_max_send()))
 
 def x_send_resp_body(sock: Socket, +sid: U32, +body: List<&2, U32>, too_big: Bool) ->
@@ -2399,9 +2464,16 @@ def x_send_resp_body(sock: Socket, +sid: U32, +body: List<&2, U32>, too_big: Boo
     case False{}:
       x_send_data_frame(sock, sid, body)
 
+# The server's response sender is a flow send too, but it has no response
+# to read: a frame that arrives while the body goes out (a pipelined
+# request, say) is dropped here exactly as the flow sender dropped it
+# before TASK-042 phase 2b. Threading it into the server loop is a
+# separate change, noted in the task file.
 def x_send_resp_body2(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
-  x_send_data_start(sock, sid, body)
+  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+    out : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_data_start(sock, sid, body)
+    IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, x_flow_drop(out))
 
 def x_send_resp_head(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
@@ -3492,22 +3564,25 @@ def client.on.send_req_head(sock: Socket, +sid: U32, +block: List<&2, U32>, is_e
   x_send_frame(sock, x_t_headers(), client.on.head_flags(is_empty), sid, block)
 
 def client.on.send_req_body(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Fail{e}, Nil{}))
     case Done{u}:
       match is_empty:
         case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, Nil{}))
         case False{}:
           x_send_data_start(sock, sid, body)
 
+# The request send hands back the read seed a flow body may have left
+# (TASK-042 phase 2b): an empty body or a one-frame body never stops on
+# a frame, a body that outruns the window can stop on the response.
 def client.on.send_req(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   +empty = List.is_empty(&2, U32, body)
-  do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req_head(sock, sid, client.on.req_block(host, port, method, path, hs), empty)
     client.on.send_req_body(sent, sid, body, empty)
 
@@ -5203,9 +5278,9 @@ def client_stream.drained(drained: Socket & Result<&1, &1, U32 & String, U32 & U
         x : Unit <- TLS.tls_close(s)
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Done{counts})
 
-def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
+def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  (sock, r) = sent
+  (sock, r, rest) = sent
   match r:
     case Fail{e}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
@@ -5213,13 +5288,13 @@ def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, 
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client.on.sdrop(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client.on.sdrop(~H, 0, (sock, GotErr{0, "next"}), rest, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
         client_stream.drained(drained)
 
 def client_stream.exch(~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, 1, host, port, method, path, hs, body)
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.on.send_req(sock, 1, host, port, method, path, hs, body)
     client_stream.sent(~H, sent)
 
 def client_stream.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
@@ -5328,15 +5403,15 @@ def client.on.drained_keep(drained: Socket & Result<&1, &1, U32 & String, Respon
     case Done{+resp}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (s, Done{resp}, client.on.next_st(st, t)))
 
-def client.on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +st: CliSt) ->
+def client.on.sent_keep(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +st: CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & CliSt):
-  (sock, r) = sent
+  (sock, r, rest) = sent
   match r:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Response> & CliSt, (sock, Fail{e}, st))
     case Done{u}:
       do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client.on.drain(0, (sock, GotErr{0, "next"}), Nil{}, client.on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client.on.st_sid(st), 4)
+        drained : Socket & Result<&1, &1, U32 & String, Response> & Tab <- client.on.drain(0, (sock, GotErr{0, "next"}), rest, client.on.st_tab(st), Head{0, Nil{}}, Nil{}, 0, 0, 0, Nil{}, 0, 0, client.on.st_sid(st), 4)
         client.on.drained_keep(drained, st)
 
 def client.on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req: Request) ->
@@ -5344,7 +5419,7 @@ def client.on.exch_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req
   match req:
     case Request{method, path, headers, body}:
       do IO<Socket & Result<&1, &1, U32 & String, Response> & CliSt>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, client.on.st_sid(st), host, port, method, path, headers, body)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.on.send_req(sock, client.on.st_sid(st), host, port, method, path, headers, body)
         client.on.sent_keep(sent, st)
 
 def client.on.fit_keep(sock: Socket, +st: CliSt, +host: String, +port: U32, req: Request, fit: Bool, ok: Bool) ->
@@ -6118,8 +6193,13 @@ def client_conc.valid_go(reqs: List<&2, Request>, +host: String, +port: U32, ok:
 def client_conc.valid_all(reqs: List<&2, Request>, +host: String, +port: U32) -> Bool:
   client_conc.valid_go(reqs, host, port, True{})
 
-def client_conc.send_kept(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket:
-  (s, r) = sent
+# The concurrent lane pipelines every request before it drains, so a
+# frame that stopped a send (an early response mid-body) has nowhere to
+# go yet: dropped here exactly as the flow sender dropped it before
+# TASK-042 phase 2b. Threading it into client_conc's drain is a separate
+# change, noted in the task file.
+def client_conc.send_kept(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) -> Socket:
+  (s, r, rest) = sent
   s
 
 @unsafe
@@ -6130,7 +6210,7 @@ def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, req
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
     case Request{+method, +path, +headers, +body} <> t:
       do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.on.send_req(sock, sid, host, port, method, path, headers, body)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.on.send_req(sock, sid, host, port, method, path, headers, body)
         client_conc.send_all(client_conc.send_kept(sent), (sid + 2 : U32), host, port, t)
 
 # Concurrent drain leafs (sum, no tab return; connection closes after)
