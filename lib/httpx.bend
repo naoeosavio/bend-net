@@ -3375,11 +3375,18 @@ def httpxn.trailer_act(+end: U32) -> U32:
     case _:
       5
 
+# The trailer decision only applies to a complete block: a fragmented
+# HEADERS (need 1) has to walk the CONTINUATION path first, because the
+# END_STREAM that closes a trailer rides the last CONTINUATION frame, not
+# this one (a HEADERS with END_STREAM and without END_HEADERS is a
+# protocol error anyway). x_resp.decode on a partial block answers status
+# 0, so without the gate a fragmented trailer looked like a trailer with
+# the END_STREAM missing (act 5) instead of act 6.
 def httpxn.head_act2(is_trailer: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
-  match is_trailer:
-    case True{}:
+  match is_trailer need:
+    case True{} 0:
       httpxn.trailer_act(end)
-    case False{}:
+    case _ _:
       httpxn.head_act(need, ok, end)
 
 # Single-stream response drain (once shape; keep-alive threads tab/sid
@@ -5127,6 +5134,22 @@ def client.on.sdata_act(is_cont: Bool, has: Bool, +end: U32) -> U32:
     case _ _ _:
       0
 
+# The streaming handler sees a StreamHead only for a complete, real head.
+# A fragmented block (need 1) has no decoded head yet — x_resp.decode on
+# the first fragment answers status 0 — and the last CONTINUATION frame
+# rejoins phase 4 handler-free, so the old code handed the handler a
+# StreamHead{0} it could only cancel on. A trailer is recognized but
+# never becomes an event either (TASK-042 phase 3): it closes the body
+# (httpxn.trailer_act) or fails closed when its END_STREAM is missing.
+def client.on.stream_head_act(~H: StreamEv -> StreamOut, ev: StreamEv, is_tr: Bool, +need: U32, ok: Bool, +end: U32) -> U32:
+  match is_tr need:
+    case _ 1:
+      httpxn.head_act(need, ok, end)
+    case True{} _:
+      httpxn.trailer_act(end)
+    case False{} _:
+      client.on.stream_act(client.on.is_cont(H(ev)), need, ok, end)
+
 def client.on.sfail(got: Socket & Got, +code: U32, +msg: String) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
   (s, g) = got
@@ -5167,6 +5190,9 @@ def client.on.wu_blest(got: Socket & Got, buf: List<&2, U32>, +sid: U32, +inc: U
 # CONTINUATION inline leaves for sdrop (Phase 15 item 2): fresh Err-next
 # pair to (re)enter the cont-read phase, and GOAWAY-fail mapping for a
 # bad CONT frame (mirror client.on.cont_failed, sdrop result shape).
+# The phase 7 entry re-reads `end` from the frame that completed the
+# block: the END_STREAM that closes a fragmented head (or trailer) rides
+# the last CONTINUATION, never the first HEADERS (TASK-042 phase 3b).
 # Pure leaves above the loop (callee-above-caller, no ~H inside).
 # ---------------------------------------------------------------------
 
@@ -5234,8 +5260,8 @@ def client.on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
           +nt : Tab = x_resp.tab(dr)
           +ok : Bool = x_resp.ok(dr)
           +need : U32 = httpxn.need_u(typ, flags)
-          +out : StreamOut = H(StreamHead{nh})
-          client.on.sdrop(~H, 4, got, buf, nt, nh, total, fins, typ, flags, sid2, payload, cls, end, exp, client.on.stream_act(client.on.is_cont(out), need, ok, end))
+          +is_tr : Bool = httpxn.is_trailer(head, nh)
+          client.on.sdrop(~H, 4, got, buf, nt, httpxn.head_keep_go(head, nh, is_tr), total, fins, typ, flags, sid2, payload, cls, end, exp, client.on.stream_head_act(~H, StreamHead{nh}, is_tr, need, ok, end))
         case 0:
           +fin : Bool = U32.is_eq(end, 1)
           +out0 : StreamOut = H(StreamData{payload, fin})
@@ -5286,13 +5312,15 @@ def client.on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client.on.sdrop(~H, 7, (s6, GotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, exp, flags6), end, exp, 0)
+              client.on.sdrop(~H, 7, (s6, GotOk{frame6, buf6}), buf6, tab, head, total, fins, typ6, flags6, sid6, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, exp, flags6), U32.and(flags6, x_f_end_stream()), exp, 0)
     case 7:
       (s7, g7) = got
       match cls:
         case 0:
           +dr7 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client.on.sdrop(~H, 4, client.on.again(s7), buf, x_resp.tab(dr7), x_resp.rh(dr7), total, fins, typ, flags, sid2, Nil{}, cls, end, exp, httpxn.head_act(0, x_resp.ok(dr7), end))
+          +nh7 : Head = x_resp.rh(dr7)
+          +is_tr7 : Bool = httpxn.is_trailer(head, nh7)
+          client.on.sdrop(~H, 4, client.on.again(s7), buf, x_resp.tab(dr7), httpxn.head_keep_go(head, nh7, is_tr7), total, fins, typ, flags, sid2, Nil{}, cls, end, exp, httpxn.head_act2(is_tr7, 0, x_resp.ok(dr7), end))
         case 1:
           client.on.sdrop(~H, 6, client.on.sdrop_next(s7), buf, tab, head, total, fins, 0, 0, 0, payload, 0, end, exp, 0)
         case _:
@@ -6182,6 +6210,24 @@ def httpxc.head_of(st: ClSt) -> Head:
         case Some{+h}:
           h
 
+# Head stored for one sid, or Head{0, Nil{}} when the ledger has no
+# entry. Reads the slots list without rebuilding it (the shape
+# httpxc.has/has_some use), and httpxn.is_trailer needs the stored head
+# to tell a trailer block from a real one (TASK-042 phase 3b).
+def httpxc.head_lookup_go(eq: Bool, +st: ClSt, rec: Head) -> Head:
+  match eq:
+    case True{}:
+      httpxc.head_of(st)
+    case False{}:
+      rec
+
+def httpxc.head_lookup(slots: List<&2, ClSt>, +sid: U32) -> Head:
+  match slots:
+    case Nil{}:
+      Head{0, Nil{}}
+    case +st <> t:
+      httpxc.head_lookup_go(U32.is_eq(httpxc.sid_of(st), sid), st, httpxc.head_lookup(t, sid))
+
 def httpxc.resp_of(+head: Head, +body: List<&2, U32>) -> Response:
   match head:
     case Head{+status, +headers}:
@@ -6275,7 +6321,10 @@ def client_conc.finish_next(+pending: U32) -> U32:
 
 # CONTINUATION inline leaves for conc drain (Phase 15 item 3): same shape
 # as the sdrop pair — fresh Err-next pair plus GOAWAY-fail mapping with
-# the conc result type. No ~H inside (leaves above the loop).
+# the conc result type. No ~H inside (leaves above the loop). The phase 8
+# entry re-reads `end` from the frame that completed the block: the
+# END_STREAM that closes a fragmented head (or trailer) rides the last
+# CONTINUATION, never the first HEADERS (TASK-042 phase 3b).
 # ---------------------------------------------------------------------
 
 def client_conc.next(s: Socket) -> Socket & Got:
@@ -6289,6 +6338,25 @@ def client_conc.sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
       IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s, Fail{e}))
     case Done{u}:
       IO.pure(Socket & Result<&1, &1, U32 & String, U32>, (s, Fail{(502, "continuation")}))
+
+# The answer for a HEADERS block that ends a stream. A real head (status
+# present) answers from itself with no body, the ledger untouched: the
+# old path, still O(1). A trailer block — x_resp.decode answers status 0
+# when no :status is present, and a stored head is what makes it a
+# trailer (httpxn.is_trailer) — answers from the slot entry it closes,
+# taken out so the ledger neither leaks nor loses the accumulated body.
+# Both ride out through ClTaken, so the caller keeps the usual
+# taken_slots/taken_st pair and httpxc.req_of_st builds the response.
+# has arrives as a parameter: a match cannot scrutinize a call.
+def client_conc.answer_go(has: Bool, slots: List<&2, ClSt>, +sid2: U32, +nh: Head) -> ClTaken:
+  match has:
+    case True{}:
+      ClTaken{slots, ClSt{Some{nh}, Nil{}, sid2}}
+    case False{}:
+      httpxc.take_del(slots, sid2)
+
+def client_conc.answer(slots: List<&2, ClSt>, +sid2: U32, +nh: Head) -> ClTaken:
+  client_conc.answer_go(client.on.has_head(nh), slots, sid2, nh)
 
 @unsafe
 def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +slots: List<&2, ClSt>, +pending: U32, +total: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +nh: Head, act: U32) ->
@@ -6338,7 +6406,10 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
       match typ:
         case 1:
           +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client_conc.drain(~H, 4, got, buf, x_resp.tab(dr), slots, pending, total, typ, flags, sid2, payload, cls, end, x_resp.rh(dr), httpxn.head_act(httpxn.need_u(typ, flags), x_resp.ok(dr), end))
+          +nh1 : Head = x_resp.rh(dr)
+          +need : U32 = httpxn.need_u(typ, flags)
+          +is_tr : Bool = httpxn.is_trailer(httpxc.head_lookup(slots, sid2), nh1)
+          client_conc.drain(~H, 4, got, buf, x_resp.tab(dr), slots, pending, total, typ, flags, sid2, payload, cls, end, nh1, httpxn.head_act2(is_tr, need, x_resp.ok(dr), end))
         case 0:
           client_conc.drain(~H, 5, got, buf, tab, slots, pending, total, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, httpxn.decide_data(httpxc.has(slots, sid2), end))
         case _:
@@ -6348,8 +6419,10 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
         case 0:
           client_conc.drain(~H, 0, got, buf, tab, httpxc.put(slots, ClSt{Some{nh}, Nil{}, sid2}), pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 1:
-          +sc1 : U32 = H(httpxc.resp_of(nh, Nil{}))
-          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, slots, (pending - 1 : U32), (total + sc1 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
+          +tp1 : ClTaken = client_conc.answer(slots, sid2, nh)
+          +resp1 : Response = httpxc.req_of_st(httpxc.taken_st(tp1), Nil{})
+          +sc1 : U32 = H(resp1)
+          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.taken_slots(tp1), (pending - 1 : U32), (total + sc1 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 6:
           client_conc.drain(~H, 6, client_conc.next(httpx.wo(got)), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, 0)
         case 5:
@@ -6385,13 +6458,15 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), end, Head{0, Nil{}}, 0)
+              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), U32.and(flags6, x_f_end_stream()), Head{0, Nil{}}, 0)
     case 8:
       (s8, g8) = got
       match cls:
         case 0:
           +dr8 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
-          client_conc.drain(~H, 4, client_conc.next(s8), buf, x_resp.tab(dr8), slots, pending, total, typ, flags, sid2, Nil{}, cls, end, x_resp.rh(dr8), httpxn.head_act(0, x_resp.ok(dr8), end))
+          +nh8 : Head = x_resp.rh(dr8)
+          +is_tr8 : Bool = httpxn.is_trailer(httpxc.head_lookup(slots, sid2), nh8)
+          client_conc.drain(~H, 4, client_conc.next(s8), buf, x_resp.tab(dr8), slots, pending, total, typ, flags, sid2, Nil{}, cls, end, nh8, httpxn.head_act2(is_tr8, 0, x_resp.ok(dr8), end))
         case 1:
           client_conc.drain(~H, 6, client_conc.next(s8), buf, tab, slots, pending, total, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, 0)
         case _:
