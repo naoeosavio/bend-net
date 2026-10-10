@@ -6366,7 +6366,10 @@ def client.concurrent_insecure(~H: Response -> U32, +host: String, +port: U32, +
 # ~H: SrvEv -> SrvOut (Continue buffers like today, RespondEarly
 # sends + frees + skips rest via stray-skip). Shares take_del/has/
 # put/classify/preface/plumbing (no copy); self-recursive own loop (no
-# mutual with httpx). No WU sends (backpressure via withheld WU, like httpx).
+# mutual with httpx). No WU sends for tracked streams (backpressure via
+# withheld WU, like httpx); the one credit is httpxs.wu_conn, which gives
+# a discarded DATA frame's bytes back to the CONNECTION window so a peer
+# that is still uploading does not stall (TASK-042 phase 2).
 # Stray DATA skips (not closes) to allow early-rest skipping.
 # ---------------------------------------------------------------------
 
@@ -6482,6 +6485,54 @@ def httpxs.data_resp_from_out(+out: SrvOut) -> Response:
     case Cancel{}:
       Response{0, Nil{}, Nil{}}
 
+# Credit a discarded DATA frame back to the CONNECTION window (act 8):
+# the bytes counted against it, and a peer whose connection window drains
+# to zero stops sending on every stream -- the deadlock TASK-042 phase 2
+# fixes. Connection only: the stream that owned the DATA is gone (that is
+# why the frame is stray), so a stream-level WINDOW_UPDATE would be
+# meaningless. A zero-length DATA has nothing to credit, and a
+# WINDOW_UPDATE with a zero increment is a protocol error (RFC 9113
+# section 6.9), hence the guard -- the same one x_send_wu_len.go applies
+# before its double WU.
+
+def httpxs.wu_conn.go(sock: Socket, +inc: U32, empty: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  match empty:
+    case True{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+    case False{}:
+      x_send_wu(sock, 0, inc)
+
+def httpxs.wu_conn(sock: Socket, +inc: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  httpxs.wu_conn.go(sock, inc, U32.is_eq(inc, 0))
+
+# After a complete early response, a request whose HEADERS did not carry
+# END_STREAM still owes a body this server will never read: tell the peer
+# to stop with RST_STREAM (RFC 9113 section 8.1 -- complete response
+# first, then the reset; the code is CANCEL, the "stream no longer
+# needed" the client lane already sends at httpx.bend:5034). Once per
+# stream, because the early answer frees the slot once; DATA already in
+# flight is credited by httpxs.wu_conn, never reset twice. end == 1 means
+# the head ended the stream and there is no body to stop.
+
+def httpxs.rst_early.go(sock: Socket, +sid: U32, +end: U32, no_body: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  match no_body:
+    case True{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+    case False{}:
+      x_send_rst(sock, sid, 8)
+
+def httpxs.rst_early(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +end: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
+    case Done{u}:
+      httpxs.rst_early.go(s, sid, end, U32.is_eq(end, 1))
+
 def httpxs.head_act_of(~H: SrvEv -> SrvOut, ok: Bool, +need: U32, +end: U32, +nh: ReqHead, +nt: Tab, +sid: U32) -> U32:
   match ok need:
     case _ 1:
@@ -6591,7 +6642,8 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(s4, sid2, resp)
-            httpx_stream(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            rst : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.rst_early(sent, sid2, end)
+            httpx_stream(~H, 0, httpx.sent(rst), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
           httpx_stream(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
@@ -6613,7 +6665,9 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_resp(httpx.wo(got2), sid2, resp)
             httpx_stream(~H, 0, httpx.sent(sent), httpxn.taken_slots(httpxn.take_del(slots, sid2)), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 8:
-          httpx_stream(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          do IO<Unit>:
+            wu : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.wu_conn(sb2, x_len32(payload))
+            httpx_stream(~H, 0, httpx.sent(wu), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
           TLS.tls_close(sb2)
         case _:
