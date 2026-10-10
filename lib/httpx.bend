@@ -642,8 +642,14 @@ def x_frame.end_of(+flags: U32) -> Bool:
 def x_frame.len3(+l0: U32, +l1: U32, +l2: U32) -> U32:
   (l0 * 65536 + l1 * 256 + l2 : U32)
 
+# The R bit is the MSB of the FIRST of the four bytes (RFC 9113 section
+# 4.1), so it is s0 that gets masked: masking s3 (the low byte) dropped
+# bit 7 of every stream id whose low byte had it set -- sid 129 read back
+# as 1, sid 255 as 127 -- which misroutes every frame above the 64th
+# stream. TASK-042 phase 5, found while reusing this reader for the
+# GOAWAY last-stream-id.
 def x_frame.sid4(+s0: U32, +s1: U32, +s2: U32, +s3: U32) -> U32:
-  (s0 * 16777216 + s1 * 65536 + s2 * 256 + U32.and(s3, 127) : U32)
+  (U32.and(s0, 127) * 16777216 + s1 * 65536 + s2 * 256 + s3 : U32)
 
 # The record one frame's raw bytes decode to — the price this lane pays
 # for the shared outcome (TASK-026 Phase 3). UnitOut's unit is RAW BYTES
@@ -2114,6 +2120,159 @@ def x_classify(+frame: Frame) -> U32:
     case Frame{+typ, +flags, +sid, +payload}:
       x_cls(typ, sid, flags, payload)
 
+# H2 control-frame errors (TASK-042 phase 5)
+# ------------------------------------------
+# RFC 9113 section 7: every connection and stream error carries a wired
+# U32 code. The names are the registered ones (section 7.1), so a Fail
+# says which error the peer sent instead of a bare "goaway"/"rst_stream",
+# and the caller that wants to repeat a request reads the code (503 for
+# "not processed", 502 for "the peer may have acted on it"), not the text.
+def x_h2_err.name(+code: U32) -> String:
+  match code:
+    case 0:
+      "NO_ERROR"
+    case 1:
+      "PROTOCOL_ERROR"
+    case 2:
+      "INTERNAL_ERROR"
+    case 3:
+      "FLOW_CONTROL_ERROR"
+    case 4:
+      "SETTINGS_TIMEOUT"
+    case 5:
+      "STREAM_CLOSED"
+    case 6:
+      "FRAME_SIZE_ERROR"
+    case 7:
+      "REFUSED_STREAM"
+    case 8:
+      "CANCEL"
+    case 9:
+      "COMPRESSION_ERROR"
+    case 10:
+      "CONNECT_ERROR"
+    case 11:
+      "ENHANCE_YOUR_CALM"
+    case 12:
+      "INADEQUATE_SECURITY"
+    case 13:
+      "HTTP_1_1_REQUIRED"
+    case _:
+      "UNKNOWN"
+
+def x_h2_err.text(+code: U32) -> String:
+  x_h2_err.name(code) ++ "(" ++ U32.show(code) ++ ")"
+
+def x_h2_err.frame_size() -> U32:
+  6
+
+# The Fail code of a control-frame error: 503 when the peer said the
+# stream was not processed (safe to repeat), 502 when it may have been.
+def x_fail_status(is_retry: Bool) -> U32:
+  match is_retry:
+    case True{}:
+      503
+    case False{}:
+      502
+
+# The 4-byte big-endian field reader, 0 when the payload is shorter than
+# the field. x_flow_wu_inc shares this body: one arithmetic for the
+# WINDOW_UPDATE increment, the GOAWAY error code and the RST_STREAM code.
+def x_be32_rd(+pay: List<&2, U32>) -> U32:
+  match pay:
+    case Nil{}:
+      0
+    case +b0 <> r0:
+      match r0:
+        case Nil{}:
+          0
+        case +b1 <> r1:
+          match r1:
+            case Nil{}:
+              0
+            case +b2 <> r2:
+              match r2:
+                case Nil{}:
+                  0
+                case +b3 <> r3:
+                  (b0 * 16777216 + b1 * 65536 + b2 * 256 + b3 : U32)
+
+# RFC 9113 section 6.8: a GOAWAY payload is the last-stream-id (31 bits,
+# the R bit reserved) plus the error code, and may carry debug data. Fewer
+# than 8 bytes is a connection error (FRAME_SIZE_ERROR), so the readers
+# answer fail-closed: x_goaway.none is the largest U32, which no stream is
+# above, so nothing looks safe to repeat, and the code is FRAME_SIZE_ERROR.
+def x_goaway.none() -> U32:
+  4294967295
+
+# The 31 bits of a stream identifier (the R bit is the 32nd).
+def x_sid31_mask() -> U32:
+  2147483647
+
+def x_goaway.last_go(is_short: Bool, +pay: List<&2, U32>) -> U32:
+  match is_short:
+    case True{}:
+      x_goaway.none()
+    case False{}:
+      U32.and(x_be32_rd(pay), x_sid31_mask())
+
+def x_goaway.last(+pay: List<&2, U32>) -> U32:
+  x_goaway.last_go(U32.is_lt(x_len32(pay), 8), pay)
+
+def x_goaway.code_go(is_short: Bool, +pay: List<&2, U32>) -> U32:
+  match is_short:
+    case True{}:
+      x_h2_err.frame_size()
+    case False{}:
+      x_be32_rd(x_drop32(4, pay))
+
+def x_goaway.code(+pay: List<&2, U32>) -> U32:
+  x_goaway.code_go(U32.is_lt(x_len32(pay), 8), pay)
+
+# RFC 9113 section 8.7: a stream above the last-stream-id was not
+# processed, so repeating the request is allowed; at or below it the peer
+# may have acted on the stream, so the failure is real.
+def x_goaway.retry(+pay: List<&2, U32>, +sid: U32) -> Bool:
+  U32.is_lt(x_goaway.last(pay), sid)
+
+def x_goaway.status(+pay: List<&2, U32>, +sid: U32) -> U32:
+  x_fail_status(x_goaway.retry(pay, sid))
+
+def x_goaway.last_text_go(is_short: Bool, +pay: List<&2, U32>) -> String:
+  match is_short:
+    case True{}:
+      "short"
+    case False{}:
+      "last=" ++ U32.show(x_goaway.last(pay))
+
+def x_goaway.reason(+pay: List<&2, U32>, +sid: U32) -> String:
+  "goaway " ++ x_h2_err.text(x_goaway.code(pay)) ++ " "
+    ++ x_goaway.last_text_go(U32.is_lt(x_len32(pay), 8), pay)
+    ++ " sid=" ++ U32.show(sid)
+
+# RFC 9113 section 6.8: RST_STREAM carries exactly one 4-byte error code,
+# so any other length is FRAME_SIZE_ERROR (a connection error).
+def x_rst.code_go(is_exact: Bool, +pay: List<&2, U32>) -> U32:
+  match is_exact:
+    case True{}:
+      x_be32_rd(pay)
+    case False{}:
+      x_h2_err.frame_size()
+
+def x_rst.code(+pay: List<&2, U32>) -> U32:
+  x_rst.code_go(U32.is_eq(x_len32(pay), 4), pay)
+
+# REFUSED_STREAM is the peer saying "I did not process this stream", the
+# same "safe to repeat" signal a GOAWAY above the stream id gives.
+def x_rst.retry(+pay: List<&2, U32>) -> Bool:
+  U32.is_eq(x_rst.code(pay), 7)
+
+def x_rst.status(+pay: List<&2, U32>) -> U32:
+  x_fail_status(x_rst.retry(pay))
+
+def x_rst.reason(+pay: List<&2, U32>) -> String:
+  "rst_stream " ++ x_h2_err.text(x_rst.code(pay))
+
 def x_send_raw_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   TLS.tls_send_bytes(sock, x_frame_write(typ, flags, sid, pay))
@@ -2139,24 +2298,10 @@ def x_flow_min.pick(+a: U32, +b: U32, pick_a: Bool) -> U32:
 def x_flow_min(+a: U32, +b: U32) -> U32:
   x_flow_min.pick(a, b, U32.is_le(a, b))
 
+# The increment of a WINDOW_UPDATE payload: the shared 4-byte big-endian
+# reader (x_be32_rd), named for the field this lane reads with it.
 def x_flow_wu_inc(+pay: List<&2, U32>) -> U32:
-  match pay:
-    case Nil{}:
-      0
-    case +b0 <> r0:
-      match r0:
-        case Nil{}:
-          0
-        case +b1 <> r1:
-          match r1:
-            case Nil{}:
-              0
-            case +b2 <> r2:
-              match r2:
-                case Nil{}:
-                  0
-                case +b3 <> r3:
-                  (((b0 * 16777216 + b1 * 65536 + b2 * 256 + b3 : U32)))
+  x_be32_rd(pay)
 
 def x_flow_credit.mine(+cw: U32, +sw: U32, +inc: U32, is_mine: Bool) -> U32 & U32:
   match is_mine:
@@ -2363,10 +2508,11 @@ def x_f_seed(+flags: U32) -> U32:
 # arriving while the body is still going: the wire bytes go back as the
 # caller's read seed, TASK-042 phase 2b); 14 keeps sending and stashes the
 # frame (DATA or HEADERS of another stream, PRIORITY, PUSH_PROMISE — what
-# the old routing dropped, TASK-042 phase 2e); 12 is the frames the sender
-# answers itself (WINDOW_UPDATE, SETTINGS, PING, RST_STREAM, GOAWAY). The
-# bools take their own def because a match cannot scrutinize a computed
-# value.
+# the old routing dropped, TASK-042 phase 2e — plus a sibling's RST_STREAM,
+# see x_flow.keep_cls); 12 is the frames the sender answers itself
+# (WINDOW_UPDATE, SETTINGS, PING, the RST_STREAM of the stream being sent,
+# GOAWAY). The bools take their own def because a match cannot scrutinize a
+# computed value.
 def x_flow.route_go(is_head: Bool, same: Bool, is_keep: Bool) -> U32:
   match is_head same is_keep:
     case _ _ False{}:
@@ -2376,8 +2522,25 @@ def x_flow.route_go(is_head: Bool, same: Bool, is_keep: Bool) -> U32:
     case _ _ _:
       14
 
+# The frames the sender hands to the caller instead of acting on them: the
+# class-0 bucket (DATA, HEADERS, PRIORITY, PUSH_PROMISE) and a RST_STREAM
+# of another stream. The sibling RST is the node:http2 shape -- a peer
+# resets a stream it already answered while the next request's body is
+# still going -- and the drain is the one place that decides whose frame it
+# is (client.on.stream_cls), so the sender stashes it like any other
+# foreign frame. The RST of the stream being sent is not kept: it stops the
+# send with the typed error.
+def x_flow.keep_cls(+cls: U32, same: Bool) -> Bool:
+  match cls same:
+    case 0 _:
+      True{}
+    case 3 False{}:
+      True{}
+    case _ _:
+      False{}
+
 def x_flow.route(+typ: U32, +sid29: U32, +sid: U32, +cls: U32) -> U32:
-  x_flow.route_go(U32.is_eq(typ, 1), U32.is_eq(sid29, sid), U32.is_eq(cls, 0))
+  x_flow.route_go(U32.is_eq(typ, 1), U32.is_eq(sid29, sid), x_flow.keep_cls(cls, U32.is_eq(sid29, sid)))
 
 # The bytes a stopping or stashed frame adds to the caller's read seed: the
 # frame re-encoded the way the reader expects it, followed by the rest of
@@ -2443,9 +2606,9 @@ def x_flow.do_act(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, 
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)
         x_send_data_flow(4, x_flow_sent(sent), sid, body, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case 3:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "rst_stream")}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(x_rst.status(pay2), x_rst.reason(pay2))}, Nil{}))
     case 7:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "goaway")}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(x_goaway.status(pay2, sid), x_goaway.reason(pay2, sid))}, Nil{}))
     case 9:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "continuation")}, Nil{}))
     case _:
@@ -3366,8 +3529,26 @@ def client.on.mine_go(+cls: U32, is_stream: Bool, is_mine: Bool) -> U32:
     case _ _:
       cls
 
+# Classes that belong to exactly one stream, so a drain that opened
+# another sid must not act on them: DATA and HEADERS (6) and RST_STREAM
+# (2). A sibling's RST is legitimate -- a peer resets a stream it already
+# answered (node:http2 sends RST_STREAM NO_ERROR once the response is out
+# and the request body is still coming) and a pushed stream is reset
+# freely -- so treating it as ours failed the request with a bare 502.
+# CONTINUATION (8) stays unfiltered: RFC 9113 section 6.10 makes a
+# CONTINUATION for another stream while a block is open a connection
+# error, which is exactly the fail-closed arm the drains already have.
+def client.on.stream_cls(+cls: U32) -> Bool:
+  match cls:
+    case 2:
+      True{}
+    case 6:
+      True{}
+    case _:
+      False{}
+
 def client.on.mine_cls(+cls: U32, +sid2: U32, +exp: U32) -> U32:
-  client.on.mine_go(cls, U32.is_eq(cls, 6), U32.is_eq(sid2, exp))
+  client.on.mine_go(cls, client.on.stream_cls(cls), U32.is_eq(sid2, exp))
 
 # Upload cap removed (item 2): the flow sender slices DATA to peer windows
 # (server gives WU per DATA). Bodies any size go through; the H1 lane keeps
@@ -3477,7 +3658,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
             gotp : Socket & Got <- client.on.ack_ping(got, payload)
             client.on.drain(0, gotp, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
-          client.on.fail(got, tab, 502, "goaway")
+          client.on.fail(got, tab, x_goaway.status(payload, exp), x_goaway.reason(payload, exp))
         case 7:
           client.on.drain(0, got, buf, tab, head, body, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 9:
@@ -3485,7 +3666,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
         case 8:
           client.on.fail(got, tab, 502, "continuation")
         case 2:
-          client.on.fail(got, tab, 502, "rst_stream")
+          client.on.fail(got, tab, x_rst.status(payload), x_rst.reason(payload))
         case 6:
           client.on.drain(3, got, buf, tab, head, body, typ, flags, sid2, payload, cls, end, exp, 4)
         case 0:
@@ -5337,7 +5518,7 @@ def client.on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
             gotp : Socket & Got <- client.on.ack_ping(got, payload)
             client.on.sdrop(~H, 0, gotp, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 5:
-          client.on.sfail(got, 502, "goaway")
+          client.on.sfail(got, x_goaway.status(payload, exp), x_goaway.reason(payload, exp))
         case 7:
           client.on.sdrop(~H, 0, got, buf, tab, head, total, fins, 0, 0, 0, Nil{}, 0, 0, exp, 4)
         case 9:
@@ -5345,7 +5526,7 @@ def client.on.sdrop(~H: StreamEv -> StreamOut, phase: U32, got: Socket & Got, +b
         case 8:
           client.on.sfail(got, 502, "continuation")
         case 2:
-          client.on.sfail(got, 502, "rst_stream")
+          client.on.sfail(got, x_rst.status(payload), x_rst.reason(payload))
         case 6:
           client.on.sdrop(~H, 3, got, buf, tab, head, total, fins, typ, flags, sid2, payload, cls, end, exp, 4)
         case 0:
@@ -6496,7 +6677,7 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
             gotp : Socket & Got <- client.on.ack_ping(got, payload)
             client_conc.drain(~H, 0, gotp, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 5:
-          client_conc.fail(got, 502, "goaway")
+          client_conc.fail(got, x_goaway.status(payload, client_conc.first_sid()), x_goaway.reason(payload, client_conc.first_sid()))
         case 7:
           client_conc.drain(~H, 0, got, buf, tab, slots, pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 9:
@@ -6618,10 +6799,17 @@ def client_conc.after_send(~H: Response -> U32, sent: Socket & Result<&1, &1, U3
         drained : Socket & Result<&1, &1, U32 & String, U32> <- client_conc.drain(~H, 0, (sock, GotErr{0, "next"}), seed, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         client_conc.drained(drained)
 
+# The batch opens sids 1, 3, 5, ... (client_conc.exch starts at 1), so the
+# first one is the lowest: a GOAWAY at or below it may have been acted on
+# by the peer, and the batch fails as a whole, so that is the sid the
+# retry verdict is read against.
+def client_conc.first_sid() -> U32:
+  1
+
 def client_conc.exch(~H: Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   do IO<Result<&1, &1, U32 & String, U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, 1, host, port, reqs, Nil{})
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
     client_conc.after_send(~H, sent, pending)
 
 def client_conc.conn(~H: Response -> U32, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->

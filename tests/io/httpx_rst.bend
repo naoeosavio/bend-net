@@ -93,6 +93,15 @@ def v_mine_data() -> U32:
 def v_foreign_data() -> U32:
   b2u(U32.is_eq(HTTPX.client.on.mine_cls(HTTPX.x_classify(HTTPX.Frame{0, 1, 3, [104, 105]}), 3, 1), 0))
 
+# A sibling's RST_STREAM is legitimate (node:http2 resets a stream it
+# already answered while the request body is still coming; a pushed stream
+# is reset freely), so the drain must not act on it: only RST_STREAM for
+# the sid it opened is ours. Before TASK-042 phase 5 the sid filter only
+# covered DATA/HEADERS and a sibling RST failed the request with a bare
+# 502 "rst_stream".
+def v_foreign_rst() -> U32:
+  b2u(U32.is_eq(HTTPX.client.on.mine_cls(HTTPX.x_classify(HTTPX.Frame{3, 0, 3, [0, 0, 0, 8]}), 3, 1), 0))
+
 # Wire shapes: RST_STREAM carries the 4-byte error code, GOAWAY the last-sid
 # then the code (RFC 9113 section 6.8 / 6.9).
 
@@ -102,6 +111,67 @@ def v_rst_pay() -> U32:
 def v_goaway_pay() -> U32:
   bytes_eq(HTTPX.x_send_goaway.pay(3, 1), [0, 0, 0, 3, 0, 0, 0, 1])
 
+# Read side of the same two frames (TASK-042 phase 5): the GOAWAY
+# last-stream-id is a 31-bit field (R bit is the MSB of the first byte) and
+# the error code names the failure, so a Fail can say which error arrived
+# and whether the stream was processed at all.
+
+def go_pay() -> List<&2, U32>:
+  [0, 0, 0, 3, 0, 0, 0, 0]
+
+def go_r_pay() -> List<&2, U32>:
+  [128, 0, 0, 3, 0, 0, 0, 0]
+
+def go_short() -> List<&2, U32>:
+  [0, 0, 0, 3]
+
+def v_goaway_last() -> U32:
+  (b2u(U32.is_eq(HTTPX.x_goaway.last(go_pay()), 3))
+    + b2u(U32.is_eq(HTTPX.x_goaway.last(go_r_pay()), 3))
+    + b2u(U32.is_eq(HTTPX.x_goaway.code(go_pay()), 0)) : U32)
+
+# RFC 9113 8.7: above the last-stream-id the stream was not processed (503,
+# safe to repeat); at or below it the peer may have acted (502, real).
+def v_goaway_verdict() -> U32:
+  (b2u(Bool.not(HTTPX.x_goaway.retry(go_pay(), 1)))
+    + b2u(HTTPX.x_goaway.retry(go_pay(), 5))
+    + b2u(U32.is_eq(HTTPX.x_goaway.status(go_pay(), 1), 502))
+    + b2u(U32.is_eq(HTTPX.x_goaway.status(go_pay(), 5), 503)) : U32)
+
+def v_goaway_reason() -> U32:
+  b2u(String.eq(HTTPX.x_goaway.reason(go_pay(), 1), "goaway NO_ERROR(0) last=3 sid=1"))
+
+# A GOAWAY shorter than the 8 bytes RFC 9113 6.8 requires is a connection
+# error: the reader answers the fail-closed sentinel for the id (no stream
+# is above it, so nothing looks safe to repeat) and FRAME_SIZE_ERROR (6).
+def v_goaway_short() -> U32:
+  (b2u(U32.is_eq(HTTPX.x_goaway.last(go_short()), 4294967295))
+    + b2u(U32.is_eq(HTTPX.x_goaway.code(go_short()), 6))
+    + b2u(U32.is_eq(HTTPX.x_goaway.status(go_short(), 1), 502))
+    + b2u(String.eq(HTTPX.x_goaway.reason(go_short(), 1), "goaway FRAME_SIZE_ERROR(6) short sid=1")) : U32)
+
+# REFUSED_STREAM (7) is the RST_STREAM "I did not process this" signal, the
+# same safe-to-repeat verdict a GOAWAY above the sid gives; any other code
+# (CANCEL 8 here) is a real failure.
+def v_rst_verdict() -> U32:
+  (b2u(U32.is_eq(HTTPX.x_rst.code([0, 0, 0, 7]), 7))
+    + b2u(HTTPX.x_rst.retry([0, 0, 0, 7]))
+    + b2u(U32.is_eq(HTTPX.x_rst.status([0, 0, 0, 7]), 503))
+    + b2u(String.eq(HTTPX.x_rst.reason([0, 0, 0, 7]), "rst_stream REFUSED_STREAM(7)"))
+    + b2u(Bool.not(HTTPX.x_rst.retry([0, 0, 0, 8])))
+    + b2u(U32.is_eq(HTTPX.x_rst.status([0, 0, 0, 8]), 502))
+    + b2u(String.eq(HTTPX.x_rst.reason([0, 0, 0, 8]), "rst_stream CANCEL(8)")) : U32)
+
+def v_rst_short() -> U32:
+  (b2u(U32.is_eq(HTTPX.x_rst.code([0, 0, 0, 7, 0]), 6))
+    + b2u(U32.is_eq(HTTPX.x_rst.status([0, 0, 0, 7, 0]), 502)) : U32)
+
+def v_err_name() -> U32:
+  (b2u(String.eq(HTTPX.x_h2_err.name(0), "NO_ERROR"))
+    + b2u(String.eq(HTTPX.x_h2_err.name(7), "REFUSED_STREAM"))
+    + b2u(String.eq(HTTPX.x_h2_err.name(99), "UNKNOWN"))
+    + b2u(String.eq(HTTPX.x_h2_err.text(8), "CANCEL(8)")) : U32)
+
 law main:
   IO(U32)
 
@@ -110,8 +180,10 @@ def main():
     +total : U32 = (v_rst() + v_goaway() + v_ping() + v_settings_ack() + v_cont()
       + v_rst_sid0() + v_cont_sid0() + v_wu_ok() + v_wu_zero() + v_wu_short()
       + v_wu_long() + v_wu_reserved_bit() + v_mine_rst() + v_mine_data()
-      + v_foreign_data() + v_rst_pay() + v_goaway_pay() : U32)
-    +pass : U32 = b2u(U32.is_eq(total, 17))
+      + v_foreign_data() + v_rst_pay() + v_goaway_pay() + v_foreign_rst()
+      + v_goaway_last() + v_goaway_verdict() + v_goaway_reason()
+      + v_goaway_short() + v_rst_verdict() + v_rst_short() + v_err_name() : U32)
+    +pass : U32 = b2u(U32.is_eq(total, 43))
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
     return pass

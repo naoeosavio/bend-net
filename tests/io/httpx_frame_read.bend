@@ -110,9 +110,21 @@ def v_padded_strip() -> U32:
 def v_priority_strip() -> U32:
   frame_len(HTTPX.x_parse(HTTPX.x_frame_write(0, 32, 1, [0, 0, 0, 0, 0, 104])))
 
+# The stream id is a 31-bit field whose R bit is the MSB of the FIRST id
+# byte (RFC 9113 4.1): a reader that masks the last byte instead drops bit
+# 7 of every low byte, so sid 129 read back as 1 and sid 255 as 127 --
+# every frame above the 64th stream was misrouted (TASK-042 phase 5).
+def sid_frame(sid: U32) -> List<&2, U32>:
+  HTTPX.x_frame_write(0, 0, sid, Nil{})
+
+def v_sid_above_127() -> U32:
+  (b2u(U32.is_eq(frame_sid(HTTPX.x_parse(sid_frame(129))), 129))
+    + b2u(U32.is_eq(frame_sid(HTTPX.x_parse(sid_frame(255))), 255))
+    + b2u(U32.is_eq(frame_sid(HTTPX.x_parse(sid_frame(2147483647))), 2147483647)) : U32)
+
 def chk_parser() -> U32:
   (v_empty() + v_half_header() + v_short_payload() + v_roundtrip() + v_over_cap()
-    + v_padded_strip() + v_priority_strip() : U32)
+    + v_padded_strip() + v_priority_strip() + v_sid_above_127() : U32)
 
 # The head block the paced peer ships: 8 pad headers of 64 chars each, so the
 # encoded block is well over 640 bytes and needs several 128-byte sends.
@@ -144,7 +156,7 @@ law main:
 def main():
   do IO<U32>:
     +score : U32 = (chk_parser() + chk_pieces() : U32)
-    +pass : U32 = b2u(U32.is_eq(score, 11))
+    +pass : U32 = b2u(U32.is_eq(score, 14))
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
     return pass

@@ -51,8 +51,16 @@ def main() -> IO(U32):
     # 8. the seed keeps wire order: accumulated, then the frame, then the
     #    rest of the recv.
     h : U32 = list_ok(HTTPX.x_flow.seed_add([1], 0, 0, 3, [7], [9]), [1, 0, 0, 1, 0, 0, 0, 0, 0, 3, 7, 9])
-    +total : U32 = (a + b + c + d + e + f + g + h : U32)
+    # 9. the RST_STREAM of the stream being sent stops it (typed error).
+    i : U32 = route_ok(3, 7, 7, 3, 12)
+    # 10. a sibling's RST_STREAM is stashed like any foreign frame: the
+    #     drain filters it by sid (client.on.stream_cls), the sender must
+    #     not fail the upload it is still feeding.
+    j : U32 = route_ok(3, 5, 7, 3, 14)
+    # 11. GOAWAY is connection-level, never kept.
+    k : U32 = route_ok(7, 0, 7, 5, 12)
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k : U32)
     w : Unit <- IO.print(U32.show(total))
     return total
 
-#|8
+#|11
