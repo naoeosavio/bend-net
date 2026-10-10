@@ -103,6 +103,18 @@ def server_tls(l: Listener) -> IO(String):
     x : Unit <- HTTPX.server.on_alpn(~site_handler, l, TLS_CERT(), TLS_KEY())
     return "tls lane down"
 
+# Base's TCP.listen fixes the accept queue at 16, so a burst of more
+# dials than that makes the kernel drop the excess SYNs and every dropped
+# dial waits out the TCP retry (~1s, measured in TASK-041). This server
+# is dialed by peers that can arrive together, so it listens with the
+# package's depth instead.
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, U32 & String, Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 # A busy port is reported, not retried: the URL printed above has to be
 # the URL the browser opens.
 def listen_or_die.go(r: Result<&1, &1, U32 & String, Listener>, port: U32) -> IO(Listener):
@@ -114,7 +126,7 @@ def listen_or_die.go(r: Result<&1, &1, U32 & String, Listener>, port: U32) -> IO
 
 def listen_or_die(+port: U32) -> IO(Listener):
   do IO<Listener>:
-    r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(port)
+    r : Result<&1, &1, U32 & String, Listener> <- listen_deep(port)
     listen_or_die.go(r, port)
 
 def main() -> IO(Unit):

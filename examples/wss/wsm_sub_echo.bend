@@ -54,10 +54,22 @@ def main_go(r):
         z : Unit <- WSM.server_on_sub(~h.echo, ["p1"], l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
         return 0
 
+# Base's TCP.listen fixes the accept queue at 16, so a burst of more
+# dials than that makes the kernel drop the excess SYNs and every dropped
+# dial waits out the TCP retry (~1s, measured in TASK-041). This server
+# is dialed by peers that can arrive together, so it listens with the
+# package's depth instead.
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, U32 & String, Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 law main:
   IO(U32)
 
 def main():
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(19894)
+    r : Result<&1, &1, U32 & String, Listener> <- listen_deep(19894)
     main_go(r)

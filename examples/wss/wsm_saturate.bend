@@ -1,4 +1,4 @@
-# Saturation + bench driver for lib/https.bend and lib/wsm.bend.
+# Saturation + bench driver for lib/httpx.bend and lib/wsm.bend.
 # Bend<->Bend loopback over ephemeral ports (no fixed-port clashes with
 # the 19892/19893 echo peers). The HTTPS server is HTTPX.server.on and
 # the WSS server is WSM.server_on (both IO.spawn per connection, so the
@@ -9,12 +9,19 @@
 # Clients run N=20 per lane in parallel: run_* forks one client, then
 # recurses for the rest while it flies, then joins — all N overlap.
 # Prints SAT OK x/20 per lane plus BENCH lines (wall time comes from
-# `time` around the run; Bend has no clock effect).
+# `time` around the run; the phases are timed inside .scratch/perf/att.bend
+# with IO.now).
+#
+# The listeners come from TCP.listen_backlog, not Base's TCP.listen: the
+# runtime fixes that queue at 16, so a 20-client burst would drop SYNs and
+# every dropped dial would wait out the TCP retry (~1s per burst, measured
+# in TASK-041). 20 clients here, so the depth has to be real.
 #
 # Manual only — never runs in check.sh (needs loopback + TLS):
 #   bend examples/wss/wsm_saturate.bend
 #   time bend examples/wss/wsm_saturate.bend
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/wsm.bend as WSM
 import ../../lib/httpx.bend as HTTPX
@@ -134,6 +141,13 @@ def run_wss(port, n):
         a : U32 <- IO.join(U32, chan)
         IO.pure(U32, (a + rest : U32))
 
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, U32 & String, Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 law listen_retry:
   for port: U32
   for r: Result<&1, &1, U32 & String, Listener>
@@ -159,7 +173,7 @@ def listen_any(tries, port):
     case 1n+t:
       rest = listen_any(t, (port + 1 : U32))
       do IO<Listener & U32>:
-        r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(port)
+        r : Result<&1, &1, U32 & String, Listener> <- listen_deep(port)
         listen_retry(port, r, rest)
 
 law main_wss:

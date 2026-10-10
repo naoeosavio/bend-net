@@ -5,6 +5,7 @@
 # Run one server at a time (fixed port).
 # Run: bend examples/wsm/server.bend
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/wsm.bend as WSM
 
 law b2u:
@@ -397,12 +398,24 @@ def bound(res):
     case Done{l}:
       serve(l)
 
+# Base's TCP.listen fixes the accept queue at 16, so a burst of more
+# dials than that makes the kernel drop the excess SYNs and every dropped
+# dial waits out the TCP retry (~1s, measured in TASK-041). This server
+# is dialed by peers that can arrive together, so it listens with the
+# package's depth instead.
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, U32 & String, Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 law main:
   IO(U32)
 
 def main():
   do IO<U32>:
-    res : Result<&1, &1, U32 & String, Listener> <- TCP.listen(19880)
+    res : Result<&1, &1, U32 & String, Listener> <- listen_deep(19880)
     +total : U32 <- bound(res)
     w : Unit <- IO.print(U32.show(total))
     return total

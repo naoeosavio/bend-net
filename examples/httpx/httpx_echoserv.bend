@@ -4,6 +4,7 @@
 # Usage: bend examples/httpx/httpx_echoserv.bend -o /tmp/opencode/httpx_echoserv
 #        /tmp/opencode/httpx_echoserv   # prints PORT, serves until killed
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
 
 def echo(req: HTTPX.Request) -> IO(HTTPX.Response):
@@ -31,6 +32,18 @@ def listen_retry(port, r, rest):
     case Fail{e}:
       rest
 
+# Base's TCP.listen fixes the accept queue at 16, so a burst of more
+# dials than that makes the kernel drop the excess SYNs and every dropped
+# dial waits out the TCP retry (~1s, measured in TASK-041). This server
+# is dialed by peers that can arrive together, so it listens with the
+# package's depth instead.
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, (U32 & String), Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 law listen_any:
   for tries: Nat
   for +port: U32
@@ -43,7 +56,7 @@ def listen_any(tries, port):
     case 1n+t:
       rest = listen_any(t, (port + 1 : U32))
       do IO<Listener & U32>:
-        r : Result<&1, &1, (U32 & String), Listener> <- TCP.listen(port)
+        r : Result<&1, &1, (U32 & String), Listener> <- listen_deep(port)
         listen_retry(port, r, rest)
 
 law main_go:

@@ -5,6 +5,7 @@
 # not in check.sh).
 #   bend examples/httpx/httpx_echo_server.bend
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
 
 def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
@@ -36,7 +37,19 @@ def after_listen(r: Result<&1, &1, U32 & String, Listener>) -> IO(Unit):
         z : Unit <- IO.print("DONE 1/1")
         IO.die(Unit, 0, "")
 
+# Base's TCP.listen fixes the accept queue at 16, so a burst of more
+# dials than that makes the kernel drop the excess SYNs and every dropped
+# dial waits out the TCP retry (~1s, measured in TASK-041). This server
+# is dialed by peers that can arrive together, so it listens with the
+# package's depth instead.
+law listen_deep:
+  for port: U32
+  IO(Result<&1, &1, U32 & String, Listener>)
+
+def listen_deep(port):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
 def main() -> IO(Unit):
   do IO<Unit>:
-    r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(19893)
+    r : Result<&1, &1, U32 & String, Listener> <- listen_deep(19893)
     after_listen(r)
