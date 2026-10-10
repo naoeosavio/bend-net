@@ -5058,9 +5058,25 @@ def x_h1.cli.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
         case Done{+hd}:
           match hd:
             case Head{+code, +hs}:
-              +fr = x_h1.frame_of(hs, method, code)
-              +nb = x_h1.stream.frame_nbody(fr)
-              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nb, x_h1.stream.frame_chunked(fr), x_h1.stream.frame_cl(fr), x_h1.split_rest(x_h1.split(acc)), 0, x_h1.chunk_init(), x_h1.cli.stream.head_act(H(StreamHead{hd}), nb), (x_h1.chunk_init(), End{Nil{}}), total, chunks, x_h1.cli.stream.no_head())
+              # `found` carries the interim flag into phase 4 (the slot is
+              # free after phase 2): a 1xx head is dropped without ever
+              # reaching the handler (TASK-042 phase 4b).
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 4, got, acc, fuel, x_h1.is_info(code), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 4:
+      match found:
+        case True{}:
+          +rest = x_h1.split_rest(x_h1.split(acc))
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, got, rest, fuel, x_h1.split.test(rest), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+        case False{}:
+          match hres:
+            case Fail{e}:
+              x_h1.cli.stream.failed(~close, got, e)
+            case Done{+hd}:
+              match hd:
+                case Head{+code, +hs}:
+                  +fr = x_h1.frame_of(hs, method, code)
+                  +nb = x_h1.stream.frame_nbody(fr)
+                  x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nb, x_h1.stream.frame_chunked(fr), x_h1.stream.frame_cl(fr), x_h1.split_rest(x_h1.split(acc)), 0, x_h1.chunk_init(), x_h1.cli.stream.head_act(H(StreamHead{hd}), nb), (x_h1.chunk_init(), End{Nil{}}), total, chunks, x_h1.cli.stream.no_head())
     case 5:
       match act:
         case 0:
