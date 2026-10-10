@@ -64,9 +64,42 @@ def srv_last(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
     case Done{u}:
       TLS.tls_close(s)
 
-# Trailer is out: close.
+# Answers are out: a real H2 peer keeps the connection (it does not close
+# without GOAWAY), so read until the client closes. Closing right here
+# would race the credit the client sends for the DATA it just read: the
+# write hits a dead socket, the peer answers RST and the frames still in
+# flight are lost.
+@unsafe
+def srv_idle(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, g0) = got
+      do IO<Unit>:
+        got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s0, buf)
+        srv_idle(1, got2, buf)
+    case 1:
+      (s1, g1) = got
+      match g1:
+        case HTTPX.GotErr{code, msg}:
+          TLS.tls_close(s1)
+        case HTTPX.GotOk{+frame, +buf2}:
+          srv_idle(0, (s1, HTTPX.GotOk{frame, buf2}), buf2)
+    case _:
+      (s9, g9) = got
+      TLS.tls_close(s9)
+
+def srv_idle_from(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s, r) = m
+  match r:
+    case Fail{e}:
+      TLS.tls_close(s)
+    case Done{u}:
+      srv_idle(0, (s, HTTPX.GotErr{0, "next"}), Nil{})
+
+# Trailer is out: keep the connection until the client closes (see
+# srv_idle).
 def srv_sent3(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
-  srv_last(m)
+  srv_idle_from(m)
 
 # Data is out: send the trailer with END_STREAM.
 def srv_sent2(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):

@@ -6287,24 +6287,33 @@ def client_conc.valid_all(reqs: List<&2, Request>, +host: String, +port: U32) ->
   client_conc.valid_go(reqs, host, port, True{})
 
 # The concurrent lane pipelines every request before it drains, so a
-# frame that stopped a send (an early response mid-body) has nowhere to
-# go yet: dropped here exactly as the flow sender dropped it before
-# TASK-042 phase 2b. Threading it into client_conc's drain is a separate
-# change, noted in the task file.
-def client_conc.send_kept(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) -> Socket:
+# frame that stopped a send (an early response mid-body) has nowhere to go
+# yet: it is kept and handed to client_conc.drain once the pipeline is
+# done (TASK-042 follow-up 2b). Before, the frame was dropped, the early
+# answer never reached the drain and the call ended in Fail 502 (stray
+# DATA) or hung for a response that had already arrived. Seeds accumulate
+# in wire order: bytes read during an earlier send are always ahead of the
+# ones read during a later one.
+@unsafe
+def client_conc.send_next(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +sid: U32, +host: String, +port: U32, reqs: List<&2, Request>, +acc: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   (s, r, rest) = sent
-  s
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{e}, acc))
+    case Done{u}:
+      client_conc.send_all(s, (sid + 2 : U32), host, port, reqs, List.append(&2, U32, acc, rest))
 
 @unsafe
-def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, Request>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, Request>, +acc: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match reqs:
     case Nil{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (sock, Done{Unit{}}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, acc))
     case Request{+method, +path, +headers, +body} <> t:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.on.send_req(sock, sid, host, port, method, path, headers, body)
-        client_conc.send_all(client_conc.send_kept(sent), (sid + 2 : U32), host, port, t)
+        client_conc.send_next(sent, sid, host, port, t, acc)
 
 # Concurrent drain leafs (sum, no tab return; connection closes after)
 # --------------------------------------------------------------------
@@ -6439,12 +6448,16 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
     case 5:
       match act:
         case 0:
-          client_conc.drain(~H, 0, got, buf, tab, httpxc.data_cont_slots(httpxc.take_del(slots, sid2), payload), pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
+          do IO<Socket & Result<&1, &1, U32 & String, U32>>:
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            client_conc.drain(~H, 0, got2, buf, tab, httpxc.data_cont_slots(httpxc.take_del(slots, sid2), payload), pending, total, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 1:
-          +tp1 : ClTaken = httpxc.take_del(slots, sid2)
-          +resp1 : Response = httpxc.req_of_st(httpxc.taken_st(tp1), payload)
-          +sc5 : U32 = H(resp1)
-          client_conc.drain(~H, client_conc.finish_next(pending), got, buf, tab, httpxc.taken_slots(tp1), (pending - 1 : U32), (total + sc5 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
+          do IO<Socket & Result<&1, &1, U32 & String, U32>>:
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, x_len32(payload))
+            +tp1 : ClTaken = httpxc.take_del(slots, sid2)
+            +resp1 : Response = httpxc.req_of_st(httpxc.taken_st(tp1), payload)
+            +sc5 : U32 = H(resp1)
+            client_conc.drain(~H, client_conc.finish_next(pending), got2, buf, tab, httpxc.taken_slots(tp1), (pending - 1 : U32), (total + sc5 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         case 4:
           client_conc.fail(got, 502, "stray data")
         case _:
@@ -6499,9 +6512,9 @@ def client_conc.drained(drained: Socket & Result<&1, &1, U32 & String, U32>) ->
         x : Unit <- TLS.tls_close(s)
         IO.pure(Result<&1, &1, U32 & String, U32>, Done{total})
 
-def client_conc.after_send(~H: Response -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit>, +pending: U32) ->
+def client_conc.after_send(~H: Response -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
-  (sock, r) = sent
+  (sock, r, seed) = sent
   match r:
     case Fail{e}:
       do IO<Result<&1, &1, U32 & String, U32>>:
@@ -6509,13 +6522,13 @@ def client_conc.after_send(~H: Response -> U32, sent: Socket & Result<&1, &1, U3
         IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32> <- client_conc.drain(~H, 0, (sock, GotErr{0, "next"}), Nil{}, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
+        drained : Socket & Result<&1, &1, U32 & String, U32> <- client_conc.drain(~H, 0, (sock, GotErr{0, "next"}), seed, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, 4)
         client_conc.drained(drained)
 
 def client_conc.exch(~H: Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   do IO<Result<&1, &1, U32 & String, U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- client_conc.send_all(sock, 1, host, port, reqs)
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, 1, host, port, reqs, Nil{})
     client_conc.after_send(~H, sent, pending)
 
 def client_conc.conn(~H: Response -> U32, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
