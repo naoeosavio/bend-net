@@ -12,9 +12,18 @@
 # UTF-8 lives in wsm), the H2 preface (RFC 9113 section 3.4), frame
 # write/parse + short NeedMore + oversize Bad 413 (RFC 9113 section
 # 4.1), HPACK req/resp round trips (RFC 7541 section 5.1), the H1 cut,
-# request parse + version gate, render CRLF refusal (RFC 9112 section
-# 3.2), framing pieces, the RFC 9112 section 7.1 chunked body, the 200
-# first line and the URL gates. Golden 1 iff every check is 1.
+# request parse + version gate + the request-head rules of RFC 9112
+# sections 3.2/6.3 (x_h1.srv.head_err: TE+CL, TE not chunked, duplicated
+# and invalid Content-Length, Host required on 1.1 / duplicated / empty),
+# render CRLF refusal (RFC 9112 section 3.2), framing pieces, the RFC
+# 9112 section 7.1 chunked body, the 200 first line and the URL gates.
+# Golden 1 iff every check is 1.
+#
+# The wire half of the same rules is IO, not pure: the H1 refusals and
+# the 431 head cap (TASK-042 phase 6) are measured on a raw socket by
+# tests/io/httpx_h1_hardening.bend, and the typed GOAWAY/RST_STREAM
+# verdicts of RFC 9113 section 8.7 (TASK-042 phase 5) by
+# tests/io/httpx_h2_goaway.bend.
 import Base
 import ../../lib/httpx.bend as HTTPX
 

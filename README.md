@@ -322,6 +322,41 @@ guarded explicitly — the same as the reference machine — but it cannot becom
 a silently wrong body: the measured vector answers `400`, because a wrapped
 size no longer matches the bytes that follow it.
 
+H1 server head rules (TASK-042 phase 6): the H1 server refuses with `400`,
+before reading a single body byte, a head it cannot frame — a
+`Transfer-Encoding` next to a `Content-Length` (the request-smuggling pair:
+a proxy in front may pick the other framing and the two peers disagree on
+where the body ends), a `Transfer-Encoding` that is not `chunked` (RFC 9112
+§6.3: the body length cannot be determined), two `Content-Length` fields, a
+`Content-Length` that is not a plain decimal (`-1`, `5x` and an empty value
+all read as 0 through `U32.read`), a missing `Host` on an HTTP/1.1 request,
+and a duplicated or empty `Host` (RFC 9112 §3.2; a 1.0 request may omit it
+and is still served). One validator serves the three server lanes:
+keep-alive (`on_h1`/`on_h1_plain`/`once_h1`), the 101 upgrade lane
+(`on_h1_open_plain`/`once_h1_open`) and the streaming lane (`stream_plain`).
+A head past **16384 bytes** is `431 Request Header Fields Too Large` (the
+number `lib/http.bend` documents for its lane and the default of
+`node --max-http-header-size`; the read fuel is only the slow-drip
+backstop). Every terminal failure whose code is `400..599` is **rendered as
+a response before the connection ends** — the rule TASK-033 set for the
+chunk reader — while `(0, "close")` and the `6xx` transport codes stay
+silent closes. `tests/io/httpx_h1_hardening.bend` measures all of it on the
+wire, one raw connection per case.
+
+H2 control errors (TASK-042 phase 5): a `GOAWAY` or an `RST_STREAM` is a
+typed stream error, never a bare `502`. The fail code carries the RFC 9113
+§8.7 verdict — `503` when the peer said the stream was **not processed** (a
+`GOAWAY` above the stream id, an `RST_STREAM` `REFUSED_STREAM`), so
+repeating the request is allowed; `502` when it may have been processed. The
+text names the wired code and the last-stream-id
+(`goaway NO_ERROR(0) last=1 sid=1`), and a `GOAWAY` shorter than the 8 bytes
+of §6.8 fails closed as `FRAME_SIZE_ERROR`. The three client drains and the
+flow sender all use it. A **sibling's `RST_STREAM`** — `node:http2` resets a
+stream it already answered while the next request's body is still coming —
+is not ours to fail on: the single-stream drains filter it by sid and the
+sender stashes it into the read seed, so the drain decides.
+`tests/io/httpx_h2_goaway.bend` covers the six shapes.
+
 Streaming contract (TASK-036, kept different by decision): HTTPX speaks two
 families — download `StreamEv{StreamHead, StreamData}` /
 `StreamOut{StreamContinue, StreamCancel}` and upload `SrvEv{SrvReqHead,
@@ -393,6 +428,21 @@ a pair that must outlive two uses is wrapped in a `Data` record (`Taken`,
 traversals saved against the `get` plus `+` it replaces — `test.bend` has the
 shapes: a pair costs nothing next to a rebuild, and a U32 counter beats a
 `Nat` one while a list walk dominates.
+
+### Closed / ignored by design
+
+What HTTPX does **not** do, and why — so a missing behavior is not read as a
+bug (TASK-042, phase 7):
+
+| Item | Why it is out |
+|---|---|
+| `h2c` (H2 over plaintext, prior knowledge or `Upgrade`) | a browser never speaks it: it takes `h2` from ALPN over TLS. Plaintext stays on the H1 lane (`server.on_h1_plain`, `client.fetch_insecure`). Making it work is a task of its own |
+| IPv6 / `AAAA` | the dial resolves `A` records only (`lib/dns.bend`). A browser that resolves `localhost` to `::1` falls back to `127.0.0.1` through Happy Eyeballs, so the peer still connects |
+| Trailers handed to the handler | there is no trailer event in `StreamEv`/`SrvEv`, and adding one changes the public contract. A trailer block is recognized, closes the body and never replaces the response head (RFC 9113 §8.1) |
+| `server.on` (sequential) with N parallel browser fetches | one stream at a time by design: a pipelined `HEADERS` gets `RST_STREAM 7` (documented in `docs/modes.md`). A browser with parallel fetches wants `server.concurrent` |
+| `PUSH_PROMISE` | the client has no push handler and never answers one; a promise is stashed by the sender or skipped by the drain. It is not an error, just not a feature |
+| Huffman **encoding** | the encoder stays literal (valid HPACK, only bigger); the decoder covers huffman, static 1–61, literals and a minimal dynamic table — which is what `node:http2` needs |
+| `client.concurrent` over HTTP/1.1 | H2-only by design (`h2_only` closes an H1 connection with `615`); the H1 lane has `client.on` and `client.stream` |
 
 ## WebSocket (WSM)
 

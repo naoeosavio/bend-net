@@ -14,6 +14,14 @@
 # close table (section 5.5.1), strict UTF-8 (section 5.6), fragments
 # (section 5.4), client 101 check, scan_len and host_port. Golden 1
 # iff every check is 1.
+#
+# The loop-level fixes of TASK-042 phase 1 are IO, not pure (the fold
+# here was always correct): the control frame between fragments that
+# must keep the accumulator, the coalesced continuation that must not be
+# dropped, the 1009 close on the payload cap and the mixed-fragment
+# refusal are measured by tests/io/wsm_ctrl_frag.bend,
+# tests/io/wsm_frag_coalesce.bend, tests/io/wsm_cap_close.bend and
+# tests/io/wsm_frag_mixed.bend.
 import Base
 import ../../lib/wsm.bend as WSM
 import ../../lib/httpx.bend as HTTPX
