@@ -991,12 +991,26 @@ def wsm_frag_ev.go(r: Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>
 def wsm_frag_ev(+acc: MsgAcc, fin: Bool, +op: U32, +pay: List<&2, U32>) -> WsStep:
   wsm_frag_ev.go(wsm_frag_step(acc, fin, op, pay))
 
+# A whole data message that arrives while a fragment is still open is a
+# mixed fragment (RFC 6455 section 5.4). The frame decoder reports a
+# complete message as InMsg, so this path never reaches the reassembly
+# fold: the loop has to reject it here exactly like the fold rejects a
+# non-continuation frame on the InOp path (wsm_frag_got -> Fail 400
+# "mixed fragment"). One match on the accumulator, no traversal and no
+# allocation: the check is O(1) whatever the open fragment holds.
+def wsm_msg_step(+acc: MsgAcc, msg: WSMessage) -> WsStep:
+  match acc:
+    case FragIdle{}:
+      StepEv{EvMsg{msg}}
+    case FragOpen{op0, buf}:
+      StepEv{EvError{400, "mixed fragment"}}
+
 # Loop helpers: the 1009 close answered on Fail 413, and the opcode
 # carried by a handler answer (255 when the answer is no opcode frame,
 # so the loops can tell a handler-initiated close apart).
 
 def wsm_cap_close_out() -> WSOut:
-  wsm_out_close([3, 249])
+  wsm_out_close([3, 241])
 
 def wsm_out_op_of(out: WSOut) -> U32:
   match out:
@@ -1928,15 +1942,15 @@ def wsm_loop(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
         case Done{inn}:
           match inn:
             case InMsg{msg}:
-              wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvMsg{msg}}, rest, FragIdle{}, shut)
+              wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), wsm_msg_step(acc, msg), rest, FragIdle{}, shut)
             case InOp{fin, op, pay}:
               match op:
                 case 8:
                   wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{wsm_close_ev(pay)}, rest, FragIdle{}, shut)
                 case 9:
-                  wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPing{pay}}, rest, FragIdle{}, shut)
+                  wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPing{pay}}, rest, acc, shut)
                 case 10:
-                  wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPong{pay}}, rest, FragIdle{}, shut)
+                  wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), StepEv{EvPong{pay}}, rest, acc, shut)
                 case 0:
                   wsm_loop(~recv, ~send, ~close, ~H, is_client, 2, (s, Done{InOp{False{}, 0, []}}, []), wsm_frag_ev(acc, fin, op, pay), rest, FragIdle{}, shut)
                 case 1:
@@ -1983,7 +1997,7 @@ def wsm_loop(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
                 close(s)
         case StepFrag{acc2}:
           do IO<Unit>:
-            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- wsm_recv_in(~recv, s, b, is_client)
+            m3 : Socket & Result<&1, &1, U32 & String, WSIn> & List<&2, U32> <- wsm_recv_in(~recv, s, buf, is_client)
             wsm_loop(~recv, ~send, ~close, ~H, is_client, 1, m3, StepEv{EvError{0, ""}}, [], acc2, shut)
         case StepOut{out2}:
           +o2 = out2
