@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -16,6 +18,19 @@ struct TlsConn {
   void* ctx;
   int   fd;
 };
+#endif
+
+// Nagle holds the second of two small writes until the peer's delayed ACK
+// (~40ms per connection, measured on the WSS lane), so every accepted TLS
+// fd turns it off. Best effort: a failed setsockopt costs latency, never
+// correctness, so the result is deliberately not propagated.
+#ifndef TLS_NO_DELAY_DEFINED
+#define TLS_NO_DELAY_DEFINED
+static void tls_no_delay(int fd) {
+  int one = 1;
+  int _rc = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  (void)_rc;
+}
 #endif
 
 #define TLS_ALPN_H2 1
@@ -277,6 +292,7 @@ Term tls_accept_raw_run(Env e, Term* f, IoWork* w) {
     free(s);
     return io_tup(e, io_hand(lfd), r);
   }
+  tls_no_delay(got);
   s->fd = got;
   return io_work(w, tls_serve_call, tls_serve_pack);
 }
@@ -300,6 +316,7 @@ static Term tls_accept_more2(Env e, IoWork* w) {
     free(s);
     return io_tup(e, io_hand(lfd), r);
   }
+  tls_no_delay(got);
   s->fd = got;
   return io_work(w, tls_serve_call, tls_serve_pack);
 }
