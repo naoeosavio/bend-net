@@ -176,7 +176,7 @@ def tok_done.go(r: Result<&1, &1, U32 & String,
     case Done{q}:
       1
 
-def head_fails.go(r: Result<&1, &1, U32 & String, HTTPX.ReqHead>,
+def head_fails.go(r: Result<&1, &1, U32 & String, HTTPX.H1Head>,
   code: U32) -> U32:
   match r:
     case Fail{e}:
@@ -185,15 +185,36 @@ def head_fails.go(r: Result<&1, &1, U32 & String, HTTPX.ReqHead>,
     case Done{head}:
       0
 
-def head_method.go(r: Result<&1, &1, U32 & String, HTTPX.ReqHead>,
+def head_method.go(r: Result<&1, &1, U32 & String, HTTPX.H1Head>,
   want: String) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{head}:
       match head:
-        case HTTPX.ReqHead{method, path, headers}:
-          str_is(method, want)
+        case HTTPX.H1Head{head, is_11}:
+          match head:
+            case HTTPX.ReqHead{method, path, headers}:
+              str_is(method, want)
+
+# The HTTP/1.1 flag the Host rule keys on (RFC 9112 section 3.2): the
+# version token keeps the CR of its line (String.lines cuts on \n only),
+# so this also pins the trim in x_h1.req_head.
+def head_11.go(r: Result<&1, &1, U32 & String, HTTPX.H1Head>,
+  want: Bool) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{head}:
+      match head:
+        case HTTPX.H1Head{head, is_11}:
+          bool_is(is_11, want)
+
+def head_err.go(heads: List<&2, HTTPX.Hdr>, is_11: Bool, want: U32) -> U32:
+  u32_is(HTTPX.x_h1.srv.head_err(heads, is_11), want)
+
+def host_headers() -> List<&2, HTTPX.Hdr>:
+  [HTTPX.Hdr{"Host", "a"}]
 
 def parse_t() -> U32:
   (render_fails(400)
@@ -201,7 +222,22 @@ def parse_t() -> U32:
     + head_fails.go(HTTPX.x_h1.req_head(HTTPX.x_h1.req_tok(
       ["GET", "/a", "HTTP/2.0"])), 400)
     + head_method.go(HTTPX.x_h1.req_head(HTTPX.x_h1.req_tok(
-      ["POST", "/", "HTTP/1.1"])), "POST") : U32)
+      ["POST", "/", "HTTP/1.1"])), "POST")
+    + head_11.go(HTTPX.x_h1.req_head(HTTPX.x_h1.req_tok(
+      ["GET", "/a", "HTTP/1.1\r"])), True{})
+    + head_11.go(HTTPX.x_h1.req_head(HTTPX.x_h1.req_tok(
+      ["GET", "/a", "HTTP/1.0\r"])), False{})
+    + head_err.go(host_headers(), True{}, 0)
+    + head_err.go(Nil{}, True{}, 400)
+    + head_err.go(Nil{}, False{}, 0)
+    + head_err.go([HTTPX.Hdr{"Host", "a"},
+      HTTPX.Hdr{"Content-Length", "5"},
+      HTTPX.Hdr{"Transfer-Encoding", "chunked"}], True{}, 400)
+    + head_err.go([HTTPX.Hdr{"Host", "a"},
+      HTTPX.Hdr{"Content-Length", "5"},
+      HTTPX.Hdr{"Content-Length", "5"}], True{}, 400)
+    + head_err.go([HTTPX.Hdr{"Host", "a"},
+      HTTPX.Hdr{"Content-Length", "-1"}], True{}, 400) : U32)
 
 # Framing pieces: exact CL, chunked flag, no-body rule.
 def cl_headers() -> List<&2, HTTPX.Hdr>:
@@ -296,7 +332,7 @@ def main():
     +total : U32 = (ascii_t() + preface_t() + frame_t() + hpack_t()
       + cut_t() + parse_t() + framing_t() + chunked_t() + status_t()
       + url_t() : U32)
-    +want : U32 = (2 + 1 + 4 + 2 + 3 + 4 + 6 + 2 + 1 + 4 : U32)
+    +want : U32 = (2 + 1 + 4 + 2 + 3 + 12 + 6 + 2 + 1 + 4 : U32)
     +pass : U32 = u32_is(total, want)
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")

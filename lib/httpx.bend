@@ -497,6 +497,15 @@ type Hdr is Data:
 type ReqHead is Data:
   ReqHead{method: String, path: String, headers: List<&2, Hdr>}
 
+# The parsed H1 request head plus the version flag the Host rule keys on
+# (RFC 9112 section 3.2 asks for 400 on a missing Host for HTTP/1.1
+# requests only, and the request-line parse is where the version is known).
+# A Data type, not a pair: the value travels inside a Result inside another
+# pair in the streaming lane, and bend 2.0.36 cannot infer a Sigma whose
+# second half is a Bool in that position.
+type H1Head is Data:
+  H1Head{head: ReqHead, is_11: Bool}
+
 type Request is Data:
   Request{method: String, path: String, headers: List<&2, Hdr>, body: List<&2, U32>}
 
@@ -4016,6 +4025,8 @@ def x_h1.reason(st: U32) -> String:
       "Length Required"
     case 413:
       "Content Too Large"
+    case 431:
+      "Request Header Fields Too Large"
     case 500:
       "Internal Error"
     case 502:
@@ -4111,6 +4122,20 @@ def x_h1.rest_lines(lines: List<&2, String>) -> List<&2, String>:
     case h <> t:
       t
 
+def x_h1.strip_cr.go(h: Char, t: String, is_cr: Bool) -> String:
+  match is_cr:
+    case True{}:
+      t
+    case False{}:
+      SCon{h, t}
+
+def x_h1.strip_cr(s: String) -> String:
+  match s:
+    case SNil{}:
+      SNil{}
+    case SCon{+h, t}:
+      x_h1.strip_cr.go(h, t, Char.is_eq(h, Chr{13}))
+
 # Request line: exactly 3 tokens; validity folds version + target +
 # bad chars into one Bool carried as param (head_act discipline).
 # ---------------------------------------------------------------------
@@ -4137,7 +4162,16 @@ def x_h1.req_tok(parts: List<&2, String>) -> Result<&1, &1, U32 & String, String
     case Nil{}:
       Fail{(400, "bad request line")}
 
-def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Bool>) -> Result<&1, &1, U32 & String, ReqHead>:
+# The request line as the server needs it: the ReqHead the handler sees
+# plus the HTTP/1.1 flag the Host rule keys on (RFC 9112 section 3.2 asks
+# for 400 on a missing Host for HTTP/1.1 requests only). Same tokenizer,
+# same validation; only the version, which the parse used to drop, rides
+# out beside the head. The version token still carries the CR of its line
+# (String.lines cuts on \n only; x_h1.parse_hs trims it off every header
+# line for the same reason), so String.trim runs before the compare:
+# without it the flag is False for every peer and the Host rule never
+# fires.
+def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Bool>) -> Result<&1, &1, U32 & String, H1Head>:
   match r:
     case Fail{e}:
       Fail{e}
@@ -4146,27 +4180,29 @@ def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Boo
         case (m, p, v, ok):
           match ok:
             case True{}:
-              Done{ReqHead{m, p, Nil{}}}
+              Done{H1Head{ReqHead{m, p, Nil{}}, String.eq(String.trim(v), "HTTP/1.1")}}
             case False{}:
               Fail{(400, "bad request")}
 
-def x_h1.req_join.hs(+m: String, +p: String, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
-  Result<&1, &1, U32 & String, ReqHead>:
+def x_h1.req_join.hs(+m: String, +p: String, +is_11: Bool, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
+  Result<&1, &1, U32 & String, H1Head>:
   match hs:
     case Fail{e}:
       Fail{e}
     case Done{+headers}:
-      Done{ReqHead{m, p, headers}}
+      Done{H1Head{ReqHead{m, p, headers}, is_11}}
 
-def x_h1.req_join(tok: Result<&1, &1, U32 & String, ReqHead>, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
-  Result<&1, &1, U32 & String, ReqHead>:
+def x_h1.req_join(tok: Result<&1, &1, U32 & String, H1Head>, hs: Result<&1, &1, U32 & String, List<&2, Hdr>>) ->
+  Result<&1, &1, U32 & String, H1Head>:
   match tok:
     case Fail{e}:
       Fail{e}
     case Done{+rh}:
       match rh:
-        case ReqHead{+m, +p, +hs0}:
-          x_h1.req_join.hs(m, p, hs)
+        case H1Head{head, is_11}:
+          match head:
+            case ReqHead{+m, +p, +hs0}:
+              x_h1.req_join.hs(m, p, is_11, hs)
 
 # Status line: version + numeric code (Maybe.default like http.bend:976).
 # ---------------------------------------------------------------------
@@ -4208,20 +4244,6 @@ def x_h1.res_lift(r: Result<&1, &1, U32 & String, U32 & Bool>) -> Result<&1, &1,
 
 def x_h1.is_blank(+l: String) -> Bool:
   Bool.or(String.is_empty(l), String.eq(l, "\r"))
-
-def x_h1.strip_cr.go(h: Char, t: String, is_cr: Bool) -> String:
-  match is_cr:
-    case True{}:
-      t
-    case False{}:
-      SCon{h, t}
-
-def x_h1.strip_cr(s: String) -> String:
-  match s:
-    case SNil{}:
-      SNil{}
-    case SCon{+h, t}:
-      x_h1.strip_cr.go(h, t, Char.is_eq(h, Chr{13}))
 
 def x_h1.hdr_val(+line: String, +nlen: Nat) -> String:
   String.trim(String.drop(line, (nlen + 1n : Nat)))
@@ -4291,6 +4313,154 @@ def x_h1.te_go(hs: List<&2, Hdr>, acc: Bool) -> Bool:
 
 def x_h1.is_chunked(hs: List<&2, Hdr>) -> Bool:
   x_h1.te_go(hs, False{})
+
+# Request-head validation (RFC 9112 sections 3.2 and 6.3, TASK-042 phase 6)
+# ------------------------------------------------------------------------
+# What the H1 server refuses with a 400 before it reads a single body byte.
+# The framing pair is the request-smuggling shape: a Transfer-Encoding next
+# to a Content-Length (a proxy in front may pick the other framing and the
+# two peers disagree on where the body ends), two Content-Length fields,
+# and a Content-Length that is not a plain decimal ("-1", "5x", "" all read
+# as 0 through U32.read, which is a body of a different length than the
+# sender meant). The Host rules are the RFC 9112 section 3.2 ones: more than
+# one Host field or an empty one is 400 for any version, and a missing Host
+# is 400 for an HTTP/1.1 request only (a 1.0 request may omit it).
+def x_h1.count_if(is_hit: Bool, +acc: U32) -> U32:
+  match is_hit:
+    case True{}:
+      (acc + 1 : U32)
+    case False{}:
+      acc
+
+def x_h1.cl_count.go(+hs: List<&2, Hdr>, +acc: U32) -> U32:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.cl_count.go(t, x_h1.count_if(x_h1.eq_ci(n, "content-length"), acc))
+
+def x_h1.cl_count(hs: List<&2, Hdr>) -> U32:
+  x_h1.cl_count.go(hs, 0)
+
+def x_h1.cl_bad_at(is_cl: Bool, +v: String) -> Bool:
+  match is_cl:
+    case True{}:
+      Bool.or(String.is_empty(v), Bool.not(DNS.all_digits(v)))
+    case False{}:
+      False{}
+
+def x_h1.cl_bad.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.cl_bad.go(t, Bool.or(acc, x_h1.cl_bad_at(x_h1.eq_ci(n, "content-length"), v)))
+
+def x_h1.cl_bad(hs: List<&2, Hdr>) -> Bool:
+  x_h1.cl_bad.go(hs, False{})
+
+def x_h1.host_count.go(+hs: List<&2, Hdr>, +acc: U32) -> U32:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.host_count.go(t, x_h1.count_if(x_h1.eq_ci(n, "host"), acc))
+
+def x_h1.host_count(hs: List<&2, Hdr>) -> U32:
+  x_h1.host_count.go(hs, 0)
+
+def x_h1.host_empty_at(is_host: Bool, +v: String) -> Bool:
+  match is_host:
+    case True{}:
+      String.is_empty(v)
+    case False{}:
+      False{}
+
+def x_h1.host_empty.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.host_empty.go(t, Bool.or(acc, x_h1.host_empty_at(x_h1.eq_ci(n, "host"), v)))
+
+def x_h1.host_empty(hs: List<&2, Hdr>) -> Bool:
+  x_h1.host_empty.go(hs, False{})
+
+# A Transfer-Encoding the server cannot frame (anything but chunked): RFC
+# 9112 section 6.3 says the body length cannot be determined reliably, so
+# the answer is 400 and the connection ends.
+def x_h1.te_any.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.te_any.go(t, Bool.or(acc, x_h1.eq_ci(n, "transfer-encoding")))
+
+def x_h1.te_any(hs: List<&2, Hdr>) -> Bool:
+  x_h1.te_any.go(hs, False{})
+
+def x_h1.te_bad(+hs: List<&2, Hdr>) -> Bool:
+  Bool.and(x_h1.te_any(hs), Bool.not(x_h1.is_chunked(hs)))
+
+# The head validation code: 400 for a head the server must not serve
+# (RFC 9112 sections 3.2/6.3), 0 when it is clean. The first rule that fires
+# wins, so a request with two problems reports the framing one. The bools
+# ride in as parameters because a match cannot scrutinize a call.
+def x_h1.srv.head_err_go(cl_bad: Bool, cl_dup: Bool, te_bad: Bool, te_cl: Bool, h_dup: Bool, h_none: Bool, h_empty: Bool, is_11: Bool) -> U32:
+  match cl_bad cl_dup te_bad te_cl h_dup h_none h_empty is_11:
+    case True{} _ _ _ _ _ _ _:
+      400
+    case _ True{} _ _ _ _ _ _:
+      400
+    case _ _ True{} _ _ _ _ _:
+      400
+    case _ _ _ True{} _ _ _ _:
+      400
+    case _ _ _ _ True{} _ _ _:
+      400
+    case _ _ _ _ _ True{} _ True{}:
+      400
+    case _ _ _ _ _ _ True{} _:
+      400
+    case _ _ _ _ _ _ _ _:
+      0
+
+def x_h1.srv.head_err(+hs: List<&2, Hdr>, is_11: Bool) -> U32:
+  x_h1.srv.head_err_go(x_h1.cl_bad(hs), U32.is_gt(x_h1.cl_count(hs), 1), x_h1.te_bad(hs), Bool.and(x_h1.te_any(hs), U32.is_gt(x_h1.cl_count(hs), 0)), U32.is_gt(x_h1.host_count(hs), 1), U32.is_eq(x_h1.host_count(hs), 0), x_h1.host_empty(hs), is_11)
+
+# A terminal code the peer must see before the connection ends: 400..599 is
+# a status this server renders, 0 ("close") and the 6xx transport codes
+# (TLS/DNS) are not. One rule for the three H1 server lanes.
+def x_h1.srv.is_status(+code: U32) -> Bool:
+  Bool.and(U32.is_ge(code, 400), U32.is_lt(code, 600))
+
+# The server's head cap: 16384 bytes, the number lib/http.bend documents for
+# its H1 lane and the default node uses (--max-http-header-size). The read
+# fuel (64 turns) stays as the slow-drip backstop; both answer 431.
+def x_h1.head_max() -> U32:
+  16384
+
+def x_h1.head_cap() -> U32:
+  431
+
+def x_h1.head_over(+n: U32) -> Bool:
+  U32.is_gt(n, x_h1.head_max())
+
+# The two values the accumulate step feeds the next turn when the head is
+# past the cap: phase 0 (whose fuel floor answers 431) with no fuel left.
+def x_h1.fuel_cap(fuel: Nat, over: Bool) -> Nat:
+  match over:
+    case True{}:
+      0n
+    case False{}:
+      fuel
+
+def x_h1.head_phase(over: Bool) -> U32:
+  match over:
+    case True{}:
+      0
+    case False{}:
+      2
 
 def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
   match head:
@@ -7262,15 +7432,53 @@ def x_h1.stream.closed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, 
 def x_h1.stream.bad(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
   x_h1.stream.respond(~send, ~close, got, Response{400, Nil{}, Nil{}})
 
+# A terminal code the peer must see before the connection ends: the same
+# rule the keep-alive machine uses (400..599 is a status this server
+# renders; 0 "close" and the 6xx transport codes are not).
+def x_h1.stream.told_go(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +code: U32, told: Bool) -> IO(Unit):
+  match told:
+    case True{}:
+      x_h1.stream.respond(~send, ~close, got, Response{code, Nil{}, Nil{}})
+    case False{}:
+      x_h1.stream.closed(~close, got)
+
+def x_h1.stream.told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +code: U32) -> IO(Unit):
+  x_h1.stream.told_go(~send, ~close, got, code, x_h1.srv.is_status(code))
+
+# The terminal code of a failed head read: 400/413/431/502 ride out as a
+# response, 0 "close" and the transport codes do not.
+def x_h1.stream.stop_told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, e: U32 & String) -> IO(Unit):
+  (code, msg) = e
+  x_h1.stream.told(~send, ~close, got, code)
+
+# The head answer slot for a validated head: the handler's head event when
+# the head is clean, the refusal code when it is not (the handler never
+# sees a refused request). The code rides in the slot's first half and the
+# loop routes on it with x_h1.stream.err_phase, so a match never has to
+# scrutinize a computed value.
+def x_h1.stream.head_ans(~H: SrvEv -> SrvOut, +code: U32, +m: String, +p: String, +hs: List<&2, Hdr>, nb: Bool) -> U32 & Response:
+  match code:
+    case 0:
+      x_h1.stream.head_act(H(SrvReqHead{1, ReqHead{m, p, hs}}), nb)
+    case _:
+      (code, Response{0, Nil{}, Nil{}})
+
+def x_h1.stream.err_phase(+code: U32) -> U32:
+  match code:
+    case 0:
+      5
+    case _:
+      4
+
 def x_h1.stream.no_ans() -> U32 & Response:
   (0, Response{0, Nil{}, Nil{}})
 
-def x_h1.stream.no_head() -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+def x_h1.stream.no_head() -> Result<&1, &1, U32 & String, H1Head> & List<&2, U32>:
   (Fail{(400, "bad request")}, Nil{})
 
 # got B (TASK-040): one x_h1.split traversal for head-lines and rest,
 # where the pair rides in as a parameter (E1 rejects a computed variant).
-def x_h1.stream.parsed.got(p: List<&2, U32> & List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+def x_h1.stream.parsed.got(p: List<&2, U32> & List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, H1Head> & List<&2, U32>:
   match p:
     case (head, rest, found):
       +hl = x_h1.head_lines(head)
@@ -7279,23 +7487,24 @@ def x_h1.stream.parsed.got(p: List<&2, U32> & List<&2, U32> & Bool) -> Result<&1
 # The request head, parsed. The bytes that arrived with the head seed
 # the pending buffer — a request that arrives whole in one packet must
 # not lose its body.
-def x_h1.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>:
+def x_h1.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, H1Head> & List<&2, U32>:
   x_h1.stream.parsed.got(x_h1.split(acc))
 
 # The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
-# the blank-line cut); 3 parses, frames (GET/HEAD carry no body, like
-# the one-shot server) and hands the head over; 5 acts on the head
-# answer; 6 asks the framing for the next chunk through x_h1.stream.next
-# above; 7 delivers it and acts; 9 reads more body and 10 takes the read
-# back. ans rides the last answer as code plus the response it chose.
+# the blank-line cut, 431 past either cap); 3 parses, validates the head
+# (RFC 9112 sections 3.2/6.3, 400) and frames it (GET/HEAD carry no body,
+# like the one-shot server); 5 acts on the head answer; 6 asks the framing
+# for the next chunk through x_h1.stream.next above; 7 delivers it and
+# acts; 9 reads more body and 10 takes the read back. ans rides the last
+# answer as code plus the response it chose.
 @unsafe
-def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: ChunkSt, ans: U32 & Response, out: ChunkSt & UnitOut, head: Result<&1, &1, U32 & String, ReqHead> & List<&2, U32>) -> IO(Unit):
+def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: SrvEv -> SrvOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: ChunkSt, ans: U32 & Response, out: ChunkSt & UnitOut, head: Result<&1, &1, U32 & String, H1Head> & List<&2, U32>) -> IO(Unit):
   match phase:
     case 0:
       (s0, r0) = got
       match fuel:
         case 0n:
-          x_h1.stream.closed(~close, got)
+          x_h1.stream.told(~send, ~close, got, x_h1.head_cap())
         case 1n+f:
           do IO<Unit>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
@@ -7311,7 +7520,8 @@ def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
               x_h1.stream.closed(~close, got)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2), nbody, chunked, cl, pending, seen, cst, ans, out, head)
+              +over = x_h1.head_over(x_len32(acc2))
+              x_h1.stream.go(~recv, ~send, ~close, ~H, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2), nbody, chunked, cl, pending, seen, cst, ans, out, head)
     case 2:
       match found:
         case True{}:
@@ -7323,14 +7533,19 @@ def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
         case (h3, p3):
           match h3:
             case Fail{e}:
-              x_h1.stream.closed(~close, got)
+              x_h1.stream.stop_told(~send, ~close, got, e)
             case Done{+rh}:
               match rh:
-                case ReqHead{+m, +p, +hs}:
-                  +nb = Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD"))
-                  +ch = x_h1.is_chunked(hs)
-                  +clv = x_h1.cl_of(hs)
-                  x_h1.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, nb, ch, clv, p3, 0, x_h1.chunk_init(), x_h1.stream.head_act(H(SrvReqHead{1, ReqHead{m, p, hs}}), nb), (x_h1.chunk_init(), End{Nil{}}), x_h1.stream.no_head())
+                case H1Head{head, is_11}:
+                  match head:
+                    case ReqHead{+m, +p, +hs}:
+                      +code = x_h1.srv.head_err(hs, is_11)
+                      +nb = Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD"))
+                      x_h1.stream.go(~recv, ~send, ~close, ~H, x_h1.stream.err_phase(code), got, Nil{}, 0n, False{}, nb, x_h1.is_chunked(hs), x_h1.cl_of(hs), p3, 0, x_h1.chunk_init(), x_h1.stream.head_ans(~H, code, m, p, hs, nb), (x_h1.chunk_init(), End{Nil{}}), x_h1.stream.no_head())
+    case 4:
+      match ans:
+        case (a4, resp4):
+          x_h1.stream.told(~send, ~close, got, a4)
     case 5:
       match ans:
         case (a5, resp5):
@@ -7824,6 +8039,30 @@ def x_h1.srv.stop(s: Socket, e: U32 & String) ->
   IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
     (s, Fail{(code, msg)}))
 
+# A terminal code the peer must see before the connection ends: 400..599 is
+# a status this server renders (the parse errors, the 413 caps, the 431
+# head cap), 0 ("close") and the 6xx transport codes (TLS/DNS) are not, and
+# a send that already failed is not retried.
+def x_h1.srv.told_sent(~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s2, r2) = sent
+  close(s2)
+
+def x_h1.srv.told_go(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket, +code: U32, told: Bool) -> IO(Unit):
+  match told:
+    case True{}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(s, x_h1.show_resp(code, Nil{}, Nil{}))
+        x_h1.srv.told_sent(~close, sent)
+    case False{}:
+      close(s)
+
+def x_h1.srv.told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket, e: U32 & String) -> IO(Unit):
+  (+code, msg) = e
+  x_h1.srv.told_go(~send, ~close, s, code, x_h1.srv.is_status(code))
+
+def x_h1.srv.cap_told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket) -> IO(Unit):
+  x_h1.srv.told(~send, ~close, s, (x_h1.head_cap(), "head too large"))
+
 def x_h1.srv.sent_keep(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   (s2, r2) = sent
@@ -7979,15 +8218,25 @@ def x_h1.srv.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
         case False{}:
           x_h1.srv.cl(~recv, ~send, ~close, ~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1.srv.ruled(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) ->
+def x_h1.srv.checked(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, +m: String, +p: String, +hs: List<&2, Hdr>, code: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match code:
+    case 0:
+      x_h1.srv.go(~recv, ~send, ~close, ~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+    case _:
+      x_h1.srv.stop(s1, (code, "refused"))
+
+def x_h1.srv.ruled(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, H1Head>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
   match joinres:
     case Fail{e}:
       x_h1.srv.stop(s1, e)
     case Done{+rh}:
       match rh:
-        case ReqHead{+m, +p, +hs}:
-          x_h1.srv.go(~recv, ~send, ~close, ~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+        case H1Head{head, is_11}:
+          match head:
+            case ReqHead{+m, +p, +hs}:
+              x_h1.srv.checked(~recv, ~send, ~close, ~H, s1, rest, fuel, m, p, hs, x_h1.srv.head_err(hs, is_11))
 
 # got B (TASK-040): one x_h1.split traversal for head-lines and rest.
 def x_h1.srv.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, p: List<&2, U32> & List<&2, U32> & Bool, fuel: Nat) ->
@@ -8008,7 +8257,7 @@ def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
       (s0, r0) = got
       match fuel:
         case 0n:
-          close(s0)
+          x_h1.srv.cap_told(~send, ~close, s0)
         case 1n+f:
           do IO<Unit>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
@@ -8024,7 +8273,8 @@ def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
               close(s1)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.srv.head(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2))
+              +over = x_h1.head_over(x_len32(acc2))
+              x_h1.srv.head(~recv, ~send, ~close, ~H, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2))
     case 2:
       match found:
         case False{}:
@@ -8048,7 +8298,7 @@ def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
       (s3, r3) = got
       match r3:
         case Fail{e}:
-          close(s3)
+          x_h1.srv.told(~send, ~close, s3, e)
         case Done{+seed}:
           match seed:
             case Nil{}:
@@ -8246,14 +8496,23 @@ def x_h1.srv.go_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & St
         case False{}:
           x_h1.srv.cl_open(~recv, ~send, ~close, ~H, ~K, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
 
-def x_h1.srv.ruled_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, ReqHead>) -> IO(Unit):
+def x_h1.srv.checked_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, +m: String, +p: String, +hs: List<&2, Hdr>, code: U32) -> IO(Unit):
+  match code:
+    case 0:
+      x_h1.srv.go_open(~recv, ~send, ~close, ~H, ~K, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+    case _:
+      x_h1.srv.told(~send, ~close, s1, (code, "refused"))
+
+def x_h1.srv.ruled_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: Request -> IO(Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, H1Head>) -> IO(Unit):
   match joinres:
     case Fail{e}:
-      close(s1)
+      x_h1.srv.told(~send, ~close, s1, e)
     case Done{+rh}:
       match rh:
-        case ReqHead{+m, +p, +hs}:
-          x_h1.srv.go_open(~recv, ~send, ~close, ~H, ~K, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+        case H1Head{head, is_11}:
+          match head:
+            case ReqHead{+m, +p, +hs}:
+              x_h1.srv.checked_open(~recv, ~send, ~close, ~H, ~K, s1, rest, fuel, m, p, hs, x_h1.srv.head_err(hs, is_11))
 
 # got B (TASK-040), open variant: one x_h1.split traversal for head-lines
 # and rest (see x_h1.srv.parsed.got).
@@ -8273,7 +8532,7 @@ def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
       (s0, r0) = got
       match fuel:
         case 0n:
-          close(s0)
+          x_h1.srv.cap_told(~send, ~close, s0)
         case 1n+f:
           do IO<Unit>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
@@ -8289,7 +8548,8 @@ def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
               close(s1)
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2))
+              +over = x_h1.head_over(x_len32(acc2))
+              x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2))
     case 2:
       (s2, r2) = got
       match found:
