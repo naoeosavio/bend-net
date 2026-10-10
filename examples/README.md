@@ -114,6 +114,50 @@ node examples/real/https_real.js
 bend examples/real/httpx_fetch_bulk.bend -o /tmp/fetchbulk && /tmp/fetchbulk
 ```
 
+## Listeners
+
+Every server here listens with `TCP.listen_backlog(port,
+TCP.LISTEN_BACKLOG())` from `lib/tcp.bend`, not with Base's
+`TCP.listen`. The reason is the accept queue: the runtime's own listen
+hardcodes 16, and a peer burst larger than that makes the kernel drop the
+excess SYNs, so every dropped dial waits out the TCP retry (~1s). The
+queue only shows up in bursts — 10 simultaneous dials take 120-148ms on
+either listener, 20 take ~1.08s on the 16-deep one and ~0.06s on the
+deep one — and a TLS accept is slow per connection (~12ms, the handshake
+runs inline), which keeps the queue full while it drains. These are the
+files meant to be dialed by another process, so they take the depth:
+
+```python
+import Base
+import ../../lib/tcp.bend as TCP
+import ../../lib/httpx.bend as HTTPX
+
+# The package's listener: same handle as TCP.listen, real queue depth.
+def listen_deep(port: U32) -> IO(Result<&1, &1, U32 & String, Listener>):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+
+def serve_listener(r: Result<&1, &1, U32 & String, Listener>) -> IO(Unit):
+  match r:
+    case Fail{e}:
+      IO.die(Unit, 1, "listen failed")
+    case Done{l}:
+      serve(l)
+
+def main() -> IO(Unit):
+  do IO<Unit>:
+    r : Result<&1, &1, U32 & String, Listener> <- listen_deep(19893)
+    serve_listener(r)
+```
+
+Both names resolve under the same `TCP` alias (Base's `TCP.listen` /
+`TCP.connect` / `TCP.accept` and the package's `TCP.listen_backlog` /
+`TCP.send_bytes` do not shadow each other), so a file that needs the old
+listener — a one-peer test, or the superseded `h2_big_loopback.bend` —
+does not have to import anything else. The rule and the numbers are in
+the main `README.md` (`### Picking a listener`); the gate's tests dial
+one connection at a time and keep `TCP.listen`, except
+`tests/io/tcp_listen_backlog.bend`, which drives the 20-client burst.
+
 ## Ports
 
 Fixed ports are per lane, and two families share a few numbers — run one peer

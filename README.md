@@ -705,6 +705,7 @@ bend tests/io/httpx_h1_fetch_chunk.bend     # 8 (chunked response end to end, tr
 bend tests/io/httpx_h1_server_chunk.bend    # 6 (chunked request end to end: 200, 400, 413, keep-alive, upgrade lane)
 bend tests/io/httpx_h1_upgrade.bend         # 7 (101 detaches the socket: server + client)
 bend tests/io/httpx_h1_upgrade_client.bend  # 7 (renderer + raw peer + 200 -> 502)
+bend tests/io/tcp_listen_backlog.bend       # 20 (20-client burst through the deep listener + fail-closed paths)
 
 bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
 bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
@@ -743,6 +744,70 @@ public `resolve` is a pure wrapper in `lib/dns.bend`. (A def named
 `TCP.recv_frame` would instead compile to the host `tcp_recv_frame`;
 that is the shape of the parallel `bend2/` Base patch, so the two trees
 are not interchangeable.)
+
+`lib/tcp.bend` also carries the one listener the runtime cannot express:
+`listen_backlog(port, backlog)` (`listen_backlog_run` / `listen_backlog`,
+`CID_LISTEN_BACKLOG`). Backlog 0 fails with EINVAL and a busy port with
+EADDRINUSE, both as the errno code plus its message. Every TLS socket the
+package hands out, client or server, also turns Nagle off
+(`TCP_NODELAY`): without it the second of two small writes waits for the
+peer's delayed ACK, which measured ~40ms per WSS connection (TASK-041).
+
+### Picking a listener: `TCP.listen` vs `TCP.listen_backlog`
+
+`TCP.listen` is Base's: one argument, and the runtime's own effect fixes
+the accept queue at 16 (`listen(fd, 16)`, visible in the emitted C).
+`TCP.listen_backlog` is the package's twin: the same listener
+(SO_REUSEADDR, `0.0.0.0`, non-blocking, the errno as the fail code), with
+the queue depth as an argument. Both names resolve under the same `TCP`
+alias — the Base effect and the package's effects do not shadow each
+other — so one import gives a file either or both:
+
+```python
+import Base
+import ./tcp.bend as TCP      # from lib/; ../../lib/tcp.bend from examples/
+
+# One peer at a time, or a test: the runtime's listener is enough.
+def listen_once(port: U32) -> IO(Result<&1, &1, U32 & String, Listener>):
+  TCP.listen(port)
+
+# A server that can be dialed by more than one peer at once.
+def listen_deep(port: U32) -> IO(Result<&1, &1, U32 & String, Listener>):
+  TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())
+```
+
+Why the depth is a choice and not a default (loopback, 8 cores, TASK-041):
+the queue is a threshold, not a slope, and the only thing that changes
+across it is whether a dial loses its SYN and waits out the TCP retry
+(~1s). Measured on one lane, each dial a new TLS connection:
+
+| dials at once | `TCP.listen` (queue 16) | `TCP.listen_backlog(…, 128)` |
+|---|---|---|
+| 10 | 120-148ms | same — the queue is never full |
+| 20 | ~1.08s | **~0.06s** (native), 234ms (interp) |
+
+The accept path is what makes the queue fill at all: the server
+handshakes TLS inline (~12ms per accept in the native runtime), so a
+burst keeps arriving while the queue drains one connection at a time. The
+rule:
+
+- **one or a few peers, or a test** → `TCP.listen`;
+- **a server whose peers can arrive together, or whose accept is slow per
+  connection** → `TCP.listen_backlog(port, TCP.LISTEN_BACKLOG())`;
+- **a load driver** → always the deep one; that is what
+  `examples/wss/wsm_saturate.bend` does.
+
+The server examples under `examples/` all listen deep now
+(`httpx/httpx_echoserv`, `httpx/httpx_echo_server`,
+`httpx/httpx_http1_server`, `httpx/httpx_server_stream`,
+`httpx/httpx_site`, `wsm/server`, `wsm/server_on`,
+`wss/wsm_frag_echo`, `wss/wsm_sub_echo`). The gate's `tests/io/*` keep
+Base's `TCP.listen`: they dial one connection at a time, so the listener
+choice would not move a number there — and the one test that does drive a
+burst (`tests/io/tcp_listen_backlog.bend`) uses the deep one and fails if
+the burst misses its budget. `examples/httpx/h2_big_loopback.bend` also
+keeps Base's: it rides the superseded `lib/http2.bend` and opens exactly
+one connection.
 
 The C side targets the Bend 2.0.21 runtime: `io_wait_on(w, fd, evts,
 time, more)` takes the deadline word (pass `0`), and `io_node` takes
