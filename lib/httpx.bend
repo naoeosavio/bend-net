@@ -3063,7 +3063,7 @@ def server.concurrent_alpn(~H: Request -> IO(Response), listener: Listener, +cer
 # ---------------------------------------------------------------------
 
 type Cont is Data:
-  Cont{block: List<&2, U32>, rest: List<&2, U32>}
+  Cont{block: List<&2, U32>, rest: List<&2, U32>, end: U32}
 
 type CliSt is Data:
   CliSt{sid: U32, tab: Tab, is_h2: Bool}
@@ -3235,8 +3235,13 @@ def client.on.cont_failed(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
     case Done{u}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s, Fail{(502, "continuation")}))
 
+# `end` is the END_STREAM of the frame that completed the block: a
+# fragmented head or trailer carries it on the last CONTINUATION, never
+# on the first HEADERS (RFC 9113 section 6.2 forbids END_STREAM without
+# END_HEADERS), so the drain cannot decide the act from the HEADERS flags
+# (TASK-042 phase 3c). Phase 0 overwrites it on every frame read.
 @unsafe
-def client.on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & Got, +cls: U32, +frag: List<&2, U32>) ->
+def client.on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>, prev: Socket & Got, +cls: U32, +frag: List<&2, U32>, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Cont>):
   match phase:
     case 0:
@@ -3247,20 +3252,20 @@ def client.on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<
             case 0:
               do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
                 got2 : Socket & Got <- x_read_frame(s0, buf)
-                client.on.cont_read(0, sid, acc, buf, got2, 0, Nil{})
+                client.on.cont_read(0, sid, acc, buf, got2, 0, Nil{}, 0)
             case _:
               IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s0, Fail{(code, msg)}))
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ, +flags, +sid2, +payload}:
-              client.on.cont_read(1, sid, acc, buf2, (s0, GotErr{0, "next"}), client.on.cont_cls_of(typ, sid2, sid, flags), payload)
+              client.on.cont_read(1, sid, acc, buf2, (s0, GotErr{0, "next"}), client.on.cont_cls_of(typ, sid2, sid, flags), payload, U32.and(flags, x_f_end_stream()))
     case 1:
       (s1, g1) = prev
       match cls:
         case 0:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s1, Done{Cont{List.append(&2, U32, acc, frag), buf}}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Cont>, (s1, Done{Cont{List.append(&2, U32, acc, frag), buf, end}}))
         case 1:
-          client.on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, GotErr{0, "next"}), 0, Nil{})
+          client.on.cont_read(0, sid, List.append(&2, U32, acc, frag), buf, (s1, GotErr{0, "next"}), 0, Nil{}, end)
         case _:
           do IO<Socket & Result<&1, &1, U32 & String, Cont>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s1, 0, 1)
@@ -3271,7 +3276,7 @@ def client.on.cont_read(+phase: U32, +sid: U32, +acc: List<&2, U32>, +buf: List<
 
 def client.on.cont_start(sock: Socket, +sid: U32, +acc: List<&2, U32>, +buf: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Cont>):
-  client.on.cont_read(0, sid, acc, buf, (sock, GotErr{0, "next"}), 0, Nil{})
+  client.on.cont_read(0, sid, acc, buf, (sock, GotErr{0, "next"}), 0, Nil{}, 0)
 
 # Single-stream drain leafs (once/keep-alive share; streaming adds WU)
 # ---------------------------------------------------------------------
@@ -3461,7 +3466,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
         case 6:
           do IO<Socket & Result<&1, &1, U32 & String, Response> & Tab>:
             cres : Socket & Result<&1, &1, U32 & String, Cont> <- client.on.cont_start(httpx.wo(got), exp, payload, buf)
-            client.on.drain_conted(cres, tab, head, body, end, exp)
+            client.on.drain_conted(cres, tab, head, body, exp)
         case 5:
           client.on.fail(got, tab, 502, "head decode")
         case _:
@@ -3488,11 +3493,13 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
 # no interleave allowed mid-sequence, so no per-stream ledger); here the
 # full block decodes with need=0 and rejoins phase 4. Fail closes like
 # the old fragmented path. Below drain (forward from @unsafe), calls
-# drain above (backward) — probe3 pattern.
+# drain above (backward) — probe3 pattern. The act reads the END_STREAM
+# out of the Cont (the completing frame), not out of the caller: a
+# fragmented block carries it on its last CONTINUATION (TASK-042 3c).
 # ---------------------------------------------------------------------
 
 @unsafe
-def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +head: Head, +body: List<&2, U32>, +end: U32, +exp: U32) ->
+def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +tab: Tab, +head: Head, +body: List<&2, U32>, +exp: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Response> & Tab):
   (cs, cr) = cres
   match cr:
@@ -3500,7 +3507,7 @@ def client.on.drain_conted(cres: Socket & Result<&1, &1, U32 & String, Cont>, +t
       client.on.fail(client.on.again(cs), tab, fc, fm)
     case Done{+mc}:
       match mc:
-        case Cont{+block, +rest}:
+        case Cont{+block, +rest, +end}:
           +dr2 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(block, tab)
           +nh2 : Head = x_resp.rh(dr2)
           +is_tr2 : Bool = httpxn.is_trailer(head, nh2)
