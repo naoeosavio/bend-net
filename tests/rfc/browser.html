@@ -18,11 +18,21 @@ Start the Bend servers first (see the ports below), open this file, and
 compare the log with the <code>OK</code>/<code>DONE</code> lines.
 </p>
 <ol>
-<li>H1: serve <code>tests/rfc/h1_oracle.js server 19881</code> or the Bend
-H1 plain server on 19881, then press Fetch.</li>
-<li>WS: serve <code>tests/rfc/ws_oracle.js server 19884</code> or the Bend
-WS plain server on 19884, then press WebSocket.</li>
+<li>H1: serve <code>tests/rfc/h1_oracle.js server 19881</code> or
+<code>bend examples/httpx/browser_leg.bend</code>, then press Fetch.</li>
+<li>WS: serve <code>tests/rfc/ws_oracle.js server 19884</code> (the same
+example starts both), then press WebSocket.</li>
 </ol>
+<p>
+Two things the server must do for a <em>browser</em>, and both recipes do:
+send <code>Access-Control-Allow-Origin</code> on the H1 answers (this page
+is opened from <code>file://</code>, so every fetch is cross-origin) and
+echo the requested <code>chat</code> subprotocol in the 101 (a browser
+fails the handshake when it asked for one and the answer has none). The
+legs were run in a headless Chromium against the Bend example and against
+the oracles; the same page log ends in <code>DONE 2/2 fetch</code> and
+<code>DONE 4/4 ws</code>.
+</p>
 <p>
 <button id="fetchBtn">Run fetch leg</button>
 <button id="wsBtn">Run WebSocket leg</button>

@@ -44,6 +44,10 @@ function counted(server, label, len) {
 /** Starts the echo server. */
 function serve() {
   const server = http.createServer((req, res) => {
+    // The browser leg (tests/rfc/browser.html) is opened from file://, so
+    // every fetch is cross-origin: without this header Chromium refuses to
+    // hand the body to the page ("Failed to fetch").
+    res.setHeader("access-control-allow-origin", "*");
     if (req.url === "/chunk" && req.method === "GET") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.write("Wiki");

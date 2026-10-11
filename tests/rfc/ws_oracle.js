@@ -215,11 +215,18 @@ function serve() {
         return;
       }
       const accept = crypto.createHash("sha1").update(key + GUID).digest("base64");
+      // A browser (and node's WebSocket) fails the handshake when it asked
+      // for a subprotocol and the 101 does not echo one, so the first
+      // requested protocol is picked -- the browser leg asks for "chat".
+      const wanted = (hs.get("sec-websocket-protocol") ?? "").split(",")[0].trim();
+      const proto = wanted === "" ? "" : `Sec-WebSocket-Protocol: ${wanted}\r\n`;
       sock.write(
         "HTTP/1.1 101 Switching Protocols\r\n"
         + "Upgrade: websocket\r\n"
         + "Connection: Upgrade\r\n"
-        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        + `Sec-WebSocket-Accept: ${accept}\r\n`
+        + proto
+        + "\r\n",
       );
       sock.write(frame_show(9, Buffer.from("s1"), false));
       check(true, "HS");
