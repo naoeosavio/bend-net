@@ -88,10 +88,27 @@ def client.conn(+port: U32,
         score : U32 <- client_result(got)
         return (b2u(is_http1) * score : U32)
 
+# The dial is Base.TCP.connect's now: it hands over the connected fd and
+# tls_connect_raw only handshakes it, which is what keeps the parks on a
+# real fd. alpn=3 offers only http/1.1, so this leg proves the ALPN byte
+# lane end to end.
+law dialed:
+  for r: Result<&1, &1, (U32 & String), Socket>
+  for port: U32
+  IO(Result<&1, &1, (U32 & String), Socket & String>)
+
+def dialed(r, port):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, (U32 & String), Socket & String>, Fail{e})
+    case Done{sock}:
+      TLS.tls_connect_raw(sock, "127.0.0.1", 0, 3)
+
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
+    d : Result<&1, &1, (U32 & String), Socket> <- TCP.connect("127.0.0.1", port)
     conn : Result<&1, &1, (U32 & String), Socket & String> <-
-      TLS.tls_connect_raw("127.0.0.1", "127.0.0.1", port, 0, 3)
+      dialed(d, port)
     client.conn(port, conn)
 
 def listen_retry(port: U32,

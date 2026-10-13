@@ -38,12 +38,15 @@ static void tls_no_delay(int fd) {
 #define TLS_ALPN_ANY 2
 #define TLS_ALPN_HTTP1 3
 
+// The dial belongs to Base.TCP.connect: it hands over a connected
+// non-blocking fd, and this thread only runs the handshake on it. That
+// keeps a real fd in the effect's first argument, which is what io_park_on
+// parks on (the lane reads op.args[0]), the same shape Base's
+// TCP.send / TCP.recv / TCP.poll have.
 struct TlsDial {
-  char* ip;
-  u64   ip_len;
+  int   fd;
   char* sni;
   u64   sni_len;
-  u32   port;
   u32   verify;
   u32   alpn;
   u32   code;
@@ -143,25 +146,25 @@ static void tls_call(IoWork* w) {
     d->code = q;
     return;
   }
-  struct sockaddr_in at;
-  if (io_nul(d->ip, d->ip_len) || io_nul(d->sni, d->sni_len)
-    || io_sys_addr(d->ip, d->port, &at) != 0) {
+  if (io_nul(d->sni, d->sni_len)) {
     d->code = 611;
     return;
   }
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    d->code = 612;
+  int fd = d->fd;
+  // The handshake runs on a BLOCKING fd: this thread is the one place in
+  // the process that is allowed to block (the JS twin parks on the lane
+  // instead). Base.TCP.connect hands the fd over non-blocking for life,
+  // because its lane parks on it, so it is made blocking here and the
+  // success path puts it back -- the byte effects expect non-blocking.
+  int fl0 = fcntl(fd, F_GETFL, 0);
+  if (fl0 < 0 || fcntl(fd, F_SETFL, fl0 & ~O_NONBLOCK) < 0) {
+    d->code = 616;
     return;
   }
   tls_no_delay(fd);
-  if (connect(fd, (struct sockaddr*)&at, sizeof(at)) != 0) {
-    close(fd);
-    d->code = 612;
-    return;
-  }
   void* ctx = p_SSL_CTX_new(p_TLS_client_method());
   if (ctx == NULL) {
+    fcntl(fd, F_SETFL, fl0);
     close(fd);
     d->code = 613;
     return;
@@ -299,7 +302,6 @@ static Term tls_pack(Env e, IoWork* w) {
   } else {
     r = io_fail(e, d->code, tls_msg(d->code));
   }
-  free(d->ip);
   free(d->sni);
   free(d);
   return r;
@@ -307,11 +309,10 @@ static Term tls_pack(Env e, IoWork* w) {
 
 Term tls_connect_raw_run(Env e, Term* f, IoWork* w) {
   struct TlsDial* d = io_mem(malloc(sizeof(*d)));
-  d->ip     = io_cstr(e, f[0], &d->ip_len);
+  d->fd     = (int)f[0];
   d->sni    = io_cstr(e, f[1], &d->sni_len);
-  d->port   = (u32)f[2];
-  d->verify = (u32)f[3];
-  d->alpn   = (u32)f[4];
+  d->verify = (u32)f[2];
+  d->alpn   = (u32)f[3];
   d->code   = 0;
   d->conn   = NULL;
   d->proto[0] = 0;

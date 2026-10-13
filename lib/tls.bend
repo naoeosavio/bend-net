@@ -25,11 +25,18 @@
 import Base
 import ./dns.bend as DNS
 
-# The raw client handshake: connects to the IPv4 ip, SNIs sni, verifies
-# the chain iff verify is 1. ALPN mode: alpn=1 offers and requires h2,
-# alpn=2 offers h2/http/1.1, alpn=3 offers only http/1.1, and
-# alpn=0 offers nothing. Answers the TLS socket (SSL*) on Done.
-def tls_connect_raw(ip: String, sni: String, port: U32, verify: U32, alpn: U32) ->
+# The raw client handshake over an already-connected fd: Base.TCP.connect
+# does the dial (so the fd is non-blocking for life) and this effect runs
+# SSL_connect on it, parking on WANT_READ / WANT_WRITE. SNI rides sni,
+# the chain is verified iff verify is 1, and the ALPN mode is
+# alpn=1 offers/requires h2, 2 offers h2+http/1.1, 3 offers only
+# http/1.1, 0 offers nothing. Answers the session box and the selected
+# protocol on Done.
+#
+# The first parameter is the socket, not the host: that is what puts a
+# real fd in op.args[0], the only thing io_park_on can wake on. The other
+# four defs take their handle the same way.
+def tls_connect_raw(sock: Socket, sni: String, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & String>):
   import "./effs/tls_connect.c"
   import "./effs/tls_connect.js"
@@ -55,6 +62,15 @@ def tls_connect.without_alpn(
       (sock, protocol) = value
       IO.pure(Result<&1, &1, U32 & String, Socket>, Done{sock})
 
+def tls_dial_any.dialed(+host: String, +verify: U32,
+  r: Result<&1, &1, U32 & String, Socket>) ->
+  IO(Result<&1, &1, U32 & String, Socket & String>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & String>, Fail{e})
+    case Done{sock}:
+      tls_connect_raw(sock, host, verify, 2)
+
 def tls_dial_any.asked(+port: U32, +verify: U32, +host: String,
   r: Result<&1, &1, U32 & String, String>) ->
   IO(Result<&1, &1, U32 & String, Socket & String>):
@@ -62,7 +78,9 @@ def tls_dial_any.asked(+port: U32, +verify: U32, +host: String,
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Socket & String>, Fail{e})
     case Done{ip}:
-      tls_connect_raw(ip, host, port, verify, 2)
+      do IO<Result<&1, &1, U32 & String, Socket & String>>:
+        d : Result<&1, &1, U32 & String, Socket> <- TCP.connect(ip, port)
+        tls_dial_any.dialed(host, verify, d)
 
 def tls_dial_any(+host: String, port: U32, verify: U32) ->
   IO(Result<&1, &1, U32 & String, Socket & String>):
@@ -118,16 +136,30 @@ def tls_close(sock: Socket) -> IO(Unit):
 # rides; the ORIGINAL host rides SNI. A resolve failure fails with the
 # DNS code (601-605) before any socket exists. alpn is the mode above
 # (1 = require h2, 0 = no ALPN).
-def tls_dial.asked(port: U32, verify: U32, alpn: U32, host: String, r: Result<&1, &1, U32 & String, String>) ->
+# The dial itself is Base.TCP.connect's, which owns the fd and its
+# non-blocking mode; alpn is the mode above (1 = require h2, 0 = none).
+def tls_dial.dialed(host: String, verify: U32, alpn: U32,
+  r: Result<&1, &1, U32 & String, Socket>) ->
+  IO(Result<&1, &1, U32 & String, Socket>):
+  match r:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
+    case Done{sock}:
+      do IO<Result<&1, &1, U32 & String, Socket>>:
+        conn : Result<&1, &1, U32 & String, Socket & String> <-
+          tls_connect_raw(sock, host, verify, alpn)
+        tls_connect.without_alpn(conn)
+
+def tls_dial.asked(port: U32, verify: U32, alpn: U32, host: String,
+  r: Result<&1, &1, U32 & String, String>) ->
   IO(Result<&1, &1, U32 & String, Socket>):
   match r:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
     case Done{ip}:
       do IO<Result<&1, &1, U32 & String, Socket>>:
-        conn : Result<&1, &1, U32 & String, Socket & String> <-
-          tls_connect_raw(ip, host, port, verify, alpn)
-        tls_connect.without_alpn(conn)
+        d : Result<&1, &1, U32 & String, Socket> <- TCP.connect(ip, port)
+        tls_dial.dialed(host, verify, alpn, d)
 
 def tls_dial(+host: String, port: U32, verify: U32, alpn: U32) ->
   IO(Result<&1, &1, U32 & String, Socket>):
