@@ -288,11 +288,21 @@ def srv(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +sc
       (s9, g9) = got
       TLS.tls_close(s9)
 
-def srv_set(got: Socket & HTTPX.Got, +scen: U32) -> IO(Unit):
+# The SETTINGS the peer sends after the preface, and then the frame loop.
+# `rest` is what came AFTER the 24 preface bytes in the first read, and it
+# must be handed on: TLS.recv answers with every application byte the pump
+# is holding, up to max -- the plaintext lane answers with whatever the
+# socket buffer holds, and the portable lane does the same -- so one read
+# routinely carries the preface, the client's SETTINGS and its first
+# request together. Starting the loop on Nil{} dropped all of it, and the
+# peer then waited for a request it had already received: the retired
+# OpenSSL twin returned one record per read, which is what hid this. A
+# deadlock only the portable lane could show.
+def srv_set(got: Socket & HTTPX.Got, +rest: List<&2, U32>, +scen: U32) -> IO(Unit):
   (s, g) = got
   do IO<Unit>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_settings(), 0, 0, HTTPX.x_settings_initial_pay())
-    srv(0, srv_acked(sent), Nil{}, 0, scen, 0, 4)
+    srv(0, srv_acked(sent), rest, 0, scen, 0, 4)
 
 # The client preface is not a frame: consume its 24 bytes first (mold
 # tests/io/httpx_client_cont.bend; @unsafe for the same reason: the phase
@@ -321,7 +331,7 @@ def srv_pre(phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
       (s2, r2) = rs
       match ok:
         case 1:
-          srv_set((s2, HTTPX.GotErr{0, "next"}), scen)
+          srv_set((s2, HTTPX.GotErr{0, "next"}), HTTPX.x_drop32(24, acc), scen)
         case _:
           do IO<Unit>:
             TLS.tls_close(s2)
