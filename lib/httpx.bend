@@ -70,18 +70,14 @@ def x_cat.go(+bs: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
 def x_cat(+bs: List<&2, U32>) -> List<&2, U32>:
   x_cat.go(bs, Nil{})
 
-# Reversed body push (stack-safe accumulation for big bodies):
-# List.append is linear-recursive (depth = len of the first list), so
-# appending each DATA onto a growing body overflows the interp machine
-# stack past ~1MB (cloudflare fetch: 1326902 bytes). Keep in-flight
-# bodies REVERSED — per-DATA work stays bounded by chunk size (reverse
-# the 16KB frag tail-recursively, append in front) — and un-reverse
-# once with x_cat (tail-recursive loop) at the finish site. All
-# drain/slot bodies below are rev-bodies; finish sites x_cat them.
+# Reversed body push (stack-safe accumulation for big bodies): one
+# tail pass, no intermediate list and no append depth. x_cat.go with
+# a non-empty seed is exactly reverse-then-prepend: walking frag
+# while prepending onto rev yields reverse(frag) ++ rev.
 # ---------------------------------------------------------------------
 
 def x_rev_push(+frag: List<&2, U32>, +rev: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, x_cat(frag), rev)
+  x_cat.go(frag, rev)
 
 # NOTE (Phase 13 P7): x_take/x_drop Nat deleted — zero callers (take32/
 # drop32 cover all sites). x_len stays: x_huff_decode.fuel takes Nat bl.
@@ -95,17 +91,12 @@ def x_len.go(+bs: List<&2, U32>, acc: Nat) -> Nat:
 def x_len(bs: List<&2, U32>) -> Nat:
   x_len.go(bs, 0n)
 
-# U32-counted list ops for the flow sender (Phase 12 item 2): the Nat
-# versions above force to_nat/from_nat conversions at every chunk step;
-# these keep the whole send path in U32 (RFC windows are U32).
-#
-# The counter is Nat on the inside and the API is U32 (TASK-026 Phase 2,
-# from TASK-023 Phases 12/13): U32 is Data U32{data: Word(32n)}, so every
-# decrement boxes and every guard is a match over Data, while Nat matches
-# 1n+p without allocating. Same shape (reversed build + x_cat), 16 KiB
-# buffer, measured in TASK-023: take 9,52 s -> 3,61 s and drop 12,92 s ->
-# 2,81 s for 200/400 calls. The conversion is O(1) and happens once per
-# call, not once per element.
+# Bounded take for the flow sender, Nat counter inside (U32 would
+# box one decrement per element): reversed build plus one x_cat,
+# same tail discipline as length_got_th in test.bend. Full-list
+# copies cost a rebuild like any got; live call sites take small
+# slices (16 KiB flow chunks, 24 B preface, 9 B headers), bounded
+# by n, not by the buffer.
 def x_take32.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
@@ -186,19 +177,19 @@ def x_str_len32.go(+s: String, +acc: U32) -> U32:
 def x_str_len32(+s: String) -> U32:
   x_str_len32.go(s, 0)
 
-def x_str_drop32.go(+s: String, +n: U32) -> String:
+def x_str_drop32.go(+s: String, +n: Nat) -> String:
   match s:
     case SNil{}:
       SNil{}
     case SCon{h, t}:
       match n:
-        case 0:
+        case 0n:
           SCon{h, t}
-        case _:
-          x_str_drop32.go(t, (n - 1 : U32))
+        case 1n+p:
+          x_str_drop32.go(t, p)
 
 def x_str_drop32(+s: String, +n: U32) -> String:
-  x_str_drop32.go(s, n)
+  x_str_drop32.go(s, U32.to_nat(n))
 
 def x_eq.mul(+acc: U32, same: Bool) -> U32:
   match same:
@@ -207,27 +198,34 @@ def x_eq.mul(+acc: U32, same: Bool) -> U32:
     case False{}:
       0
 
-def x_eq.go(a: List<&2, U32>, b: List<&2, U32>) -> U32:
+# Structural equality, tail-recursive: the conjunction rides in acc,
+# no frame held across the call, so 1M elements answer flat.
+def x_eq.go(a: List<&2, U32>, b: List<&2, U32>, +acc: U32) -> U32:
   match a b:
     case Nil{} Nil{}:
-      1
+      acc
     case h1 <> t1 h2 <> t2:
-      x_eq.mul(x_eq.go(t1, t2), U32.is_eq(h1, h2))
+      x_eq.go(t1, t2, x_eq.mul(acc, U32.is_eq(h1, h2)))
     case _ _:
       0
 
 def x_eq(a: List<&2, U32>, b: List<&2, U32>) -> U32:
-  x_eq.go(a, b)
+  x_eq.go(a, b, 1)
 
-def x_str_bytes.go(+s: String) -> List<&2, U32>:
+# ASCII-only String to bytes, tail-recursive: one cons per char,
+# reversed acc plus one x_cat, 1M chars safe. Same tail discipline
+# as x_utf8_encode.go (input spine dropped, single acc).
+def x_str_bytes.go(+s: String, acc: List<&2, U32>) -> List<&2, U32>:
   match s:
     case SNil{}:
-      Nil{}
-    case SCon{Chr{c}, t}:
-      List.append(&2, U32, [c], x_str_bytes.go(t))
+      x_cat(acc)
+    case SCon{h, t}:
+      match h:
+        case Chr{code}:
+          x_str_bytes.go(t, code <> acc)
 
 def x_str_bytes(+s: String) -> List<&2, U32>:
-  x_str_bytes.go(s)
+  x_str_bytes.go(s, Nil{})
 
 def x_bytes_str.go(+bs: List<&2, U32>) -> String:
   match bs:
@@ -237,29 +235,49 @@ def x_bytes_str.go(+bs: List<&2, U32>) -> String:
       SCon{Chr{b}, x_bytes_str.go(t)}
 
 # Chunk size for stack-safe bytes->String (below).
+# 1024 is measured, not taste: at 1M bytes it decodes faster than
+# 8192 (median 335ms vs 440ms over 5 runs) and it keeps a wide
+# margin under effects -- reaching an effect deepens the
+# interpreter's machine stack, so the per-chunk depth (one frame
+# per code point) stays a small fraction of the ceiling. Both sizes
+# survive 1M bodies with 200 held frames and effects in between.
 def x_str_chunk() -> U32:
-  8192
+  1024
 
 # Stack-safe bytes->String: x_bytes_str.go is linear-recursive (1 frame
 # per byte), so a ~1MB body overflows the interp machine stack. Split
-# into 8KB chunks (each converted with bounded depth), collect the
+# into 1KB chunks (each converted with bounded depth), collect the
 # chunk Strings reversed via a tail-recursive loop, then reverse +
-# String.concat (depth = chunk count, ~166 per MB). Same bytes out.
+# String.concat (depth = chunk count, ~977 per MB). Same bytes out.
 # ---------------------------------------------------------------------
 
-def x_str_chunks.go(+bs: List<&2, U32>, +n: U32, acc: List<&2, String>, +ch: List<&2, U32>) -> List<&2, String>:
+# Converts one reversed chunk straight to String, no x_cat pass:
+# walking [c3, c2, c1] while prepending yields c1 <> c2 <> c3 in
+# order. Tail loop, depth bounded by the chunk size.
+def x_chunk_str.go(+rev: List<&2, U32>, acc: String) -> String:
+  match rev:
+    case Nil{}:
+      acc
+    case b <> t:
+      x_chunk_str.go(t, SCon{Chr{b}, acc})
+
+# Chunk counter is Nat on the inside and U32 on the API: U32 is
+# Data, so every decrement boxes, while Nat matches 1n+p without
+# allocating. Same shape as x_take32.go (Nat inside, one conversion
+# per chunk at flush time, not per element).
+def x_str_chunks.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, String>, +ch: List<&2, U32>) -> List<&2, String>:
   match bs:
     case Nil{}:
-      x_bytes_str.go(x_cat(ch)) <> acc
+      x_chunk_str.go(ch, SNil{}) <> acc
     case h <> t:
       match n:
-        case 0:
-          x_str_chunks.go(t, (x_str_chunk() - 1 : U32), x_bytes_str.go(x_cat(ch)) <> acc, [h])
-        case _:
-          x_str_chunks.go(t, (n - 1 : U32), acc, h <> ch)
+        case 0n:
+          x_str_chunks.go(t, U32.to_nat((x_str_chunk() - 1 : U32)), x_chunk_str.go(ch, SNil{}) <> acc, [h])
+        case 1n+p:
+          x_str_chunks.go(t, p, acc, h <> ch)
 
 def x_str_chunks(+bs: List<&2, U32>) -> List<&2, String>:
-  x_str_chunks.go(bs, x_str_chunk(), Nil{}, Nil{})
+  x_str_chunks.go(bs, U32.to_nat(x_str_chunk()), Nil{}, Nil{})
 
 def x_bytes_str(bs: List<&2, U32>) -> String:
   String.concat(List.reverse(&2, String, x_str_chunks(bs)))
@@ -315,12 +333,32 @@ def x_utf8_encode.one(c: Char) -> List<&2, U32>:
     case Chr{code}:
       x_utf8_encode_char(code)
 
-def x_utf8_encode(s: String) -> List<&2, U32>:
+# ASCII fast push: one cons, no per-char dispatch or append.
+# Same tail discipline as length_th in test.bend: the input spine is
+# dropped as it is consumed and the single acc carries the answer.
+# Multibyte chars keep the bounded rev_push path (2-4 byte frags).
+def x_utf8_encode.push(+code: U32, acc: List<&2, U32>, is_ascii: Bool) -> List<&2, U32>:
+  match is_ascii:
+    case True{}:
+      code <> acc
+    case False{}:
+      x_rev_push(x_utf8_encode_char(code), acc)
+
+# Tail encode: counts nothing, rebuilds reversed in acc.
+# Every arm passes the extended accumulator as an argument, so no
+# frame is held across the call, and x_cat un-reverses once at the end.
+def x_utf8_encode.go(+s: String, acc: List<&2, U32>) -> List<&2, U32>:
   match s:
     case SNil{}:
-      Nil{}
+      x_cat(acc)
     case SCon{h, t}:
-      List.append(&2, U32, x_utf8_encode.one(h), x_utf8_encode(t))
+      match h:
+        case Chr{code}:
+          x_utf8_encode.go(t, x_utf8_encode.push(code, acc, U32.is_lt(code, 128)))
+
+# Encodes text to UTF-8 bytes, tail-recursive, 1M chars safe.
+def x_utf8_encode(s: String) -> List<&2, U32>:
+  x_utf8_encode.go(s, Nil{})
 
 def x_utf8_is_cont(+b: U32) -> Bool:
   Bool.and(U32.is_ge(b, 128), U32.is_le(b, 191))
@@ -366,7 +404,8 @@ def x_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
     case b <> t:
       match need:
         case 0:
-          x_utf8_go(t, x_utf8_need(b), x_utf8_min(x_utf8_need(b)), U32.and(b, x_utf8_mask(x_utf8_need(b))))
+          +nb = x_utf8_need(b)
+          x_utf8_go(t, nb, x_utf8_min(nb), U32.and(b, x_utf8_mask(nb)))
         case 1:
           x_utf8_go(t, x_utf8_fin(code, min, b), 0, 0)
         case 2:
@@ -379,39 +418,68 @@ def x_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
 def x_utf8_ok(bs: List<&2, U32>) -> Bool:
   x_utf8_go(bs, 0, 0, 0)
 
-# need 8 is the ASCII fast path (emit the byte carried in code) and
-# need 7 is a fresh lead byte (step the machine on the carried byte) —
-# both keep one self-recursive def with a shrinking tail.
-# need 8 is pending ASCII (emit on the next step): bytes under 128 must
-# not enter the multi-byte machine, which would swallow them. Every arm
-# shrinks the tail, so this stays one self-recursive def.
-def x_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> String:
+# Stack-safe utf-8 decode. The old one-frame-per-byte machine held one
+# (SCon{Chr{...}, <self>}), which is fine for a header and fatal for a
+# body: 16384 bytes decode, 32768 die with "memory fault (machine stack
+# overflow?)" -- measured, and it is what every String body over ~32 KB
+# hit (cloudflare.com, api.binance.com exchangeInfo). fetch_bytes answers
+# the same hosts fine: its lane is the byte lane, and this decode is the
+# only step that differs.
+#
+# Two changes, both about the stack, and neither about the bytes:
+#
+#   1. the decode itself becomes a tail-recursive loop that accumulates
+#      code points into a reversed list -- every arm passes the extended
+#      accumulator as an ARGUMENT, so no frame is held across the call and
+#      the walk is constant-stack whatever the body is;
+#   2. the code points become a String through the chunked converter
+#      already used for byte bodies (x_str_chunks/x_bytes_str), whose
+#      depth is one frame per code point INSIDE a chunk of x_str_chunk().
+#
+# No chunk boundary can split a sequence here: the state machine carries
+# (need, min, code) across the whole body, so the only "boundary" is
+# between two already-decoded code points.
+def x_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32,
+  acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
       match need:
         case 8:
-          SCon{Chr{code}, SNil{}}
+          code <> acc
         case _:
-          SNil{}
+          acc
     case b <> t:
       match need:
         case 0:
-          +nb0 = Bool.pick(U32, U32.is_lt(b, 128), 8, x_utf8_need(b))
-          x_utf8_decode.go(t, nb0, x_utf8_min(nb0), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, x_utf8_mask(nb0))))
+          +is0 = U32.is_lt(b, 128)
+          +nb0 = Bool.pick(U32, is0, 8, x_utf8_need(b))
+          x_utf8_decode.go(t, nb0, x_utf8_min(nb0),
+            Bool.pick(U32, is0, b, U32.and(b, x_utf8_mask(nb0))),
+            acc)
         case 1:
-          SCon{Chr{(code * 64 + U32.and(b, 63) : U32)}, x_utf8_decode.go(t, 0, 0, 0)}
+          x_utf8_decode.go(t, 0, 0, 0,
+            (code * 64 + U32.and(b, 63) : U32) <> acc)
         case 2:
-          x_utf8_decode.go(t, 1, min, (code * 64 + U32.and(b, 63) : U32))
+          x_utf8_decode.go(t, 1, min, (code * 64 + U32.and(b, 63) : U32), acc)
         case 3:
-          x_utf8_decode.go(t, 2, min, (code * 64 + U32.and(b, 63) : U32))
+          x_utf8_decode.go(t, 2, min, (code * 64 + U32.and(b, 63) : U32), acc)
         case 8:
           +nb8 = Bool.pick(U32, U32.is_lt(b, 128), 8, x_utf8_need(b))
-          SCon{Chr{code}, x_utf8_decode.go(t, nb8, x_utf8_min(nb8), Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, x_utf8_mask(nb8))))}
+          x_utf8_decode.go(t, nb8, x_utf8_min(nb8),
+            Bool.pick(U32, U32.is_lt(b, 128), b, U32.and(b, x_utf8_mask(nb8))),
+            code <> acc)
         case _:
-          SCon{Chr{65533}, x_utf8_decode.go(t, 0, 0, 0)}
+          x_utf8_decode.go(t, 0, 0, 0, 65533 <> acc)
 
-def x_utf8_decode(bs: List<&2, U32>) -> String:
-  x_utf8_decode.go(bs, 0, 0, 0)
+def x_utf8_decode.codes(+bs: List<&2, U32>) -> List<&2, U32>:
+  x_utf8_decode.go(bs, 0, 0, 0, Nil{})
+
+# Decodes UTF-8 bytes to text, tail-recursive, 1M bytes safe.
+# Same bytes as the legacy one-frame-per-byte machine above, constant
+# stack: code points accumulate reversed, then convert chunked.
+def x_utf8_decode(+bs: List<&2, U32>) -> String:
+  String.concat(List.reverse(&2, String,
+    x_str_chunks(x_cat(x_utf8_decode.codes(bs)))))
 
 # Consts
 # ------
@@ -1010,18 +1078,24 @@ def x_huff_nth.go(+xs: List<&2, U32>, +n: U32) -> U32:
 def x_huff_nth(+xs: List<&2, U32>, +n: U32) -> U32:
   x_huff_nth.go(xs, n)
 
-def x_huff_bits.go(+b: U32) -> List<&2, U32>:
+def x_huff_bits.octet(+b: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(b, 7n), 1), U32.and(U32.shrn(b, 6n), 1),
    U32.and(U32.shrn(b, 5n), 1), U32.and(U32.shrn(b, 4n), 1),
    U32.and(U32.shrn(b, 3n), 1), U32.and(U32.shrn(b, 2n), 1),
    U32.and(U32.shrn(b, 1n), 1), U32.and(b, 1)]
 
-def x_huff_bits(bs: List<&2, U32>) -> List<&2, U32>:
+# Bit stream builder, tail-recursive: per-byte work stays bounded by
+# the 8-bit frag (reversed push, one un-reverse at the finish), so a
+# capped 64 KiB Huffman string answers flat instead of faulting.
+def x_huff_bits.go(+bs: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
-      Nil{}
+      x_cat(acc)
     case h <> t:
-      List.append(&2, U32, x_huff_bits.go(h), x_huff_bits(t))
+      x_huff_bits.go(t, x_rev_push(x_huff_bits.octet(h), acc))
+
+def x_huff_bits(bs: List<&2, U32>) -> List<&2, U32>:
+  x_huff_bits.go(bs, Nil{})
 
 def x_huff_hit(+code: U32, +len: U32) -> Bool:
   +i = (len - 5 : U32)
@@ -1034,12 +1108,17 @@ def x_huff_at(+code: U32, +len: U32) -> U32:
   +fst = x_huff_nth(x_huff_firsts(), i)
   x_huff_nth(x_huff_order(), (x_huff_nth(x_huff_starts(), i) + (code - fst : U32) : U32))
 
-def x_huff_ones(+bits: List<&2, U32>) -> Bool:
+# All-ones scan, tail-recursive: the conjunction rides in acc, so a
+# 512 Kbit padding scan answers flat.
+def x_huff_ones.go(+bits: List<&2, U32>, ok: Bool) -> Bool:
   match bits:
     case Nil{}:
-      True{}
+      ok
     case b <> t:
-      Bool.and(U32.is_eq(b, 1), x_huff_ones(t))
+      x_huff_ones.go(t, Bool.and(ok, U32.is_eq(b, 1)))
+
+def x_huff_ones(+bits: List<&2, U32>) -> Bool:
+  x_huff_ones.go(bits, True{})
 
 def x_huff_pad(+bits: List<&2, U32>) -> Bool:
   Bool.and(Bool.not(x_has_at_least(8, bits)), x_huff_ones(bits))

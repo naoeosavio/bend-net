@@ -73,7 +73,9 @@ type WSIn is Data:
 
 # Fragment reassembly state (RFC 6455 section 5.4). FragIdle means no
 # open fragment; FragOpen holds the leading opcode (1 text, 2 binary)
-# plus the bytes stitched so far.
+# plus the bytes stitched so far, REVERSED (same rev-body discipline
+# as the HTTP lanes: per-fragment work stays O(frag) and the
+# un-reverse happens once with x_cat at completion).
 
 type MsgAcc is Data:
   FragIdle{}
@@ -173,9 +175,9 @@ def wsm_utf8_ok(bs: List<&2, U32>) -> Bool:
 # need 8 is pending ASCII (emit on the next step): bytes under 128 must
 # not enter the multi-byte machine, which would swallow them. Every arm
 # shrinks the tail, so this stays one self-recursive def.
-def wsm_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> String:
-  HTTPX.x_utf8_decode.go(bs, need, min, code)
-
+# The whole-message decode is the tail decoder (x_utf8_decode), like
+# the HTTP body lane. Incremental validation rides wsm_utf8_ok, which
+# never holds more than one frame.
 def wsm_utf8_decode(bs: List<&2, U32>) -> String:
   HTTPX.x_utf8_decode(bs)
 
@@ -912,7 +914,7 @@ def wsm_frag_single(+op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & Strin
 def wsm_frag_begin.go(+op: U32, +pay: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match ok:
     case True{}:
-      Done{(FragOpen{op, pay}, None{})}
+      Done{(FragOpen{op, HTTPX.x_cat(pay)}, None{})}
     case False{}:
       Fail{(413, "fragment too large")}
 
@@ -939,7 +941,7 @@ def wsm_frag_open(fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U3
 def wsm_frag_last(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match fin:
     case True{}:
-      wsm_frag_single_msg(op0, grown)
+      wsm_frag_single_msg(op0, HTTPX.x_cat(grown))
     case False{}:
       Done{(FragOpen{op0, grown}, None{})}
 
@@ -954,7 +956,7 @@ def wsm_frag_cont.go(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, 
   wsm_frag_cont2(fin, op0, grown, wsm_frag_capped(grown))
 
 def wsm_frag_cont(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
-  wsm_frag_cont.go(fin, op0, List.append(&2, U32, buf, pay))
+  wsm_frag_cont.go(fin, op0, HTTPX.x_rev_push(pay, buf))
 
 def wsm_frag_got.go(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>, is_cont: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match is_cont:
