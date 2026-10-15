@@ -52,16 +52,24 @@ warn() { known=$((known + 1)); printf 'KNOWN %s\n' "$1"; }
 # Known divergences, "file:check" -> why the tree still carries it and who
 # pays it. An entry here is a debt with an owner, not a mute button:
 # --strict ignores the list, so a phase gate can require the debt paid.
+#
+# NOTE: the five `generic` entries below (OpenSSL over bun:ffi) no longer
+# fire -- task-046-tls-js-lane-into-lib replaced those twins with the
+# portable lane, which has no ffi require left. They stay because removing
+# them is part of task-043-js-lane-tls-pure's Fase 5, and a sibling phase
+# gate should not quietly spend another task's checklist. The `reuse`
+# entries describe the live debt of the same family, rewritten when the
+# twins were replaced.
 exceptions="
 lib/effs/tls_connect.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_accept.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_send_bytes.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_recv_bytes.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_close.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
-lib/effs/tls_close.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_lib()
-lib/effs/tls_connect.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_lib()
-lib/effs/tls_recv_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_lib()
-lib/effs/tls_send_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_lib()
+lib/effs/tls_close.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
+lib/effs/tls_connect.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
+lib/effs/tls_recv_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
+lib/effs/tls_send_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
 "
 
 # Reports one divergence: a debt when the default mode knows it, a failure
@@ -118,10 +126,21 @@ while IFS=' ' read -r def file; do
 done <<<"$pairs"
 
 # mapping: no orphan twin (a .js no def imports is dead weight in the lane).
+# A twin may also be the shared RUNTIME the other twins load at run time:
+# the only require that resolves in every lane is cwd-absolute
+# (task-043, D2), so the five TLS effects address lib/effs/tls_rt.js that
+# way instead of importing it from a def. Nothing under lib/effs/ is here
+# without a user -- the check just has to know both kinds of user.
 for f in lib/effs/*.js; do
   [ -f "$f" ] || continue
   base="${f#lib/effs/}"
   if printf '%s\n' "$pairs" | awk '{print $2}' | grep -qxF "$base"; then
+    continue
+  fi
+  users="$(grep -lF "require(process.cwd() + \"/lib/effs/$base\")" \
+    lib/effs/*.js 2>/dev/null | grep -v "^$f\$" | tr '\n' ' ')"
+  if [ -n "$users" ]; then
+    ok "helper lib/effs/$base is loaded at run time by ${users% }"
     continue
   fi
   bad "mapping $f is imported by no def"
