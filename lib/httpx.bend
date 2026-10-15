@@ -2528,7 +2528,7 @@ def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, 
                 case Nil{}:
                   do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
                     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
-                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
+                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, List.append(&2, U32, seed, buf)))
                 case +b <> r:
                   x_send_data_flow(4, (s0, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
             case _:
@@ -2573,7 +2573,7 @@ def x_send_data_flow(+phase: U32, got: Socket & Got, +sid: U32, +body: List<&2, 
         case GotOk{+frame14, +buf14}:
           match frame14:
             case Frame{+typ14, +flags14, +sid214, +payload14}:
-              x_send_data_flow(4, (s14, GotErr{0, "next"}), sid, body, cw, sw, Nil{}, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, buf14))
+              x_send_data_flow(4, (s14, GotErr{0, "next"}), sid, body, cw, sw, buf14, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, Nil{}))
     case _:
       (s13, g13) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(502, "flow bad phase")}, Nil{}))
@@ -2591,6 +2591,14 @@ def x_f_priority() -> U32:
 def x_f_seed(+flags: U32) -> U32:
   U32.and(flags, U32.sub(255, (x_f_padded() + x_f_priority() : U32)))
 
+# The sender keeps the rest of the recv as its own read buffer after a
+# stash: the frames behind the stashed one can hold the WINDOW_UPDATE the
+# send waits for, and the old shape put them in the caller's seed, where
+# nothing applies them (measured on 2026-10-16: a client reset of a
+# sibling stream while the server sent a 70000-byte body left the sender
+# with cw=0 and the credit in the seed; both peers waited). The seed
+# carries only the frames the caller must see, in wire order.
+#
 # Where the sender goes after reading a frame while it waits for credit:
 # 13 stops the send (a HEADERS for the stream it is feeding is the answer
 # arriving while the body is still going: the wire bytes go back as the
@@ -2674,7 +2682,7 @@ def x_flow.reste(got: Socket & Got, +sid: U32, +body: List<&2, U32>, +cw: U32, +
     case Nil{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, List.append(&2, U32, seed, buf)))
     case +b <> r:
       x_send_data_flow(0, (s6, GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
 
@@ -7840,6 +7848,429 @@ def server.stream_concurrent_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert
     next : Listener <- httpxs_alpn_conn(~H, accepted)
     z : Unit <- server.stream_concurrent_alpn(~H, next, cert, key)
     return z
+
+# Concurrent streaming client (TASK-054 phase 3): the third client
+# family. StreamEv/StreamOut carry no slot, so a pure handler cannot
+# separate two downloads on one connection (discovery C2). This family
+# puts the slot in each event and in each answer, and the drain loop
+# keeps one ledger entry for each open stream (httpxc.ClSt, the ledger
+# client_conc.drain uses).
+#
+# A CStreamCancel{slot} sends RST_STREAM(slot, 8): that stream ends and
+# the siblings continue. The stream keeps a tombstone entry
+# (ClSt{None{}, Nil{}, sid}) and the pending count drops by one, because
+# the frames of that stream can still be in flight (the library server
+# sends the whole response in one write). A DATA frame for a stream
+# without a stored head is skipped, and only the connection window takes
+# the credit (the rule of httpxs.data_act_of, act 8). A head block for a
+# tombstoned stream is skipped the same way, and its HPACK block still
+# decodes, so the dynamic table stays in step.
+#
+# The trailer test reads the ledger (httpxc.head_lookup), never a loop
+# argument: two streams share this loop, and the head of one stream is
+# not the head of the other. The answer is (total bytes, finished
+# streams): a cancelled stream is not finished, and its bytes are not
+# counted.
+# ---------------------------------------------------------------------
+
+# The constructor names carry the C- prefix: Bend keeps one constructor
+# namespace for each file, so StreamHead/StreamData/StreamContinue/
+# StreamCancel belong to StreamEv/StreamOut above (probe measured on
+# 2026-10-16: two constructors with one name in one file fail to
+# compile).
+type CStreamEv is Data:
+  CStreamHead{slot: U32, head: Head}
+  CStreamData{slot: U32, chunk: List<&2, U32>, fin: Bool}
+
+type CStreamOut is Data:
+  CStreamContinue{slot: U32}
+  CStreamCancel{slot: U32}
+
+# Pure leaves (no IO, no ~H): the loop below calls them for the act code.
+# ---------------------------------------------------------------------
+
+def client_cstream.is_cancel(+out: CStreamOut) -> Bool:
+  match out:
+    case CStreamContinue{slot}:
+      False{}
+    case CStreamCancel{slot}:
+      True{}
+
+def client_cstream.out_slot(+out: CStreamOut) -> U32:
+  match out:
+    case CStreamContinue{+slot}:
+      slot
+    case CStreamCancel{+slot}:
+      slot
+
+# The answer names the stream it answers. A handler that mixes two slots
+# is a handler bug: the lane fails closed (502) and never resets the
+# wrong stream.
+def client_cstream.slot_ok(+out: CStreamOut, +sid: U32) -> Bool:
+  U32.is_eq(client_cstream.out_slot(out), sid)
+
+# A stream the ledger knows with no stored head: the batch dropped it
+# (cancel or peer reset). Its frames in flight are skipped, never read as
+# a new response.
+# Ledger predicates. httpxc.has answers "the sid is in the ledger".
+# httpxc.has_some answers "that entry has no head yet" -- the shape an
+# open fragment has, and the opposite of what the name suggests
+# (httpxc.has_some_go: None is true, Some is false; httpxn.frag_has is
+# its one user). This lane stores a head for every open stream and a None
+# head for every dropped one, so:
+#   live = known and not headless (a stream with a stored head);
+#   dead = known and headless (a tombstone: cancel or peer reset).
+# The Bools ride argument positions: a match cannot scrutinize a call or
+# a local binder (the discipline of this file).
+def client_cstream.is_live_go(known: Bool, headless: Bool) -> Bool:
+  match known:
+    case False{}:
+      False{}
+    case True{}:
+      Bool.not(headless)
+
+def client_cstream.is_live(+slots: List<&2, ClSt>, +sid: U32) -> Bool:
+  client_cstream.is_live_go(httpxc.has(slots, sid), httpxc.has_some(slots, sid))
+
+def client_cstream.is_dead_go(known: Bool, headless: Bool) -> Bool:
+  match known:
+    case False{}:
+      False{}
+    case True{}:
+      headless
+
+def client_cstream.is_dead(+slots: List<&2, ClSt>, +sid: U32) -> Bool:
+  client_cstream.is_dead_go(httpxc.has(slots, sid), httpxc.has_some(slots, sid))
+
+# Head act: 4 skip the block of a tombstoned stream, 6 read the
+# CONTINUATION frames, 1 finish (a trailer with END_STREAM), 5 fail (a
+# trailer without END_STREAM), 9 ask the handler.
+def client_cstream.head_frame(is_dead: Bool, is_live: Bool, is_tr: Bool, +need: U32, +end: U32) -> U32:
+  match is_dead:
+    case True{}:
+      match need:
+        case 1:
+          6
+        case _:
+          4
+    case False{}:
+      match is_live:
+        case False{}:
+          9
+        case True{}:
+          match is_tr need:
+            case _ 1:
+              6
+            case True{} _:
+              httpxn.trailer_act(end)
+            case False{} _:
+              9
+
+# Frame act for a DATA frame: 0 ask the handler (a live stream), 4 skip
+# the frame (a dropped stream, or one the batch never opened).
+def client_cstream.live_act(is_live: Bool) -> U32:
+  match is_live:
+    case True{}:
+      0
+    case False{}:
+      4
+
+# Peer reset act: 0 ignore the frame (the batch dropped that stream, so
+# its count already dropped), 7 drop the stream and count it.
+def client_cstream.rst_act(is_live: Bool, +pending: U32) -> U32:
+  match is_live:
+    case False{}:
+      0
+    case True{}:
+      client_conc.finish_next(pending)
+
+# Head act for a block the handler saw: 8 slot mismatch, 7 cancel, else
+# the shared httpxn.head_act (0 store, 1 finish, 5 decode fail). The
+# variant and the slot of the answer ride arguments: a match cannot
+# scrutinize a call (the discipline of this file).
+def client_cstream.head_out_act(is_slot: Bool, is_cancel: Bool, ok: Bool, +end: U32) -> U32:
+  match is_slot:
+    case False{}:
+      8
+    case True{}:
+      match is_cancel:
+        case True{}:
+          7
+        case False{}:
+          httpxn.head_act(0, ok, end)
+
+# The act from the handler answer alone: the answer names its slot, so
+# the caller calls the handler once and reads the answer twice.
+def client_cstream.head_out_go(sid: U32, +out: CStreamOut, ok: Bool, +end: U32) -> U32:
+  client_cstream.head_out_act(client_cstream.slot_ok(out, sid), client_cstream.is_cancel(out), ok, end)
+
+# Data act for a live stream: 8 slot mismatch, 7 cancel, else the shared
+# httpxn.decide_data (0 credit and continue, 1 credit and finish).
+def client_cstream.data_out_act(is_slot: Bool, is_cancel: Bool, +end: U32) -> U32:
+  match is_slot:
+    case False{}:
+      8
+    case True{}:
+      match is_cancel:
+        case True{}:
+          7
+        case False{}:
+          httpxn.decide_data(True{}, end)
+
+# The act from the handler answer alone (one call to the handler).
+def client_cstream.data_out_go(sid: U32, +out: CStreamOut, +end: U32) -> U32:
+  client_cstream.data_out_act(client_cstream.slot_ok(out, sid), client_cstream.is_cancel(out), end)
+
+# A dropped stream stays in the ledger without a head.
+def client_cstream.tombstone(slots: List<&2, ClSt>, +sid: U32) -> List<&2, ClSt>:
+  httpxc.put(slots, ClSt{None{}, Nil{}, sid})
+
+# Connection-window credit for a skipped DATA frame. The stream that
+# owned the bytes is gone, so only stream 0 can take the credit (a
+# stream-level WINDOW_UPDATE for a closed stream is meaningless, and a
+# zero increment is a protocol error). Mirrors httpxs.wu_conn, the
+# server lane's answer to the same frame.
+def client_cstream.wu_skip(got: Socket & Got, buf: List<&2, U32>, +inc: U32) -> IO(Socket & Got):
+  (s, g) = got
+  do IO<Socket & Got>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.wu_conn(s, inc)
+    IO.pure(Socket & Got, client.on.wu_kept(sent, buf))
+
+# Drain: phases 0 read, 1 decompose, 2 connection dispatch, 3 stream
+# dispatch (HEADERS decodes here, DATA gates liveness here), 4 HEADERS
+# act, 5 DATA act, 6 CONTINUATION read, 7 done, 8 CONTINUATION dispatch,
+# 9 peer-reset act, 10 DATA gate act. Every computed code rides an
+# argument and the next phase matches the parameter (the shape
+# client_conc.drain uses: a match cannot scrutinize a call).
+#
+# The counters stay U32 and the payload never accumulates in the ledger:
+# the body of a stream is the handler's business, and this lane counts
+# bytes (the shape test.bend measures: a U32 counter, no rebuild).
+@unsafe
+def client_cstream.drain(~H: CStreamEv -> CStreamOut, phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Tab, +slots: List<&2, ClSt>, +pending: U32, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +head: Head, +ok: Bool, act: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, U32 & U32>):
+  match phase:
+    case 0:
+      (s0, g0) = got
+      do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+        got2 : Socket & Got <- x_read_frame(s0, buf)
+        client_cstream.drain(~H, 1, got2, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+    case 1:
+      (s1, g1) = got
+      match g1:
+        case GotErr{code1, msg1}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s1, Fail{(code1, msg1)}))
+        case GotOk{+frame, +buf2}:
+          match frame:
+            case Frame{+typ2, +flags2, +sid22, +payload2}:
+              client_cstream.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, fins, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), Head{0, Nil{}}, False{}, 4)
+    case 2:
+      match cls:
+        case 1:
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            got2 : Socket & Got <- client.on.ack(got)
+            client_cstream.drain(~H, 0, got2, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 4:
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            gotp : Socket & Got <- client.on.ack_ping(got, payload)
+            client_cstream.drain(~H, 0, gotp, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 5:
+          client.on.sfail(got, x_goaway.status(payload, client_conc.first_sid()), x_goaway.reason(payload, client_conc.first_sid()))
+        case 7:
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 9:
+          client.on.sfail(got, 502, "bad window_update")
+        case 8:
+          client.on.sfail(got, 502, "continuation")
+        case 2:
+          client_cstream.drain(~H, 9, got, buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, False{}, client_cstream.rst_act(client_cstream.is_live(slots, sid2), pending))
+        case 6:
+          client_cstream.drain(~H, 3, got, buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, False{}, 4)
+        case 0:
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case _:
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+    case 3:
+      match typ:
+        case 1:
+          +dr : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
+          +nh : Head = x_resp.rh(dr)
+          +nt : Tab = x_resp.tab(dr)
+          +is_tr : Bool = httpxn.is_trailer(httpxc.head_lookup(slots, sid2), nh)
+          +dead : Bool = client_cstream.is_dead(slots, sid2)
+          +live : Bool = client_cstream.is_live(slots, sid2)
+          client_cstream.drain(~H, 4, got, buf, nt, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, nh, x_resp.ok(dr), client_cstream.head_frame(dead, live, is_tr, httpxn.need_u(typ, flags), end))
+        case 0:
+          client_cstream.drain(~H, 10, got, buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, False{}, client_cstream.live_act(client_cstream.is_live(slots, sid2)))
+        case _:
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+    case 4:
+      match act:
+        case 0:
+          client_cstream.drain(~H, 0, got, buf, tab, httpxc.put(slots, ClSt{Some{head}, Nil{}, sid2}), pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 1:
+          client_cstream.drain(~H, client_conc.finish_next(pending), got, buf, tab, client_cstream.tombstone(slots, sid2), (pending - 1 : U32), total, (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 4:
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 6:
+          client_cstream.drain(~H, 6, client_conc.next(httpx.wo(got)), buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, 0, end, Head{0, Nil{}}, False{}, 0)
+        case 8:
+          client.on.sfail(got, 502, "slot mismatch")
+        case 5:
+          client.on.sfail(got, 502, "head decode")
+        case 7:
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got), sid2, 8)
+            client_cstream.drain(~H, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, client_cstream.tombstone(slots, sid2), (pending - 1 : U32), total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 9:
+          client_cstream.drain(~H, 4, got, buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, head, ok, client_cstream.head_out_go(sid2, H(CStreamHead{sid2, head}), ok, end))
+        case _:
+          client.on.sfail(got, 502, "head")
+    case 5:
+      match act:
+        case 0:
+          # one walk of the chunk feeds the credit and the byte count
+          # (test.bend: a list walk dominates, so walk once).
+          +len0 : U32 = x_len32(payload)
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, len0)
+            client_cstream.drain(~H, 0, got2, buf, tab, slots, pending, (total + len0 : U32), fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 1:
+          +len1 : U32 = x_len32(payload)
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            got2 : Socket & Got <- client.on.wu_blest(got, buf, sid2, len1)
+            client_cstream.drain(~H, client_conc.finish_next(pending), got2, buf, tab, client_cstream.tombstone(slots, sid2), (pending - 1 : U32), (total + len1 : U32), (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case 8:
+          client.on.sfail(got, 502, "slot mismatch")
+        case 7:
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got), sid2, 8)
+            client_cstream.drain(~H, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, client_cstream.tombstone(slots, sid2), (pending - 1 : U32), total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case _:
+          client.on.sfail(got, 502, "data")
+    case 6:
+      (s6, g6) = got
+      match g6:
+        case GotErr{code6, msg6}:
+          match code6:
+            case 0:
+              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+                got6 : Socket & Got <- x_read_frame(s6, buf)
+                client_cstream.drain(~H, 6, got6, buf, tab, slots, pending, total, fins, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, False{}, 0)
+            case _:
+              IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32>, (s6, Fail{(code6, msg6)}))
+        case GotOk{+frame6, +buf6}:
+          match frame6:
+            case Frame{+typ6, +flags6, +sid6, +pay6}:
+              client_cstream.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, fins, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), U32.and(flags6, x_f_end_stream()), Head{0, Nil{}}, False{}, 0)
+    case 7:
+      client.on.sdone(got, total, fins)
+    case 8:
+      (s8, g8) = got
+      match cls:
+        case 0:
+          +dr8 : Result<&1, &1, U32 & String, Head & Tab> = x_resp.decode(payload, tab)
+          +nh8 : Head = x_resp.rh(dr8)
+          +is_tr8 : Bool = httpxn.is_trailer(httpxc.head_lookup(slots, sid2), nh8)
+          +dead8 : Bool = client_cstream.is_dead(slots, sid2)
+          +live8 : Bool = client_cstream.is_live(slots, sid2)
+          client_cstream.drain(~H, 4, client_conc.next(s8), buf, x_resp.tab(dr8), slots, pending, total, fins, typ, flags, sid2, Nil{}, cls, end, nh8, x_resp.ok(dr8), client_cstream.head_frame(dead8, live8, is_tr8, 0, end))
+        case 1:
+          client_cstream.drain(~H, 6, client_conc.next(s8), buf, tab, slots, pending, total, fins, 0, 0, sid2, payload, 0, end, Head{0, Nil{}}, False{}, 0)
+        case _:
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s8, 0, 1)
+            client.on.sdrop_sendfail(sent)
+    case 9:
+      match act:
+        case 0:
+          # a reset frame for a stream the batch already dropped: ignore it
+          client_cstream.drain(~H, 0, got, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        case _:
+          client_cstream.drain(~H, client_conc.finish_next(pending), got, buf, tab, client_cstream.tombstone(slots, sid2), (pending - 1 : U32), total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+    case 10:
+      match act:
+        case 0:
+          client_cstream.drain(~H, 5, got, buf, tab, slots, pending, total, fins, typ, flags, sid2, payload, cls, end, Head{0, Nil{}}, False{}, client_cstream.data_out_go(sid2, H(CStreamData{sid2, payload, U32.is_eq(end, 1)}), end))
+        case _:
+          # The tail of a response the batch already dropped. The bytes
+          # belong to a dead stream, so only the connection window takes
+          # the credit, or the peer stops on every stream.
+          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32>>:
+            got2 : Socket & Got <- client_cstream.wu_skip(got, buf, x_len32(payload))
+            client_cstream.drain(~H, 0, got2, buf, tab, slots, pending, total, fins, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+    case _:
+      client.on.sfail(got, 502, "bad phase")
+
+# Public: pipeline N requests on one H2 connection, stream the answers to
+# a pure handler, and close. The answer is (total bytes, finished
+# streams).
+# ---------------------------------------------------------------------
+
+def client_cstream.after_send(~H: CStreamEv -> CStreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (sock, r, seed) = sent
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        x : Unit <- TLS.tls_close(sock)
+        IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{u}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client_cstream.drain(~H, 0, client_conc.next(sock), seed, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        client_stream.drained(drained)
+
+def client_cstream.exch(~H: CStreamEv -> CStreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
+    client_cstream.after_send(~H, sent, pending)
+
+def client_cstream.conn(~H: CStreamEv -> CStreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      client_cstream.exch(~H, sock, host, port, reqs, pending)
+
+def client_cstream.go(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match insecure:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_cstream.conn(~H, conn, host, port, reqs, pending)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_cstream.conn(~H, conn, host, port, reqs, pending)
+
+def client_cstream.fit_n(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match pending:
+    case 0:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Done{(0, 0)})
+    case _:
+      client_cstream.go(~H, host, port, reqs, pending, insecure)
+
+def client_cstream.fit(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, +reqs: List<&2, Request>, insecure: Bool, valid: Bool) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match valid:
+    case True{}:
+      client_cstream.fit_n(~H, host, port, reqs, client_conc.count(reqs), insecure)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(400, "bad request")})
+
+def client.stream_concurrent(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  client_cstream.fit(~H, host, port, reqs, False{}, client_conc.valid_all(reqs, host, port))
+
+def client.stream_concurrent_insecure(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  client_cstream.fit(~H, host, port, reqs, True{}, client_conc.valid_all(reqs, host, port))
 
 # Sequential server (Phase 10): one stream at a time per connection, same
 # wire contract as the httpx (literal-only 1-DATA 16KB responses, same Fail

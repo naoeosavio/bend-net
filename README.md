@@ -497,6 +497,8 @@ bend tests/io/httpx_client_concurrent.bend # 4
 bend tests/io/httpx_client_stream.bend    # 1
 bend tests/io/httpx_server_stream.bend    # 2
 bend tests/io/httpx_stream_concurrent.bend # 4 (cancel resets one stream, siblings continue)
+bend tests/io/httpx_client_stream_concurrent.bend # 3 (client slots: cancel one, siblings finish)
+bend tests/io/httpx_client_stream_concurrent_skip.bend # 1 (frames in flight of a dropped stream)
 bend tests/io/httpx_read_url.bend         # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend            # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend       # 3 (batch entry vs mini server)
@@ -854,6 +856,8 @@ bend tests/io/httpx_client_concurrent.bend  # 4
 bend tests/io/httpx_client_stream.bend      # 1
 bend tests/io/httpx_server_stream.bend      # 2
 bend tests/io/httpx_stream_concurrent.bend  # 4 (cancel resets one stream, siblings continue)
+bend tests/io/httpx_client_stream_concurrent.bend  # 3 (client slots: cancel one, siblings finish)
+bend tests/io/httpx_client_stream_concurrent_skip.bend  # 1 (frames in flight of a dropped stream)
 bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
