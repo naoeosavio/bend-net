@@ -65,6 +65,15 @@ static int   (*s_SSL_accept)(void*);
 static void  (*s_SSL_get0_alpn_selected)(const void*, const unsigned char**, unsigned*);
 static int   (*s_SSL_shutdown)(void*);
 static void  (*s_SSL_free)(void*);
+static unsigned long (*s_ERR_peek_last_error)(void);
+
+// ERR_GET_REASON(): the low 23 bits of a packed OpenSSL error code.
+#define TLS_S_ERR_REASON(e) ((int)((e) & 0x7FFFFF))
+// Our own ALPN refusal surfaces as SSL_R_NO_APPLICATION_PROTOCOL (235);
+// a peer's alert 120 arrives as 1000 + 120. Both are the ALPN contract
+// failing, so they answer 615 like the JS lane, never a generic 613.
+#define TLS_S_R_NO_APPLICATION_PROTOCOL       235
+#define TLS_S_R_ALERT_NO_APPLICATION_PROTOCOL 1120
 
 static u32 tls_s_init(void) {
   pthread_mutex_lock(&tls_s_gate);
@@ -98,6 +107,7 @@ static u32 tls_s_init(void) {
   TLS_S_SYM(SSL_get0_alpn_selected)
   TLS_S_SYM(SSL_shutdown)
   TLS_S_SYM(SSL_free)
+  TLS_S_SYM(ERR_peek_last_error)
 #undef TLS_S_SYM
   tls_s_ready = 1;
   pthread_mutex_unlock(&tls_s_gate);
@@ -114,7 +124,12 @@ static const char* tls_s_msg(u32 code) {
   }
 }
 
-// ALPN select: preserve the client's protocol order.
+// ALPN select: preserve the client's protocol order. A peer that sent no
+// extension is not a mismatch -- the handshake continues with no protocol
+// selected (RFC 7301 s3.2, SSL_TLSEXT_ERR_NOACK). A peer that DID send a
+// list with no overlap must fail with the fatal no_application_protocol
+// alert (SSL_TLSEXT_ERR_ALERT_FATAL), which is what the RFC requires and
+// what the JS lane already does.
 static int tls_alpn_cb(void* ssl, const unsigned char** out,
   unsigned char* outlen, const unsigned char* in, unsigned inlen, void* arg) {
   (void)ssl;
@@ -145,7 +160,7 @@ static int tls_alpn_cb(void* ssl, const unsigned char** out,
     }
     i += 1 + l;
   }
-  return 3;
+  return inlen == 0 ? 3 : 2;
 }
 
 static void tls_serve_call(IoWork* w) {
@@ -196,6 +211,10 @@ static void tls_serve_call(IoWork* w) {
   }
   s_SSL_set_fd(ssl, s->fd);
   int r = s_SSL_accept(ssl);
+  // Read the reason BEFORE shutdown/free: they push their own errors. Our
+  // own ALPN refusal surfaces as SSL_R_NO_APPLICATION_PROTOCOL (235), and
+  // a buggy peer's alert 120 as 1000 + 120.
+  int reason = (int)(TLS_S_ERR_REASON(s_ERR_peek_last_error()));
   if (nb) {
     int fl2 = fcntl(s->fd, F_GETFL, 0);
     if (fl2 >= 0) fcntl(s->fd, F_SETFL, fl2 | O_NONBLOCK);
@@ -205,7 +224,8 @@ static void tls_serve_call(IoWork* w) {
     s_SSL_free(ssl);
     s_SSL_CTX_free(ctx);
     close(s->fd);
-    s->code = 613;
+    s->code = (reason == TLS_S_R_NO_APPLICATION_PROTOCOL
+      || reason == TLS_S_R_ALERT_NO_APPLICATION_PROTOCOL) ? 615 : 613;
     return;
   }
   const unsigned char* selected = NULL;

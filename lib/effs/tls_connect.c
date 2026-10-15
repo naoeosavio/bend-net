@@ -75,6 +75,7 @@ static long  (*p_SSL_get_verify_result)(void*);
 static int   (*p_SSL_shutdown)(void*);
 static void  (*p_SSL_free)(void*);
 static int   (*p_SSL_get_error)(void*, int);
+static unsigned long (*p_ERR_peek_last_error)(void);
 
 static u32 tls_init(void) {
   pthread_mutex_lock(&tls_gate);
@@ -112,11 +113,20 @@ static u32 tls_init(void) {
   TLS_SYM(SSL_shutdown)
   TLS_SYM(SSL_free)
   TLS_SYM(SSL_get_error)
+  TLS_SYM(ERR_peek_last_error)
 #undef TLS_SYM
   tls_ready = 1;
   pthread_mutex_unlock(&tls_gate);
   return 0;
 }
+
+// ERR_GET_REASON(): the low 23 bits of a packed OpenSSL error code.
+#define TLS_ERR_REASON(e) ((int)((e) & 0x7FFFFF))
+// A peer that aborts the handshake with the fatal no_application_protocol
+// alert (120) reports reason 1000 + 120: that IS the ALPN contract
+// failing, so it answers 615 like the JS lane, never a generic 613.
+#define TLS_R_ALERT_NO_APPLICATION_PROTOCOL 1120
+#define TLS_R_NO_APPLICATION_PROTOCOL       235
 
 static const char* tls_msg(u32 code) {
   switch (code) {
@@ -233,11 +243,15 @@ static void tls_call(IoWork* w) {
   p_SSL_set_fd(ssl, fd);
   if (p_SSL_connect(ssl) <= 0) {
     long vr = d->verify ? p_SSL_get_verify_result(ssl) : 0;
+    // Read the reason BEFORE shutdown/free: they push their own errors.
+    int reason = TLS_ERR_REASON(p_ERR_peek_last_error());
     p_SSL_shutdown(ssl);
     p_SSL_free(ssl);
     p_SSL_CTX_free(ctx);
     close(fd);
-    d->code = (d->verify && vr != 0) ? 614 : 613;
+    d->code = (d->verify && vr != 0) ? 614
+      : (reason == TLS_R_ALERT_NO_APPLICATION_PROTOCOL
+        || reason == TLS_R_NO_APPLICATION_PROTOCOL) ? 615 : 613;
     return;
   }
   if (d->verify && p_SSL_get_verify_result(ssl) != 0) {
