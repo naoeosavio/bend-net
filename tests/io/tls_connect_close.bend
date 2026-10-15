@@ -2,7 +2,9 @@
 # self-signed) plus fail-closed paths. The server accepts one TLS
 # connection with the test cert/key, echoes 5 bytes; the client sends
 # "hello" and checks the echo. Port 0 dies in validation (611) and a
-# refused port dies in dial (612), both without a handshake.
+# refused port dies in the dial — Base.TCP.connect's own errno (measured
+# 111 ECONNREFUSED; the effect stopped answering 612 when the dial left
+# it, task-047) — both without a handshake.
 import Base
 import ../../lib/tls.bend as TLS
 
