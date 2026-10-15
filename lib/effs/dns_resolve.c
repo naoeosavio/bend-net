@@ -8,6 +8,10 @@
 // stays free. Stable fail codes (the JS twin maps its UDP answer to
 // the same table): 601 bad host, 602 host not found, 603 resolve
 // failed (try again), 604 no IPv4 address, 605 resolve error.
+// lib/dns.bend refuses an address form that is not a canonical quad
+// (01.2.3.4, 127.1, 0x7f.1, 256.1.1.1) with 601 before the effect, so
+// libc's legacy numeric forms never reach the getaddrinfo below
+// (task-051 A2).
 static u32 dns_map(int gai) {
   switch (gai) {
     case EAI_NONAME: return 602;

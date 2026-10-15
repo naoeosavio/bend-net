@@ -1,11 +1,17 @@
 # DNS resolve: package-local A lookup for the HTTP lib (no Base
 # patch). The public lane is resolve: a canonical dotted quad answers
-# itself, "localhost" answers 127.0.0.1, and everything else must pass
-# the host checks before the effect runs. The effect (dns_lookup) is
+# itself, "localhost" answers 127.0.0.1, an address form that is not
+# canonical (01.2.3.4, 127.1, 0x7f.1, 256.1.1.1) fails 601, and
+# everything else must pass the host checks before the effect runs. The
+# effect (dns_lookup) is
 # a twin pair like tcp.bend's: C rides getaddrinfo on io_work's
 # helper thread (the loop stays free); JS writes one A query over UDP
-# to the first nameserver of /etc/resolv.conf, parks on the socket
-# with a deadline (one retry), and answers the first A record.
+# to the first nameserver of /etc/resolv.conf — read with the
+# runtime's own fs, a guarded require("fs"), no libc of its own
+# (2026-10-12), falling back to 127.0.0.53 when the file names no
+# usable one — parks on the socket with a 3 s deadline (one retry),
+# and answers the first A record. A records only: no AAAA, and no TCP
+# fallback for a truncated 512-byte answer.
 #
 # Fail codes are stable numbers, never resolver text: 601 bad host
 # (validation), 602 host not found, 603 resolve failed (try again),
@@ -154,10 +160,96 @@ def name_len(+host: String) -> Bool:
 def valid_name(+host: String) -> Bool:
   Bool.and(name_len(host), Bool.and(chars_ok(host), labels_ok(String.split(host, '.'))))
 
-# resolve: the fast paths answer without the effect, so both lanes
-# see only real names. A dotted quad that fails the canonical check
-# is a NAME to the resolver ("256.1.1.1" is asked and fails 602/603,
-# never connected as if it were an IP).
+# Address forms. A host whose characters are only digits, dots and the
+# letter x cannot be a DNS name that resolves: libc reads "01.2.3.4" as
+# 1.2.3.4, "127.1" as 127.0.0.1 and "0x7f.1" as 127.0.0.1, while the JS
+# twin would ask the resolver for a name. ICANN forbids all-numeric TLDs,
+# so refusing 601 here removes the lane difference instead of documenting
+# it (task-051 A2). The rest of the hex alphabet counts as an address
+# character only when the host carries a 0x/0X prefix, so a real name
+# such as "beef1.cafe" is still a name.
+
+def addr_char.is_dot(+c: Char) -> Bool:
+  Char.is_eq(c, Chr{46})
+
+def addr_char.is_x(+c: Char) -> Bool:
+  Bool.or(Char.is_eq(c, Chr{120}), Char.is_eq(c, Chr{88}))
+
+def hex_letter.lower(+code: U32) -> Bool:
+  Bool.and(U32.is_ge(code, 97), U32.is_le(code, 102))
+
+def hex_letter.upper(+code: U32) -> Bool:
+  Bool.and(U32.is_ge(code, 65), U32.is_le(code, 70))
+
+def hex_letter.put(is_lower: Bool, is_upper: Bool) -> Bool:
+  match is_lower:
+    case True{}:
+      True{}
+    case False{}:
+      is_upper
+
+def hex_letter(+c: Char) -> Bool:
+  hex_letter.put(hex_letter.lower(Char.to_u32(c)),
+    hex_letter.upper(Char.to_u32(c)))
+
+def addr_char.base(+c: Char) -> Bool:
+  Bool.or(Bool.or(Char.is_digit(c), addr_char.is_dot(c)), addr_char.is_x(c))
+
+def addr_char.take(is_base: Bool, is_hex: Bool) -> Bool:
+  match is_base:
+    case True{}:
+      True{}
+    case False{}:
+      is_hex
+
+def addr_char(+c: Char, hex_ok: Bool) -> Bool:
+  addr_char.take(addr_char.base(c), Bool.and(hex_ok, hex_letter(c)))
+
+def addr_chars.put(ok: Bool, rest: Bool) -> Bool:
+  match ok:
+    case True{}:
+      rest
+    case False{}:
+      False{}
+
+def addr_chars(s: String, +hex_ok: Bool) -> Bool:
+  match s:
+    case SNil{}:
+      True{}
+    case SCon{+h, +t}:
+      addr_chars.put(addr_char(h, hex_ok), addr_chars(t, hex_ok))
+
+def has_digit.put(seen: Bool, rest: Bool) -> Bool:
+  match seen:
+    case True{}:
+      True{}
+    case False{}:
+      rest
+
+def has_digit(s: String) -> Bool:
+  match s:
+    case SNil{}:
+      False{}
+    case SCon{+h, +t}:
+      has_digit.put(Char.is_digit(h), has_digit(t))
+
+def addr_form.put(has_num: Bool, is_addr: Bool) -> Bool:
+  match has_num:
+    case True{}:
+      is_addr
+    case False{}:
+      False{}
+
+def addr_form(+host: String) -> Bool:
+  addr_form.put(has_digit(host),
+    addr_chars(host, String.contains(String.to_lower(host), "0x")))
+
+# resolve: the fast paths answer without the effect, so both lanes see
+# only real names. A canonical dotted quad answers itself; a host that is
+# an address form but NOT canonical ("256.1.1.1", "01.2.3.4", "127.1",
+# "0x7f.1") fails 601 before the effect, so neither lane can connect it
+# as an IP; anything else is a name (and a name that fails the checks
+# also fails 601).
 
 def resolve.checked(ok: Bool, host: String) ->
   IO(Result<&1, &1, U32 & String, String>):
@@ -175,13 +267,21 @@ def resolve.named(is_local: Bool, +host: String) ->
     case False{}:
       resolve.checked(valid_name(host), host)
 
+def resolve.formed(is_addr: Bool, +host: String) ->
+  IO(Result<&1, &1, U32 & String, String>):
+  match is_addr:
+    case True{}:
+      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(601, "bad host")})
+    case False{}:
+      resolve.named(String.eq(host, "localhost"), host)
+
 def resolve.put(quad: Bool, +host: String) ->
   IO(Result<&1, &1, U32 & String, String>):
   match quad:
     case True{}:
       IO.pure(Result<&1, &1, U32 & String, String>, Done{host})
     case False{}:
-      resolve.named(String.eq(host, "localhost"), host)
+      resolve.formed(addr_form(host), host)
 
 def resolve(+host: String) -> IO(Result<&1, &1, U32 & String, String>):
   resolve.put(is_quad(host), host)
