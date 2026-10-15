@@ -2,7 +2,8 @@
 // Node/Bun: native `tls` + `net`.
 // Browser: accepts an explicit wss:// URL in `ip`; this is WebSocket framing,
 // not a raw TCP/TLS byte stream. Promise-returning effects require the async
-// effect-dispatch hook documented in ../README.md.
+// effect-dispatch hook documented in tasks/task-043-js-lane-tls-pure.md
+// (the lane's README lived on the retired branch and is not in this tree).
 
 // True when the host is reporting "the peer would not agree on a
 // protocol". Node rejects the connection before `secureConnect` when the

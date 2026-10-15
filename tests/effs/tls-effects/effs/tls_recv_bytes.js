@@ -1,6 +1,7 @@
 // TLS receive effect. Returns the Bend List<U32> used by the original effect.
 // Empty list represents EOF, matching the original SSL_read implementation.
-// Promise-returning effects require the async effect-dispatch hook in README.md.
+// Promise-returning effects require the async effect-dispatch hook in
+// tasks/task-043-js-lane-tls-pure.md.
 async function tls_recv_bytes(socket, max, k) {
   const bad = (code, text) => io_tup(socket, { $: "Fail", error: io_tup(code, text) });
   const conn = socket;

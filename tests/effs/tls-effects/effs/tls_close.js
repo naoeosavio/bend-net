@@ -1,6 +1,7 @@
 // TLS close effect. Ends the TLS stream so the runtime can send close_notify,
 // then destroys the transport once shutdown finishes.
-// Promise-returning effects require the async effect-dispatch hook in README.md.
+// Promise-returning effects require the async effect-dispatch hook in
+// tasks/task-043-js-lane-tls-pure.md.
 async function tls_close(socket) {
   const conn = socket;
   if (!conn || conn.$ !== "TlsConn") return { $: "Unit" };

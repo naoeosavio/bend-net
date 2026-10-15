@@ -3,10 +3,14 @@
 # runtime's client and server, in TLS 1.3 AND TLS 1.2, measured against
 # OpenSSL as the reference peer -- in Node AND in Bun.
 #
-# The peer is always the system `openssl`, never the host's own `tls`
-# builtin: testing our pure-JS handshake against the same OpenSSL the
-# lane replaced proves interoperability, and testing it against Node's
-# `tls` would only prove Node agrees with Node.
+# Every protocol rung's peer is the system `openssl`, never the host's
+# own `tls` builtin: testing our pure-JS handshake against the same
+# OpenSSL the lane replaced proves interoperability, and testing it
+# against Node's `tls` would only prove Node agrees with Node. One
+# deliberate exception: the six hermetic `cbc-len` rungs peer with a
+# Node `tls` server, because bun's `tls` server refuses
+# ECDHE-RSA-AES128-SHA256 -- the client under test still runs on the
+# host named.
 #
 # Checks (each one run under every host in $HOSTS):
 #   client13   our client  -> openssl s_server -tls1_3, ALPN h2 required
@@ -54,7 +58,16 @@
 #              policy) this is a normal path, not an edge case, so it
 #              needs its own rung: the transcript must restart from the
 #              synthetic message_hash of ClientHello1 (RFC 8446 s4.4.1)
-#              or every peer with a different group order fails.
+#              or every peer with a different group order fails. The
+#              expected hrrs (0 or 1) is pinned per group.
+#   hrr-server the same retry in the SERVER role: openssl sends a share
+#              for ffdhe2048 (a group we do not serve) and lists x25519,
+#              so our server must answer an HRR, take the re-share and
+#              complete the handshake (task-051 A6)
+#   expired    the validity window of every certificate in the chain, not
+#              only the leaf: hermetic material with a one-day
+#              intermediate and a ten-year leaf, verified at now and at
+#              now + 2 days (task-051 A8)
 #   bun-ffi    zero `bun:ffi` require in this package
 #   effs       the five EFFECT twins' input contracts (611 / 22 / Unit),
 #              loaded the way the compiler loads them. Every rung above
@@ -69,7 +82,7 @@
 #              out the door and not about a staged twin of it
 #
 # BEND_EFFS_DIR points every probe at another copy of the runtime (the
-# default is this package's own effs/), which is how the same 85 rungs
+# default is this package's own effs/), which is how the same ~90 rungs
 # run against lib/effs/ instead:
 #   BEND_EFFS_DIR=lib/effs tests/effs/tls-generic.sh
 #
@@ -92,6 +105,7 @@ padlen_probe="$pkg/scratch/padlen_probe.js"
 framing_probe="$pkg/scratch/framing_probe.js"
 eff_probe="$pkg/scratch/eff_contract_probe.js"
 xsign_probe="$pkg/scratch/xsign_probe.js"
+expired_probe="$pkg/scratch/expired_probe.js"
 bend_bin="${BEND:-bend}"
 node_bin="${NODE:-node}"
 bun_bin="${BUN:-bun}"
@@ -197,6 +211,46 @@ if gen_xsign "$xsign_dir"; then
   note "cross-sign material ready in $xsign_dir"
 else
   echo "FAIL cannot create the cross-sign material"; exit 1
+fi
+
+# Material for the expired-chain rung (task-051 A8): a root that lives ten
+# years, an intermediate that lives ONE day, and a leaf that lives ten
+# years. A `now` two days ahead expires only the intermediate, so the rung
+# isolates "the chain walk reads every validity window" from "the leaf
+# expired". Hermetic, like the cross-sign material above.
+gen_expired() {
+  local d="$1"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$d/root.key" \
+    2>/dev/null || return 1
+  openssl ecparam -name prime256v1 -genkey -noout -out "$d/int.key" \
+    2>/dev/null || return 1
+  openssl ecparam -name prime256v1 -genkey -noout -out "$d/leaf.key" \
+    2>/dev/null || return 1
+  openssl req -x509 -new -key "$d/root.key" -subj "/CN=Expired Root" \
+    -out "$d/root.pem" -days 3650 >/dev/null 2>&1 || return 1
+  openssl req -new -key "$d/int.key" -subj "/CN=Expired Intermediate" \
+    -out "$d/int.csr" >/dev/null 2>&1 || return 1
+  printf 'basicConstraints=CA:TRUE\n' >"$d/int.ext"
+  openssl x509 -req -in "$d/int.csr" -CA "$d/root.pem" -CAkey "$d/root.key" \
+    -CAcreateserial -days 1 -extfile "$d/int.ext" -out "$d/int.pem" \
+    >/dev/null 2>&1 || return 1
+  openssl req -new -key "$d/leaf.key" -subj "/CN=expired.test" \
+    -addext "subjectAltName=DNS:expired.test" -out "$d/leaf.csr" \
+    >/dev/null 2>&1 || return 1
+  openssl x509 -req -in "$d/leaf.csr" -CA "$d/int.pem" -CAkey "$d/int.key" \
+    -CAcreateserial -copy_extensions copy -days 3650 -out "$d/leaf.pem" \
+    >/dev/null 2>&1 || return 1
+  return 0
+}
+
+expired_dir="$work/expired"
+mkdir -p "$expired_dir" || {
+  echo "FAIL cannot create the expired-chain directory"; exit 1;
+}
+if gen_expired "$expired_dir"; then
+  note "expired-chain material ready in $expired_dir"
+else
+  echo "FAIL cannot create the expired-chain material"; exit 1
 fi
 
 # The HTTP request openssl's -www mode expects before it answers.
@@ -565,9 +619,9 @@ cipher_check() {
 # HelloRetryRequest -- and the retry is the interesting part: the
 # transcript must restart from the synthetic message_hash of CH1
 # (RFC 8446 s4.4.1), NOT from CH1 itself.
-# $1 label, $2 host, $3 peer group
+# $1 label, $2 host, $3 peer group, $4 expected hrrs (0 or 1)
 hrr_check() {
-  local label="$1" host="$2" group="$3"
+  local label="$1" host="$2" group="$3" want_hrrs="$4"
   local port out
   port="$(free_port)"
   openssl s_server -accept "$port" -cert "$work/c.pem" -key "$work/k.pem" \
@@ -580,16 +634,68 @@ hrr_check() {
   kill "$srv" 2>/dev/null
   wait "$srv" 2>/dev/null
   case "$out" in
-    *"hrrs=1 done=true"*)
-      ok "$name $label: one HelloRetryRequest, handshake completed (synthetic transcript)"
-      ;;
-    *"hrrs=0 done=true"*)
-      ok "$name $label: peer accepted our first share, no retry needed"
+    *"hrrs=$want_hrrs done=true"*)
+      if [ "$want_hrrs" = "1" ]; then
+        ok "$name $label: one HelloRetryRequest, handshake completed (synthetic transcript)"
+      else
+        ok "$name $label: peer accepted our first share, no retry (hrrs=0)"
+      fi
       ;;
     *)
-      bad "$name $label: $out"
+      bad "$name $label: wanted hrrs=$want_hrrs done=true, got: $out"
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# hrr-server: the retry in the SERVER role. openssl sends a key share for
+# the FIRST -groups entry (ffdhe2048 here) and lists x25519 after it; our
+# runtime serves x25519/P-256/P-384/P-521, so the server MUST answer a
+# HelloRetryRequest and complete the handshake when the peer re-shares.
+# The probe's `group=x25519` proves the re-share was adopted, and a
+# completed handshake proves the synthetic transcript is right -- before
+# task-051 this path killed the process (a null suite in send_hrr) and no
+# rung reached it.
+# $1 name, $2 host
+hrr_server_check() {
+  local name="$1" host="$2"
+  local port log out
+  port="$(free_port)"
+  log="$work/hrr_srv_$name.log"
+  "$host" "$sprobe" "$work/c.pem" "$work/k.pem" "$port" 2 >"$log" 2>&1 &
+  local srv=$!
+  wait_port "$port"
+  out="$(timeout 30 openssl s_client -connect "127.0.0.1:$port" \
+    -tls1_3 -groups ffdhe2048:x25519 -quiet </dev/null 2>&1)"
+  sleep 0.3
+  kill "$srv" 2>/dev/null
+  wait "$srv" 2>/dev/null
+  if grep -qa "OK ver=1.3 .*group=x25519" "$log"; then
+    ok "$name hrr-server: share skipped, HRR sent, x25519 re-share accepted"
+  else
+    bad "$name hrr-server: $(grep -a '^OK\|^FAIL\|TypeError' "$log" \
+      | head -2 | tr '\n' ' ')"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# expired-chain: the validity window counts for EVERY certificate in the
+# chain, not only the leaf (task-051 A8). The material has an intermediate
+# that lives one day and a leaf that lives ten years, and the probe asks
+# verify_chain twice: at `now` (control, must verify) and two days ahead
+# (the intermediate is expired, the leaf is not -- must answer 614).
+# Hermetic: no sockets, no network.
+# $1 name, $2 host
+expired_check() {
+  local name="$1" host="$2"
+  local dir="$expired_dir" out
+  out="$(timeout 60 "$host" "$expired_probe" "$dir/root.pem" \
+    "$dir/int.pem" "$dir/leaf.pem" expired.test 2>&1)"
+  if [ $? -eq 0 ]; then
+    ok "$name expired-chain: $(printf '%s' "$out" | tail -n 1)"
+  else
+    bad "$name expired-chain: $(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -740,8 +846,9 @@ for host in $hosts; do
   cipher_check "cipher-only" "$bin" "TLS_CHACHA20_POLY1305_SHA256" 613
   probe_check "padlen" "$bin" "$padlen_probe"
   probe_check "framing" "$bin" "$framing_probe"
-  # The five twins' own contracts, loaded as the compiler loads them. This
-  # is the only rung that opens an effect file at all.
+  # The five twins' own contracts, loaded as the compiler loads them.
+  # The only PROBE that opens one of the five def-backed twins; the
+  # `installed` rung below is the only other place they run.
   probe_check "effs" "$bin" "$eff_probe"
   # A cross-signed root must end the chain: the shape that made every
   # verified fetch of a real host answer 614 UNABLE_TO_GET_ISSUER_CERT-
@@ -749,11 +856,17 @@ for host in $hosts; do
   # Hermetic -- the chain and the store are made above, no network.
   probe_check "xsign" "$bin" "$xsign_probe" "$xsign_dir"
   # Our client offers x25519 first, so any peer that does not accept it
-  # forces the retry. Each of these is a group we also serve.
-  hrr_check "hrr-p256" "$bin" P-256
-  hrr_check "hrr-p384" "$bin" P-384
-  hrr_check "hrr-p521" "$bin" P-521
-  hrr_check "hrr-x25519" "$bin" X25519
+  # forces the retry. Each of these is a group we also serve, and the
+  # expected hrrs value is pinned: 1 for the groups outside the share, 0
+  # for the control where the peer takes our first share.
+  hrr_check "hrr-p256" "$bin" P-256 1
+  hrr_check "hrr-p384" "$bin" P-384 1
+  hrr_check "hrr-p521" "$bin" P-521 1
+  hrr_check "hrr-x25519" "$bin" X25519 0
+  # The same retry in the server role (task-051 A6), and the chain
+  # validity window for every certificate (task-051 A8).
+  hrr_server_check "$name" "$bin"
+  expired_check "$name" "$bin"
   # 15, 31, 47, 63: (n + 32) % 16 == 15, i.e. the peer sends
   # padding_length == 0. 16 and 200 are the ordinary sizes, kept as a
   # control so the rung fails for the right reason if it ever does.
@@ -784,9 +897,11 @@ done
 # five old ffi twins that task-043-js-lane-tls-pure still has to retire
 # (its Fase 5), which is a different task's debt and would report a
 # number nobody here can move. Comments and design notes do not count:
-# only a require() is a dependency.
+# only a require() is a dependency, so a `//` mention is filtered out
+# (the resolver keeps one in its history note).
 ffi_count="$(grep -rn 'require("bun:ffi")\|require(.bun:ffi.)' \
-  "$pkg" 2>/dev/null | wc -l | tr -d ' ')"
+  "$pkg" 2>/dev/null | grep -v ':[0-9]*:[[:space:]]*//' \
+  | wc -l | tr -d ' ')"
 if [ "$ffi_count" = "0" ]; then
   ok "no bun:ffi require in the tls-generic package"
 else
@@ -845,7 +960,9 @@ fi
 
 # The lib/ twins are still on the old lane. Reported, not failed: this
 # task's scope is the package, and task-043 owns retiring them.
-lib_ffi="$(grep -rln 'require("bun:ffi")' lib 2>/dev/null | wc -l | tr -d ' ')"
+lib_ffi="$(grep -rn 'require("bun:ffi")' lib 2>/dev/null \
+  | grep -v ':[0-9]*:[[:space:]]*//' | cut -d: -f1 | sort -u \
+  | wc -l | tr -d ' ')"
 if [ "$lib_ffi" = "0" ]; then
   ok "lib/ is off bun:ffi too"
 else

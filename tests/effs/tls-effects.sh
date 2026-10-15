@@ -411,11 +411,12 @@ else
   grep -rn --include='*.js' 'require("bun:ffi")' "$pkg" 2>/dev/null | head -5
 fi
 
-# The lib/ twins are still on the old lane. Reported, not failed: this
-# task's scope is the package, and task-043-js-lane-tls-pure owns
-# retiring them (its phase 5). Comment lines are skipped, the same way
-# the package check above skips them: a design note that names the old
-# dependency is not a dependency.
+# Does lib/ still carry a bun:ffi twin? Reported, not failed: this task's
+# scope is the package, and task-043-js-lane-tls-pure owns that debt (its
+# phase 5). Comment lines are skipped, the same way the package check
+# above skips them: a design note that names the old dependency is not a
+# dependency. The debt is paid as of 2026-10-15 (the only mention left is
+# a history note in lib/effs/dns_resolve.js), so the rung passes.
 ffi_re='require("bun:ffi")'
 lib_ffi="$(grep -n -e "$ffi_re" lib/effs/*.js 2>/dev/null |
   grep -v -e ':[0-9]*: *//' | cut -d: -f1 | sort -u | grep -c .)"

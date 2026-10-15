@@ -2,7 +2,8 @@
 // Preferred input: a runtime-native plain TCP server/listener object that emits
 // `connection`. Numeric legacy FDs are supported only where io_sys() can accept
 // them; this fallback still depends on the existing TCP runtime layer.
-// Promise-returning effects require the async dispatch hook in ../README.md.
+// Promise-returning effects require the async dispatch hook recorded in
+// tasks/task-043-js-lane-tls-pure.md.
 
 // True when the host is reporting "the peer would not agree on a
 // protocol": node answers a client with no protocol in common by sending

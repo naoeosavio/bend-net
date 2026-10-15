@@ -1,6 +1,7 @@
 // TLS send effect. Supports native TLS sockets and the Browser WSS adapter
 // returned by tls_connect_raw when passed an explicit wss:// URL.
-// Promise-returning effects require the async effect-dispatch hook in README.md.
+// Promise-returning effects require the async effect-dispatch hook in
+// tasks/task-043-js-lane-tls-pure.md.
 async function tls_send_bytes(socket, data, k) {
   const bad = (code, text) => io_tup(socket, { $: "Fail", error: io_tup(code, text) });
   const conn = socket;

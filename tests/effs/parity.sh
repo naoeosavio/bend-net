@@ -57,19 +57,19 @@ warn() { known=$((known + 1)); printf 'KNOWN %s\n' "$1"; }
 # fire -- task-046-tls-js-lane-into-lib replaced those twins with the
 # portable lane, which has no ffi require left. They stay because removing
 # them is part of task-043-js-lane-tls-pure's Fase 5, and a sibling phase
-# gate should not quietly spend another task's checklist. The `reuse`
-# entries describe the live debt of the same family, rewritten when the
-# twins were replaced.
+# gate should not quietly spend another task's checklist. The three live
+# `reuse` entries describe the debt of the same family: the shared runtime
+# loader is repeated in the four handshaking twins (tls_close rides the
+# handle and defines no loader, so it has no entry of its own).
 exceptions="
 lib/effs/tls_connect.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_accept.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_send_bytes.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_recv_bytes.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
 lib/effs/tls_close.js:generic=declared: OpenSSL por bun:ffi -- nao ha API generica de TLS cru em JS; o require e guardado e o bundle sobrevive
-lib/effs/tls_close.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
-lib/effs/tls_connect.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
-lib/effs/tls_recv_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
-lib/effs/tls_send_bytes.js:reuse=declared: os cinco twins ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt()
+lib/effs/tls_connect.js:reuse=declared: os twins que handshakeiam ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt(), e tls_close nao carrega nada
+lib/effs/tls_recv_bytes.js:reuse=declared: os twins que handshakeiam ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt(), e tls_close nao carrega nada
+lib/effs/tls_send_bytes.js:reuse=declared: os twins que handshakeiam ficam separados por decisao (o merge foi revertido); cada um carrega o seu tls_rt(), e tls_close nao carrega nada
 "
 
 # Reports one divergence: a debt when the default mode knows it, a failure
