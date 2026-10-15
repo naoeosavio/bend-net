@@ -1,11 +1,12 @@
 # examples
 
-Runnable interop programs — **not published** with the package and **not run**
-by the gate. `check.sh --checks` only typechecks every `.bend` here and runs
-`node --check` on every `.js`; running them is manual and almost always needs
-a second process (the peer of the pair) or the public internet.
+These interop programs are runnable, but they are **not published** with the
+package and **not run** by the gate. `check.sh --checks` only typechecks
+every `.bend` file here and runs `node --check` on every `.js` file. Run
+these programs by hand. Almost always they need a second process (the peer
+of the pair) or the public internet.
 
-Run everything from the repository root, so the relative imports and the
+Run everything from the repository root. Then the relative imports and the
 `tests/io/tls_test_*.pem` paths resolve:
 
 ```sh
@@ -15,17 +16,17 @@ bend examples/wsm/cliente.bend
 
 ## Families
 
-The folders are the transport lane, and each one holds its **pairs** (a
-server and the client that dials it) and **quadruples** (the same session in
-Bend and in Node, hand-driven and event-driven). Any server talks to any
-client of the same family unless noted.
+The folders are the transport lanes. Each folder holds its **pairs** and its
+**quadruples**. A pair is a server and the client that dials it. A quadruple
+is the same session in Bend and in Node, hand-driven and event-driven. Any
+server talks to any client of the same family unless noted.
 
 ### `wsm/` — `ws://`, plaintext WebSocket
 
-The scripted 6-step session on `127.0.0.1:19880` (`/chat`):
+The scripted session has 6 steps on `127.0.0.1:19880` (`/chat`):
 `101 -> ping s1/pong -> ping c1/pong -> hello/echo -> ping s2/pong -> close`.
-Each side prints one `OK` line per step and `DONE 6/6`; pass = `DONE` present
-with no `FAIL`.
+Each side prints one `OK` line per step. Each side also prints `DONE 6/6`.
+A run passes when `DONE` is present and no `FAIL` is present.
 
 | Server | Client | Shape |
 |---|---|---|
@@ -46,7 +47,7 @@ node examples/wsm/server_native.js 19880  # no dependencies at all
 ### `wss/` — `wss://`, WebSocket over TLS
 
 The test PEMs (`tests/io/tls_test_cert.pem` / `_key.pem`, CN `127.0.0.1`)
-stand in for a CA. One session per pair, then close.
+stand in for a CA. Each pair does one session. Then the pair closes.
 
 | Server | Client | Port | What it proves |
 |---|---|---|---|
@@ -65,7 +66,7 @@ bend examples/wss/wsm_saturate.bend            # manual bench, never in the gate
 bend examples/wss/wsm_binance_bookticker.bend | head -20
 ```
 
-The fragment pair needs a compiled binary: the interpreter faults past
+The fragment pair needs a compiled binary. The interpreter faults past
 ~25 KB in a single transfer.
 
 ### `httpx/` — `lib/httpx.bend`: mini-H2, ALPN split and the H1 lanes
@@ -91,14 +92,15 @@ bend examples/httpx/httpx_client_once.bend
 bend examples/httpx/httpx_site.bend
 ```
 
-Big bodies need a compiled binary (`bend file.bend -o /tmp/bin && /tmp/bin`);
-the interpreter faults past ~25 KB per transfer and is far too slow for the
-multi-MB bulk clients.
+Big bodies need a compiled binary (`bend file.bend -o /tmp/bin && /tmp/bin`).
+The interpreter faults past ~25 KB per transfer. The interpreter is far too
+slow for the multi-MB bulk clients.
 
 ### `real/` — live public peers, by name
 
-Manual smoke against the internet: they need a working resolver and a peer
-that speaks the same subset (HPACK/HTTP-2). Never in the gate.
+These programs are a manual smoke test against the internet. They need a
+working resolver. They also need a peer that speaks the same subset
+(HPACK/HTTP-2). The gate never runs them.
 
 | Program | What it does |
 |---|---|
@@ -117,15 +119,16 @@ bend examples/real/httpx_fetch_bulk.bend -o /tmp/fetchbulk && /tmp/fetchbulk
 ## Listeners
 
 Every server here listens with `TCP.listen_backlog(port,
-TCP.LISTEN_BACKLOG())` from `lib/tcp.bend`, not with Base's
-`TCP.listen`. The reason is the accept queue: the runtime's own listen
-hardcodes 16, and a peer burst larger than that makes the kernel drop the
-excess SYNs, so every dropped dial waits out the TCP retry (~1s). The
-queue only shows up in bursts — 10 simultaneous dials take 120-148ms on
-either listener, 20 take ~1.08s on the 16-deep one and ~0.06s on the
-deep one — and a TLS accept is slow per connection (~12ms, the handshake
-runs inline), which keeps the queue full while it drains. These are the
-files meant to be dialed by another process, so they take the depth:
+TCP.LISTEN_BACKLOG())` from `lib/tcp.bend`. It does not listen with the
+`TCP.listen` of Base. The reason is the accept queue. The listen call in the
+runtime hardcodes 16. A peer burst larger than 16 makes the kernel drop the
+excess SYNs. Each dropped dial then waits out the TCP retry (~1s).
+
+The queue only shows up in bursts. 10 simultaneous dials take 120-148ms on
+either listener. 20 simultaneous dials take ~1.08s on the 16-deep listener
+and ~0.06s on the deep listener. A TLS accept is slow for each connection
+(~12ms, the handshake runs inline). That delay keeps the queue full while it
+drains. Another process dials these files, so the files take the depth:
 
 ```python
 import Base
@@ -149,19 +152,20 @@ def main() -> IO(Unit):
     serve_listener(r)
 ```
 
-Both names resolve under the same `TCP` alias (Base's `TCP.listen` /
-`TCP.connect` / `TCP.accept` and the package's `TCP.listen_backlog` /
-`TCP.send_bytes` do not shadow each other), so a file that needs the old
-listener — a one-peer test, or the superseded `h2_big_loopback.bend` —
-does not have to import anything else. The rule and the numbers are in
-the main `README.md` (`### Picking a listener`); the gate's tests dial
-one connection at a time and keep `TCP.listen`, except
-`tests/io/tcp_listen_backlog.bend`, which drives the 20-client burst.
+Both names resolve under the same `TCP` alias. The `TCP.listen`,
+`TCP.connect` and `TCP.accept` of Base do not shadow the
+`TCP.listen_backlog` and `TCP.send_bytes` of the package. Thus a file that
+needs the old listener — a one-peer test, or the superseded
+`h2_big_loopback.bend` — does not have to import anything else. The rule and
+the numbers are in the main `README.md` (`### Picking a listener`). The
+gate's tests dial one connection at a time and keep `TCP.listen`. The
+exception is `tests/io/tcp_listen_backlog.bend`, which drives the 20-client
+burst.
 
 ## Ports
 
-Fixed ports are per lane, and two families share a few numbers — run one peer
-per port at a time:
+Fixed ports are per lane. Two families share a few numbers. Run one peer for
+each port at a time:
 
 | Port | Owner |
 |---|---|
@@ -173,7 +177,8 @@ per port at a time:
 ## See also
 
 - `README.md` — the library contracts and the golden tests.
-- `docs/modes.md` — the two HTTPX delivery modes (`on`/`once` vs `stream`).
+- `docs/modes.md` — the two HTTPX delivery modes (`on`/`once` compared with
+  `stream`).
 - `docs/h1-transport.md` — the H1 lane over the `~recv`/`~send`/`~close`
   triple (TLS and plain TCP).
 - `tasks/` — the engineering log: what each interop matrix measured and when.

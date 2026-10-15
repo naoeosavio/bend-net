@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bend-net &mdash; HTTP and WebSocket for Bend</title>
 <meta name="description" content="HTTP/1.1, HTTP/2, ws:// and wss://
-written in user-land Bend on top of the TCP kit, with package-local DNS
+in user-land Bend on the TCP kit, with package-local DNS
 and TLS.">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -14,12 +14,16 @@ and TLS.">
   <p class="kicker">bend-net</p>
   <h1>HTTP and WebSocket, written in Bend</h1>
   <p class="lede">
-    HTTP/1.1, HTTP/2, <code>ws://</code> and <code>wss://</code> in
-    user-land <a href="https://bend-lang.com">Bend</a>, on top of the
-    <code>TCP.*</code> kit, with package-local DNS and TLS (client and
-    server, OpenSSL through <code>dlopen</code> &mdash; no link flags). The
-    native code is the byte-level socket effects, the A-record resolver
-    and the TLS effects; everything else is Bend.
+    HTTP/1.1, HTTP/2, <code>ws://</code> and <code>wss://</code> are
+    user-land <a href="https://bend-lang.com">Bend</a> code on the
+    <code>TCP.*</code> kit, with package-local DNS and TLS for the
+    client and the server. The native code holds the byte-level socket
+    effects, the A-record resolver and the TLS effects. Each effect has
+    a C twin for the binary target and a JS twin for every other lane.
+    The C twin uses OpenSSL through <code>dlopen</code>, with no link
+    flags. The five TLS JS twins share one portable runtime,
+    TLS&nbsp;1.2&nbsp;+&nbsp;1.3 in pure JS over the host's crypto.
+    All the other code is Bend.
   </p>
   <nav class="cta">
     <a href="#install">Install</a>
@@ -36,8 +40,8 @@ and TLS.">
   <h2>Install</h2>
   <pre><code>curl -fsSL https://bend-lang.com/install.sh | sh   # Bend 2.0.21+
 git clone https://github.com/naoeosavio/bend-net</code></pre>
-  <p>Local import, relative to your file (always run from the repo
-     root, so the imports resolve):</p>
+  <p>A local import is relative to your file. Always run the code from
+     the repo root, so the imports resolve:</p>
   <pre><code>import Base
 import ./lib/httpx.bend as HTTPX
 
@@ -45,7 +49,7 @@ def main() -> IO(Unit):
   do IO&lt;Unit&gt;:
     body : String &lt;- HTTPX.fetch("https://example.com/")
     IO.print(body)</code></pre>
-  <p>Or through the hub, after a publish &mdash; imports are not transitive,
+  <p>Or use the hub, after a publish. Imports are not transitive,
      so import the API from its own file:</p>
   <pre><code>import 0x&lt;hash&gt;/httpx.bend as HTTPX</code></pre>
 </section>
@@ -55,51 +59,60 @@ def main() -> IO(Unit):
   <ul class="grid">
     <li>
       <h3>HTTP/1.1</h3>
-      <p>Pure request/response codec plus a keep-alive server and client
-         lane: <code>Content-Length</code> <em>and</em>
+      <p>The HTTP/1.1 code is a pure request/response codec with a
+         keep-alive server lane and a keep-alive client lane. It uses
+         <code>Content-Length</code> <em>and</em>
          <code>Transfer-Encoding: chunked</code> in both directions,
-         plaintext (<code>http://</code>) and over TLS.</p>
+         for plaintext (<code>http://</code>) and for TLS.</p>
     </li>
     <li>
       <h3>HTTP/2</h3>
-      <p>A full codec in <code>lib/http2.bend</code> and a mini-H2 inside
-         <code>lib/httpx.bend</code>: framing, HPACK (static table,
-         Huffman and dynamic-table decode), flow control with
-         <code>WINDOW_UPDATE</code> credit, CONTINUATION reassembly.</p>
+      <p><code>lib/http2.bend</code> holds a full codec and
+         <code>lib/httpx.bend</code> holds a mini-H2. Both codecs read
+         and write frames, and both do HPACK (static table, Huffman and
+         dynamic-table decode). They also do flow control with
+         <code>WINDOW_UPDATE</code> credit, and CONTINUATION
+         reassembly.</p>
     </li>
     <li>
       <h3>WebSocket</h3>
-      <p>One RFC 6455 implementation in <code>lib/wsm.bend</code> for
-         both <code>ws://</code> and <code>wss://</code>: handshake,
-         masking, fragmentation, ping/pong, close codes.</p>
+      <p><code>lib/wsm.bend</code> holds one RFC 6455 implementation for
+         <code>ws://</code> and <code>wss://</code>. It covers the
+         handshake, the frame mask, fragmentation, ping/pong and close
+         codes.</p>
     </li>
     <li>
       <h3>DNS and TLS</h3>
-      <p>A package-local A-record resolver (fail-closed host checks) and a
-         client + server TLS lane with ALPN <code>h2</code>, certificate
-         chain and hostname verification (<code>SSL_set1_host</code>).</p>
+      <p>A package-local A-record resolver fails closed on the host
+         checks. One TLS lane serves the client and the server, with
+         ALPN <code>h2</code> — one contract, two wire implementations.
+         The binary target uses OpenSSL through <code>dlopen</code>, and
+         every other lane uses TLS 1.2 + 1.3 in pure JS. Both
+         implementations verify the certificate chain and the hostname.
+         The dial is Base's <code>TCP.connect</code>, and the effect does
+         only the handshake.</p>
     </li>
     <li>
       <h3>Fail-closed</h3>
-      <p>Every parser answers <code>Result</code> with a stable code:
-         <code>400/413/502/503</code> (codec), <code>601-605</code> (DNS),
-         <code>611-616</code> (TLS). A truncated body is never read as a
-         whole one.</p>
+      <p>Every parser answers <code>Result</code> with a stable fail
+         code. The codes are <code>400/413/502/503</code> (codec),
+         <code>601-605</code> (DNS) and <code>611-616</code> (TLS). No
+         parser reads a truncated body as a whole one.</p>
     </li>
     <li>
       <h3>Bytes stay bytes</h3>
       <p>Frames never go through UTF-8: the byte effects send and receive
-         <code>List&lt;&amp;2, U32&gt;</code>, so a binary WebSocket frame
-         or a chunked body survives the round trip untouched.</p>
+         <code>List&lt;&amp;2, U32&gt;</code>. Thus a binary WebSocket
+         frame or a chunked body stays untouched in the round trip.</p>
     </li>
   </ul>
 </section>
 
 <section id="api">
   <h2>API</h2>
-  <p>The three modules share one shape: a request is
-     <code>method &amp; path &amp; headers &amp; body</code>, a response is
-     <code>status &amp; headers &amp; body</code>, and headers are
+  <p>The three modules share one shape. A request is
+     <code>method &amp; path &amp; headers &amp; body</code>, and a response
+     is <code>status &amp; headers &amp; body</code>. Headers are
      <code>List&lt;&amp;1, String &amp; String&gt;</code>.</p>
 
   <h3><code>lib/httpx.bend</code> &mdash; server</h3>
@@ -112,7 +125,7 @@ def main() -> IO(Unit):
         <td>Interleaved streams, answered in any completion order</td></tr>
     <tr><td><code>server.stream</code> / <code>_alpn</code> /
             <code>_plain</code></td>
-        <td>Upload streaming: a pure handler classifies
+        <td>Streamed upload: a pure handler classifies
             <code>SrvReqHead</code> / <code>SrvReqData</code> into
             <code>Continue</code>, <code>RespondEarly</code> or
             <code>Cancel</code></td></tr>
@@ -133,7 +146,7 @@ def main() -> IO(Unit):
     <tr><td><code>client.concurrent</code></td>
         <td>Pipelined N requests drained through slots</td></tr>
     <tr><td><code>client.stream</code> / <code>_plain</code></td>
-        <td>Download streaming to a pure handler
+        <td>Streamed download to a pure handler
             (<code>StreamHead</code> / <code>StreamData</code>)</td></tr>
     <tr><td><code>fetch</code> / <code>fetch_bytes</code> /
             <code>request</code></td>
@@ -152,38 +165,38 @@ def main() -> IO(Unit):
         <td>One-shot echo convenience</td></tr>
     <tr><td><code>show_masked</code> / <code>frame_need</code> /
             <code>frame_split</code></td>
-        <td>Pure codec: masking, length prefix, incremental split into
-            <code>Got</code> / <code>NeedMore</code> /
+        <td>Pure codec: the frame mask, length prefix, incremental split
+            into <code>Got</code> / <code>NeedMore</code> /
             <code>Bad</code></td></tr>
   </table>
 </section>
 
 <section id="modes">
   <h2>Two delivery modes</h2>
-  <p>Every HTTPX entry belongs to exactly one discipline, and the handler
-     signature tells which:</p>
+  <p>Every HTTPX entry belongs to exactly one discipline. The handler
+     signature tells which discipline:</p>
   <ul>
     <li><strong>Whole response</strong> &mdash; <code>~H: Request -&gt;
-        IO(Response)</code>. IO is allowed (DB, upstream, files), the
-        handler sees the complete request.</li>
+        IO(Response)</code>. The handler can use IO (DB, upstream,
+        files), and the handler sees the complete request.</li>
     <li><strong>Streaming</strong> &mdash; <code>~H: SrvEv -&gt; SrvOut</code>.
-        A <em>pure</em> classifier: per event it answers
-        <code>Continue</code>, <code>RespondEarly</code> or
-        <code>Cancel</code>, and every byte of IO stays in the loop. That
-        buys O(1) per chunk and early answers without draining &mdash; and it
-        means a streaming handler cannot touch a file or a database.</li>
+        A <em>pure</em> classifier answers <code>Continue</code>,
+        <code>RespondEarly</code> or <code>Cancel</code> for each event,
+        and every byte of IO stays in the loop. This design gives O(1) for
+        each chunk and early answers without a drain. Thus a handler in
+        this mode cannot touch a file or a database.</li>
   </ul>
-  <p>Rule of thumb: need IO while deciding? Use
+  <p>Rule of thumb: if you need IO while you decide, use
      <code>server.concurrent</code> / <code>server.on</code> /
-     <code>client.once</code>. Need incremental delivery? Use
+     <code>client.once</code>. If you need incremental delivery, use
      <code>server.stream</code> / <code>client.stream</code>.</p>
 </section>
 
 <section id="examples">
   <h2>Examples</h2>
-  <p><code>examples/</code> is grouped by lane; each folder holds the
-     server and the clients that dial it (Bend and Node peers next to each
-     other):</p>
+  <p><code>examples/</code> groups the folders by lane. Each folder holds
+     the server and the clients that dial the server (Bend peers and Node
+     peers together):</p>
   <table>
     <tr><th>Folder</th><th>Lane</th><th>Port</th></tr>
     <tr><td><code>examples/wsm/</code></td>
@@ -204,35 +217,36 @@ def main() -> IO(Unit):
 
 <section id="tests">
   <h2>Tests</h2>
-  <p>The suite is golden-based: each file prints a score and the gate
-     compares it with the <code>#|N</code> marker at the end. A few
-     entries:</p>
+  <p>The suite uses golden values. Each file prints a score, and the gate
+     compares the score with the <code>#|N</code> marker at the end. A
+     few entries:</p>
   <pre><code>bend tests/io/httpx_h1_pure.bend          # 481441153
 bend tests/io/httpx_h1_sec.bend           # 15
 bend tests/io/httpx_plain_h1.bend         # 4
 bend tests/io/httpx_site.bend             # 3
 bend tests/io/wsm_handshake_sub.bend      # 12
 bend tests/io/hpack_huffman.bend          # 11111111</code></pre>
-  <p><code>check.sh</code> runs two gates: <code>--checks</code>
-     typechecks the library and the examples, <code>--tests</code> runs
-     the suite. <code>--changed</code> narrows both to what an edit can
-     break.</p>
+  <p><code>check.sh</code> runs two gates. <code>--checks</code>
+     typechecks the library and the examples, and <code>--tests</code> runs
+     the suite. <code>--changed</code> narrows both gates to what an edit
+     can break.</p>
 </section>
 
 <section id="security">
   <h2>Security policy</h2>
   <ul>
     <li>Every renderer rejects CRLF and NUL in a name or a value with
-        <code>Fail 400</code>: header injection ends closed, never as
+        <code>Fail 400</code>. Header injection ends closed, never as
         extra fields.</li>
-    <li>Heads are capped at 16 KB, bodies at the lane's own fuel; an
-        oversize message is <code>413</code>.</li>
-    <li>Client WebSocket frames are masked with a key from the host
+    <li>A head has a cap of 16 KB. A body has a cap of the lane's own
+        fuel. An oversize message is <code>413</code>.</li>
+    <li>The client masks WebSocket frames with a key from the host
         entropy pool.</li>
-    <li>Name hosts resolve through the package resolver; the resolved IP
+    <li>A name host resolves with the package resolver. The resolved IP
         is transport-only, so <code>Host</code> keeps the original
         name.</li>
-    <li>TLS verifies the chain and the hostname; there is no custom-CA or
+    <li>TLS verifies the chain and the hostname against the root store
+        that the host ships. The code has no custom-CA override and no
         SNI override, only <code>*_insecure</code> for loopback.</li>
   </ul>
 </section>
@@ -243,10 +257,10 @@ bend tests/io/hpack_huffman.bend          # 11111111</code></pre>
     <a href="https://github.com/naoeosavio/bend-net">repository</a> &middot;
     <a href="https://bend-lang.com">bend-lang.com</a> &middot;
     <a href="https://github.com/naoeosavio/bend-net/tree/bend-net/docs">
-      docs/ (modes.md, h1-transport.md)</a>
+      docs/ (modes.md, h1-transport.md, tls-dns.md)</a>
   </p>
-  <p class="fine">Served by <code>examples/httpx/httpx_site.bend</code>,
-     which reads these files with <code>Static.read_bytes</code>.</p>
+  <p class="fine"><code>examples/httpx/httpx_site.bend</code> serves this
+     site. It reads these files with <code>Static.read_bytes</code>.</p>
 </footer>
 </body>
 </html>
