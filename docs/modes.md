@@ -42,6 +42,7 @@ drain.
 | Entry | Loop | Shape |
 |---|---|---|
 | `server.stream[_alpn]` | `httpx_stream` (H2); `x_h1.stream.go` (H1) | upload events to a pure `~H`; `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`) |
+| `server.stream_concurrent[_alpn]` | `httpx_stream` (H2); `x_h1.stream.go` (H1) | the same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (task-053). A `Cancel` resets one stream (`RST_STREAM` 8) and the siblings continue. H1 stays one request for each connection |
 | `server.stream_plain` | `x_h1.stream.go` (TCP triple) | plaintext H1 upload over `TCP.accept`, one request per connection, then close |
 | `client.stream[_insecure]` | `client.on.sdrop` (H2); `x_h1.cli.stream.go` (H1) | download events to a pure `~H`; dispatches on `CliSt.is_h2` (`client_stream.dispatched`) |
 | `client.stream_plain` | `x_h1.cli.stream.go` (TCP triple) | plaintext H1 download over `plain.dial`, then close |

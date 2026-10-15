@@ -7393,6 +7393,10 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
             httpx_stream(~H, 0, httpx.sent_seed(rst, buf), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
           httpx_stream(~H, 0, got, httpxn.put(slots, St{None{}, x_cat(payload), sid2}), httpxn.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+        case 2:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s4, sid2, 8)
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
           TLS.tls_close(s4)
         case 7:
@@ -7415,6 +7419,10 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
           do IO<Unit>:
             wu : Socket & Result<&1, &1, U32 & String, Unit> <- httpxs.wu_conn(sb2, x_len32(payload))
             httpx_stream(~H, 0, httpx.sent(wu), slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+        case 2:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(sb2, sid2, 8)
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.del(slots, sid2), httpxn.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
           TLS.tls_close(sb2)
         case _:
@@ -7804,6 +7812,33 @@ def server.stream_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert: String, +
       TLS.tls_accept_alpn(listener, cert, key)
     next : Listener <- httpxs_alpn_conn(~H, accepted)
     z : Unit <- server.stream_alpn(~H, next, cert, key)
+    return z
+
+# Concurrent streaming server (H2): the loop keeps a slot for each open
+# stream, so several uploads interleave on one connection and each event
+# carries its slot. A Cancel answer resets only that stream (RST_STREAM
+# 8) and the siblings continue (task-053). H1 has no multiplexing: each
+# connection serves one request, and the accept loop spawns one task for
+# each connection.
+@unsafe
+def server.stream_concurrent(~H: SrvEv -> SrvOut, l: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept(l, cert, key)
+    l2 : Listener <- httpxs_conn(~H, m)
+    z : Unit <- server.stream_concurrent(~H, l2, cert, key)
+    return z
+
+# The same server with the H1 leg on one port: ALPN sends h2 to the
+# interleave loop and http/1.1 to the H1 streaming lane.
+@unsafe
+def server.stream_concurrent_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert: String, +key: String) ->
+  IO(Unit):
+  do IO<Unit>:
+    accepted : Listener & Result<&1, &1, U32 & String, Socket & String> <-
+      TLS.tls_accept_alpn(listener, cert, key)
+    next : Listener <- httpxs_alpn_conn(~H, accepted)
+    z : Unit <- server.stream_concurrent_alpn(~H, next, cert, key)
     return z
 
 # Sequential server (Phase 10): one stream at a time per connection, same

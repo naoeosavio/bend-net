@@ -361,7 +361,8 @@ are pure): `docs/modes.md`.
 | `server.once(~H, l, cert, key)` / `server.once_h1(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants; `once_h1` is the `http/1.1` pair |
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
-| `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` closes without responding. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
+| `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` resets that stream with `RST_STREAM` 8 and the siblings continue. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
+| `server.stream_concurrent(~H, l, cert, key)` / `server.stream_concurrent_alpn` | The same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (2026-10-15, task-053). The `_alpn` variant adds the H1 leg on the same port; H1 has no multiplexing, so each connection serves one request |
 | `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
 | `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
@@ -495,6 +496,7 @@ bend tests/io/httpx_client_request.bend   # 7 (4 chained + reset + H1 reuse)
 bend tests/io/httpx_client_concurrent.bend # 4
 bend tests/io/httpx_client_stream.bend    # 1
 bend tests/io/httpx_server_stream.bend    # 2
+bend tests/io/httpx_stream_concurrent.bend # 4 (cancel resets one stream, siblings continue)
 bend tests/io/httpx_read_url.bend         # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend            # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend       # 3 (batch entry vs mini server)
@@ -851,6 +853,7 @@ bend tests/io/httpx_client_request.bend     # 7   (4 chained + reset + H1 reuse)
 bend tests/io/httpx_client_concurrent.bend  # 4
 bend tests/io/httpx_client_stream.bend      # 1
 bend tests/io/httpx_server_stream.bend      # 2
+bend tests/io/httpx_stream_concurrent.bend  # 4 (cancel resets one stream, siblings continue)
 bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
