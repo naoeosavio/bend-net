@@ -4,9 +4,10 @@
 # runtime, over one loopback listener: the client dials with
 # Base.TCP.connect and the handshake is lib/effs/tls_connect.js's, the
 # server accepts with lib/effs/tls_accept.js's. No probe in between, no
-# openssl: this rung exists because the 85-rung ladder of
-# tests/effs/tls-generic.sh drives the runtime directly and never loaded
-# an effect, so nothing measured the files that ship.
+# openssl: this rung exists because the ~90-rung ladder of
+# tests/effs/tls-generic.sh drives the runtime directly and (until its
+# `installed` rung) never loaded an effect, so nothing measured the
+# files that ship.
 #
 # The contract in two halves:
 #   * a client that offers NO protocol is not a mismatch. RFC 7301 s3.2:

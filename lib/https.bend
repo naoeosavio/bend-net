@@ -1006,7 +1006,9 @@ def serve.alpn_conn(
         listener, sock)
 
 # Public servers. The plain pair keeps the legacy H2-only contract
-# (strict h2 ALPN); the _alpn pair accepts HTTP/1.1 on the same port.
+# (h2 preferred: a peer whose offered list has no overlap is refused with
+# the fatal no_application_protocol alert and 615 on either lane); the
+# _alpn pair accepts HTTP/1.1 on the same port.
 
 @unsafe
 def server_on(~H: H2.H2Request -> IO(H2.H2Response), l: Listener, +cert: String, +key: String) ->

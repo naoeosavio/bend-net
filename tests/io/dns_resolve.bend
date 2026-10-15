@@ -1,8 +1,11 @@
 # lib (dns_resolve): DNS.resolve fast paths and the fail-closed host
 # checks. Every case is hermetic: the quad and localhost lanes answer
 # inside the pure layer, and each bad host fails 601 BEFORE the
-# effect — no name ever leaves the machine here. The twins' real
-# resolution is proven by the manual example (examples/real/httpx_h1_real.bend).
+# effect — no name ever leaves the machine here. The last four cases are
+# address forms libc would read as an IP (01.2.3.4, 127.1, 0x7f.1,
+# 256.1.1.1): they must fail 601 in BOTH lanes, never reach getaddrinfo
+# (task-051 A2). The twins' real resolution is proven by the manual
+# example (examples/real/httpx_h1_real.bend).
 import Base
 import ../../lib/dns.bend as DNS
 
@@ -56,6 +59,10 @@ def main():
     h : Result<&1, &1, U32 & String, String> <- DNS.resolve(String.from_list([Chr{0}]) ++ "h")
     i : Result<&1, &1, U32 & String, String> <- DNS.resolve(String.repeat("a", 70n))
     j : Result<&1, &1, U32 & String, String> <- DNS.resolve(String.repeat("a", 300n))
+    k : Result<&1, &1, U32 & String, String> <- DNS.resolve("01.2.3.4")
+    l : Result<&1, &1, U32 & String, String> <- DNS.resolve("127.1")
+    m : Result<&1, &1, U32 & String, String> <- DNS.resolve("0x7f.1")
+    n : Result<&1, &1, U32 & String, String> <- DNS.resolve("256.1.1.1")
     s1 : U32 = is_ok(a, "127.0.0.1")
     s2 : U32 = (is_ok(b, "127.0.0.1") * 10 : U32)
     s3 : U32 = (is_ok(c, "93.184.215.14") * 100 : U32)
@@ -66,8 +73,13 @@ def main():
     s8 : U32 = (is_code(h, 601) * 10000000 : U32)
     s9 : U32 = (is_code(i, 601) * 100000000 : U32)
     s10 : U32 = (is_code(j, 601) * 1000000000 : U32)
+    s11 : U32 = (is_code(k, 601) * 1000 : U32)
+    s12 : U32 = (is_code(l, 601) * 100 : U32)
+    s13 : U32 = (is_code(m, 601) * 10 : U32)
+    s14 : U32 = is_code(n, 601)
     +total : U32 = (s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 : U32)
-    w : Unit <- IO.print(U32.show(total))
+    +extra : U32 = (s11 + s12 + s13 + s14 : U32)
+    w : Unit <- IO.print(U32.show(total) ++ U32.show(extra))
     return total
 
-#|1111111111
+#|11111111111111

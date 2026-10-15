@@ -7708,7 +7708,10 @@ def server.stream_plain(~H: SrvEv -> SrvOut, listener: Listener) -> IO(Unit):
 
 # Streaming accept plumbing: ALPN dispatch (H2 takes the slot lane,
 # HTTP/1.1 takes the H1 lane above); the non-ALPN server.stream stays
-# H2-only behind tls_accept, which requires H2 at the handshake.
+# H2-only behind tls_accept, which asks for h2 at the handshake -- a peer
+# whose offered list has no overlap is refused 615 (fatal alert) on
+# either lane, and a peer that offers no ALPN at all completes with no
+# protocol selected (see lib/tls.bend).
 # ---------------------------------------------------------------------
 
 @unsafe
