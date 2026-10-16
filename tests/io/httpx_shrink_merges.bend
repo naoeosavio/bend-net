@@ -75,9 +75,55 @@ def t_seq() -> U32:
 def t_huff() -> U32:
   b2u(U32.is_eq(HTTPX.x_huff_entry(Nil{}), 1))
 
+# Phase 4a: one slot type for both engines. The head rides a tag, so a
+# fresh list per check keeps the linear value legal.
+def t_slot.req() -> HTTPX.St:
+  HTTPX.St{Some{HTTPX.SlotReq{HTTPX.ReqHead{"POST", "/x", Nil{}}}}, Nil{}, 3}
+
+def t_slot.resp() -> HTTPX.St:
+  HTTPX.St{Some{HTTPX.SlotResp{HTTPX.Head{200, Nil{}}}}, Nil{}, 5}
+
+def t_slot.slots() -> List<&2, HTTPX.St>:
+  [HTTPX.St{None{}, Nil{}, 1}, t_slot.req()]
+
+# Phase 4b: the client twins are gone; the httpxn walkers serve both lanes.
+def t_slot.has() -> U32:
+  (b2u(HTTPX.httpxn.has(t_slot.slots(), 3)) * b2u(Bool.not(HTTPX.httpxn.has(t_slot.slots(), 7))) : U32)
+
+def t_slot.has_some() -> U32:
+  (b2u(HTTPX.httpxn.has_some(t_slot.slots(), 1)) * b2u(Bool.not(HTTPX.httpxn.has_some(t_slot.slots(), 3))) : U32)
+
+def t_slot.del_put() -> U32:
+  (b2u(Bool.not(HTTPX.httpxn.has(HTTPX.httpxn.del(t_slot.slots(), 1), 1))) * b2u(HTTPX.httpxn.has(HTTPX.httpxn.put(t_slot.slots(), HTTPX.St{None{}, Nil{}, 7}), 7)) : U32)
+
+def t_slot.take_st(p: HTTPX.Taken) -> U32:
+  b2u(U32.is_eq(HTTPX.httpx.sid_of(HTTPX.httpxn.taken_st(p)), 3))
+
+def t_slot.take() -> U32:
+  (t_slot.take_st(HTTPX.httpxn.take_del(t_slot.slots(), 3)) * b2u(Bool.not(HTTPX.httpxn.has(HTTPX.httpxn.taken_slots(HTTPX.httpxn.take_del(t_slot.slots(), 3)), 3))) : U32)
+
+# The two lane builders read their own tag; a foreign tag answers empty.
+def t_slot.reqof(req: HTTPX.Request) -> U32:
+  match req:
+    case HTTPX.Request{method, path, headers, body}:
+      b2u(Bool.and(String.eq(method, "POST"), String.eq(path, "/x")))
+
+def t_slot.respof(resp: HTTPX.Response) -> U32:
+  match resp:
+    case HTTPX.Response{status, headers, body}:
+      b2u(U32.is_eq(status, 200))
+
+def t_slot.req_empty(req: HTTPX.Request) -> U32:
+  match req:
+    case HTTPX.Request{method, path, headers, body}:
+      b2u(Bool.and(String.is_empty(method), String.is_empty(path)))
+
+def t_slot.build() -> U32:
+  (t_slot.reqof(HTTPX.httpx.req_of_st(t_slot.req(), [1])) * t_slot.respof(HTTPX.httpxc.req_of_st(t_slot.resp(), [1])) * t_slot.req_empty(HTTPX.httpx.req_of_st(t_slot.resp(), [1])) : U32)
+
 law main:
   U32
 
 def main():
-  (t_pick() + t_count() + t_srvout() + t_wu() + t_b2u() + t_valid() + t_seq() + t_huff() : U32)
-#|8
+  (t_pick() + t_count() + t_srvout() + t_wu() + t_b2u() + t_valid() + t_seq() + t_huff() + t_slot.has() + t_slot.has_some() + t_slot.del_put() + t_slot.take() + t_slot.build() : U32)
+#|13

@@ -116,8 +116,8 @@ def t_keep() -> U32:
 
 # Dead httpxc.body_of + client.on.st_h2: sid ledger + next sid + has_head.
 def t_clst() -> U32:
-  st: HTTPX.ClSt = HTTPX.ClSt{None{}, Nil{}, 7}
-  b2u(Bool.and(Bool.and(U32.is_eq(HTTPX.httpxc.sid_of(st), 7), U32.is_eq(HTTPX.client.on.next_sid(1), 3)), HTTPX.client.on.has_head(HTTPX.Head{200, Nil{}})))
+  st: HTTPX.St = HTTPX.St{None{}, Nil{}, 7}
+  b2u(Bool.and(Bool.and(U32.is_eq(HTTPX.httpx.sid_of(st), 7), U32.is_eq(HTTPX.client.on.next_sid(1), 3)), HTTPX.client.on.has_head(HTTPX.Head{200, Nil{}})))
 
 # Dead httpxc.resp_of via live twin client.on.resp_of: status rides through.
 def t_respof.go(resp: HTTPX.Response) -> U32:
