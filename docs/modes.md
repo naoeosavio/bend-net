@@ -2,7 +2,8 @@
 
 `lib/httpx.bend` holds one H2 codec and **two delivery disciplines**. Every
 public entry belongs to exactly one discipline; the handler signature shows
-which one. (A grep for `~H:` gives 102 hits and no third shape.)
+which one. (A grep for `~H:` gives 124 hits, and every hit is a family
+below.)
 
 ## Mode 1 — whole response ("on/once")
 
@@ -38,14 +39,21 @@ drain.
   `Continue` / `RespondEarly` / `Cancel` answers)
 - Client: `~H: StreamEv -> StreamOut` (`StreamHead` / `StreamData`;
   `StreamContinue` / `StreamCancel`)
+- Client (concurrent, H2): `~H: CStreamEv -> CStreamOut` (`CStreamHead` /
+  `CStreamData`; `CStreamContinue{slot}` / `CStreamCancel{slot}`). The
+  slot names the stream, so one pure handler serves every stream of the
+  connection. H1 cannot feed a slot, so the plaintext entry keeps
+  `StreamEv` (task-054 C13).
 
 | Entry | Loop | Shape |
 |---|---|---|
 | `server.stream[_alpn]` | `httpx_stream` (H2); `x_h1.stream.go` (H1) | upload events to a pure `~H`; `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`) |
-| `server.stream_concurrent[_alpn]` | `httpx_stream` (H2); `x_h1.stream.go` (H1) | the same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (task-053). A `Cancel` resets one stream (`RST_STREAM` 8) and the siblings continue. H1 stays one request for each connection |
-| `server.stream_plain` | `x_h1.stream.go` (TCP triple) | plaintext H1 upload over `TCP.accept`, one request per connection, then close |
+| `server.stream_concurrent[_alpn]` | `httpx_stream` (H2); `x_h1.stream.go` (H1) | the same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (task-054). A `Cancel` resets one stream (`RST_STREAM` 8) and the siblings continue. H1 stays one request for each connection |
+| `server.stream_plain` | `x_h1.stream.go` (TCP triple) | plaintext H1 upload over `TCP.accept`, one request per connection, then close. `server.stream_concurrent_plain` is the alias of this loop |
 | `client.stream[_insecure]` | `client.on.sdrop` (H2); `x_h1.cli.stream.go` (H1) | download events to a pure `~H`; dispatches on `CliSt.is_h2` (`client_stream.dispatched`) |
+| `client.stream_concurrent[_insecure]` | `client_cstream.drain` (slot ledger) | H2 only: N requests pipelined on one connection, every event and every answer carries the slot, `CStreamCancel{slot}` resets that stream. The answer is `(bytes, finished streams)` |
 | `client.stream_plain` | `x_h1.cli.stream.go` (TCP triple) | plaintext H1 download over `plain.dial`, then close |
+| `client.stream_concurrent_plain` | `client_cstream_plain.fan` over `client.stream_plain` | plaintext H1: one connection for each request, all dials at the same time, no slot. The batch is validated before the first dial, and the answer counts the finished connections |
 
 ## Shared substrate (no `~H`)
 
@@ -67,10 +75,11 @@ Two reasons cause this rule; one reason is critical:
    `httpxs.head_resp_of` (which response?) — see phase 7. An IO handler,
    or any non-deterministic handler, can answer differently each time and
    can corrupt dispatch. Purity makes the two calls agree. The H1 lanes
-   (`x_h1.stream.go`, `x_h1.cli.stream.go`) and the H2 download lane
-   (`client.on.sdrop`) call `H` **once** per event and decode the answer at
-   once (`head_act` / `data_act`). These lanes have the same purity
-   requirement with a single call.
+   (`x_h1.stream.go`, `x_h1.cli.stream.go`), the H2 download lane
+   (`client.on.sdrop`) and the concurrent client lane
+   (`client_cstream.drain`) call `H` **once** per event and decode the
+   answer at once (`head_act` / `data_act`). These lanes have the same
+   purity requirement with a single call.
 2. **Checker discipline (D9/D10).** IO in the handler can force
    `do`-blocks into phased dispatch and can add mutual-recursion risk
    between the loop and the handler path. A pure handler keeps every
@@ -90,6 +99,11 @@ no second head delivery.
   `client.stream[_insecure]` / `client.stream_plain`) for incremental
   delivery: an early response, O(1) chunks, no body buffer. The handler
   stays pure.
+- Use **stream concurrent** (`server.stream_concurrent[_alpn]`,
+  `client.stream_concurrent[_insecure]`,
+  `client.stream_concurrent_plain`) when several streams stay open at
+  once. On H2 the slot separates them; on H1 the entry opens one
+  connection for each request.
 
 Two files show both disciplines: `examples/httpx/httpx_site.bend` (manual)
 and `tests/io/httpx_site.bend` (gated). The site in `docs/site/` is served
@@ -99,7 +113,9 @@ routes from **literal** pages, and that is not a shortcut. A stream handler
 is pure, and `~H` is a *closed template*. The call
 `server.stream_plain(~mk(body), l)` is rejected: "body is a variable here,
 not comptime". So the handler can read no file and can capture no bytes
-read before the loop — see task-040 D1.
+read before the loop — see task-040 D1. A runtime slot cannot enter the
+handler for the same reason (task-054 C13), which is why the plaintext
+concurrent entry carries none.
 
 If a stream handler ever needs IO, the redesign uses a single call: one `H`
 call gives back an `(act, resp)` pair. The phases then need `do`-blocks.

@@ -362,13 +362,15 @@ are pure): `docs/modes.md`.
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
 | `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` resets that stream with `RST_STREAM` 8 and the siblings continue. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
-| `server.stream_concurrent(~H, l, cert, key)` / `server.stream_concurrent_alpn` | The same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (2026-10-15, task-053). The `_alpn` variant adds the H1 leg on the same port; H1 has no multiplexing, so each connection serves one request |
+| `server.stream_concurrent(~H, l, cert, key)` / `server.stream_concurrent_alpn` | The same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (2026-10-16, task-054). The `_alpn` variant adds the H1 leg on the same port; H1 has no multiplexing, so each connection serves one request. `server.stream_concurrent_plain(~H, l)` is the plaintext `http://` alias of `server.stream_plain`, which is the same loop |
 | `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
 | `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
 | `client.connect(_insecure)(host, port)` | Hands back `Socket & CliSt{sid, tab, is_h2}`. `client.request(sock, st, host, port, req)` is **one** exchange on it, both ALPN answers, and it **never closes**: the caller closes (`client.on`/`client.once` do) or calls again for the next request, threading the socket and the state — the returned `CliSt` carries the advanced sid and the HPACK table the next response decodes against. N requests are that loop at the call site |
 | `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
 | `client.stream(_insecure)(~H, host, port, ...)` | Download streaming with a pure `~H` (`StreamHead`/`StreamData`); dispatches H2/HTTP-1.1 by ALPN on the one socket. `StreamCancel` sends `RST_STREAM` on H2, closes with `Fail` 8 on H1. `client.stream_plain` is the plaintext `http://` peer |
+| `client.stream_concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests on one H2 connection, streamed to a pure `~H: CStreamEv -> CStreamOut`: each event and each answer carries the stream slot, so `CStreamCancel{slot}` resets that stream (`RST_STREAM` 8) and the siblings continue. The answer is `(total bytes, finished streams)`, and a cancel is not counted (2026-10-16, task-054) |
+| `client.stream_concurrent_plain(~H, host, port, reqs)` | The plaintext `http://` peer of the row above: one connection for each request through `client.stream_plain`, with all dials in flight at the same time. H1 has no multiplexing, and a template handler cannot capture a runtime slot, so this entry keeps `~H: StreamEv -> StreamOut` and the answer counts the finished connections (task-054) |
 | `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
 | `request_bytes(_insecure)` | Same with raw-bytes body in and out |
 | `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `read_url` (ported from `http.bend`, no import); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
@@ -465,15 +467,22 @@ The single-stream drains filter it by sid and the sender stashes it into
 the read seed, so the drain decides. `tests/io/httpx_h2_goaway.bend`
 covers the six shapes.
 
-Streaming contract (TASK-036, kept different by decision): HTTPX speaks
-two families. The download family is `StreamEv{StreamHead, StreamData}` /
+Streaming contract (TASK-036, kept different by decision): the download
+family is `StreamEv{StreamHead, StreamData}` /
 `StreamOut{StreamContinue, StreamCancel}`. The upload family is
 `SrvEv{SrvReqHead, SrvReqData}` / `SrvOut{Continue, RespondEarly,
-Cancel}`. `lib/core/type.bend` speaks one 3+3 family,
+Cancel}`. The concurrent client family is `CStreamEv{CStreamHead,
+CStreamData}` / `CStreamOut{CStreamContinue{slot}, CStreamCancel{slot}}`
+(task-054): the slot names the stream, so one pure handler serves several
+streams of one H2 connection.
+
+`lib/core/type.bend` speaks one 3+3 family,
 `CT.StreamEv{StreamReq, StreamHead, StreamData}` /
 `CT.StreamOut{Continue, RespondEarly, Cancel}` with
-`frame: Maybe<BodyFrame>`. They are **not interchangeable**: a `~H`
-written against one does not compile against the other.
+`frame: Maybe<BodyFrame>`. The families are **not interchangeable**: a `~H`
+written against one does not compile against another. H1 carries no slot,
+and a template handler cannot capture one (task-054 C13), so
+`client.stream_concurrent_plain` keeps `StreamEv`.
 
 Streaming in HTTPX speaks both lanes (TASK-036 phase 6). `client.stream`
 and `server.stream_alpn` dispatch H2/HTTP-1.1 by ALPN on the negotiated
@@ -481,8 +490,9 @@ socket. `server.stream` stays H2-only behind `tls_accept`, which requires
 h2 at the handshake; `client.concurrent` stays H2-only behind `h2_only`.
 `client.stream_plain` / `server.stream_plain` are the plaintext `http://`
 peers. The H1 lanes are one request per connection, then close. They have
-no keep-alive and no pipelining. Backpressure is the read itself (at most
-one recv per chunk). `x_h1.frame_of` threads the framing decision through
+no keep-alive and no pipelining. The concurrent plaintext entry opens one
+connection for each request, so N requests travel at the same time.
+Backpressure is the read itself (at most one recv per chunk). `x_h1.frame_of` threads the framing decision through
 the download lane. The upload lane frames from the request head the same
 way the one-shot H1 server does.
 
@@ -499,6 +509,7 @@ bend tests/io/httpx_server_stream.bend    # 2
 bend tests/io/httpx_stream_concurrent.bend # 4 (cancel resets one stream, siblings continue)
 bend tests/io/httpx_client_stream_concurrent.bend # 3 (client slots: cancel one, siblings finish)
 bend tests/io/httpx_client_stream_concurrent_skip.bend # 1 (frames in flight of a dropped stream)
+bend tests/io/httpx_client_stream_concurrent_plain.bend # 5 (N clear H1 connections at once, alias server)
 bend tests/io/httpx_read_url.bend         # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend            # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend       # 3 (batch entry vs mini server)
@@ -506,7 +517,7 @@ bend tests/io/httpx_server_seq.bend       # 2 (terminal requests vs sequential s
 bend tests/io/httpx_http1_fallback.bend   # 1 (dual client vs H1 server)
 bend tests/io/httpx_server_alpn.bend      # 2 (ALPN split, H2 + H1 clients)
 bend tests/io/httpx_echo_once.bend        # 2 (server.once + server.echo, client.once/echo)
-bend tests/io/httpx_plain_h1.bend         # 2 (http:// end to end over server.on_h1_plain)
+bend tests/io/httpx_plain_h1.bend         # 4 (http:// end to end over server.on_h1_plain; four requests)
 bend tests/io/httpx_h1_keepalive.bend     # 14 (H1 close policy + reuse + client batch + terminal)
 bend tests/io/httpx_flow.bend             # 1 (25 KB up+down through pump v2 + WU credit)
 bend tests/io/httpx_client_cont.bend      # 1 (fragmented HEADERS+CONT vs once drain)
@@ -812,7 +823,7 @@ bend tests/io/httpx_h1_fetch_head.bend  # 11111
 bend tests/io/httpx_h1_fetch_host.bend  # 111
 bend tests/io/httpx_h1_server_on.bend   # 111
 bend tests/io/tcp_bytes.bend          # 11
-bend tests/io/tcp_bytes_loopback.bend # 1
+bend tests/io/tcp_bytes_loopback.bend # 11 (two lanes, one line each)
 bend tests/io/dns_resolve.bend        # 11111111111111
 bend tests/io/dns_addr_form.bend      # 11111111 (pure addr_form vectors, incl. beef1.cafe)
 bend tests/io/tls_connect_close.bend  # 111
@@ -858,6 +869,7 @@ bend tests/io/httpx_server_stream.bend      # 2
 bend tests/io/httpx_stream_concurrent.bend  # 4 (cancel resets one stream, siblings continue)
 bend tests/io/httpx_client_stream_concurrent.bend  # 3 (client slots: cancel one, siblings finish)
 bend tests/io/httpx_client_stream_concurrent_skip.bend  # 1 (frames in flight of a dropped stream)
+bend tests/io/httpx_client_stream_concurrent_plain.bend  # 5 (N clear H1 connections at once, alias server)
 bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
 bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
 bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
