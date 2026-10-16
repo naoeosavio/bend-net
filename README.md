@@ -900,8 +900,10 @@ bend tests/io/core_read_url.bend          # 1 (core URL vectors + valid_* gates)
 
 Each file ends with a `#|` line that holds the expected output. That line
 is the golden, but `bend` itself does not compare it: a test that prints
-something else still exits 0. Thus capture stdout and diff it (as
-`.p26/suite.sh` does). Do not trust the exit status alone. A file with no
+something else still exits 0. `./check.sh --tests` compares the golden, so a
+changed answer fails there. A hand run of `bend <file>` prints the value
+only, so capture stdout and diff it when you run one by hand. Do not trust
+the exit status alone. A file with no
 `main` (like `lib/package.bend`) instead prints `All terms check.` The
 echo server's `@unsafe` annotation is expected.
 JS and C lanes:
