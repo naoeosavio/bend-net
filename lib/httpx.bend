@@ -7849,6 +7849,15 @@ def server.stream_concurrent_alpn(~H: SrvEv -> SrvOut, listener: Listener, +cert
     z : Unit <- server.stream_concurrent_alpn(~H, next, cert, key)
     return z
 
+# Plaintext concurrent streaming server: the very same loop as
+# server.stream_plain above, under the concurrent family name. H1 has no
+# multiplexing (discovery C4): the accept loop spawns one task for each
+# connection, and each connection serves one request. Nothing else
+# changes, so this entry adds a name and no behavior.
+@unsafe
+def server.stream_concurrent_plain(~H: SrvEv -> SrvOut, listener: Listener) -> IO(Unit):
+  server.stream_plain(~H, listener)
+
 # Concurrent streaming client (TASK-054 phase 3): the third client
 # family. StreamEv/StreamOut carry no slot, so a pure handler cannot
 # separate two downloads on one connection (discovery C2). This family
@@ -8271,6 +8280,108 @@ def client.stream_concurrent(~H: CStreamEv -> CStreamOut, +host: String, +port: 
 def client.stream_concurrent_insecure(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, +reqs: List<&2, Request>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   client_cstream.fit(~H, host, port, reqs, True{}, client_conc.valid_all(reqs, host, port))
+
+# Concurrent streaming client over plaintext H1 (TASK-054 phase 4): one
+# connection for each request, through client.stream_plain. H1 has no
+# multiplexing (discovery C4), so no slot names a stream. A runtime slot
+# cannot reach the handler of a template lane either (discovery C13): the
+# checker rejects a ~ argument that mentions a runtime variable. The
+# events stay StreamEv/StreamOut, and the handler answers each connection
+# on the event sequence of that connection.
+#
+# Every connection is forked before the first join, so the N dials
+# overlap. The answer is the concurrent contract of the H2 lane: (total
+# bytes, finished streams). The H1 answer to StreamCancel is Fail 8
+# "cancelled": that connection contributes nothing and is not counted,
+# and the other connections still answer. Any other Fail fails the batch
+# with the first failure in request order.
+#
+# Every callee stays above its caller (the rule of this file): the pure
+# leaves first, then the merge, then the batch.
+# ---------------------------------------------------------------------
+
+def client_cstream_plain.cancel_code() -> U32:
+  8
+
+# One connection: the whole H1 streaming lane, unchanged.
+def client_cstream_plain.one(~H: StreamEv -> StreamOut, +host: String, +port: U32, req: Request) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match req:
+    case Request{+method, +path, +headers, +body}:
+      client.stream_plain(~H, host, port, method, path, headers, body)
+
+def client_cstream_plain.merge_add_tail(total: U32, b: U32 & U32) ->
+  Result<&1, &1, U32 & String, U32 & U32>:
+  match b:
+    case (t2, fins):
+      Done{((total + t2 : U32), (fins + 1 : U32))}
+
+def client_cstream_plain.merge_add(a: U32 & U32, b: U32 & U32) ->
+  Result<&1, &1, U32 & String, U32 & U32>:
+  match a:
+    case (total, _):
+      client_cstream_plain.merge_add_tail(total, b)
+
+def client_cstream_plain.merge_code(is_cancel: Bool, code: U32, msg: String, rest: Result<&1, &1, U32 & String, U32 & U32>) ->
+  Result<&1, &1, U32 & String, U32 & U32>:
+  match is_cancel:
+    case True{}:
+      rest
+    case False{}:
+      Fail{(code, msg)}
+
+def client_cstream_plain.merge_stop(e: U32 & String, rest: Result<&1, &1, U32 & String, U32 & U32>) ->
+  Result<&1, &1, U32 & String, U32 & U32>:
+  match e:
+    case (+code, msg):
+      client_cstream_plain.merge_code(U32.is_eq(code, client_cstream_plain.cancel_code()), code, msg, rest)
+
+# The answer of one connection plus the answers of the requests after it.
+# The outer value is the earlier request, so the first failure wins. A
+# cancelled connection is not a failure: the caller asked for it, and the
+# connections after it answer for the batch. A finished connection adds
+# its bytes and counts one; its chunk count stays its own business.
+def client_cstream_plain.merge(one: Result<&1, &1, U32 & String, U32 & U32>, rest: Result<&1, &1, U32 & String, U32 & U32>) ->
+  Result<&1, &1, U32 & String, U32 & U32>:
+  match one rest:
+    case Done{counts} Done{counts2}:
+      client_cstream_plain.merge_add(counts, counts2)
+    case Done{_} Fail{e}:
+      Fail{e}
+    case Fail{e} rest2:
+      client_cstream_plain.merge_stop(e, rest2)
+
+# The batch: fork every connection, then join each one as the recursion
+# unwinds, so all dials are in flight before the first join. Every fork
+# is joined, thus no socket outlives the call.
+def client_cstream_plain.fan(~H: StreamEv -> StreamOut, +host: String, +port: U32, reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match reqs:
+    case Nil{}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Done{(0, 0)})
+    case req <> t:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        chan : Chan(Result<&1, &1, U32 & String, U32 & U32>) <-
+          IO.fork(Result<&1, &1, U32 & String, U32 & U32>, client_cstream_plain.one(~H, host, port, req))
+        after : Result<&1, &1, U32 & String, U32 & U32> <- client_cstream_plain.fan(~H, host, port, t)
+        mine : Result<&1, &1, U32 & String, U32 & U32> <- IO.join(Result<&1, &1, U32 & String, U32 & U32>, chan)
+        IO.pure(Result<&1, &1, U32 & String, U32 & U32>, client_cstream_plain.merge(mine, after))
+
+# The batch gate: the whole list is validated before any dial, the rule of
+# the H2 lane (client_conc.valid_all). An invalid request in the list
+# answers 400 "bad request" and no connection opens, so a bad batch has no
+# side effect on the peer.
+def client_cstream_plain.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +reqs: List<&2, Request>, valid: Bool) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match valid:
+    case True{}:
+      client_cstream_plain.fan(~H, host, port, reqs)
+    case False{}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(400, "bad request")})
+
+def client.stream_concurrent_plain(~H: StreamEv -> StreamOut, +host: String, +port: U32, +reqs: List<&2, Request>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  client_cstream_plain.fit(~H, host, port, reqs, client_conc.valid_all(reqs, host, port))
 
 # Sequential server (Phase 10): one stream at a time per connection, same
 # wire contract as the httpx (literal-only 1-DATA 16KB responses, same Fail
