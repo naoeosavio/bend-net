@@ -9,7 +9,8 @@
 # socket that still works (one byte down, the same byte back).
 # A second peer answers 200: the open chain must refuse it fail-closed
 # with 502 "upgrade without 101" without reading a body.
-# Golden 7 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502).
+# Golden 10 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502) + 3 (the
+# same three checks behind a 100 that must be discarded).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
@@ -53,6 +54,13 @@ def frame_want() -> List<&2, U32>:
 
 def canned101() -> List<&2, U32>:
   List.append(&2, U32, HTTPX.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), frame_want())
+
+# A 100 Continue before the 101 (RFC 9110 section 15.2): the client must
+# discard the interim head and read the next one. The plain lane always
+# did; TASK-055 Phase 6b gives the upgrade lane the same rule, because one
+# chain now serves both.
+def canned_info101() -> List<&2, U32>:
+  List.append(&2, U32, HTTPX.x_str_bytes("HTTP/1.1 100 Continue\r\n\r\n"), canned101())
 
 def canned200() -> List<&2, U32>:
   HTTPX.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
@@ -146,7 +154,7 @@ def peer_after(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
 # answer the wrong bytes and desync the round trip. One phased def
 # (the dialect forbids the drain/drained/found mutual trio).
 @unsafe
-def peer_drain(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(U32):
+def peer_drain(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +head: List<&2, U32>) -> IO(U32):
   match phase:
     case 0:
       (s0, r0) = got
@@ -158,7 +166,7 @@ def peer_drain(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U
         case 1n+f:
           do IO<U32>:
             r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TCP.recv_bytes(s0, 16384)
-            peer_drain(1, r, acc, f, False{})
+            peer_drain(1, r, acc, f, False{}, head)
     case 1:
       (s1, r1) = got
       match r1:
@@ -168,16 +176,16 @@ def peer_drain(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U
             IO.pure(U32, 0)
         case Done{+part}:
           +acc2 : List<&2, U32> = List.append(&2, U32, acc, part)
-          peer_drain(2, (s1, Done{Nil{}}), acc2, fuel, HTTPX.x_h1.split_found(HTTPX.x_h1.split(acc2)))
+          peer_drain(2, (s1, Done{Nil{}}), acc2, fuel, HTTPX.x_h1.split_found(HTTPX.x_h1.split(acc2)), head)
     case 2:
       (s2, r2) = got
       match found:
         case True{}:
           do IO<U32>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(s2, canned101())
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(s2, head)
             peer_after(sent)
         case False{}:
-          peer_drain(0, (s2, Done{Nil{}}), acc, fuel, False{})
+          peer_drain(0, (s2, Done{Nil{}}), acc, fuel, False{}, head)
     case _:
       (s9, r9) = got
       do IO<U32>:
@@ -190,12 +198,32 @@ def peer_open(conn: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(U32):
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{sock}:
-      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, canned101())
 
 def peer_side(l: Listener) -> IO(U32):
   do IO<U32>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
     peer_open(m)
+
+def peer_open_info(conn: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(U32):
+  (l, r) = conn
+  match r:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{sock}:
+      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, canned_info101())
+
+def peer_side_info(l: Listener) -> IO(U32):
+  do IO<U32>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    peer_open_info(m)
+
+def run_info(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side_info(l))
+    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
+    cli_round(conn, port)
 
 def run_open(b: Listener & U32) -> IO(U32):
   (l, +port) = b
@@ -293,9 +321,11 @@ def main():
     +up : U32 <- run_open(b1)
     b2 : Listener & U32 <- listen_any(32n, 18521)
     +rej : U32 <- run_reject(b2)
-    +total : U32 = (pure + up + rej : U32)
+    b3 : Listener & U32 <- listen_any(32n, 18522)
+    +inf : U32 <- run_info(b3)
+    +total : U32 = (pure + up + rej + inf : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|7
+#|10

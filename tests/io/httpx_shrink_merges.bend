@@ -1,7 +1,7 @@
-# lib (lib_httpx_shrink_merges): coverage gate for TASK-055 Phase 3.
-# Phase 3 replaces 17 defs with 6 and removes 7 Base forks. This test pins
-# the live half of each merge, so a wrong cut fails here. Pure, no IO/TLS.
-# Each check returns 1. Golden 8.
+# lib (lib_httpx_shrink_merges): coverage gate for the merges of TASK-055.
+# Each phase replaces defs with one shared def. This test pins the live half
+# of each merge, so a wrong cut fails here. Pure, no IO/TLS.
+# Each check returns 1. Golden 18.
 import Base
 import ../../lib/httpx.bend as HTTPX
 
@@ -29,6 +29,27 @@ def t_count.host() -> U32:
 
 def t_count() -> U32:
   (t_count.cl() * t_count.host() : U32)
+
+# Phase 6a: one header-list fold (x_h1.hdr_any.go) serves five questions.
+# Each entry pins the two arms of its own predicate. A fresh list per call
+# keeps the linear value legal. The mixed case in the names pins eq_ci.
+def t_folds.hs() -> List<&2, HTTPX.Hdr>:
+  [HTTPX.Hdr{"host", ""}, HTTPX.Hdr{"connection", "close"}, HTTPX.Hdr{"transfer-encoding", "chunked"}, HTTPX.Hdr{"content-length", "12"}]
+
+def t_folds.bad() -> U32:
+  (b2u(Bool.not(HTTPX.x_h1.bad_hdrs(t_folds.hs()))) * b2u(HTTPX.x_h1.bad_hdrs([HTTPX.Hdr{"x", "a\r\nY: 1"}])) : U32)
+
+def t_folds.close() -> U32:
+  (b2u(HTTPX.x_h1.conn_close(t_folds.hs())) * b2u(Bool.not(HTTPX.x_h1.conn_close([HTTPX.Hdr{"host", "a"}]))) : U32)
+
+def t_folds.cl() -> U32:
+  (b2u(Bool.not(HTTPX.x_h1.cl_bad(t_folds.hs()))) * b2u(HTTPX.x_h1.cl_bad([HTTPX.Hdr{"Content-Length", "1a"}])) : U32)
+
+def t_folds.host() -> U32:
+  (b2u(HTTPX.x_h1.host_empty(t_folds.hs())) * b2u(Bool.not(HTTPX.x_h1.host_empty([HTTPX.Hdr{"Host", "a"}]))) : U32)
+
+def t_folds.te() -> U32:
+  (b2u(HTTPX.x_h1.te_any(t_folds.hs())) * b2u(Bool.not(HTTPX.x_h1.te_any([HTTPX.Hdr{"host", "a"}]))) : U32)
 
 # httpxs.resp_from_out replaces the head and data projections: the three
 # SrvOut arms.
@@ -125,5 +146,5 @@ law main:
   U32
 
 def main():
-  (t_pick() + t_count() + t_srvout() + t_wu() + t_b2u() + t_valid() + t_seq() + t_huff() + t_slot.has() + t_slot.has_some() + t_slot.del_put() + t_slot.take() + t_slot.build() : U32)
-#|13
+  (t_pick() + t_count() + t_folds.bad() + t_folds.close() + t_folds.cl() + t_folds.host() + t_folds.te() + t_srvout() + t_wu() + t_b2u() + t_valid() + t_seq() + t_huff() + t_slot.has() + t_slot.has_some() + t_slot.del_put() + t_slot.take() + t_slot.build() : U32)
+#|18

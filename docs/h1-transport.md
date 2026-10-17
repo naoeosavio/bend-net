@@ -35,11 +35,13 @@ unification (`lib/wsm.bend`, task-028 Phase 4) needs **one** handshake lane
 for `ws://` and `wss://`, not two lanes to choose between.
 
 The H1 lane had the same problem: `x_h1.*` (TLS) plus a 28-def mirror
-`x_h1p.*` (plaintext). Task-028 Phase 1 removed the mirror. The collapse
-prevents a second copy of the 101-upgrade chain (Phase 2: `hd2_open` …
-`head_open` + `exch.open`; Phase 3: `answer_open` + `on_h1_open`). The
-collapse also prevents a second fix of the bug that motivates Phase 2: the
-`nbody=True` arm of `x_h1.cli.hd2` drops `rest`.
+`x_h1p.*` (plaintext). Task-028 Phase 1 removed the mirror. Task-055
+Phase 6b removed the last copy of the client chain: one `x_h1.cli` chain
+answers the triple `Response & List<&2,U32>` for both lanes, the flag `upg`
+turns the `nbody=False` arm into `Fail 502` (fail closed), and the plain
+entries drop the rest with `x_h1.cli.rest_drop`. The server lane keeps its
+`_open` copy: it answers `IO(Unit)`, because `~K` owns the socket after
+the 101.
 
 ## Rules
 
@@ -92,7 +94,9 @@ The 101 handshake reuses the same triple, and adds two more templates.
 `~K: Socket -> List<&2,U32> -> IO(Unit)` owns the socket after it.
 
 - Client: `x_h1.cli.exch.open` renders with `upgrade=True` and stops at the
-  head (`head_open` chain). A non-101 answer is `Fail 502`, fail closed.
+  head of the merged `x_h1.cli` chain with `upg=True`. A non-101 answer is
+  `Fail 502`, fail closed, and an interim 1xx is discarded like it is on
+  the plain lane.
   `h1_open`/`h1_open_insecure` dial (TLS) and return
   `Socket & Response & rest`, or close and `Fail`. `h1_open.rewrap` closes
   on `Fail`, because a refused handshake gives no socket.
