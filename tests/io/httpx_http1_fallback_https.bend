@@ -3,7 +3,10 @@
 # the client is HTTPX.request_insecure, which offers h2+http/1.1, negotiates
 # http/1.1 and transparently takes the H1 lane. Also pins the H1 request
 # renderer: :authority and connection are rewritten/dropped and the Host line
-# is synthesised from the host and port.
+# is synthesised from the host and port. The last check dials the same port
+# with TLS.tls_connect and wants the refusal 615: that dial offers h2, the
+# H1 server serves no overlap, and the fatal no_application_protocol alert
+# answers 615 on both lanes (task-051 A7; code 614 is a verify failure).
 import Base
 import ../../lib/httpx.bend as HTTPX
 import ../../lib/tls.bend as TLS
@@ -88,7 +91,7 @@ def roundtrip(+port: U32) -> IO(U32):
         Nil{}, "hello")
     verify : Result<&1, &1, (U32 & String), Socket> <-
       TLS.tls_connect("127.0.0.1", port)
-    return (client_score(result) * fail_code(verify, 614) : U32)
+    return (client_score(result) * fail_code(verify, 615) : U32)
 
 def listen_retry(port: U32,
   result: Result<&1, &1, (U32 & String), Listener>,
