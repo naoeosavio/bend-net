@@ -5,7 +5,7 @@
 # inject it). A method with a space fails closed with 400 before
 # touching the net.
 import Base
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 
 law b2u:
   for b: Bool

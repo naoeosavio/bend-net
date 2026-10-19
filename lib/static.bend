@@ -12,7 +12,7 @@
 # - every callee is defined ABOVE its caller; only self-recursion.
 # - match scrutinees are params or pattern-bound vars, never computed.
 import Base
-import ./http.bend as HTTP
+import ./http1.bend as HTTP
 
 # True when the path is safe to join under a root.
 

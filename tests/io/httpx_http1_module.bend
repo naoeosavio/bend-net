@@ -1,5 +1,5 @@
 import Base
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 import ../../lib/https_http1.bend as HTTP1
 import ../../lib/tls.bend as TLS
 

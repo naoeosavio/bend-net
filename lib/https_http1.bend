@@ -1,5 +1,5 @@
 import Base
-import ./http.bend as HTTP
+import ./http1.bend as HTTP
 import ./tls.bend as TLS
 
 type HTTP1Request is Data:

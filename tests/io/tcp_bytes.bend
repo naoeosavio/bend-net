@@ -5,7 +5,7 @@
 # the echo. Both effects hand the socket back on every path.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 
 law b2u:
   for b: Bool

@@ -1,10 +1,10 @@
-# lib (lib_httpx_h1_pure): the pure layer of lib/http.bend -- url parsing,
+# lib (lib_httpx_h1_pure): the pure layer of lib/http1.bend -- url parsing,
 # case-insensitive header lookup, request/response roundtrips, the
 # keep-alive decision, chunked decoding and the Bytes UTF-8 roundtrip.
 # Request bodies are Strings here (not U32 lengths); lengths ride the
 # Content-Length header instead.
 import Base
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 
 law b2u:
   for b: Bool

@@ -5,7 +5,7 @@
 # Content-Length is short of the bytes that arrived. Each case is a raw
 # one-shot server on an ephemeral port.
 import Base
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 
 law b2u:
   for b: Bool

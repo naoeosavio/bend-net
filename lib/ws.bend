@@ -19,7 +19,7 @@
 # - match scrutinees are params or pattern-bound vars, never computed.
 # - helpers above drivers are leaves: they never call back down.
 import Base
-import ./http.bend as HTTP
+import ./http1.bend as HTTP
 import ./sha1.bend as SHA1
 import ./b64.bend as B64
 import ./tcp.bend as TCP

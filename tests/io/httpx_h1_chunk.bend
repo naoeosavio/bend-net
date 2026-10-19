@@ -30,7 +30,7 @@
 # Golden 35 iff all 35 checks are 1.
 import Base
 import ../../lib/httpx.bend as HTTPX
-import ../../lib/http.bend as HTTP
+import ../../lib/http1.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
