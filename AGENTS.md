@@ -1,0 +1,67 @@
+# AGENTS.md
+
+bend-net: user-land HTTP/WS for Bend on top of the `Base.TCP.*` kit.
+Published bundle is `lib/package.bend` (httpx + wsm + tcp + dns + tls + sha1 + b64).
+
+## Use this, not that
+
+- New code: `lib/httpx.bend` as `HTTPX` (H1 + H2 + HTTPS, client + server,
+  plain + TLS, ALPN split, streaming, H1 `101` upgrade lane) and
+  `lib/wsm.bend` as `WSM` (RFC 6455 `ws://` + `wss://` over the httpx upgrade lane).
+- Superseded, old callers only: `lib/http.bend`, `lib/http2.bend`,
+  `lib/https.bend`, `lib/https_http1.bend`, `lib/ws.bend`, `lib/wss.bend`.
+- Native code lives only in `lib/effs/` (C + JS twins; JS lane rides `tls_rt.js`).
+  Everything else is pure Bend.
+
+## Commands (always from repo root)
+
+Relative imports (`../../lib/x.bend`) and the cwd-absolute `tls_rt.js`
+require break from any other directory. Bend 2.0.21+.
+
+- Single test: `bend tests/io/<name>.bend`, then compare the last numeric
+  output line against the trailing `#|N` golden in the file
+  (bend itself does not check goldens; `check.sh` does).
+- Focused gate: `bash check.sh <pattern>` — default runs only files changed
+  since HEAD plus their importers. `bash check.sh --all` is the full gate.
+  `--checks` / `--tests` split typecheck vs run. `BEND_TIMEOUT=<secs>`
+  overrides the 150 s per-file ceiling.
+- Typecheck only: `bend <file> --check-only`.
+- Twin lint + units: `bash tests/effs/parity.sh`, `bash tests/effs/eff-unit.sh`.
+- Publish: `bend lib/package.bend --publish` (imports are not transitive;
+  import each API from its own file).
+
+## Layout
+
+- `lib/httpx.bend` — the HTTP library. `lib/wsm.bend` — the WebSocket library.
+  `lib/tls.bend` — TLS dial/accept with ALPN modes. `lib/dns.bend` — A-record
+  resolve. `lib/tcp.bend` — byte send/recv/frame effects.
+- `tests/io/` — goldens: pure codec vectors plus loopback IO (each asserts via `#|N`).
+- `tests/effs/` — effects lab: twin parity, TLS interop ladder, bridge probes.
+  `BEND_EFFS_DIR=lib/effs` runs ladder rungs against installed files.
+- `examples/` — runnable peers by lane (`wsm/`, `wss/`, `httpx/`, `real/`);
+  gate only typechecks them. `real/` hits live hosts, never in the gate.
+- `tasks/` — engineering log (decisions, why-lanes-exist). `docs/modes.md`,
+  `docs/tls-dns.md` — architecture that README compresses.
+
+## Gotchas
+
+- `.gitignore` is a whitelist (`*` ignored by default). Tracked: `lib/`,
+  `examples/`, `docs/`, `tests/`, `task*`, root `README`/`package`/`AGENTS`/`LICENSE`.
+  `src/`, root `*.bend`, `.scratch/` are untracked scratch — do not put code there.
+  Run `git check-ignore -v <path>` before adding a new path.
+- `check.sh` default (`--changed`) exits 0 with `nothing changed since HEAD`
+  when nothing is touched — that proves nothing; use `--all` or a pattern for a real gate.
+  Files under `tests/` without `def main` are contracts: reported, never run, never fail.
+- TLS handle is opaque (session/pump box, never a raw fd): close with
+  `TLS.tls_close`, never `Socket.close`. The dial is `Base.TCP.connect`'s;
+  the effect only handshakes the already-connected fd.
+- Fail codes are stable numbers, never text: DNS `601-605`, TLS `611-616`,
+  HTTP `400/413/431/502/503`. DNS failures surface before any socket exists.
+  The dial connects by resolved IP but `Host`/SNI keep the ORIGINAL name.
+- Naming: `_insecure` means "no chain verify" (loopback/self-signed), never
+  "no TLS". `_plain` means cleartext (`ws://`, `http://`) and takes no cert.
+  No `is_tls` flags anywhere.
+- Fail-closed codes: malformed input answers `Fail` with the code above, never
+  a partial body. H1 head cap 16 KB (`431` past it); H1 server refuses
+  `Transfer-Encoding` + `Content-Length` pairs, non-`chunked` TE, double
+  `Content-Length`, missing/duplicate `Host` with `400` before reading a body byte.

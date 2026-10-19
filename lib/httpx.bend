@@ -486,6 +486,13 @@ def x_f_end_stream() -> U32:
 def x_f_end_headers() -> U32:
   4
 
+# The flag tests of the frame loops, named.
+def x_fin(flags: U32) -> U32:
+  U32.and(flags, x_f_end_stream())
+
+def x_fin_hdr(flags: U32) -> U32:
+  U32.and(flags, x_f_end_headers())
+
 def x_t_data() -> U32:
   0
 
@@ -708,7 +715,7 @@ def x_frame_payload(+pay: List<&2, U32>, +typ: U32, +flags: U32, +len: U32) -> L
 # END_STREAM is flag bit 0, and it is the protocol-neutral fin of the
 # shared outcome.
 def x_frame.end_of(+flags: U32) -> Bool:
-  U32.is_eq(U32.and(flags, x_f_end_stream()), 1)
+  U32.is_eq(x_fin(flags), 1)
 
 # The 3 length bytes and the 4 stream id bytes of the frame header
 # (RFC 9113 section 4.1), as arithmetic. They are here, and not written
@@ -1507,14 +1514,11 @@ def x_tab.ins_fit(+ents: List<&2, Hdr>, +size: U32, +max: U32, +name: String, +v
     case True{}:
       x_tab.do(ents, size, max, name, value, es)
 
-def x_tab.ins_go(+tab: Tab, +name: String, +value: String) -> Tab:
+def x_tab.insert(+tab: Tab, +name: String, +value: String) -> Tab:
   match tab:
     case Tab{+ents, +size, +max}:
       +es = x_tab.entry_size(name, value)
       x_tab.ins_fit(ents, size, max, name, value, U32.is_le(es, max), es)
-
-def x_tab.insert(+tab: Tab, +name: String, +value: String) -> Tab:
-  x_tab.ins_go(tab, name, value)
 
 def x_tab.resize.go(+tab: Tab, +max: U32) -> Tab:
   match tab:
@@ -2007,7 +2011,7 @@ def x_preface_ok(+buf: List<&2, U32>) -> U32:
   x_eq(x_take32(24, buf), x_preface())
 
 def x_needs_cont(+typ: U32, +flags: U32) -> Bool:
-  Bool.and(U32.is_eq(typ, x_t_headers()), U32.is_eq(U32.and(flags, x_f_end_headers()), 0))
+  Bool.and(U32.is_eq(typ, x_t_headers()), U32.is_eq(x_fin_hdr(flags), 0))
 
 def x_wu.val(+v: U32) -> Bool:
   Bool.and(U32.is_gt(v, 0), U32.is_lt(v, 2147483648))
@@ -2692,6 +2696,13 @@ def httpx.cls_fix(base: U32, +flags: U32) -> U32:
 
 # Parking value: the loop reads on every turn, so the carrier only has to
 # carry the socket while no frame is in hand.
+# The two slot questions of the frame loops, named.
+def x_same_sid(st: St, sid: U32) -> Bool:
+  U32.is_eq(httpx.sid_of(st), sid)
+
+def x_cls_of(frame: Frame, flags: U32) -> U32:
+  httpx.cls_fix(x_classify(frame), flags)
+
 def httpx.again(s: Socket) -> Socket & Got:
   (s, GotOk{Frame{0, 0, 0, Nil{}}, Nil{}})
 
@@ -2780,7 +2791,7 @@ def httpxn.has(slots: List<&2, St>, +sid: U32) -> Bool:
     case Nil{}:
       False{}
     case +st <> t:
-      Bool.or(U32.is_eq(httpx.sid_of(st), sid), httpxn.has(t, sid))
+      Bool.or(x_same_sid(st, sid), httpxn.has(t, sid))
 
 # Single-traversal fragment probe: slot with sid exists AND head is None.
 # 2 traversals + S clones -> 1 traversal, S incs (sids unique via put).
@@ -2802,7 +2813,7 @@ def httpxn.has_some(slots: List<&2, St>, +sid: U32) -> Bool:
     case Nil{}:
       False{}
     case +st <> t:
-      httpxn.has_some_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxn.has_some(t, sid))
+      httpxn.has_some_go(x_same_sid(st, sid), st, httpxn.has_some(t, sid))
 
 def httpxn.del_go(eq: Bool, +st: St, rest: List<&2, St>) -> List<&2, St>:
   match eq:
@@ -2816,7 +2827,7 @@ def httpxn.del(slots: List<&2, St>, +sid: U32) -> List<&2, St>:
     case Nil{}:
       Nil{}
     case +st <> t:
-      httpxn.del_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxn.del(t, sid))
+      httpxn.del_go(x_same_sid(st, sid), st, httpxn.del(t, sid))
 
 # Single-traversal take in a Data wrapper (a top-level A & B pair is not
 # Data and admits no + reuse). 1x O(S) always: strict args run the tail
@@ -2837,7 +2848,7 @@ def httpxn.take_del(slots: List<&2, St>, +sid: U32) -> Taken:
     case Nil{}:
       Taken{Nil{}, St{None{}, Nil{}, 0}}
     case +st <> t:
-      httpxn.take_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxn.take_del(t, sid))
+      httpxn.take_go(x_same_sid(st, sid), st, httpxn.take_del(t, sid))
 
 def httpxn.taken_slots(p: Taken) -> List<&2, St>:
   match p:
@@ -3051,7 +3062,7 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              httpx(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), ReqHead{"", "", Nil{}}, 4, tab)
+              httpx(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, x_cls_of(frame, flags2), x_fin(flags2), ReqHead{"", "", Nil{}}, 4, tab)
     case 2:
       match cls:
         case 1:
@@ -3071,7 +3082,7 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), tab)
+          httpx(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, x_fin_hdr(flags), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), x_fin_hdr(flags)), tab)
         case 6:
           httpx(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, 4, tab)
         case 0:
@@ -3142,12 +3153,11 @@ def httpx(~H: Request -> IO(Response), phase: U32, got: Socket & Got, +slots: Li
     case _:
       httpx(~H, 0, got, slots, fends, buf, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, tab)
 
-# Preface entry for the three H2 loops: the client, the server streaming
-# loop and the sequential server. It owns the byte buffer end to end, so
-# pipelined frames are never dropped between streams. The loop arrives as
-# ~enter, because each loop has its own argument list.
+# Preface entry (owns the byte buffer end-to-end, so pipelined frames are
+# never dropped between streams). Below httpx: calls upward.
+
 @unsafe
-def httpx_pre(~enter: Socket & Got -> List<&2, U32> -> IO(Unit), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+def httpx_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
   IO(Unit):
   match phase:
     case 0:
@@ -3157,39 +3167,38 @@ def httpx_pre(~enter: Socket & Got -> List<&2, U32> -> IO(Unit), phase: U32, rs:
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          httpx_pre(~enter, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
+          httpx_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
     case 1:
       (s1, r1) = rs
       match short:
         case True{}:
           do IO<Unit>:
             r2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s1, 16384)
-            httpx_pre(~enter, 0, r2, acc, 0, False{})
+            httpx_pre(~H, 0, r2, acc, 0, False{})
         case False{}:
-          httpx_pre(~enter, 2, rs, acc, ok, short)
+          httpx_pre(~H, 2, rs, acc, ok, short)
     case 2:
       (s2, r2) = rs
       match ok:
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            enter(httpx.sent(sent), x_drop32(24, acc))
+            httpx(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, x_tab.empty())
         case _:
           TLS.tls_close(s2)
     case _:
       (s9, r9) = rs
       TLS.tls_close(s9)
+
 def httpx_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-    httpx_pre(st => rest => httpx(~H, 0, st, httpxn.no_slots(), httpxn.no_fends(), rest, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, x_tab.empty()), 0, r1, Nil{}, 0, False{})
-def httpx_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
-  httpx_start(~H, sock)
+    httpx_pre(~H, 0, r1, Nil{}, 0, False{})
 
 def httpx_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, httpx_spawn.go(~H, sock))
+    x : Unit <- IO.spawn(Unit, httpx_start(~H, sock))
     return l
 
 def httpx_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
@@ -3382,7 +3391,7 @@ def client.on.cont_ok(+typ: U32, +sid: U32, +exp: U32) -> Bool:
   Bool.and(U32.is_eq(typ, x_t_cont()), Bool.and(U32.is_eq(sid, exp), U32.is_gt(sid, 0)))
 
 def client.on.cont_last(+flags: U32) -> Bool:
-  U32.is_eq(U32.and(flags, x_f_end_headers()), x_f_end_headers())
+  U32.is_eq(x_fin_hdr(flags), x_f_end_headers())
 
 def client.on.cont_cls(+typ: U32, +sid2: U32, +sid: U32, +flags: U32, ok: Bool) -> U32:
   match ok:
@@ -3578,7 +3587,7 @@ def client.on.drain(phase: U32, got: Socket & Got, +buf: List<&2, U32>, +tab: Ta
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              client.on.drain(2, (s1, GotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client.on.mine_cls(httpx.cls_fix(x_classify(frame), flags2), sid22, exp), U32.and(flags2, x_f_end_stream()), exp, 4)
+              client.on.drain(2, (s1, GotOk{frame, buf2}), buf2, tab, head, body, typ2, flags2, sid22, payload2, client.on.mine_cls(x_cls_of(frame, flags2), sid22, exp), x_fin(flags2), exp, 4)
     case 2:
       match cls:
         case 1:
@@ -3799,17 +3808,6 @@ def x_h1.eq_ci(a: String, b: String) -> Bool:
 def x_h1.bad_char(+s: String) -> Bool:
   Bool.or(client.on.has_crlf(s), client.on.has_nul(s))
 
-# The header-list "any" fold: one walk answers five questions (a bad field,
-# a close, a bad length, an empty host, a transfer encoding). The predicate
-# arrives as a parameter, in the shape of the handler parameters of this
-# file.
-def x_h1.hdr_any.go(~at: String -> String -> Bool, +hs: List<&2, Hdr>, acc: Bool) -> Bool:
-  match hs:
-    case Nil{}:
-      acc
-    case Hdr{+n, +v} <> t:
-      x_h1.hdr_any.go(~at, t, Bool.or(acc, at(n, v)))
-
 # Render safety of a header FIELD (TASK-030): render_hs.go writes
 # "name: value\r\n" verbatim, so a CR/LF/NUL inside either half ends the
 # field early and the rest is read as headers the caller never asked for —
@@ -3819,8 +3817,20 @@ def x_h1.hdr_any.go(~at: String -> String -> Bool, +hs: List<&2, Hdr>, acc: Bool
 # source: it cuts the head on CRLF, so a parsed value never carries one —
 # the source is text the app built itself (a decoded query/path echoed
 # into a response header is the classic case).
+def x_h1.bad_hdr(+h: Hdr) -> Bool:
+  match h:
+    case Hdr{+n, +v}:
+      Bool.or(x_h1.bad_char(n), x_h1.bad_char(v))
+
+def x_h1.bad_hdrs.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case h <> t:
+      x_h1.bad_hdrs.go(t, Bool.or(acc, x_h1.bad_hdr(h)))
+
 def x_h1.bad_hdrs(hs: List<&2, Hdr>) -> Bool:
-  x_h1.hdr_any.go(n => v => Bool.or(x_h1.bad_char(n), x_h1.bad_char(v)), hs, False{})
+  x_h1.bad_hdrs.go(hs, False{})
 
 # Everything the request line and the header block render, in one place:
 # the same expression was copied inline in x_h1.render_req and
@@ -3843,8 +3853,15 @@ def x_h1.forbidden(+name: String) -> Bool:
 # "connection: close" is the one signal — HTTP/1.1 keeps the connection
 # alive by default, and the client codec never renders the header
 # (x_h1.forbidden skips it), so a peer that sends it means it.
+def x_h1.conn_close.go(hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.conn_close.go(t, Bool.or(acc, Bool.and(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(v, "close"))))
+
 def x_h1.conn_close(hs: List<&2, Hdr>) -> Bool:
-  x_h1.hdr_any.go(n => v => Bool.and(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(v, "close")), hs, False{})
+  x_h1.conn_close.go(hs, False{})
 
 def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) -> List<&2, U32>:
   match skip:
@@ -4242,8 +4259,15 @@ def x_h1.cl_bad_at(is_cl: Bool, +v: String) -> Bool:
     case False{}:
       False{}
 
+def x_h1.cl_bad.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.cl_bad.go(t, Bool.or(acc, x_h1.cl_bad_at(x_h1.eq_ci(n, "content-length"), v)))
+
 def x_h1.cl_bad(hs: List<&2, Hdr>) -> Bool:
-  x_h1.hdr_any.go(n => v => x_h1.cl_bad_at(x_h1.eq_ci(n, "content-length"), v), hs, False{})
+  x_h1.cl_bad.go(hs, False{})
 
 def x_h1.host_count(hs: List<&2, Hdr>) -> U32:
   x_h1.hdr_count.go(hs, "host", 0)
@@ -4255,14 +4279,28 @@ def x_h1.host_empty_at(is_host: Bool, +v: String) -> Bool:
     case False{}:
       False{}
 
+def x_h1.host_empty.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.host_empty.go(t, Bool.or(acc, x_h1.host_empty_at(x_h1.eq_ci(n, "host"), v)))
+
 def x_h1.host_empty(hs: List<&2, Hdr>) -> Bool:
-  x_h1.hdr_any.go(n => v => x_h1.host_empty_at(x_h1.eq_ci(n, "host"), v), hs, False{})
+  x_h1.host_empty.go(hs, False{})
 
 # A Transfer-Encoding the server cannot frame (anything but chunked): RFC
 # 9112 section 6.3 says the body length cannot be determined reliably, so
 # the answer is 400 and the connection ends.
+def x_h1.te_any.go(+hs: List<&2, Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case Hdr{+n, +v} <> t:
+      x_h1.te_any.go(t, Bool.or(acc, x_h1.eq_ci(n, "transfer-encoding")))
+
 def x_h1.te_any(hs: List<&2, Hdr>) -> Bool:
-  x_h1.hdr_any.go(n => v => x_h1.eq_ci(n, "transfer-encoding"), hs, False{})
+  x_h1.te_any.go(hs, False{})
 
 def x_h1.te_bad(+hs: List<&2, Hdr>) -> Bool:
   Bool.and(x_h1.te_any(hs), Bool.not(x_h1.is_chunked(hs)))
@@ -5610,12 +5648,9 @@ def client_stream.drained(drained: Socket & Result<&1, &1, U32 & String, U32 & U
         x : Unit <- TLS.tls_close(s)
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Done{counts})
 
-# The send edge the two streaming lanes share. A write Fail closes the
-# socket. A write Done hands the read seed to the lane's drain, which
-# rides a run-time parameter: its closure reads the lane's runtime values.
-def client.sent_go(drain: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, U32 & U32>), sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) ->
+def client_stream.sent(~H: StreamEv -> StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  (sock, r, seed) = sent
+  (sock, r, rest) = sent
   match r:
     case Fail{e}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
@@ -5623,41 +5658,22 @@ def client.sent_go(drain: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, 
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- drain(sock, seed)
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client.on.sdrop(~H, 0, (sock, GotErr{0, "next"}), rest, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4)
         client_stream.drained(drained)
 
 def client_stream.exch(~H: StreamEv -> StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.on.send_req(sock, 1, host, port, method, path, hs, body)
-    client.sent_go(s => r => client.on.sdrop(~H, 0, (s, GotErr{0, "next"}), r, x_tab.empty(), Head{0, Nil{}}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 1, 4), sent)
+    client_stream.sent(~H, sent)
 
-# The connection step the three streaming lanes share: a dial answer is a
-# Fail that travels back, or a socket that the lane's exchange takes.
-# ~exch names the exchange, because each lane has its own argument list.
-def client.conn(exch: Socket -> IO(Result<&1, &1, U32 & String, U32 & U32>), conn: Result<&1, &1, U32 & String, Socket>) ->
+def client_stream.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   match conn:
     case Fail{e}:
       IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{sock}:
-      exch(sock)
-
-# The two TLS dials behind one flag. client_stream keeps the CliSt, because
-# its dispatcher reads is_h2; the H2-only lanes take the bare socket.
-def client.on.dial(insecure: Bool, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket & CliSt>):
-  match insecure:
-    case True{}:
-      client.on.connect_insecure(host, port)
-    case False{}:
-      client.on.connect_secure(host, port)
-
-def client.on.h2_dial(insecure: Bool, +host: String, +port: U32) ->
-  IO(Result<&1, &1, U32 & String, Socket>):
-  do IO<Result<&1, &1, U32 & String, Socket>>:
-    c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.dial(insecure, host, port)
-    client.on.h2_only(c)
+      client_stream.exch(~H, sock, host, port, method, path, hs, body)
 
 # ALPN dispatch for streaming download (Phase 6): H2 takes the slot
 # lane above, HTTP/1.1 takes the H1 lane on the same socket.
@@ -5672,15 +5688,21 @@ def client_stream.dispatched(~H: StreamEv -> StreamOut, c: Result<&1, &1, U32 & 
         case CliSt{sid, tab, is_h2}:
           match is_h2:
             case True{}:
-              client.conn(s => client_stream.exch(~H, s, host, port, method, path, hs, body), Done{sock})
+              client_stream.conn(~H, Done{sock}, host, port, method, path, hs, body)
             case False{}:
               x_h1.cli.stream.tls(~H, sock, host, port, method, path, hs, body)
 
 def client_stream.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.dial(insecure, host, port)
-    client_stream.dispatched(~H, c, host, port, method, path, hs, body)
+  match insecure:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        client_stream.dispatched(~H, c, host, port, method, path, hs, body)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        client_stream.dispatched(~H, c, host, port, method, path, hs, body)
 
 def client_stream.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, insecure: Bool, fit: Bool, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
@@ -6269,11 +6291,22 @@ def request.plain(+host: String, +port: U32, +method: String, +path: String, hs:
     conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
     h1_once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
 
+# Plaintext streaming download (http://): the H1 lane over the
+# plaintext dial — the sibling of client.stream, which always speaks
+# TLS. One dial, one render, the response streamed to the handler.
+def client.stream_plain.conn(~H: StreamEv -> StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      x_h1.cli.stream.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, sock, host, port, method, path, hs, body)
+
 def client.stream_plain.go(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
     conn : Result<&1, &1, U32 & String, Socket> <- plain.dial(host, port)
-    client.conn(s => x_h1.cli.stream.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, s, host, port, method, path, hs, body), conn)
+    client.stream_plain.conn(~H, conn, host, port, method, path, hs, body)
 
 def client.stream_plain.fit(~H: StreamEv -> StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
@@ -6399,7 +6432,7 @@ def httpxc.head_lookup(slots: List<&2, St>, +sid: U32) -> Head:
     case Nil{}:
       Head{0, Nil{}}
     case +st <> t:
-      httpxc.head_lookup_go(U32.is_eq(httpx.sid_of(st), sid), st, httpxc.head_lookup(t, sid))
+      httpxc.head_lookup_go(x_same_sid(st, sid), st, httpxc.head_lookup(t, sid))
 
 def httpxc.req_of_st(st: St, +payload: List<&2, U32>) -> Response:
   match st:
@@ -6549,7 +6582,7 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              client_conc.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), Head{0, Nil{}}, 4)
+              client_conc.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, typ2, flags2, sid22, payload2, x_cls_of(frame, flags2), x_fin(flags2), Head{0, Nil{}}, 4)
     case 2:
       match cls:
         case 1:
@@ -6636,7 +6669,7 @@ def client_conc.drain(~H: Response -> U32, phase: U32, got: Socket & Got, +buf: 
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), U32.and(flags6, x_f_end_stream()), Head{0, Nil{}}, 0)
+              client_conc.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), x_fin(flags6), Head{0, Nil{}}, 0)
     case 8:
       (s8, g8) = got
       match cls:
@@ -6706,9 +6739,17 @@ def client_conc.conn(~H: Response -> U32, conn: Result<&1, &1, U32 & String, Soc
 
 def client_conc.go(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32>):
-  do IO<Result<&1, &1, U32 & String, U32>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_dial(insecure, host, port)
-    client_conc.conn(~H, conn, host, port, reqs, pending)
+  match insecure:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_conc.conn(~H, conn, host, port, reqs, pending)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_conc.conn(~H, conn, host, port, reqs, pending)
 
 def client_conc.fit_n(~H: Response -> U32, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32>):
@@ -6883,7 +6924,7 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              httpx_stream(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+              httpx_stream(~H, 2, (s1, GotOk{frame, buf2}), slots, fends, buf2, typ2, flags2, sid22, payload2, x_cls_of(frame, flags2), x_fin(flags2), ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 2:
       match cls:
         case 1:
@@ -6903,7 +6944,7 @@ def httpx_stream(~H: SrvEv -> SrvOut, phase: U32, got: Socket & Got, +slots: Lis
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx_stream(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, U32.and(flags, x_f_end_headers()), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), U32.and(flags, x_f_end_headers())), Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          httpx_stream(~H, 6, got, slots, fends, buf, typ, flags, sid2, payload, cls, x_fin_hdr(flags), ReqHead{"", "", Nil{}}, httpxn.decide_cont(httpxn.frag_has(slots, sid2), x_fin_hdr(flags)), Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
           httpx_stream(~H, 3, got, slots, fends, buf, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 0:
@@ -7259,17 +7300,49 @@ def server.stream_plain(~H: SrvEv -> SrvOut, listener: Listener) -> IO(Unit):
 # protocol selected (see lib/tls.bend).
 # ---------------------------------------------------------------------
 
+@unsafe
+def httpxs_pre(~H: SrvEv -> SrvOut, phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+  IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = rs
+      match r0:
+        case Fail{e}:
+          TLS.tls_close(s0)
+        case Done{+chunk}:
+          +acc2 = List.append(&2, U32, acc, chunk)
+          httpxs_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
+    case 1:
+      (s1, r1) = rs
+      match short:
+        case True{}:
+          do IO<Unit>:
+            r2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s1, 16384)
+            httpxs_pre(~H, 0, r2, acc, 0, False{})
+        case False{}:
+          httpxs_pre(~H, 2, rs, acc, ok, short)
+    case 2:
+      (s2, r2) = rs
+      match ok:
+        case 1:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
+            httpx_stream(~H, 0, httpx.sent(sent), httpxn.no_slots(), httpxn.no_fends(), x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got())
+        case _:
+          TLS.tls_close(s2)
+    case _:
+      (s9, r9) = rs
+      TLS.tls_close(s9)
+
 def httpxs_start(~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-    httpx_pre(st => rest => httpx_stream(~H, 0, st, httpxn.no_slots(), httpxn.no_fends(), rest, 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 4, Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got()), 0, r1, Nil{}, 0, False{})
-def httpxs_spawn.go(~H: SrvEv -> SrvOut, sock: Socket) -> IO(Unit):
-  httpxs_start(~H, sock)
+    httpxs_pre(~H, 0, r1, Nil{}, 0, False{})
 
 def httpxs_spawn(~H: SrvEv -> SrvOut, sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, httpxs_spawn.go(~H, sock))
+    x : Unit <- IO.spawn(Unit, httpxs_start(~H, sock))
     return l
 
 def httpxs_conn(~H: SrvEv -> SrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
@@ -7566,7 +7639,7 @@ def client_cstream.drain(~H: CStreamEv -> CStreamOut, phase: U32, got: Socket & 
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              client_cstream.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, fins, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), Head{0, Nil{}}, False{}, 4)
+              client_cstream.drain(~H, 2, (s1, GotOk{frame, buf2}), buf2, tab, slots, pending, total, fins, typ2, flags2, sid22, payload2, x_cls_of(frame, flags2), x_fin(flags2), Head{0, Nil{}}, False{}, 4)
     case 2:
       match cls:
         case 1:
@@ -7665,7 +7738,7 @@ def client_cstream.drain(~H: CStreamEv -> CStreamOut, phase: U32, got: Socket & 
         case GotOk{+frame6, +buf6}:
           match frame6:
             case Frame{+typ6, +flags6, +sid6, +pay6}:
-              client_cstream.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, fins, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), U32.and(flags6, x_f_end_stream()), Head{0, Nil{}}, False{}, 0)
+              client_cstream.drain(~H, 8, (s6, GotOk{frame6, buf6}), buf6, tab, slots, pending, total, fins, typ6, flags6, sid2, List.append(&2, U32, payload, pay6), client.on.cont_cls_of(typ6, sid6, sid2, flags6), x_fin(flags6), Head{0, Nil{}}, False{}, 0)
     case 7:
       client.on.sdone(got, total, fins)
     case 8:
@@ -7710,17 +7783,46 @@ def client_cstream.drain(~H: CStreamEv -> CStreamOut, phase: U32, got: Socket & 
 # streams).
 # ---------------------------------------------------------------------
 
+def client_cstream.after_send(~H: CStreamEv -> CStreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (sock, r, seed) = sent
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        x : Unit <- TLS.tls_close(sock)
+        IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{u}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        drained : Socket & Result<&1, &1, U32 & String, U32 & U32> <- client_cstream.drain(~H, 0, client.on.sdrop_next(sock), seed, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4)
+        client_stream.drained(drained)
+
 def client_cstream.exch(~H: CStreamEv -> CStreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
-    client.sent_go(s => r => client_cstream.drain(~H, 0, client.on.sdrop_next(s), r, x_tab.empty(), Nil{}, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, Head{0, Nil{}}, False{}, 4), sent)
+    client_cstream.after_send(~H, sent, pending)
+
+def client_cstream.conn(~H: CStreamEv -> CStreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      client_cstream.exch(~H, sock, host, port, reqs, pending)
 
 def client_cstream.go(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_dial(insecure, host, port)
-    client.conn(s => client_cstream.exch(~H, s, host, port, reqs, pending), conn)
+  match insecure:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_insecure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_cstream.conn(~H, conn, host, port, reqs, pending)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        c : Result<&1, &1, U32 & String, Socket & CliSt> <- client.on.connect_secure(host, port)
+        conn : Result<&1, &1, U32 & String, Socket> <- client.on.h2_only(c)
+        client_cstream.conn(~H, conn, host, port, reqs, pending)
 
 def client_cstream.fit_n(~H: CStreamEv -> CStreamOut, +host: String, +port: U32, reqs: List<&2, Request>, +pending: U32, insecure: Bool) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
@@ -7896,7 +7998,7 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
         case GotOk{+frame, +buf2}:
           match frame:
             case Frame{+typ2, +flags2, +sid22, +payload2}:
-              httpx_seq(~H, 2, 4, 0, (s1, GotOk{frame, buf2}), buf2, tab, typ2, flags2, sid22, payload2, httpx.cls_fix(x_classify(frame), flags2), U32.and(flags2, x_f_end_stream()), rh, sid_a, body, frag, frag_end, 0)
+              httpx_seq(~H, 2, 4, 0, (s1, GotOk{frame, buf2}), buf2, tab, typ2, flags2, sid22, payload2, x_cls_of(frame, flags2), x_fin(flags2), rh, sid_a, body, frag, frag_end, 0)
     case 2:
       match cls:
         case 1:
@@ -7916,7 +8018,7 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
         case 9:
           httpx.close_got(got)
         case 8:
-          httpx_seq(~H, httpx.seq_cnext(Bool.not(List.is_empty(&2, U32, frag))), 4, U32.and(flags, x_f_end_headers()), got, buf, tab, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
+          httpx_seq(~H, httpx.seq_cnext(Bool.not(List.is_empty(&2, U32, frag))), 4, x_fin_hdr(flags), got, buf, tab, typ, flags, sid2, payload, cls, end, ReqHead{"", "", Nil{}}, sid_a, body, frag, frag_end, 0)
         case 6:
           httpx_seq(~H, httpx.seq_tphase(typ, Bool.or(Bool.not(U32.is_eq(sid_a, 0)), Bool.not(List.is_empty(&2, U32, frag)))), httpxn.decide_data(Bool.and(Bool.not(U32.is_eq(sid_a, 0)), U32.is_eq(sid2, sid_a)), end), 0, got, buf, tab, typ, flags, sid2, payload, cls, end, rh, sid_a, body, frag, frag_end, httpxn.need_u(typ, flags))
         case 0:
@@ -7990,17 +8092,58 @@ def httpx_seq(~H: Request -> IO(Response), phase: U32, act: U32, +endh: U32, got
 # httpx_pre; enters httpx_seq instead of httpx).
 # ---------------------------------------------------------------------
 
+def seq_pre.recv(rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s1, r1) = rs
+  TLS.tls_recv_bytes(s1, 16384)
+
+@unsafe
+def seq_pre(~H: Request -> IO(Response), phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, +ok: U32, short: Bool) ->
+  IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = rs
+      match r0:
+        case Fail{e}:
+          TLS.tls_close(s0)
+        case Done{+chunk}:
+          +acc2 = List.append(&2, U32, acc, chunk)
+          seq_pre(~H, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(x_has_at_least(24, acc2)))
+    case 1:
+      match short:
+        case True{}:
+          do IO<Unit>:
+            r2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- seq_pre.recv(rs)
+            seq_pre(~H, 0, r2, acc, 0, False{})
+        case False{}:
+          seq_pre(~H, 2, rs, acc, ok, short)
+    case 2:
+      (s2, r2) = rs
+      match ok:
+        case 1:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
+            httpx_seq(~H, 0, 4, 0, httpx.sent(sent), x_drop32(24, acc), x_tab.empty(), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0)
+        case _:
+          TLS.tls_close(s2)
+    case _:
+      (s9, r9) = rs
+      TLS.tls_close(s9)
+
 def seq_start(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   do IO<Unit>:
     r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(sock, 16384)
-    httpx_pre(st => rest => httpx_seq(~H, 0, 4, 0, st, rest, x_tab.empty(), 0, 0, 0, Nil{}, 0, 0, ReqHead{"", "", Nil{}}, 0, Nil{}, Nil{}, 0, 0), 0, r1, Nil{}, 0, False{})
+    seq_pre(~H, 0, r1, Nil{}, 0, False{})
+
+# Accept plumbing (sequential, H2-only): every connection runs seq_start.
+# ---------------------------------------------------------------------
+
 def seq_spawn.go(~H: Request -> IO(Response), sock: Socket) -> IO(Unit):
   seq_start(~H, sock)
 
 def seq_spawn(~H: Request -> IO(Response), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, seq_spawn.go(~H, sock))
+    x : Unit <- IO.spawn(Unit, seq_start(~H, sock))
     return l
 
 def seq_conn(~H: Request -> IO(Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
