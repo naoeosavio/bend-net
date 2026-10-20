@@ -12,9 +12,9 @@
 # resolved IP is transport-only, `Host` keeps the original name), and
 # SHA1 + B64 behind `Sec-WebSocket-Accept`.
 #
-# The old per-protocol modules (http.bend, http2.bend, https.bend,
-# https_http1.bend, ws.bend, wss.bend) stay in the tree but are out of
-# this bundle: HTTPX and WSM replace them, one lib per protocol family.
+# The retired per-protocol modules (http.bend, http1.bend, http2.bend,
+# https.bend, https_http1.bend, ws.bend, wss.bend) are out of this bundle:
+# HTTPX and WSM replace them, one lib per protocol family.
 #
 # Boundaries: every lane fails closed — HTTP 400 / 413 / 502 on
 # malformed input (never a partial answer), DNS 601-605, TLS 611-616.

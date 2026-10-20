@@ -35,9 +35,8 @@
 # Answers: 1 when valid text roundtrips byte-identically, 2 when lone
 # continuations answer one U+FFFD per pair, 4 when the 64 KB ASCII body
 # decodes, 8 when the 20 K multi-byte body keeps every character,
-# 16 when the continuation-byte body survives, 32 when fetch.text
-# answers a 64 KB body as a String.
-# Golden 63.
+# 16 when the continuation-byte body survives.
+# Golden 31.
 import Base
 import ../../lib/httpx.bend as HTTPX
 

@@ -411,6 +411,15 @@ def x_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
 def x_utf8_ok(bs: List<&2, U32>) -> Bool:
   x_utf8_go(bs, 0, 0, 0)
 
+# Keeps the accumulator when the sequence is still valid, and adds one
+# U+FFFD in front of it when the sequence aborts.
+def x_utf8_fffd(is_ok: Bool, acc: List<&2, U32>) -> List<&2, U32>:
+  match is_ok:
+    case True{}:
+      acc
+    case False{}:
+      65533 <> acc
+
 # Stack-safe utf-8 decode. The old one-frame-per-byte machine held one
 # (SCon{Chr{...}, <self>}), which is fine for a header and fatal for a
 # body: 16384 bytes decode, 32768 die with "memory fault (machine stack
@@ -431,7 +440,10 @@ def x_utf8_ok(bs: List<&2, U32>) -> Bool:
 #
 # No chunk boundary can split a sequence here: the state machine carries
 # (need, min, code) across the whole body, so the only "boundary" is
-# between two already-decoded code points.
+# between two already-decoded code points. Every continuation byte is
+# checked with the rules x_utf8_ok uses: a non-continuation byte, or a
+# code point out of range, aborts the sequence and the pair answers one
+# U+FFFD. That is what the invalid-lead arm (need 9) already did.
 def x_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32,
   acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
@@ -450,12 +462,23 @@ def x_utf8_decode.go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32,
             Bool.pick(U32, is0, b, U32.and(b, x_utf8_mask(nb0))),
             acc)
         case 1:
+          +is_c = x_utf8_is_cont(b)
+          +code1 = (code * 64 + U32.and(b, 63) : U32)
+          +ok1 = Bool.and(is_c, x_utf8_code_ok(code1, min))
           x_utf8_decode.go(t, 0, 0, 0,
-            (code * 64 + U32.and(b, 63) : U32) <> acc)
+            Bool.pick(U32, ok1, code1, 65533) <> acc)
         case 2:
-          x_utf8_decode.go(t, 1, min, (code * 64 + U32.and(b, 63) : U32), acc)
+          +is_c2 = x_utf8_is_cont(b)
+          x_utf8_decode.go(t, Bool.pick(U32, is_c2, 1, 0),
+            Bool.pick(U32, is_c2, min, 0),
+            Bool.pick(U32, is_c2, (code * 64 + U32.and(b, 63) : U32), 0),
+            x_utf8_fffd(is_c2, acc))
         case 3:
-          x_utf8_decode.go(t, 2, min, (code * 64 + U32.and(b, 63) : U32), acc)
+          +is_c3 = x_utf8_is_cont(b)
+          x_utf8_decode.go(t, Bool.pick(U32, is_c3, 2, 0),
+            Bool.pick(U32, is_c3, min, 0),
+            Bool.pick(U32, is_c3, (code * 64 + U32.and(b, 63) : U32), 0),
+            x_utf8_fffd(is_c3, acc))
         case 8:
           +nb8 = Bool.pick(U32, U32.is_lt(b, 128), 8, x_utf8_need(b))
           x_utf8_decode.go(t, nb8, x_utf8_min(nb8),
