@@ -8,19 +8,21 @@
 # import ../../lib/wsm.bend as WSM (from tests/io and examples/).
 #
 # One module, one surface, two lanes, built on the HTTP library. The
-# handshake rides the H1 upgrade lane of lib/httpx.bend — the HTTP lib,
-# not a side helper (task-028 Phases 1-3: h1_open for TLS, TCP.connect +
-# cli.exch.open for cleartext, on_h1_open(+_plain) for the server);
+# handshake rides the H1 upgrade lane: h1_open for TLS, TCP.connect +
+# x_h1.cli.exch.open for cleartext, on_h1_open(+_plain) for the server;
 # frames ride tls.bend / tcp.bend directly once ~K owns the socket.
-# Nothing here imports ws.bend, wss.bend or http.bend — the codec
-# (frames, mask, close, ping/pong, fragments) and the handshake
-# live in this file, ported def by def and adapted to httpx.Hdr;
-# UTF-8 lives in httpx (HTTPX.x_utf8_*) with wsm_utf8_* wrappers.
+# The codec (frames, mask, close, ping/pong, fragments) and the handshake
+# live in this file, ported def by def and adapted to HTTP.Hdr; the H1
+# text leaves (x_h1.split, x_h1.parse_hs, x_h1.render_req.go) come from
+# ./http1.bend, and UTF-8 lives in the core (HTTP.x_utf8_*) with
+# wsm_utf8_* wrappers.
 #
-# Imports: Base (prelude); ./httpx.bend as HTTPX (the upgrade lane +
-# x_* byte helpers); ./tls.bend as TLS and ./tcp.bend as TCPB (the two
-# transports); ./sha1.bend as SHA1 and ./b64.bend as B64 (the leaf codecs
-# behind Sec-WebSocket-Accept). No lanes, no HTTP text layer.
+# Imports: Base (prelude); ./httpx.bend as HTTPX (the upgrade and server
+# entries); ./http1.bend as HTTP1 (the H1 text helpers and the open
+# exchange); ./http.bend as HTTP (the types and the byte leaves);
+# ./tls.bend as TLS and ./tcp.bend as TCPB (the two transports);
+# ./sha1.bend as SHA1 and ./b64.bend as B64 (the leaf codecs behind
+# Sec-WebSocket-Accept). No lanes, no HTTP text layer of its own.
 #
 # Surface: `server_on` (+ `_sub`, `_plain`) and `client_on` (+ `_sub`,
 # `_plain`, `_insecure`) take one pure ~H over WSEv/WSOut; `client_echo`
@@ -33,24 +35,26 @@
 # names, so the [mig] is a requalification, not a redesign: WSMessage
 # (WSText / WSBin), WSOut (answers), WSIn (one read), WSEv (lifecycle),
 # WsStep (loop carrier), MsgAcc (fragment reassembly), WSMask (client
-# key). The incremental framing answer is HTTPX.UnitOut itself (Got /
-# NeedMore / End / Bad) — httpx.bend's own TASK-026 mirror of
-# CT.UnitOut, shared instead of redeclared: one question, one shape,
-# the same answer the H1 chunked decoder gives.
+# key). The incremental framing answer is HTTP.UnitOut itself (Got /
+# NeedMore / End / Bad) — http.bend's TASK-026 mirror of CT.UnitOut,
+# shared instead of redeclared: one question, one shape, the same answer
+# the H1 chunked decoder gives.
 #
 # Discipline (same as lib/httpx.bend): callee above caller; match
 # scrutinees are params or pattern-bound vars; self-recursion only,
 # with a structurally shrinking argument; + binders only for Data.
 # Streaming note: this module answers WSEv/WSOut only; the HTTP
-# streaming families (HTTPX.StreamEv/SrvEv) and CT.StreamEv/StreamOut
+# streaming families (HTTP.StreamEv/SrvEv) and CT.StreamEv/StreamOut
 # of lib/core/type.bend are different contracts kept by decision
 # (TASK-036) — do not look for them here.
 import Base
 import ./httpx.bend as HTTPX
+import ./http.bend as HTTP
 import ./tls.bend as TLS
 import ./tcp.bend as TCPB
 import ./sha1.bend as SHA1
 import ./b64.bend as B64
+import ./http1.bend as HTTP1
 
 # Messages: WSText is UTF-8 String on the wire via wsm_utf8_encode /
 # wsm_utf8_decode (this module's text lane, TASK-028 Phase 5.9);
@@ -111,7 +115,7 @@ type WSMask is Data:
   WSMask{k0: U32, k1: U32, k2: U32, k3: U32}
 
 # UTF-8 (RFC 3629): WSText on the wire. The machine lives in httpx
-# (HTTPX.x_utf8_*, TASK-036 Phase 3) — this module keeps the wsm_utf8_*
+# (HTTP.x_utf8_*, TASK-036 Phase 3) — this module keeps the wsm_utf8_*
 # names as thin callers' vocabulary, one implementation, no fork.
 # The H1 byte helpers in httpx (x_str_bytes/x_bytes_str) are ASCII-only
 # (raw code points, one byte each) and feed the H1 renderers; real text
@@ -119,55 +123,55 @@ type WSMask is Data:
 # ---------------------------------------------------------------------
 
 def wsm_utf8_encode.go2(+code: U32) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.go2(code)
+  HTTP.x_utf8_encode.go2(code)
 
 def wsm_utf8_encode.go3(+code: U32) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.go3(code)
+  HTTP.x_utf8_encode.go3(code)
 
 def wsm_utf8_encode.go4(+code: U32) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.go4(code)
+  HTTP.x_utf8_encode.go4(code)
 
 def wsm_utf8_encode.big(code: U32, is2: Bool, is3: Bool) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.big(code, is2, is3)
+  HTTP.x_utf8_encode.big(code, is2, is3)
 
 def wsm_utf8_encode.small(code: U32, is1: Bool, is2: Bool, is3: Bool) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.small(code, is1, is2, is3)
+  HTTP.x_utf8_encode.small(code, is1, is2, is3)
 
 def wsm_utf8_encode_char(+code: U32) -> List<&2, U32>:
-  HTTPX.x_utf8_encode_char(code)
+  HTTP.x_utf8_encode_char(code)
 
 def wsm_utf8_encode.one(c: Char) -> List<&2, U32>:
-  HTTPX.x_utf8_encode.one(c)
+  HTTP.x_utf8_encode.one(c)
 
 def wsm_utf8_encode(s: String) -> List<&2, U32>:
-  HTTPX.x_utf8_encode(s)
+  HTTP.x_utf8_encode(s)
 
 def wsm_utf8_is_cont(+b: U32) -> Bool:
-  HTTPX.x_utf8_is_cont(b)
+  HTTP.x_utf8_is_cont(b)
 
 def wsm_utf8_need(+b: U32) -> U32:
-  HTTPX.x_utf8_need(b)
+  HTTP.x_utf8_need(b)
 
 def wsm_utf8_min(+need: U32) -> U32:
-  HTTPX.x_utf8_min(need)
+  HTTP.x_utf8_min(need)
 
 def wsm_utf8_mask(+need: U32) -> U32:
-  HTTPX.x_utf8_mask(need)
+  HTTP.x_utf8_mask(need)
 
 def wsm_utf8_code_ok(+code: U32, +min: U32) -> Bool:
-  HTTPX.x_utf8_code_ok(code, min)
+  HTTP.x_utf8_code_ok(code, min)
 
 def wsm_utf8_fin2(+code2: U32, +min: U32) -> U32:
-  HTTPX.x_utf8_fin2(code2, min)
+  HTTP.x_utf8_fin2(code2, min)
 
 def wsm_utf8_fin(+code: U32, +min: U32, +b: U32) -> U32:
-  HTTPX.x_utf8_fin(code, min, b)
+  HTTP.x_utf8_fin(code, min, b)
 
 def wsm_utf8_go(+bs: List<&2, U32>, +need: U32, +min: U32, +code: U32) -> Bool:
-  HTTPX.x_utf8_go(bs, need, min, code)
+  HTTP.x_utf8_go(bs, need, min, code)
 
 def wsm_utf8_ok(bs: List<&2, U32>) -> Bool:
-  HTTPX.x_utf8_ok(bs)
+  HTTP.x_utf8_ok(bs)
 
 # need 8 is the ASCII fast path (emit the byte carried in code) and
 # need 7 is a fresh lead byte (step the machine on the carried byte) —
@@ -179,7 +183,7 @@ def wsm_utf8_ok(bs: List<&2, U32>) -> Bool:
 # the HTTP body lane. Incremental validation rides wsm_utf8_ok, which
 # never holds more than one frame.
 def wsm_utf8_decode(bs: List<&2, U32>) -> String:
-  HTTPX.x_utf8_decode(bs)
+  HTTP.x_utf8_decode(bs)
 
 # Small pure helpers (the ones the old tree spread over HTTP/UTILS/CORE;
 # each is a few lines, so they live here instead of growing imports).
@@ -300,25 +304,25 @@ def wsm_scan_proto_add(+acc: List<&2, String>, +val: String, is_proto: Bool) -> 
     case False{}:
       acc
 
-def wsm_scan_go(hs: List<&2, HTTPX.Hdr>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool) -> String & Bool:
+def wsm_scan_go(hs: List<&2, HTTP.Hdr>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool) -> String & Bool:
   match hs:
     case Nil{}:
       (key_acc, Bool.and(up_ok, Bool.and(ver_ok, Bool.and(conn_ok, wsm_key_ok(key_acc)))))
-    case HTTPX.Hdr{name, value} <> t:
+    case HTTP.Hdr{name, value} <> t:
       +nn = name
       +vv = value
       +tv = String.trim(vv)
       +low = String.to_lower(String.trim(vv))
       wsm_scan_go(t, Bool.pick(String, wsm_eq_ci(nn, "Sec-WebSocket-Key"), tv, key_acc), Bool.or(up_ok, Bool.and(wsm_eq_ci(nn, "Upgrade"), String.eq(low, "websocket"))), Bool.or(ver_ok, Bool.and(wsm_eq_ci(nn, "Sec-WebSocket-Version"), String.eq(tv, "13"))), Bool.or(conn_ok, Bool.and(wsm_eq_ci(nn, "Connection"), wsm_conn_has_upgrade(vv))))
 
-def wsm_scan(hs: List<&2, HTTPX.Hdr>) -> String & Bool:
+def wsm_scan(hs: List<&2, HTTP.Hdr>) -> String & Bool:
   wsm_scan_go(hs, "", False{}, False{}, False{})
 
-def wsm_scan_full_go(hs: List<&2, HTTPX.Hdr>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool, +proto_acc: List<&2, String>) -> String & Bool & List<&2, String>:
+def wsm_scan_full_go(hs: List<&2, HTTP.Hdr>, +key_acc: String, up_ok: Bool, ver_ok: Bool, conn_ok: Bool, +proto_acc: List<&2, String>) -> String & Bool & List<&2, String>:
   match hs:
     case Nil{}:
       (key_acc, Bool.and(up_ok, Bool.and(ver_ok, Bool.and(conn_ok, wsm_key_ok(key_acc)))), proto_acc)
-    case HTTPX.Hdr{name, value} <> t:
+    case HTTP.Hdr{name, value} <> t:
       +nn = name
       +vv = value
       +tv = String.trim(vv)
@@ -332,7 +336,7 @@ def wsm_scan_full_go(hs: List<&2, HTTPX.Hdr>, +key_acc: String, up_ok: Bool, ver
       +vv4 = vv
       wsm_scan_full_go(t, Bool.pick(String, wsm_eq_ci(nn, "Sec-WebSocket-Key"), tv, key_acc), Bool.or(up_ok, Bool.and(wsm_eq_ci(nn2, "Upgrade"), String.eq(low, "websocket"))), Bool.or(ver_ok, Bool.and(wsm_eq_ci(nn3, "Sec-WebSocket-Version"), String.eq(tv, "13"))), Bool.or(conn_ok, Bool.and(wsm_eq_ci(nn4, "Connection"), wsm_conn_has_upgrade(vv2))), wsm_scan_proto_add(proto_acc, vv3, wsm_eq_ci(nn5, "Sec-WebSocket-Protocol")))
 
-def wsm_scan_full(hs: List<&2, HTTPX.Hdr>) -> String & Bool & List<&2, String>:
+def wsm_scan_full(hs: List<&2, HTTP.Hdr>) -> String & Bool & List<&2, String>:
   wsm_scan_full_go(hs, "", False{}, False{}, False{}, Nil{})
 
 def wsm_accept_of(+key: String) -> String:
@@ -340,11 +344,11 @@ def wsm_accept_of(+key: String) -> String:
   +joined = trimmed ++ wsm_guid()
   B64.encode(SHA1.sha1(wsm_utf8_encode(joined)))
 
-def wsm_accept_hdrs(+accept: String) -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Accept", accept}]
+def wsm_accept_hdrs(+accept: String) -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Accept", accept}]
 
-def wsm_accept_hdrs_sub(+accept: String, +proto: String) -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Accept", accept}, HTTPX.Hdr{"Sec-WebSocket-Protocol", proto}]
+def wsm_accept_hdrs_sub(+accept: String, +proto: String) -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Accept", accept}, HTTP.Hdr{"Sec-WebSocket-Protocol", proto}]
 
 def wsm_valid_headers(+key: String, ok: Bool) -> Result<&1, &1, U32 & String, String>:
   match ok:
@@ -364,7 +368,7 @@ def wsm_validate.go(+m: String, pair: String & Bool) -> Result<&1, &1, U32 & Str
   (key, ok) = pair
   wsm_valid_method(key, ok, String.eq(m, "GET"))
 
-def wsm_validate(+m: String, hs: List<&2, HTTPX.Hdr>) -> Result<&1, &1, U32 & String, String>:
+def wsm_validate(+m: String, hs: List<&2, HTTP.Hdr>) -> Result<&1, &1, U32 & String, String>:
   wsm_validate.go(m, wsm_scan(hs))
 
 def wsm_valid_sub.go(+key: String, ok: Bool, +cprotos: List<&2, String>, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
@@ -385,7 +389,7 @@ def wsm_validate_sub.go(+m: String, trio: String & Bool & List<&2, String>, +wan
   (key, ok, cprotos) = trio
   wsm_validate_sub.method(key, ok, cprotos, wanted, String.eq(m, "GET"))
 
-def wsm_validate_sub(+m: String, hs: List<&2, HTTPX.Hdr>, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
+def wsm_validate_sub(+m: String, hs: List<&2, HTTP.Hdr>, +wanted: List<&2, String>) -> Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
   wsm_validate_sub.go(m, wsm_scan_full(hs), wanted)
 
 # The client request is an httpx.Request, not head text: the lane renders
@@ -404,14 +408,14 @@ def wsm_protos_bad(protos: List<&2, String>) -> Bool:
       +hh = h
       Bool.or(wsm_has_crlf(hh), wsm_protos_bad(t))
 
-def wsm_client_req.go(+path: String, +key: String, bad: Bool) -> Result<&1, &1, U32 & String, HTTPX.Request>:
+def wsm_client_req.go(+path: String, +key: String, bad: Bool) -> Result<&1, &1, U32 & String, HTTP.Request>:
   match bad:
     case True{}:
       Fail{(400, "bad request")}
     case False{}:
-      Done{HTTPX.Request{"GET", path, [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", key}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
+      Done{HTTP.Request{"GET", path, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", key}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
 
-def wsm_client_request(+path: String, +key: String) -> Result<&1, &1, U32 & String, HTTPX.Request>:
+def wsm_client_request(+path: String, +key: String) -> Result<&1, &1, U32 & String, HTTP.Request>:
   wsm_client_req.go(path, key, wsm_bad_req(path, key))
 
 def wsm_has_proto(protos: List<&2, String>) -> Bool:
@@ -424,21 +428,21 @@ def wsm_has_proto(protos: List<&2, String>) -> Bool:
 def wsm_proto_join(+protos: List<&2, String>) -> String:
   String.join(protos, ", ")
 
-def wsm_client_req_sub.hs(+path: String, +key: String, +protos: List<&2, String>, has_any: Bool) -> Result<&1, &1, U32 & String, HTTPX.Request>:
+def wsm_client_req_sub.hs(+path: String, +key: String, +protos: List<&2, String>, has_any: Bool) -> Result<&1, &1, U32 & String, HTTP.Request>:
   match has_any:
     case True{}:
-      Done{HTTPX.Request{"GET", path, [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", key}, HTTPX.Hdr{"Sec-WebSocket-Protocol", wsm_proto_join(protos)}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
+      Done{HTTP.Request{"GET", path, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", key}, HTTP.Hdr{"Sec-WebSocket-Protocol", wsm_proto_join(protos)}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
     case False{}:
-      Done{HTTPX.Request{"GET", path, [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", key}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
+      Done{HTTP.Request{"GET", path, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", key}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}], Nil{}}}
 
-def wsm_client_req_sub.go(+path: String, +key: String, +protos: List<&2, String>, bad: Bool) -> Result<&1, &1, U32 & String, HTTPX.Request>:
+def wsm_client_req_sub.go(+path: String, +key: String, +protos: List<&2, String>, bad: Bool) -> Result<&1, &1, U32 & String, HTTP.Request>:
   match bad:
     case True{}:
       Fail{(400, "bad request")}
     case False{}:
       wsm_client_req_sub.hs(path, key, protos, wsm_has_proto(protos))
 
-def wsm_client_request_sub(+path: String, +key: String, +protos: List<&2, String>) -> Result<&1, &1, U32 & String, HTTPX.Request>:
+def wsm_client_request_sub(+path: String, +key: String, +protos: List<&2, String>) -> Result<&1, &1, U32 & String, HTTP.Request>:
   wsm_client_req_sub.go(path, key, protos, Bool.or(wsm_bad_req(path, key), wsm_protos_bad(protos)))
 
 # Text entry points (pure, TASK-028 Phase 5.5): head text in, head text
@@ -458,8 +462,8 @@ def wsm_client_request_sub(+path: String, +key: String, +protos: List<&2, String
 # upgrade lane deleted).
 # ---------------------------------------------------------------------
 
-def wsm_text_parse_req(tok: Result<&1, &1, U32 & String, String & String & String & Bool>, hs: Result<&1, &1, U32 & String, List<&2, HTTPX.Hdr>>) ->
-  Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>:
+def wsm_text_parse_req(tok: Result<&1, &1, U32 & String, String & String & String & Bool>, hs: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) ->
+  Result<&1, &1, U32 & String, String & List<&2, HTTP.Hdr>>:
   match tok:
     case Fail{e}:
       Fail{e}
@@ -469,15 +473,15 @@ def wsm_text_parse_req(tok: Result<&1, &1, U32 & String, String & String & Strin
         case Fail{e2}:
           Fail{e2}
         case Done{headers}:
-          Bool.pick(Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>, ok, Done{(m, headers)}, Fail{(400, "bad request line")})
+          Bool.pick(Result<&1, &1, U32 & String, String & List<&2, HTTP.Hdr>>, ok, Done{(m, headers)}, Fail{(400, "bad request line")})
 
-def wsm_text_hs_of(raw: String) -> Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>:
-  split = HTTPX.x_h1.split(HTTPX.x_str_bytes(raw))
-  head = HTTPX.x_h1.split_head(split)
-  +lines = HTTPX.x_h1.head_lines(head)
-  wsm_text_parse_req(HTTPX.x_h1.req_tok(String.split(HTTPX.x_h1.first_line(lines), ' ')), HTTPX.x_h1.parse_hs(HTTPX.x_h1.rest_lines(lines)))
+def wsm_text_hs_of(raw: String) -> Result<&1, &1, U32 & String, String & List<&2, HTTP.Hdr>>:
+  split = HTTP1.x_h1.split(HTTP.x_str_bytes(raw))
+  head = HTTP1.x_h1.split_head(split)
+  +lines = HTTP1.x_h1.head_lines(head)
+  wsm_text_parse_req(HTTP1.x_h1.req_tok(String.split(HTTP1.x_h1.first_line(lines), ' ')), HTTP1.x_h1.parse_hs(HTTP1.x_h1.rest_lines(lines)))
 
-def wsm_text_validate.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>) -> Result<&1, &1, U32 & String, String>:
+def wsm_text_validate.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTP.Hdr>>) -> Result<&1, &1, U32 & String, String>:
   match r:
     case Fail{e}:
       Fail{e}
@@ -488,7 +492,7 @@ def wsm_text_validate.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTPX
 def wsm_text_validate(raw: String) -> Result<&1, &1, U32 & String, String>:
   wsm_text_validate.go(wsm_text_hs_of(raw))
 
-def wsm_text_validate_sub.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTPX.Hdr>>, +wanted: List<&2, String>) ->
+def wsm_text_validate_sub.go(r: Result<&1, &1, U32 & String, String & List<&2, HTTP.Hdr>>, +wanted: List<&2, String>) ->
   Result<&1, &1, U32 & String, String & Maybe<&2, String>>:
   match r:
     case Fail{e}:
@@ -501,12 +505,12 @@ def wsm_text_validate_sub(raw: String, +wanted: List<&2, String>) -> Result<&1, 
   wsm_text_validate_sub.go(wsm_text_hs_of(raw), wanted)
 
 def wsm_text_accept(+accept: String) -> List<&2, U32>:
-  HTTPX.x_h1.show_resp_head(101, wsm_accept_hdrs(accept))
+  HTTP1.x_h1.show_resp_head(101, wsm_accept_hdrs(accept))
 
 def wsm_text_accept_sub(pick: Maybe<&2, String>, +accept: String) -> List<&2, U32>:
   match pick:
     case Some{p}:
-      HTTPX.x_h1.show_resp_head(101, wsm_accept_hdrs_sub(accept, p))
+      HTTP1.x_h1.show_resp_head(101, wsm_accept_hdrs_sub(accept, p))
     case None{}:
       wsm_text_accept(accept)
 
@@ -517,7 +521,7 @@ def wsm_text_str(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
     case Nil{}:
       Fail{(400, "no response")}
     case b <> t:
-      Done{HTTPX.x_bytes_str(bs)}
+      Done{HTTP.x_bytes_str(bs)}
 
 def wsm_text_key.go(r: Result<&1, &1, U32 & String, String>) -> Result<&1, &1, U32 & String, String>:
   match r:
@@ -556,19 +560,19 @@ def wsm_client_head.render_bytes(r: Result<&1, &1, U32 & String, List<&2, U32>>)
     case Fail{e}:
       Fail{e}
     case Done{bs}:
-      Done{HTTPX.x_bytes_str(bs)}
+      Done{HTTP.x_bytes_str(bs)}
 
-def wsm_client_head.render(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, HTTPX.Hdr>, +body: List<&2, U32>) ->
+def wsm_client_head.render(+method: String, +path: String, +host: String, +port: U32, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
   Result<&1, &1, U32 & String, String>:
-  wsm_client_head.render_bytes(HTTPX.x_h1.render_req.go(True{}, False{}, method, path, host, port, hs, body))
+  wsm_client_head.render_bytes(HTTP1.x_h1.render_req.go(True{}, False{}, method, path, host, port, hs, body))
 
-def wsm_client_head.go(r: Result<&1, &1, U32 & String, HTTPX.Request>, +host: String, +port: U32) -> Result<&1, &1, U32 & String, String>:
+def wsm_client_head.go(r: Result<&1, &1, U32 & String, HTTP.Request>, +host: String, +port: U32) -> Result<&1, &1, U32 & String, String>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{req}:
       match req:
-        case HTTPX.Request{method, path, headers, body}:
+        case HTTP.Request{method, path, headers, body}:
           wsm_client_head.render(method, path, host, port, headers, body)
 
 def wsm_client_head(+host: String, +port: U32, +path: String, +key: String) -> Result<&1, &1, U32 & String, String>:
@@ -580,18 +584,18 @@ def wsm_client_head_sub(+host: String, +port: U32, +path: String, +key: String, 
 # Client-side 101 validation over the lane's parsed Response: status 101
 # plus the Accept echoing accept_of(key) (plus the subprotocol pick for
 # _sub). Fail-closed, like the old client_ok_of over head text.
-def wsm_client_acc.go(hs: List<&2, HTTPX.Hdr>, +want: String, got: Bool) -> Bool:
+def wsm_client_acc.go(hs: List<&2, HTTP.Hdr>, +want: String, got: Bool) -> Bool:
   match hs:
     case Nil{}:
       got
-    case HTTPX.Hdr{name, value} <> t:
+    case HTTP.Hdr{name, value} <> t:
       +nn = name
       +vv = value
       +hit = wsm_eq_ci(nn, "Sec-WebSocket-Accept")
       +acc = String.eq(String.trim(vv), want)
       wsm_client_acc.go(t, want, Bool.or(got, Bool.and(hit, acc)))
 
-def wsm_client_ok(+status: U32, hs: List<&2, HTTPX.Hdr>, +want: String) -> Bool:
+def wsm_client_ok(+status: U32, hs: List<&2, HTTP.Hdr>, +want: String) -> Bool:
   Bool.and(U32.is_eq(status, 101), wsm_client_acc.go(hs, want, False{}))
 
 def wsm_client_check_end(+offered: List<&2, String>, +found: String, acc_ok: Bool, got: Bool) -> Bool:
@@ -601,11 +605,11 @@ def wsm_client_check_end(+offered: List<&2, String>, +found: String, acc_ok: Boo
     case False{}:
       acc_ok
 
-def wsm_client_check_go(hs: List<&2, HTTPX.Hdr>, +want: String, +offered: List<&2, String>, acc_ok: Bool, +found: String, got: Bool) -> Bool:
+def wsm_client_check_go(hs: List<&2, HTTP.Hdr>, +want: String, +offered: List<&2, String>, acc_ok: Bool, +found: String, got: Bool) -> Bool:
   match hs:
     case Nil{}:
       wsm_client_check_end(offered, found, acc_ok, got)
-    case HTTPX.Hdr{name, value} <> t:
+    case HTTP.Hdr{name, value} <> t:
       +nn = name
       +vv = value
       +nn2 = nn
@@ -615,7 +619,7 @@ def wsm_client_check_go(hs: List<&2, HTTPX.Hdr>, +want: String, +offered: List<&
       +found2 = found
       wsm_client_check_go(t, want2, off2, Bool.or(acc_ok, Bool.and(wsm_eq_ci(nn, "Sec-WebSocket-Accept"), String.eq(String.trim(vv), want))), Bool.pick(String, wsm_eq_ci(nn2, "Sec-WebSocket-Protocol"), String.trim(vv2), found2), Bool.or(got, wsm_eq_ci(nn, "Sec-WebSocket-Protocol")))
 
-def wsm_client_ok_sub(+status: U32, hs: List<&2, HTTPX.Hdr>, +want: String, +offered: List<&2, String>) -> Bool:
+def wsm_client_ok_sub(+status: U32, hs: List<&2, HTTP.Hdr>, +want: String, +offered: List<&2, String>) -> Bool:
   Bool.and(U32.is_eq(status, 101), wsm_client_check_go(hs, want, offered, False{}, "", False{}))
 
 # Pure compatibility defs (TASK-028 Phase 5.7): names the retired
@@ -638,13 +642,13 @@ def client_scan_len.go(p: List<&2, U32> & List<&2, U32> & Bool) -> U32:
           0
 
 def client_scan_len(bs: List<&2, U32>) -> U32:
-  client_scan_len.go(HTTPX.x_h1.split(bs))
+  client_scan_len.go(HTTP1.x_h1.split(bs))
 
 # Fit twin of the length above: True iff the head terminator is present.
 # Reuse: the same H1 split (one scan, one window constant) instead of a
 # second 4-byte scanner; compat-only, no live lane calls it.
 def client_scan_fit(bs: List<&2, U32>) -> Bool:
-  HTTPX.x_h1.split_found(HTTPX.x_h1.split(bs))
+  HTTP1.x_h1.split_found(HTTP1.x_h1.split(bs))
 
 # Host header of the RETIRED lane: the default port (80/443) is omitted.
 # The WSM wire always renders host:port (the H1 renderer owns the Host,
@@ -659,9 +663,9 @@ def ws_host_port(+host: String, +port: U32) -> String:
 # Frame codec (pure): parse and render both ways, mask, message layer,
 # strict UTF-8, close-code rules, fragment reassembly, incremental split.
 # Ported from the old lane and adapted: WST.* gone (own types above),
-# H1.h1_encode/decode is HTTPX.x_utf8_encode/decode, SHA1.bytes_of_word is
-# HTTPX.x_be32, SHA1.word_of4 is wsm_word_of4, UTILS.len_upto is
-# HTTPX.x_len_upto, and the split answer is HTTPX.UnitOut.
+# H1.h1_encode/decode is HTTP.x_utf8_encode/decode, SHA1.bytes_of_word is
+# HTTP.x_be32, SHA1.word_of4 is wsm_word_of4, UTILS.len_upto is
+# HTTP.x_len_upto, and the split answer is HTTP.UnitOut.
 # ---------------------------------------------------------------------
 
 def wsm_op_text() -> U32:
@@ -869,7 +873,7 @@ def wsm_close_ev(+pay: List<&2, U32>) -> WSEv:
 # Control frames never reach this fold; the loops emit them at once.
 
 def wsm_frag_capped(+buf: List<&2, U32>) -> Bool:
-  U32.is_le(HTTPX.x_len32(buf), wsm_max_payload())
+  U32.is_le(HTTP.x_len32(buf), wsm_max_payload())
 
 def wsm_frag_text.go(+buf: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, WSMessage>:
   match ok:
@@ -914,7 +918,7 @@ def wsm_frag_single(+op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U32 & Strin
 def wsm_frag_begin.go(+op: U32, +pay: List<&2, U32>, ok: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match ok:
     case True{}:
-      Done{(FragOpen{op, HTTPX.x_cat(pay)}, None{})}
+      Done{(FragOpen{op, HTTP.x_cat(pay)}, None{})}
     case False{}:
       Fail{(413, "fragment too large")}
 
@@ -941,7 +945,7 @@ def wsm_frag_open(fin: Bool, +op: U32, +pay: List<&2, U32>) -> Result<&1, &1, U3
 def wsm_frag_last(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match fin:
     case True{}:
-      wsm_frag_single_msg(op0, HTTPX.x_cat(grown))
+      wsm_frag_single_msg(op0, HTTP.x_cat(grown))
     case False{}:
       Done{(FragOpen{op0, grown}, None{})}
 
@@ -956,7 +960,7 @@ def wsm_frag_cont.go(fin: Bool, +op0: U32, +grown: List<&2, U32>) -> Result<&1, 
   wsm_frag_cont2(fin, op0, grown, wsm_frag_capped(grown))
 
 def wsm_frag_cont(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
-  wsm_frag_cont.go(fin, op0, HTTPX.x_rev_push(pay, buf))
+  wsm_frag_cont.go(fin, op0, HTTP.x_rev_push(pay, buf))
 
 def wsm_frag_got.go(fin: Bool, +op0: U32, +buf: List<&2, U32>, +pay: List<&2, U32>, is_cont: Bool) -> Result<&1, &1, U32 & String, MsgAcc & Maybe<&2, WSMessage>>:
   match is_cont:
@@ -1044,7 +1048,7 @@ def wsm_unmask_byte(+b: U32, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32) -
 def wsm_unmask.go(bs: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, pos: U32, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
-      HTTPX.x_cat(acc)
+      HTTP.x_cat(acc)
     case b <> rest:
       match pos:
         case 0:
@@ -1117,8 +1121,8 @@ def wsm_payload_ok(rsv_ok: Bool, +op: U32, fin: Bool, +len: U32, len_ok: Bool, c
   Bool.and(rsv_ok, Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), Bool.and(len_ok, cap_ok))))
 
 def wsm_frame_payload(+fin: Bool, rsv_ok: Bool, +op: U32, +len: U32, +k0: U32, +k1: U32, +k2: U32, +k3: U32, +rest: List<&2, U32>) -> Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>>:
-  +taken = HTTPX.x_take32(len, rest)
-  +len_ok = U32.is_eq(HTTPX.x_len32(rest), len)
+  +taken = HTTP.x_take32(len, rest)
+  +len_ok = U32.is_eq(HTTP.x_len32(rest), len)
   +cap_ok = U32.is_le(len, wsm_max_payload())
   +unmasked = wsm_unmask(taken, k0, k1, k2, k3, 0)
   +ok = wsm_payload_ok(rsv_ok, op, fin, len, len_ok, cap_ok)
@@ -1247,7 +1251,7 @@ def wsm_read_frame_unmasked(bs: List<&2, U32>) -> Result<&1, &1, U32 & String, B
 # payload) under the same rules as wsm_read_frame (RSV/opcode/control
 # and the 16MB cap); short headers Fail "short ...", invalid ones
 # Fail 400/413. wsm_frame_split(bs) never fails soft data: it answers
-# HTTPX.UnitOut with NeedMore and the real missing count while the bytes
+# HTTP.UnitOut with NeedMore and the real missing count while the bytes
 # fall short, Got with the frame plus the exact rest once complete, Bad
 # on invalid headers. The unmasked twins serve the client side, like
 # wsm_read_frame_unmasked. A partial frame is never materialized: the
@@ -1410,43 +1414,43 @@ def wsm_frame_take.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&
 def wsm_frame_take(+bs: List<&2, U32>, +total: U32) -> List<&2, U32> & List<&2, U32>:
   wsm_frame_take.go(bs, U32.to_nat(total), Nil{})
 
-def wsm_frame_take.got(p: List<&2, U32> & List<&2, U32>) -> HTTPX.UnitOut:
+def wsm_frame_take.got(p: List<&2, U32> & List<&2, U32>) -> HTTP.UnitOut:
   match p:
     case (acc, rest):
-      HTTPX.Got{HTTPX.x_cat(acc), False{}, rest}
+      HTTP.Got{HTTP.x_cat(acc), False{}, rest}
 
-def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> HTTPX.UnitOut:
+def wsm_frame_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) -> HTTP.UnitOut:
   match eq:
     case True{}:
       wsm_frame_take.got(wsm_frame_take(bs, total))
     case False{}:
-      HTTPX.NeedMore{missing, bs}
+      HTTP.NeedMore{missing, bs}
 
-def wsm_frame_split_got(+bs: List<&2, U32>, +total: U32) -> HTTPX.UnitOut:
-  +got = HTTPX.x_len_upto(total, bs)
+def wsm_frame_split_got(+bs: List<&2, U32>, +total: U32) -> HTTP.UnitOut:
+  +got = HTTP.x_len_upto(total, bs)
   wsm_frame_got_go(bs, total, U32.is_eq(got, total), U32.sub(total, got))
 
-def wsm_frame_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) -> HTTPX.UnitOut:
+def wsm_frame_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) -> HTTP.UnitOut:
   match need:
     case Fail{(c, e)}:
-      HTTPX.Bad{c, e}
+      HTTP.Bad{c, e}
     case Done{total}:
       wsm_frame_split_got(bs, total)
 
-def wsm_frame_split_hd(+bs: List<&2, U32>, unmasked_ok: Bool, missing: U32) -> HTTPX.UnitOut:
+def wsm_frame_split_hd(+bs: List<&2, U32>, unmasked_ok: Bool, missing: U32) -> HTTP.UnitOut:
   match missing:
     case 0:
       wsm_frame_split_res(bs, wsm_frame_need_go(bs, unmasked_ok))
     case _:
-      HTTPX.NeedMore{missing, bs}
+      HTTP.NeedMore{missing, bs}
 
-def wsm_frame_split_go(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
-  wsm_frame_split_hd(bs, unmasked_ok, wsm_frame_hdr_go(bs, HTTPX.x_len_upto(10, bs)))
+def wsm_frame_split_go(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTP.UnitOut:
+  wsm_frame_split_hd(bs, unmasked_ok, wsm_frame_hdr_go(bs, HTTP.x_len_upto(10, bs)))
 
-def wsm_frame_split(bs: List<&2, U32>) -> HTTPX.UnitOut:
+def wsm_frame_split(bs: List<&2, U32>) -> HTTP.UnitOut:
   wsm_frame_split_go(bs, False{})
 
-def wsm_frame_split_unmasked(bs: List<&2, U32>) -> HTTPX.UnitOut:
+def wsm_frame_split_unmasked(bs: List<&2, U32>) -> HTTP.UnitOut:
   wsm_frame_split_go(bs, True{})
 
 def wsm_show_b0(fin: Bool, +op: U32) -> U32:
@@ -1459,7 +1463,7 @@ def wsm_show_med(fin: Bool, +op: U32, +len: U32, +payload: List<&2, U32>) -> Lis
   List.append(&2, U32, [wsm_show_b0(fin, op), 126, U32.div(len, 256), U32.mod(len, 256)], payload)
 
 def wsm_show_big(fin: Bool, +op: U32, +len: U32, +payload: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, List.append(&2, U32, [wsm_show_b0(fin, op), 127, 0, 0, 0, 0], HTTPX.x_be32(len)), payload)
+  List.append(&2, U32, List.append(&2, U32, [wsm_show_b0(fin, op), 127, 0, 0, 0, 0], HTTP.x_be32(len)), payload)
 
 def wsm_show_head.go(fin: Bool, +op: U32, +len: U32, +payload: List<&2, U32>, is_small: Bool, is_med: Bool) -> List<&2, U32>:
   match is_small is_med:
@@ -1480,7 +1484,7 @@ def wsm_show_go(ok: Bool, code: U32, fin: Bool, +op: U32, +payload: List<&2, U32
       Fail{(code, "bad show")}
 
 def wsm_show_frame(+fin: Bool, +op: U32, +payload: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  +len = HTTPX.x_len32(payload)
+  +len = HTTP.x_len32(payload)
   +ok = Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), U32.is_le(len, wsm_max_payload())))
   +code = Bool.pick(U32, Bool.not(U32.is_le(len, wsm_max_payload())), 413, 400)
   wsm_show_go(ok, code, fin, op, payload, len)
@@ -1492,7 +1496,7 @@ def wsm_show_masked_med(+fin: Bool, +op: U32, +len: U32, +masked: List<&2, U32>,
   List.append(&2, U32, [wsm_show_b0(fin, op), 254, U32.div(len, 256), U32.mod(len, 256), k0, k1, k2, k3], masked)
 
 def wsm_show_masked_big(+fin: Bool, +op: U32, +len: U32, +masked: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32) -> List<&2, U32>:
-  List.append(&2, U32, List.append(&2, U32, List.append(&2, U32, [wsm_show_b0(fin, op), 255, 0, 0, 0, 0], HTTPX.x_be32(len)), [k0, k1, k2, k3]), masked)
+  List.append(&2, U32, List.append(&2, U32, List.append(&2, U32, [wsm_show_b0(fin, op), 255, 0, 0, 0, 0], HTTP.x_be32(len)), [k0, k1, k2, k3]), masked)
 
 def wsm_show_masked_head.go(fin: Bool, +op: U32, +len: U32, +masked: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, is_small: Bool, is_med: Bool) -> List<&2, U32>:
   match is_small is_med:
@@ -1508,13 +1512,13 @@ def wsm_show_masked_head.go(fin: Bool, +op: U32, +len: U32, +masked: List<&2, U3
 def wsm_show_masked.go(fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32, ok: Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
   match ok:
     case True{}:
-      +len = HTTPX.x_len32(payload)
+      +len = HTTP.x_len32(payload)
       Done{wsm_show_masked_head.go(fin, op, len, wsm_unmask(payload, k0, k1, k2, k3, 0), k0, k1, k2, k3, U32.is_le(len, 125), U32.is_le(len, 65535))}
     case False{}:
       Fail{(400, "bad masked")}
 
 def wsm_show_masked(+fin: Bool, +op: U32, +payload: List<&2, U32>, +k0: U32, +k1: U32, +k2: U32, +k3: U32) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  +len = HTTPX.x_len32(payload)
+  +len = HTTP.x_len32(payload)
   wsm_show_masked.go(fin, op, payload, k0, k1, k2, k3, Bool.and(wsm_is_op_ok(op), Bool.and(wsm_ctrl_ok(op, fin, len), U32.is_le(len, wsm_max_payload()))))
 
 def wsm_mask_key.go(a: Result<&1, &1, U32 & String, U32>, b: Result<&1, &1, U32 & String, U32>) ->
@@ -1584,7 +1588,7 @@ def wsm_recv_in_of(+fin: Bool, +op: U32, +pay: List<&2, U32>) -> WSIn:
   wsm_recv_pick(wsm_msg_of_frame(fin, op, pay), fin, op, pay)
 
 def wsm_eq_bytes(a: List<&2, U32>, b: List<&2, U32>) -> Bool:
-  U32.is_eq(HTTPX.x_eq(a, b), 1)
+  U32.is_eq(HTTP.x_eq(a, b), 1)
 
 # One-shot echo policy (serve_once only; a persistent session runs
 # wsm_loop, which reassembles fragments and answers ping via
@@ -1721,7 +1725,7 @@ def wsm_split_got(s: Socket, +frame: List<&2, U32>, +rest: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>, (s, Done{(frame, rest)}))
 
-def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
+def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> HTTP.UnitOut:
   match unmasked_ok:
     case True{}:
       wsm_frame_split_unmasked(buf)
@@ -1748,7 +1752,7 @@ def wsm_cat_chunks(+cs: List<&2, List<&2, U32>>, acc: List<&2, U32>) -> List<&2,
 # still missing, so the completion test is a match on a U32 param instead
 # of a re-walk of the buffer.
 @unsafe
-def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +chunks: List<&2, List<&2, U32>>, +need: U32, +unmasked_ok: Bool, +sp: HTTPX.UnitOut) ->
+def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), st: U32, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +chunks: List<&2, List<&2, U32>>, +need: U32, +unmasked_ok: Bool, +sp: HTTP.UnitOut) ->
   IO(Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>):
   match st:
     case 0:
@@ -1777,22 +1781,22 @@ def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
             case Nil{}:
               wsm_split_fail(s2, 400, "eof")
             case _ <> _:
-              wsm_fill(~recv, 0, (s2, Done{Nil{}}), bs <> chunks, U32.sub(need, HTTPX.x_len_upto(need, bs)), unmasked_ok, sp)
+              wsm_fill(~recv, 0, (s2, Done{Nil{}}), bs <> chunks, U32.sub(need, HTTP.x_len_upto(need, bs)), unmasked_ok, sp)
     case 2:
       # Split answer: a whole frame answers now; NeedMore starts the
       # accumulate loop with the buffer that was split as the oldest
       # chunk (both NeedMore arms carry the whole buffer).
       (s3, r3) = m
       match sp:
-        case HTTPX.NeedMore{missing, rest}:
+        case HTTP.NeedMore{missing, rest}:
           do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>>:
             m3 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s3, 8192)
             wsm_fill(~recv, 1, m3, rest <> Nil{}, missing, unmasked_ok, sp)
-        case HTTPX.Got{unit, fin, rest}:
+        case HTTP.Got{unit, fin, rest}:
           wsm_split_got(s3, unit, rest)
-        case HTTPX.End{rest}:
+        case HTTP.End{rest}:
           wsm_split_fail(s3, 400, "impossible")
-        case HTTPX.Bad{code, msg}:
+        case HTTP.Bad{code, msg}:
           wsm_split_fail(s3, code, msg)
     case _:
       (s4, r4) = m
@@ -2026,36 +2030,36 @@ def wsm_session_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & St
 # or 400 (the lane rejoins/closes normally). The session loop never
 # sees a bad handshake.
 
-def wsm_srv_h.go(+m: String, vr: Result<&1, &1, U32 & String, String>) -> IO(HTTPX.Response):
+def wsm_srv_h.go(+m: String, vr: Result<&1, &1, U32 & String, String>) -> IO(HTTP.Response):
   match vr:
     case Fail{e}:
-      IO.pure(HTTPX.Response, HTTPX.Response{400, Nil{}, Nil{}})
+      IO.pure(HTTP.Response, HTTP.Response{400, Nil{}, Nil{}})
     case Done{+key}:
-      IO.pure(HTTPX.Response, HTTPX.Response{101, wsm_accept_hdrs(wsm_accept_of(key)), Nil{}})
+      IO.pure(HTTP.Response, HTTP.Response{101, wsm_accept_hdrs(wsm_accept_of(key)), Nil{}})
 
-def wsm_srv_h(req: HTTPX.Request) -> IO(HTTPX.Response):
+def wsm_srv_h(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, path, headers, body}:
+    case HTTP.Request{+method, path, headers, body}:
       wsm_srv_h.go(method, wsm_validate(method, headers))
 
-def wsm_srv_h_sub.pick(+key: String, picked: Maybe<&2, String>) -> IO(HTTPX.Response):
+def wsm_srv_h_sub.pick(+key: String, picked: Maybe<&2, String>) -> IO(HTTP.Response):
   match picked:
     case None{}:
-      IO.pure(HTTPX.Response, HTTPX.Response{101, wsm_accept_hdrs(wsm_accept_of(key)), Nil{}})
+      IO.pure(HTTP.Response, HTTP.Response{101, wsm_accept_hdrs(wsm_accept_of(key)), Nil{}})
     case Some{+p}:
-      IO.pure(HTTPX.Response, HTTPX.Response{101, wsm_accept_hdrs_sub(wsm_accept_of(key), p), Nil{}})
+      IO.pure(HTTP.Response, HTTP.Response{101, wsm_accept_hdrs_sub(wsm_accept_of(key), p), Nil{}})
 
-def wsm_srv_h_sub.go(+m: String, vr: Result<&1, &1, U32 & String, String & Maybe<&2, String>>) -> IO(HTTPX.Response):
+def wsm_srv_h_sub.go(+m: String, vr: Result<&1, &1, U32 & String, String & Maybe<&2, String>>) -> IO(HTTP.Response):
   match vr:
     case Fail{e}:
-      IO.pure(HTTPX.Response, HTTPX.Response{400, Nil{}, Nil{}})
+      IO.pure(HTTP.Response, HTTP.Response{400, Nil{}, Nil{}})
     case Done{pr}:
       (key, picked) = pr
       wsm_srv_h_sub.pick(key, picked)
 
-def wsm_srv_h_sub(req: HTTPX.Request, +wanted: List<&2, String>) -> IO(HTTPX.Response):
+def wsm_srv_h_sub(req: HTTP.Request, +wanted: List<&2, String>) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, path, headers, body}:
+    case HTTP.Request{+method, path, headers, body}:
       wsm_srv_h_sub.go(method, wsm_validate_sub(method, headers, wanted))
 
 # One-shot echo frame policy for serve_once: read one frame (rest-seeded,
@@ -2107,14 +2111,14 @@ def wsm_serve_once_k_plain(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   wsm_echo_one(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, rest)
 
 def serve_once(sock: Socket) -> IO(Unit):
-  HTTPX.x_h1.srv.head_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, ~wsm_serve_once_k, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+  HTTP1.x_h1.srv.head_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, ~wsm_serve_once_k, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
 
 def serve_once_plain(sock: Socket) -> IO(Unit):
-  HTTPX.x_h1.srv.head_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, ~wsm_serve_once_k_plain, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+  HTTP1.x_h1.srv.head_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, ~wsm_serve_once_k_plain, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
 
 # Cleartext echo accept loop (TASK-036 Phase 1): one serve_once_plain per
 # accepted socket, no handler to write. Reuse: the body already exists
-# above; Fail keeps the listener alive like HTTPX.h1_conn, never dies.
+# above; Fail keeps the listener alive like HTTP1.h1_conn, never dies.
 def ws_conn(m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
   (l, r) = m
   match r:
@@ -2171,7 +2175,7 @@ def wsm_client_checked(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
         out : WSOut <- H(EvError{400, "bad handshake"})
         close(sock)
 
-def wsm_client_validated(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: WSEv -> IO(WSOut), r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>, +key: String) -> IO(Unit):
+def wsm_client_validated(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: WSEv -> IO(WSOut), r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, +key: String) -> IO(Unit):
   match r:
     case Fail{e}:
       (code, msg) = e
@@ -2181,7 +2185,7 @@ def wsm_client_validated(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 
     case Done{t}:
       (sock, resp, rest) = t
       match resp:
-        case HTTPX.Response{status, headers, body}:
+        case HTTP.Response{status, headers, body}:
           wsm_client_checked(~recv, ~send, ~close, ~H, sock, rest, wsm_client_ok(status, headers, wsm_accept_of(key)))
 
 def wsm_client_checked_sub(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: WSEv -> IO(WSOut), sock: Socket, +rest: List<&2, U32>, +offered: List<&2, String>, ok: Bool) -> IO(Unit):
@@ -2193,7 +2197,7 @@ def wsm_client_checked_sub(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U3
         out : WSOut <- H(EvError{400, "bad handshake"})
         close(sock)
 
-def wsm_client_validated_sub(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: WSEv -> IO(WSOut), r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>, +key: String, +offered: List<&2, String>) -> IO(Unit):
+def wsm_client_validated_sub(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: WSEv -> IO(WSOut), r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, +key: String, +offered: List<&2, String>) -> IO(Unit):
   match r:
     case Fail{e}:
       (code, msg) = e
@@ -2203,40 +2207,40 @@ def wsm_client_validated_sub(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, 
     case Done{t}:
       (sock, resp, rest) = t
       match resp:
-        case HTTPX.Response{status, headers, body}:
+        case HTTP.Response{status, headers, body}:
           wsm_client_checked_sub(~recv, ~send, ~close, ~H, sock, rest, offered, wsm_client_ok_sub(status, headers, wsm_accept_of(key), offered))
 
-def wsm_client_tls(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, port: U32, +req: HTTPX.Request, +key: String) -> IO(Unit):
+def wsm_client_tls(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, port: U32, +req: HTTP.Request, +key: String) -> IO(Unit):
   match verify:
     case True{}:
       do IO<Unit>:
-        r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open(host, port, req)
+        r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open(host, port, req)
         wsm_client_validated(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, r, key)
     case False{}:
       do IO<Unit>:
-        r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open_insecure(host, port, req)
+        r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open_insecure(host, port, req)
         wsm_client_validated(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, r, key)
 
-def wsm_client_tls_sub(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, +port: U32, +req: HTTPX.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
+def wsm_client_tls_sub(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, +port: U32, +req: HTTP.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
   match verify:
     case True{}:
       do IO<Unit>:
-        r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open(host, port, req)
+        r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open(host, port, req)
         wsm_client_validated_sub(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, r, key, offered)
     case False{}:
       do IO<Unit>:
-        r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open_insecure(host, port, req)
+        r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open_insecure(host, port, req)
         wsm_client_validated_sub(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, r, key, offered)
 
-def wsm_client_plain_sock(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, port: U32, +req: HTTPX.Request, +key: String) -> IO(Unit):
+def wsm_client_plain_sock(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, port: U32, +req: HTTP.Request, +key: String) -> IO(Unit):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
+    case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
-        rw : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
         wsm_client_validated(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, rw, key)
 
-def wsm_client_plain_conn(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, +req: HTTPX.Request, +key: String) -> IO(Unit):
+def wsm_client_plain_conn(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, +req: HTTP.Request, +key: String) -> IO(Unit):
   match conn:
     case Fail{e}:
       (code, msg) = e
@@ -2246,20 +2250,20 @@ def wsm_client_plain_conn(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & Stri
     case Done{sock}:
       wsm_client_plain_sock(~H, sock, host, port, req, key)
 
-def wsm_client_plain(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +req: HTTPX.Request, +key: String) -> IO(Unit):
+def wsm_client_plain(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +req: HTTP.Request, +key: String) -> IO(Unit):
   do IO<Unit>:
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
     wsm_client_plain_conn(~H, conn, host, port, req, key)
 
-def wsm_client_plain_sock_sub(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, +port: U32, +req: HTTPX.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
+def wsm_client_plain_sock_sub(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, +port: U32, +req: HTTP.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
+    case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
-        rw : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
         wsm_client_validated_sub(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, rw, key, offered)
 
-def wsm_client_plain_conn_sub(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +req: HTTPX.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
+def wsm_client_plain_conn_sub(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +req: HTTP.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
   match conn:
     case Fail{e}:
       (code, msg) = e
@@ -2269,12 +2273,12 @@ def wsm_client_plain_conn_sub(~H: WSEv -> IO(WSOut), conn: Result<&1, &1, U32 & 
     case Done{sock}:
       wsm_client_plain_sock_sub(~H, sock, host, port, req, key, offered)
 
-def wsm_client_plain_sub(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +req: HTTPX.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
+def wsm_client_plain_sub(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +req: HTTP.Request, +key: String, +offered: List<&2, String>) -> IO(Unit):
   do IO<Unit>:
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect(host, port)
     wsm_client_plain_conn_sub(~H, conn, host, port, req, key, offered)
 
-def wsm_client_start(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTPX.Request>) -> IO(Unit):
+def wsm_client_start(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTP.Request>) -> IO(Unit):
   match req:
     case Fail{e}:
       (code, msg) = e
@@ -2284,7 +2288,7 @@ def wsm_client_start(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, port: U
     case Done{+rr}:
       wsm_client_tls(~H, verify, host, port, rr, key)
 
-def wsm_client_start_sub(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, +port: U32, +path: String, +key: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, HTTPX.Request>) -> IO(Unit):
+def wsm_client_start_sub(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, +port: U32, +path: String, +key: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, HTTP.Request>) -> IO(Unit):
   match req:
     case Fail{e}:
       (code, msg) = e
@@ -2294,7 +2298,7 @@ def wsm_client_start_sub(~H: WSEv -> IO(WSOut), verify: Bool, +host: String, +po
     case Done{+rr}:
       wsm_client_tls_sub(~H, verify, host, port, rr, key, offered)
 
-def wsm_client_start_plain(~H: WSEv -> IO(WSOut), +host: String, port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTPX.Request>) -> IO(Unit):
+def wsm_client_start_plain(~H: WSEv -> IO(WSOut), +host: String, port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTP.Request>) -> IO(Unit):
   match req:
     case Fail{e}:
       (code, msg) = e
@@ -2304,7 +2308,7 @@ def wsm_client_start_plain(~H: WSEv -> IO(WSOut), +host: String, port: U32, +pat
     case Done{+rr}:
       wsm_client_plain(~H, host, port, rr, key)
 
-def wsm_client_start_sub_plain(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +path: String, +key: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, HTTPX.Request>) -> IO(Unit):
+def wsm_client_start_sub_plain(~H: WSEv -> IO(WSOut), +host: String, +port: U32, +path: String, +key: String, +offered: List<&2, String>, req: Result<&1, &1, U32 & String, HTTP.Request>) -> IO(Unit):
   match req:
     case Fail{e}:
       (code, msg) = e
@@ -2418,7 +2422,7 @@ def wsm_client_echo_validated(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1,
     case True{}:
       wsm_client_echo_want(~recv, ~send, ~close, sock, rest, framed, want)
 
-def wsm_client_echo_opened(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_opened(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match r:
     case Fail{e}:
@@ -2426,19 +2430,19 @@ def wsm_client_echo_opened(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U3
     case Done{t}:
       (sock, resp, rest) = t
       match resp:
-        case HTTPX.Response{status, headers, body}:
+        case HTTP.Response{status, headers, body}:
           wsm_client_echo_validated(~recv, ~send, ~close, sock, rest, key, framed, want, wsm_client_ok(status, headers, wsm_accept_of(key)))
 
-def wsm_client_echo_tls_sock(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, port: U32, rr: HTTPX.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_tls_sock(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, port: U32, rr: HTTP.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match rr:
-    case HTTPX.Request{method, path, headers, body}:
+    case HTTP.Request{method, path, headers, body}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~recv, ~send, ~close, sock, host, port, method, path, headers, body)
-        rw : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~close, out)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~recv, ~send, ~close, sock, host, port, method, path, headers, body)
+        rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~close, out)
         wsm_client_echo_opened(~recv, ~send, ~close, rw, key, framed, want)
 
-def wsm_client_echo_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, rr: HTTPX.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, rr: HTTP.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match conn:
     case Fail{e}:
@@ -2446,7 +2450,7 @@ def wsm_client_echo_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 
     case Done{sock}:
       wsm_client_echo_tls_sock(~recv, ~send, ~close, sock, host, port, rr, key, framed, want)
 
-def wsm_client_echo_go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), +host: String, +port: U32, verify: Bool, rr: HTTPX.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), +host: String, +port: U32, verify: Bool, rr: HTTP.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match verify:
     case True{}:
@@ -2458,7 +2462,7 @@ def wsm_client_echo_go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & 
         conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure(host, port)
         wsm_client_echo_conn(~recv, ~send, ~close, conn, host, port, rr, key, framed, want)
 
-def wsm_client_echo_start(+host: String, port: U32, verify: Bool, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTPX.Request>, framed: Result<&1, &1, U32 & String, List<&2, U32>>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_start(+host: String, port: U32, verify: Bool, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTP.Request>, framed: Result<&1, &1, U32 & String, List<&2, U32>>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match req:
     case Fail{e}:
@@ -2470,16 +2474,16 @@ def wsm_client_echo_start(+host: String, port: U32, verify: Bool, +path: String,
         case Done{+fb}:
           wsm_client_echo_go(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, host, port, verify, rr, key, fb, want)
 
-def wsm_client_echo_plain_sock(sock: Socket, +host: String, port: U32, rr: HTTPX.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_plain_sock(sock: Socket, +host: String, port: U32, rr: HTTP.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match rr:
-    case HTTPX.Request{method, path, headers, body}:
+    case HTTP.Request{method, path, headers, body}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
-        rw : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, out)
         wsm_client_echo_opened(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, rw, key, framed, want)
 
-def wsm_client_echo_plain_conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, rr: HTTPX.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_plain_conn(conn: Result<&1, &1, U32 & String, Socket>, +host: String, port: U32, rr: HTTP.Request, +key: String, +framed: List<&2, U32>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match conn:
     case Fail{e}:
@@ -2487,7 +2491,7 @@ def wsm_client_echo_plain_conn(conn: Result<&1, &1, U32 & String, Socket>, +host
     case Done{sock}:
       wsm_client_echo_plain_sock(sock, host, port, rr, key, framed, want)
 
-def wsm_client_echo_start_plain(+host: String, +port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTPX.Request>, framed: Result<&1, &1, U32 & String, List<&2, U32>>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
+def wsm_client_echo_start_plain(+host: String, +port: U32, +path: String, +key: String, req: Result<&1, &1, U32 & String, HTTP.Request>, framed: Result<&1, &1, U32 & String, List<&2, U32>>, want: Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Result<&1, &1, U32 & String, String>):
   match req:
     case Fail{e}:
