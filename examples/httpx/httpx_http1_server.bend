@@ -7,11 +7,12 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_echo(request: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(request: HTTP.Request) -> IO(HTTP.Response):
   match request:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def serve(listener: Listener) -> IO(Unit):
   do IO<Unit>:

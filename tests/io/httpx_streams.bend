@@ -6,6 +6,7 @@
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def body1() -> List<&2, U32>:
   [104, 101, 108, 108, 111]
@@ -13,10 +14,10 @@ def body1() -> List<&2, U32>:
 def body2() -> List<&2, U32>:
   [119, 111, 114, 108, 100, 33]
 
-def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h2_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -56,7 +57,7 @@ def client_score2(sock: Socket, body: List<&2, U32>, st_ok: U32, acc: U32) -> IO
     +eq : U32 = bytes_eq(body, body2())
     return (st_ok * eq * acc : U32)
 
-def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt) -> IO(U32):
+def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), HTTP.Response> & HTTP.CliSt) -> IO(U32):
   (s2, r, st2) = got
   match r:
     case Fail{e}:
@@ -65,12 +66,12 @@ def client_done2(acc: U32, got: Socket & Result<&1, &1, (U32 & String), HTTPX.Re
         return 0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           client_score2(s2, body, b2u(U32.is_eq(status, 200)), acc)
 
 # The port is threaded, never hardcoded: listen_any retries upwards from the
 # base, and client.request renders :authority from it.
-def client_second(acc: U32, +port: U32, got: Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt) -> IO(U32):
+def client_second(acc: U32, +port: U32, got: Socket & Result<&1, &1, (U32 & String), HTTP.Response> & HTTP.CliSt) -> IO(U32):
   (s2, r, st2) = got
   match r:
     case Fail{e}:
@@ -79,22 +80,22 @@ def client_second(acc: U32, +port: U32, got: Socket & Result<&1, &1, (U32 & Stri
         return 0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           do IO<U32>:
             +ok1 : U32 = (b2u(U32.is_eq(status, 200)) * bytes_eq(body, body1()) : U32)
-            got2 : Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt <-
-              HTTPX.client.request(s2, st2, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, body2()})
+            got2 : Socket & Result<&1, &1, (U32 & String), HTTP.Response> & HTTP.CliSt <-
+              HTTPX.client.request(s2, st2, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, body2()})
             client_done2((acc * ok1 : U32), got2)
 
-def client_conn(conn: Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
+def client_conn(conn: Result<&1, &1, (U32 & String), Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock, st) = value
       do IO<U32>:
-        got : Socket & Result<&1, &1, (U32 & String), HTTPX.Response> & HTTPX.CliSt <-
-          HTTPX.client.request(sock, st, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, body1()})
+        got : Socket & Result<&1, &1, (U32 & String), HTTP.Response> & HTTP.CliSt <-
+          HTTPX.client.request(sock, st, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, body1()})
         client_second(1, port, got)
 
 law client:
@@ -103,7 +104,7 @@ law client:
 
 def client(port):
   do IO<U32>:
-    conn : Result<&1, &1, (U32 & String), Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, (U32 & String), Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
     client_conn(conn, port)
 
 law listen_retry:

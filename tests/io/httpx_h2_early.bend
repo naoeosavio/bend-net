@@ -25,6 +25,8 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18561
@@ -75,7 +77,7 @@ def body_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       body_go(p, 46 <> acc)
 
 def body(+n: Nat) -> List<&2, U32>:
-  HTTPX.x_cat(body_go(n, Nil{}))
+  HTTP.x_cat(body_go(n, Nil{}))
 
 # Sends the body as SLICE-byte DATA frames, the record-sized slice the
 # library's own senders use: the interp's frame reader copies the buffer
@@ -104,17 +106,17 @@ def body_send(fuel: Nat, ph: U32, m: Socket & Result<&1, &1, U32 & String, Unit>
               IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s1, Fail{e}))
             case Done{u}:
               do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
-                sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s1, HTTPX.x_t_data(), 0, 1, HTTPX.x_take32(SLICE(), body))
-                body_send(p, 0, sent, HTTPX.x_drop32(SLICE(), body))
+                sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s1, HTTP2.x_t_data(), 0, 1, HTTP.x_take32(SLICE(), body))
+                body_send(p, 0, sent, HTTP.x_drop32(SLICE(), body))
 
 # Server: answer every head early. The body of the first request is
 # discarded by the loop, never handed to this handler.
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, Nil{}}}
-    case HTTPX.SrvReqData{slot, chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, Nil{}}}
+    case HTTP.SrvReqData{slot, chunk, fin}:
+      HTTP.Continue{}
 
 # Peer ledger: which of the four answers were seen, and how much
 # connection credit came back.
@@ -144,7 +146,7 @@ def bump_alive(acc: Acc) -> Acc:
 def bump_wu_ok(early: U32, rst: U32, wu: U32, alive: U32, +payload: List<&2, U32>, ok: Bool) -> Acc:
   match ok:
     case True{}:
-      Acc{early, rst, (wu + HTTPX.x_flow_wu_inc(payload) : U32), alive}
+      Acc{early, rst, (wu + HTTP2.x_flow_wu_inc(payload) : U32), alive}
     case False{}:
       Acc{early, rst, wu, alive}
 
@@ -154,7 +156,7 @@ def bump_wu_go(acc: Acc, +payload: List<&2, U32>, ok: Bool) -> Acc:
       bump_wu_ok(early, rst, wu, alive, payload, ok)
 
 def bump_wu(acc: Acc, +payload: List<&2, U32>) -> Acc:
-  bump_wu_go(acc, payload, HTTPX.x_wu_ok(payload))
+  bump_wu_go(acc, payload, HTTP2.x_wu_ok(payload))
 
 def score_of(acc: Acc) -> U32:
   match acc:
@@ -194,20 +196,20 @@ def act_of(+typ: U32, +sid: U32, +flags: U32) -> U32:
 
 # A send triple becomes the seed the read loop starts from: a failed
 # write stops the run with the code the TLS lane reported.
-def sent_seed(m: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
+def sent_seed(m: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTP.Got:
   (s, r) = m
   match r:
     case Fail{(code, msg)}:
-      (s, HTTPX.GotErr{code, msg})
+      (s, HTTP.GotErr{code, msg})
     case Done{u}:
-      (s, HTTPX.GotErr{0, "next"})
+      (s, HTTP.GotErr{0, "next"})
 
 # The stop leaves: score with or without the second response seen.
-def stop_at(got: Socket & HTTPX.Got, acc: Acc) -> Socket & U32:
+def stop_at(got: Socket & HTTP.Got, acc: Acc) -> Socket & U32:
   (s, g) = got
   (s, score_of(acc))
 
-def stop_alive(got: Socket & HTTPX.Got, acc: Acc) -> Socket & U32:
+def stop_alive(got: Socket & HTTP.Got, acc: Acc) -> Socket & U32:
   (s, g) = got
   (s, score_alive(acc))
 
@@ -217,7 +219,7 @@ def stop_alive(got: Socket & HTTPX.Got, acc: Acc) -> Socket & U32:
 # stop, 5 reset, 6 credit, 7 PING ACK, 0/other keep reading) can hop
 # freely. Every phase body is a single term; the IO leaves never call
 # back into the loop.
-def coll(fuel: Nat, ph: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, acc: Acc) -> IO(Socket & U32):
+def coll(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, acc: Acc) -> IO(Socket & U32):
   match fuel:
     case 0n:
       IO.pure(Socket & U32, stop_at(got, acc))
@@ -226,54 +228,54 @@ def coll(fuel: Nat, ph: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, acc: 
         case 0:
           (s0, g0) = got
           do IO<Socket & U32>:
-            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s0, buf)
+            got2 : Socket & HTTP.Got <- HTTP2.x_read_frame(s0, buf)
             coll(p, 1, got2, buf, acc)
         case 1:
           (s1, g1) = got
           match g1:
-            case HTTPX.GotErr{code, msg}:
+            case HTTP.GotErr{code, msg}:
               IO.pure(Socket & U32, stop_at(got, acc))
-            case HTTPX.GotOk{+frame, +buf2}:
+            case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTPX.Frame{+typ, +flags, +sid, +payload}:
-                  coll(p, act_of(typ, sid, flags), (s1, HTTPX.GotOk{frame, buf2}), buf2, acc)
+                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                  coll(p, act_of(typ, sid, flags), (s1, HTTP.GotOk{frame, buf2}), buf2, acc)
         case 2:
           (s2, g2) = got
           do IO<Socket & U32>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s2, HTTPX.x_t_settings(), HTTPX.x_f_ack(), 0, Nil{})
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s2, HTTP2.x_t_settings(), HTTP2.x_f_ack(), 0, Nil{})
             coll(p, 0, sent_seed(sent), buf, acc)
         case 3:
           (s3, g3) = got
-          coll(p, 0, (s3, HTTPX.GotErr{0, "next"}), buf, bump_early(acc))
+          coll(p, 0, (s3, HTTP.GotErr{0, "next"}), buf, bump_early(acc))
         case 4:
           (s4, g4) = got
           IO.pure(Socket & U32, stop_alive(got, acc))
         case 5:
           (s5, g5) = got
-          coll(p, 0, (s5, HTTPX.GotErr{0, "next"}), buf, bump_rst(acc))
+          coll(p, 0, (s5, HTTP.GotErr{0, "next"}), buf, bump_rst(acc))
         case 6:
           (s6, g6) = got
           match g6:
-            case HTTPX.GotErr{code, msg}:
+            case HTTP.GotErr{code, msg}:
               IO.pure(Socket & U32, stop_at(got, acc))
-            case HTTPX.GotOk{+frame, +buf6}:
+            case HTTP.GotOk{+frame, +buf6}:
               match frame:
-                case HTTPX.Frame{+typ6, +flags6, +sid6, +payload6}:
-                  coll(p, 0, (s6, HTTPX.GotErr{0, "next"}), buf6, bump_wu(acc, payload6))
+                case HTTP.Frame{+typ6, +flags6, +sid6, +payload6}:
+                  coll(p, 0, (s6, HTTP.GotErr{0, "next"}), buf6, bump_wu(acc, payload6))
         case 7:
           (s7, g7) = got
           match g7:
-            case HTTPX.GotErr{code, msg}:
+            case HTTP.GotErr{code, msg}:
               IO.pure(Socket & U32, stop_at(got, acc))
-            case HTTPX.GotOk{+frame, +buf7}:
+            case HTTP.GotOk{+frame, +buf7}:
               match frame:
-                case HTTPX.Frame{+typ7, +flags7, +sid7, +payload7}:
+                case HTTP.Frame{+typ7, +flags7, +sid7, +payload7}:
                   do IO<Socket & U32>:
-                    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s7, HTTPX.x_t_ping(), HTTPX.x_f_ack(), 0, payload7)
+                    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s7, HTTP2.x_t_ping(), HTTP2.x_f_ack(), 0, payload7)
                     coll(p, 0, sent_seed(sent), buf7, acc)
         case _:
           (s9, g9) = got
-          coll(p, 0, (s9, HTTPX.GotErr{0, "next"}), buf, acc)
+          coll(p, 0, (s9, HTTP.GotErr{0, "next"}), buf, acc)
 
 def peer_done(m: Socket & U32) -> IO(U32):
   (s, +score) = m
@@ -291,7 +293,7 @@ def peer_h3_sent(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
       peer_done((s, 0))
     case Done{u}:
       do IO<U32>:
-        got : Socket & HTTPX.Got <- HTTPX.x_read_frame(s, Nil{})
+        got : Socket & HTTP.Got <- HTTP2.x_read_frame(s, Nil{})
         res : Socket & U32 <- coll(FUEL(), 1, got, Nil{}, acc0())
         peer_done(res)
 
@@ -305,7 +307,7 @@ def peer_body_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +port: U32) -
       peer_done((s, 0))
     case Done{u}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), (HTTPX.x_f_end_headers() + HTTPX.x_f_end_stream() : U32), 3, HTTPX.client.on.req_block(HOST(), port, "GET", SECOND_PATH(), Nil{}))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 3, HTTP2.client.on.req_block(HOST(), port, "GET", SECOND_PATH(), Nil{}))
         peer_h3_sent(sent)
 
 # First request head is out: send the whole window of body.
@@ -321,10 +323,10 @@ def peer_head_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +port: U32) -
 
 def peer_start(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(sock, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, HTTPX.client.on.req_block(HOST(), port, "POST", FIRST_PATH(), Nil{}))
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.client.on.req_block(HOST(), port, "POST", FIRST_PATH(), Nil{}))
     peer_head_sent(sent, port)
 
-def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
+def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
@@ -334,7 +336,7 @@ def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure(HOST(), port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure(HOST(), port)
     peer_conn(conn, port)
 
 def server_side(l: Listener) -> IO(String):

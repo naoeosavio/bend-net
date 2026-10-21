@@ -6,11 +6,12 @@
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -20,15 +21,15 @@ def b2u(b: Bool) -> U32:
       0
 
 def is_want(+body: List<&2, U32>) -> Bool:
-  Bool.or(Bool.or(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-0")), 1), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-1")), 1)), Bool.or(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-2")), 1), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-3")), 1)))
+  Bool.or(Bool.or(U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-0")), 1), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-1")), 1)), Bool.or(U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-2")), 1), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-3")), 1)))
 
-def h(resp: HTTPX.Response) -> U32:
+def h(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200), is_want(body)))
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-3")}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-3")}]
 
 def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
   match r:

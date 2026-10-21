@@ -39,6 +39,8 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -47,8 +49,8 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def hdr(n: String, v: String) -> HTTPX.Hdr:
-  HTTPX.Hdr{n, v}
+def hdr(n: String, v: String) -> HTTP.Hdr:
+  HTTP.Hdr{n, v}
 
 # fail_code(r, want): 1 iff r is Fail with the wanted code.
 def fail_code(r: Result<&1, &1, U32 & String, List<&2, U32>>, +want: U32) ->
@@ -60,7 +62,7 @@ def fail_code(r: Result<&1, &1, U32 & String, List<&2, U32>>, +want: U32) ->
       0
 
 # fail_code_req(r, want): the same check over a Response result.
-def fail_code_req(r: Result<&1, &1, U32 & String, HTTPX.Response>, +want: U32) ->
+def fail_code_req(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: U32) ->
   U32:
   match r:
     case Fail{(c, e)}:
@@ -75,32 +77,32 @@ def has_field(r: Result<&1, &1, U32 & String, List<&2, U32>>, +want: String) ->
     case Fail{e}:
       0
     case Done{+bs}:
-      b2u(String.contains(HTTPX.x_bytes_str(bs), want))
+      b2u(String.contains(HTTP.x_bytes_str(bs), want))
 
 # A CR/LF in the value would end the field after "x: a" and the peer would
 # read "Injected: 1" as a header of its own.
 def v_value_crlf() -> U32:
-  fail_code(HTTPX.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
+  fail_code(HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
     [hdr("x", "a\r\nInjected: 1")], Nil{}), 400)
 
 # The name side splits the same way, one field earlier.
 def v_name_crlf() -> U32:
-  fail_code(HTTPX.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
+  fail_code(HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
     [hdr("x\r\nInjected: 1", "a")], Nil{}), 400)
 
 # NUL is not a line terminator, but it is the other character that makes
 # the field text unrenderable (the same predicate valid_host uses).
 def v_value_nul() -> U32:
-  fail_code(HTTPX.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
+  fail_code(HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
     [hdr("x", String.from_list([Chr{0}]))], Nil{}), 400)
 
 # The control: a space in a value is legal, and the field must come out
 # whole ("x-ok: gzip, deflate\r\n").
 def v_value_space_ok() -> U32:
-  has_field(HTTPX.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
+  has_field(HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", 80,
     [hdr("x-ok", "gzip, deflate")], Nil{}), "x-ok: gzip, deflate\r\n")
 
-def hdrs_none(hs: List<&2, HTTPX.Hdr>) -> Bool:
+def hdrs_none(hs: List<&2, HTTP.Hdr>) -> Bool:
   match hs:
     case Nil{}:
       True{}
@@ -110,27 +112,27 @@ def hdrs_none(hs: List<&2, HTTPX.Hdr>) -> Bool:
 # resp_is_500(resp): 1 iff the guard collapsed the response: 500, no
 # headers at all, no body. Nothing of what the handler asked to send is
 # left — not even the field that was fine.
-def resp_is_500(resp: HTTPX.Response) -> U32:
+def resp_is_500(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 500),
         Bool.and(hdrs_none(headers), List.is_empty(&2, U32, body))))
 
 # resp_kept(resp): 1 iff a renderable response came through untouched.
-def resp_kept(resp: HTTPX.Response) -> U32:
+def resp_kept(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200),
-        U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("keep")), 1)))
+        U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("keep")), 1)))
 
 def v_resp_bad() -> U32:
-  resp_is_500(HTTPX.x_h1.srv.safe_resp(
-    HTTPX.Response{200, [hdr("x-echo", "a\r\nInjected: 1")],
-      HTTPX.x_str_bytes("leak")}))
+  resp_is_500(HTTP1.x_h1.srv.safe_resp(
+    HTTP.Response{200, [hdr("x-echo", "a\r\nInjected: 1")],
+      HTTP.x_str_bytes("leak")}))
 
 def v_resp_ok() -> U32:
-  resp_kept(HTTPX.x_h1.srv.safe_resp(
-    HTTPX.Response{200, [hdr("x-ok", "1")], HTTPX.x_str_bytes("keep")}))
+  resp_kept(HTTP1.x_h1.srv.safe_resp(
+    HTTP.Response{200, [hdr("x-ok", "1")], HTTP.x_str_bytes("keep")}))
 
 def vectors() -> U32:
   (v_value_crlf() + v_name_crlf() + v_value_nul() + v_value_space_ok()
@@ -170,12 +172,12 @@ def listen_any(tries, port):
 # seen_go(hs, acc): True when the field the split would have produced
 # ("Injected: 1") is really there in the header list being looked at — the
 # request the handler was given, or the response the client parsed.
-def seen_go(+hs: List<&2, HTTPX.Hdr>, acc: Bool) -> Bool:
+def seen_go(+hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
   match hs:
     case Nil{}:
       acc
-    case HTTPX.Hdr{+n, +v} <> t:
-      +hit = Bool.and(HTTPX.x_h1.eq_ci(n, "injected"), String.eq(v, "1"))
+    case HTTP.Hdr{+n, +v} <> t:
+      +hit = Bool.and(HTTP1.x_h1.eq_ci(n, "injected"), String.eq(v, "1"))
       seen_go(t, Bool.or(acc, hit))
 
 def seen_text(is_injected: Bool) -> String:
@@ -189,28 +191,28 @@ def seen_text(is_injected: Bool) -> String:
 # parsed headers (never a body echo), so the response body is the witness
 # of what crossed the wire; /bad asks for the header that cannot be
 # rendered, which is Phase 3's trigger.
-def route_go(+headers: List<&2, HTTPX.Hdr>, is_bad: Bool) -> HTTPX.Response:
+def route_go(+headers: List<&2, HTTP.Hdr>, is_bad: Bool) -> HTTP.Response:
   match is_bad:
     case True{}:
-      HTTPX.Response{200, [hdr("x-echo", "a\r\nInjected: 1")],
-        HTTPX.x_str_bytes("leak")}
+      HTTP.Response{200, [hdr("x-echo", "a\r\nInjected: 1")],
+        HTTP.x_str_bytes("leak")}
     case False{}:
-      HTTPX.Response{200, Nil{},
-        HTTPX.x_str_bytes(seen_text(seen_go(headers, False{})))}
+      HTTP.Response{200, Nil{},
+        HTTP.x_str_bytes(seen_text(seen_go(headers, False{})))}
 
-def echo_service(req: HTTPX.Request) -> IO(HTTPX.Response):
+def echo_service(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, route_go(headers, String.eq(path, "/bad")))
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, route_go(headers, String.eq(path, "/bad")))
 
-def body_ok(resp: HTTPX.Response, +want: String) -> U32:
+def body_ok(resp: HTTP.Response, +want: String) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200),
-        U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
+        U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
 # ok_reply(r, want): 1 iff r is a 200 whose body is `want`.
-def ok_reply(r: Result<&1, &1, U32 & String, HTTPX.Response>, +want: String) ->
+def ok_reply(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: String) ->
   U32:
   match r:
     case Fail{e}:
@@ -222,14 +224,14 @@ def ok_reply(r: Result<&1, &1, U32 & String, HTTPX.Response>, +want: String) ->
 # injected field absent (the parser would have made one out of the split),
 # no body. Content-Length rides in the parsed headers, so only the injected
 # name is checked here, not emptiness.
-def reply_500.go(resp: HTTPX.Response) -> U32:
+def reply_500.go(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 500),
         Bool.and(Bool.not(seen_go(headers, False{})),
           List.is_empty(&2, U32, body))))
 
-def reply_500(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def reply_500(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
@@ -238,7 +240,7 @@ def reply_500(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 # The last step: score the guarded /bad answer and close. `ab` is the score
 # of the two exchanges that came before it on this same socket.
-def wire_done(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +ab: U32) ->
+def wire_done(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +ab: U32) ->
   IO(U32):
   (s3, r3) = out
   do IO<U32>:
@@ -246,32 +248,32 @@ def wire_done(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +ab: U
     cl : Unit <- Socket.close(s3)
     IO.pure(U32, (ab + c : U32))
 
-def wire_bad(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +a: U32, +port: U32) ->
+def wire_bad(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +a: U32, +port: U32) ->
   IO(U32):
   (s2, r2) = out
   do IO<U32>:
     +b : U32 = ok_reply(r2, "CLEAN")
-    out3 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s2, "127.0.0.1", port, "GET", "/bad", Nil{}, Nil{})
+    out3 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s2, "127.0.0.1", port, "GET", "/bad", Nil{}, Nil{})
     wire_done(out3, (a + b : U32))
 
 # The exchanges on one socket, in order. wire_go sends the bad-header
 # request; the pair comes back with the socket untouched (the render failed
 # before any byte), and wire_clean reuses that same socket for a clean
 # request, which is what only works if nothing was written.
-def wire_clean(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port: U32) ->
+def wire_clean(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port: U32) ->
   IO(U32):
   (s1, r1) = out
   do IO<U32>:
     +a : U32 = fail_code_req(r1, 400)
-    out2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("ho"))
+    out2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("ho"))
     wire_bad(out2, a, port)
 
 def wire_go(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    out1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", [hdr("x", "a\r\nInjected: 1")], HTTPX.x_str_bytes("hi"))
+    out1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", [hdr("x", "a\r\nInjected: 1")], HTTP.x_str_bytes("hi"))
     wire_clean(out1, port)
 
 def srv_side(l: Listener) -> IO(U32):

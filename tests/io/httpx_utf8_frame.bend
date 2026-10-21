@@ -3,7 +3,8 @@
 # roundtrip, ASCII identity, strict validator) and the x_h1.frame_of
 # carrier in its three shapes (length, chunked, absent).
 import Base
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -41,34 +42,34 @@ law chk_encode_multi:
   U32
 
 def chk_encode_multi():
-  eq_bytes(HTTPX.x_utf8_encode("é"), [195, 169])
+  eq_bytes(HTTP.x_utf8_encode("é"), [195, 169])
 
 # Multibyte decode roundtrips back to é.
 law chk_decode_multi:
   U32
 
 def chk_decode_multi():
-  b2u(String.eq(HTTPX.x_utf8_decode([195, 169]), "é"))
+  b2u(String.eq(HTTP.x_utf8_decode([195, 169]), "é"))
 
 # ASCII is identical through the UTF-8 lane.
 law chk_ascii:
   U32
 
 def chk_ascii():
-  (b2u(String.eq(HTTPX.x_utf8_decode([72, 105]), "Hi"))
-    * eq_bytes(HTTPX.x_utf8_encode("Hi"), [72, 105]) : U32)
+  (b2u(String.eq(HTTP.x_utf8_decode([72, 105]), "Hi"))
+    * eq_bytes(HTTP.x_utf8_encode("Hi"), [72, 105]) : U32)
 
 # Strict validator: valid passes, lone continuation and truncation fail.
 law chk_ok:
   U32
 
 def chk_ok():
-  (b2u(HTTPX.x_utf8_ok([72, 105]))
-    * b2u(Bool.not(HTTPX.x_utf8_ok([128])))
-    * b2u(Bool.not(HTTPX.x_utf8_ok([195]))) : U32)
+  (b2u(HTTP.x_utf8_ok([72, 105]))
+    * b2u(Bool.not(HTTP.x_utf8_ok([128])))
+    * b2u(Bool.not(HTTP.x_utf8_ok([195]))) : U32)
 
 law frame_is:
-  for f: HTTPX.BodyFrame
+  for f: HTTP.BodyFrame
   for cl: U32
   for ch: Bool
   for nb: Bool
@@ -76,7 +77,7 @@ law frame_is:
 
 def frame_is(f, cl, ch, nb):
   match f:
-    case HTTPX.BodyFrame{c, k, n}:
+    case HTTP.BodyFrame{c, k, n}:
       (b2u(U32.is_eq(c, cl)) * b2u(Cmp.is_eq(Bool.cmp(k, ch))) * b2u(Cmp.is_eq(Bool.cmp(n, nb))) : U32)
 
 # Length-delimited framing carries the Content-Length.
@@ -84,22 +85,22 @@ law chk_frame_cl:
   U32
 
 def chk_frame_cl():
-  frame_is(HTTPX.x_h1.frame_of([HTTPX.Hdr{"Content-Length", "5"}], "GET", 200), 5, False{}, False{})
+  frame_is(HTTP1.x_h1.frame_of([HTTP.Hdr{"Content-Length", "5"}], "GET", 200), 5, False{}, False{})
 
 # Chunked framing carries the flag, no length.
 law chk_frame_chunked:
   U32
 
 def chk_frame_chunked():
-  frame_is(HTTPX.x_h1.frame_of([HTTPX.Hdr{"Transfer-Encoding", "chunked"}], "POST", 200), 0, True{}, False{})
+  frame_is(HTTP1.x_h1.frame_of([HTTP.Hdr{"Transfer-Encoding", "chunked"}], "POST", 200), 0, True{}, False{})
 
 # HEAD and 204 carry no body at all.
 law chk_frame_nobody:
   U32
 
 def chk_frame_nobody():
-  (frame_is(HTTPX.x_h1.frame_of(Nil{}, "HEAD", 200), 0, False{}, True{})
-    * frame_is(HTTPX.x_h1.frame_of(Nil{}, "GET", 204), 0, False{}, True{}) : U32)
+  (frame_is(HTTP1.x_h1.frame_of(Nil{}, "HEAD", 200), 0, False{}, True{})
+    * frame_is(HTTP1.x_h1.frame_of(Nil{}, "GET", 204), 0, False{}, True{}) : U32)
 
 law main:
   U32

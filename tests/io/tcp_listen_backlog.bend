@@ -12,6 +12,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def CLIENTS() -> Nat:
   20n
@@ -30,10 +31,10 @@ def EADDRINUSE() -> U32:
 def WANT_FAIL_PATHS() -> U32:
   2
 
-def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h2_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:

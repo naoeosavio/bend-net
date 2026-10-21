@@ -1,16 +1,17 @@
 # lib (lib_httpx_server_on): the generic keep-alive HTTPS server.
 # server_on accepts on a TLS listener with IO.spawn per connection and
-# serves n sequential streams per connection (like HTTP.server_on but
+# serves n sequential streams per connection (like HTTPX.server.on but
 # over HTTP/2). Two clients connect one after the other, each POSTing
 # "hello"; both must echo. Golden 1.
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h2_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 law server_side:
   for l: Listener

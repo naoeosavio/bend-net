@@ -24,7 +24,7 @@
 # tests/io/wsm_frag_mixed.bend.
 import Base
 import ../../lib/wsm.bend as WSM
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -37,7 +37,7 @@ def u32_is(got: U32, want: U32) -> U32:
   b2u(U32.is_eq(got, want))
 
 def same(got: List<&2, U32>, want: List<&2, U32>) -> U32:
-  b2u(U32.is_eq(HTTPX.x_eq(got, want), 1))
+  b2u(U32.is_eq(HTTP.x_eq(got, want), 1))
 
 def text_is.go(r: Result<&1, &1, U32 & String, String>,
   want: String) -> U32:
@@ -191,19 +191,19 @@ def key_req() -> String:
 def accept_101() -> String:
   "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
 
-def upgrade_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"},
-    HTTPX.Hdr{"Connection", "Upgrade"},
-    HTTPX.Hdr{"Sec-WebSocket-Key", good_key()},
-    HTTPX.Hdr{"Sec-WebSocket-Version", "13"}]
+def upgrade_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"},
+    HTTP.Hdr{"Connection", "Upgrade"},
+    HTTP.Hdr{"Sec-WebSocket-Key", good_key()},
+    HTTP.Hdr{"Sec-WebSocket-Version", "13"}]
 
-def no_upgrade_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Connection", "Upgrade"},
-    HTTPX.Hdr{"Sec-WebSocket-Key", good_key()},
-    HTTPX.Hdr{"Sec-WebSocket-Version", "13"}]
+def no_upgrade_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Connection", "Upgrade"},
+    HTTP.Hdr{"Sec-WebSocket-Key", good_key()},
+    HTTP.Hdr{"Sec-WebSocket-Version", "13"}]
 
-def accept_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Sec-WebSocket-Accept", want_accept()}]
+def accept_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Sec-WebSocket-Accept", want_accept()}]
 
 # Section 1.3: the key, the byte-exact 101, the two refusals.
 def handshake_t() -> U32:

@@ -5,11 +5,12 @@
 # as the String "hello".
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_hello(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_hello(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_str_bytes("hello")})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, HTTP.x_str_bytes("hello")})
 
 def b2u(b: Bool) -> U32:
   match b:

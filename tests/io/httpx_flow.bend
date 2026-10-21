@@ -7,6 +7,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 # 25 KB = 25000 one-byte nodes (46); Nat countdown local to this test
 # (harness exception like listen_any: a U32 countdown without a list arg
@@ -21,10 +22,10 @@ def httpx_flow.body.go(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
 def httpx_flow.body() -> List<&2, U32>:
   httpx_flow.body.go(25000n, Nil{})
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def dbg_srv(n: U32) -> U32:
   n
@@ -44,12 +45,12 @@ def client_score(counts: U32 & Bool) -> U32:
   (total, ok) = counts
   b2u(Bool.and(U32.is_eq(total, 25000), Bool.not(ok)))
 
-def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+def h(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   match ev:
-    case HTTPX.StreamHead{head}:
-      HTTPX.StreamContinue{}
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamHead{head}:
+      HTTP.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
 def counts2(counts: U32 & U32) -> U32 & Bool:
   (total, fins) = counts

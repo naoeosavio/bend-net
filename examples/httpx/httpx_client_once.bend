@@ -6,6 +6,7 @@
 #        bend examples/httpx/httpx_client_once.bend
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def report_fail(label: String, c: U32, e: String) -> IO(Unit):
   do IO<Unit>:
@@ -34,16 +35,16 @@ def report_resp_after(is_200: Bool, +body: List<&2, U32>, +status: U32) -> IO(Un
     case True{}:
       do IO<Unit>:
         _ : Unit <- IO.print("OK STATUS")
-        report_echo(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello")), 1))
+        report_echo(U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello")), 1))
     case False{}:
       report_bad(status)
 
-def report_resp(resp: HTTPX.Response) -> IO(Unit):
+def report_resp(resp: HTTP.Response) -> IO(Unit):
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       report_resp_after(U32.is_eq(status, 200), body, status)
 
-def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
+def report(r: Result<&1, &1, U32 & String, HTTP.Response>) -> IO(Unit):
   match r:
     case Fail{(c, e)}:
       report_fail("POST", c, e)
@@ -53,5 +54,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     p : Unit <- IO.print("STEP dial")
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once_insecure("127.0.0.1", 19893, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTPX.client.once_insecure("127.0.0.1", 19893, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
     report(r)

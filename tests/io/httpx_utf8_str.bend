@@ -39,6 +39,7 @@
 # Golden 31.
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -78,17 +79,17 @@ def main() -> IO(U32):
     # Valid text with every sequence length: the baseline. Built with
     # x_utf8_encode (x_str_bytes is ASCII-only: raw char codes, not
     # UTF-8), so decode must roundtrip it byte-identically.
-    +small : List<&2, U32> = HTTPX.x_utf8_encode("aé漢ػb")
-    +s1 : U32 = b2u(String.eq(HTTPX.x_utf8_decode(small), "aé漢ػb"))
+    +small : List<&2, U32> = HTTP.x_utf8_encode("aé漢ػb")
+    +s1 : U32 = b2u(String.eq(HTTP.x_utf8_decode(small), "aé漢ػb"))
     w : Unit <- IO.print(U32.show(s1))
     # Invalid text: a lone continuation, a lead with nothing after it, and
     # a sequence truncated by the end. Each pair answers one U+FFFD.
-    +s2 : U32 = b2u(String.eq(HTTPX.x_utf8_decode(fill.go(7, Nil{}, 128)), want_fffd3()))
+    +s2 : U32 = b2u(String.eq(HTTP.x_utf8_decode(fill.go(7, Nil{}, 128)), want_fffd3()))
     x : Unit <- IO.print(U32.show(s2))
     # A 64 KB ASCII body: the legacy decoder dies here, x_utf8_decode
     # must not, and one byte is one character so the count is exact.
     +s4 : U32 = b2u(U32.is_eq(
-      U32.from_nat(String.length(HTTPX.x_utf8_decode(fill.go(65536, Nil{}, 97)))),
+      U32.from_nat(String.length(HTTP.x_utf8_decode(fill.go(65536, Nil{}, 97)))),
       65536))
     y : Unit <- IO.print(U32.show(s4))
     # 20 K 'é' -- 40 KB of two-byte sequences. The old decoder dies at
@@ -96,14 +97,14 @@ def main() -> IO(U32):
     # may turn into U+FFFD.
     +euro : List<&2, U32> = pair.go(20000, Nil{})
     +s8 : U32 = b2u(U32.is_eq(
-      U32.from_nat(String.length(HTTPX.x_utf8_decode(euro))), 20000))
+      U32.from_nat(String.length(HTTP.x_utf8_decode(euro))), 20000))
     z : Unit <- IO.print(U32.show(s8))
     # 64 KB of continuation bytes: invalid utf-8, and the body that no
     # "cut at a lead byte" rule can cut at all. What is pinned is that it
     # decodes instead of dying -- the count is the decoder's own (two
     # continuation bytes make one code point).
     +s16 : U32 = b2u(U32.is_eq(
-      U32.from_nat(String.length(HTTPX.x_utf8_decode(fill.go(65536, Nil{}, 128)))),
+      U32.from_nat(String.length(HTTP.x_utf8_decode(fill.go(65536, Nil{}, 128)))),
       32768))
     v : Unit <- IO.print(U32.show(s16))
     +total : U32 = (s1 + s2 * 2 + s4 * 4 + s8 * 8 + s16 * 16 : U32)

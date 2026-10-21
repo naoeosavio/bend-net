@@ -5,7 +5,7 @@
 # the echo. Both effects hand the socket back on every path.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/http1.bend as HTTP
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -25,7 +25,7 @@ law score:
 def score(r):
   match r:
     case Done{bs}:
-      b2u(String.eq(HTTP.to_string(bs), "hij"))
+      b2u(String.eq(HTTP.x_utf8_decode(bs), "hij"))
     case Fail{e}:
       0
 

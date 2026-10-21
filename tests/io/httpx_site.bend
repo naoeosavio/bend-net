@@ -24,6 +24,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/static.bend as Static
 
 # Named constants: the site root (relative to the repo root) and the read
@@ -75,49 +76,49 @@ def site_file(+path: String) -> String:
 
 # Headers of a served file: the lane stamps the length, the content type
 # comes from the extension.
-def site_headers(+path: String) -> List<&2, HTTPX.Hdr>:
-  HTTPX.Hdr{"content-type", Static.content_type(path)} <> Nil{}
+def site_headers(+path: String) -> List<&2, HTTP.Hdr>:
+  HTTP.Hdr{"content-type", Static.content_type(path)} <> Nil{}
 
-def site_error_headers() -> List<&2, HTTPX.Hdr>:
-  HTTPX.Hdr{"content-type", "text/html"} <> Nil{}
+def site_error_headers() -> List<&2, HTTP.Hdr>:
+  HTTP.Hdr{"content-type", "text/html"} <> Nil{}
 
 # The reader's codes (400 bad path, 404 missing, 413 too large) travel to
 # the client unchanged; the body is one readable line either way.
 def site_error_body() -> List<&2, U32>:
-  HTTPX.x_str_bytes("<h1>404 not found</h1>\n")
+  HTTP.x_str_bytes("<h1>404 not found</h1>\n")
 
 # The answer for a file whose bytes are known, as a pure def so the
 # handler's header choice can be scored without a socket (vectors 4/5).
 # `file` — never the request path — decides the content type: passing the
 # path here served "/" as application/octet-stream (task-040 D10).
-def site_response(+file: String, r: Result<&1, &1, U32 & String, List<&2, U32>>) -> HTTPX.Response:
+def site_response(+file: String, r: Result<&1, &1, U32 & String, List<&2, U32>>) -> HTTP.Response:
   match r:
     case Fail{(code, msg)}:
-      HTTPX.Response{code, site_error_headers(), site_error_body()}
+      HTTP.Response{code, site_error_headers(), site_error_body()}
     case Done{+body}:
-      HTTPX.Response{200, site_headers(file), body}
+      HTTP.Response{200, site_headers(file), body}
 
 # Mode 1/3 handler: IO is allowed, so the file is read per request. The
 # mapped name is bound once and used for both the read and the answer.
-def site_handler(req: HTTPX.Request) -> IO(HTTPX.Response):
+def site_handler(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, +path, headers, body}:
-      do IO<HTTPX.Response>:
+    case HTTP.Request{method, +path, headers, body}:
+      do IO<HTTP.Response>:
         +file : String = site_file(path)
         r : Result<&1, &1, U32 & String, List<&2, U32>> <- Static.read_bytes(SITE_ROOT(), file, SITE_CAP())
-        IO.pure(HTTPX.Response, site_response(file, r))
+        IO.pure(HTTP.Response, site_response(file, r))
 
 # Mode 2 pages. The streaming handler is pure (no IO) and `~H` is a
 # closed template (task-040 D1), so it serves literals carrying the same
 # markers the real files carry.
 def stream_missing() -> List<&2, U32>:
-  HTTPX.x_str_bytes("<h1>404 not found</h1>\n")
+  HTTP.x_str_bytes("<h1>404 not found</h1>\n")
 
 def stream_css() -> List<&2, U32>:
-  HTTPX.x_str_bytes("body { font-family: monospace; }\n")
+  HTTP.x_str_bytes("body { font-family: monospace; }\n")
 
 def stream_index() -> List<&2, U32>:
-  HTTPX.x_str_bytes("<h1>bend-net</h1><p>pure streaming mode</p>\n")
+  HTTP.x_str_bytes("<h1>bend-net</h1><p>pure streaming mode</p>\n")
 
 def stream_ans.css(+path: String, is_css: Bool) -> U32 & List<&2, U32>:
   match is_css:
@@ -138,22 +139,22 @@ def stream_ans(+path: String) -> U32 & List<&2, U32>:
 
 # The pair from stream_ans arrives as a parameter, never as a scrutinee:
 # a destructuring let on a computed value is rejected (task-040 D9).
-def stream_answer(ans: U32 & List<&2, U32>) -> HTTPX.SrvOut:
+def stream_answer(ans: U32 & List<&2, U32>) -> HTTP.SrvOut:
   (code, +body) = ans
-  HTTPX.RespondEarly{HTTPX.Response{code, Nil{}, body}}
+  HTTP.RespondEarly{HTTP.Response{code, Nil{}, body}}
 
-def site_stream.head(head: HTTPX.ReqHead) -> HTTPX.SrvOut:
+def site_stream.head(head: HTTP.ReqHead) -> HTTP.SrvOut:
   match head:
-    case HTTPX.ReqHead{method, +path, headers}:
+    case HTTP.ReqHead{method, +path, headers}:
       stream_answer(stream_ans(path))
 
 # Mode 2 handler: answer at the head, never drain the request body.
-def site_stream(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def site_stream(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
+    case HTTP.SrvReqHead{slot, head}:
       site_stream.head(head)
-    case HTTPX.SrvReqData{slot, chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqData{slot, chunk, fin}:
+      HTTP.Continue{}
 
 def server_side(l: Listener) -> IO(String):
   do IO<String>:
@@ -203,14 +204,14 @@ def hdr_pick.go(is_want: Bool, +value: String, +found: String) -> String:
 def hdr_pick(+name: String, +value: String, +want: String, +found: String) -> String:
   hdr_pick.go(String.eq(name, want), value, found)
 
-def hdr_lookup(+want: String, headers: List<&2, HTTPX.Hdr>, +found: String) -> String:
+def hdr_lookup(+want: String, headers: List<&2, HTTP.Hdr>, +found: String) -> String:
   match headers:
     case Nil{}:
       found
-    case HTTPX.Hdr{+name, +value} <> rest:
+    case HTTP.Hdr{+name, +value} <> rest:
       hdr_lookup(want, rest, hdr_pick(name, value, want, found))
 
-def hdr_value(headers: List<&2, HTTPX.Hdr>, +want: String) -> String:
+def hdr_value(headers: List<&2, HTTP.Hdr>, +want: String) -> String:
   hdr_lookup(want, headers, "")
 
 def resp_ok.both(is_status: Bool, is_ctype: Bool) -> U32:
@@ -220,17 +221,17 @@ def resp_ok.both(is_status: Bool, is_ctype: Bool) -> U32:
     case False{}:
       0
 
-def resp_ok.go(got: U32, headers: List<&2, HTTPX.Hdr>, +status: U32, +ctype: String) -> U32:
+def resp_ok.go(got: U32, headers: List<&2, HTTP.Hdr>, +status: U32, +ctype: String) -> U32:
   resp_ok.both(U32.is_eq(got, status), String.eq(hdr_value(headers, "content-type"), ctype))
 
-def resp_ok(resp: HTTPX.Response, +status: U32, +ctype: String) -> U32:
+def resp_ok(resp: HTTP.Response, +status: U32, +ctype: String) -> U32:
   match resp:
-    case HTTPX.Response{got, headers, body}:
+    case HTTP.Response{got, headers, body}:
       resp_ok.go(got, headers, status, ctype)
 
 def handler_check(+route: String, +status: U32, +ctype: String) -> IO(U32):
   do IO<U32>:
-    resp : HTTPX.Response <- site_handler(HTTPX.Request{"GET", route, Nil{}, Nil{}})
+    resp : HTTP.Response <- site_handler(HTTP.Request{"GET", route, Nil{}, Nil{}})
     IO.pure(U32, resp_ok(resp, status, ctype))
 
 def client(+port: U32) -> IO(U32):

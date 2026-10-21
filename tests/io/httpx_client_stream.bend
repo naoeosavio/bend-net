@@ -5,11 +5,12 @@
 # bytes 5 and fins 1 (one HEADERS + one DATA with END_STREAM).
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -18,12 +19,12 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+def h(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   match ev:
-    case HTTPX.StreamHead{head}:
-      HTTPX.StreamContinue{}
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamHead{head}:
+      HTTP.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
 def client_score_counts(counts: U32 & U32) -> U32:
   (total, fins) = counts
@@ -38,7 +39,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
     IO.pure(U32, client_score(r))
 
 law server_side:

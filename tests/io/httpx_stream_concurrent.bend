@@ -12,6 +12,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -22,77 +23,77 @@ def b2u(b: Bool) -> U32:
 
 # The handler: "/cancel" is refused at the head; each other stream echoes
 # every data chunk with 200.
-def h_head(is_cancel: Bool) -> HTTPX.SrvOut:
+def h_head(is_cancel: Bool) -> HTTP.SrvOut:
   match is_cancel:
     case True{}:
-      HTTPX.Cancel{}
+      HTTP.Cancel{}
     case False{}:
-      HTTPX.Continue{}
+      HTTP.Continue{}
 
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
+    case HTTP.SrvReqHead{slot, head}:
       match head:
-        case HTTPX.ReqHead{method, path, headers}:
+        case HTTP.ReqHead{method, path, headers}:
           h_head(String.eq(path, "/cancel"))
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
 def is_stream_code(+code: U32) -> U32:
   b2u(Bool.or(U32.is_eq(code, 502), U32.is_eq(code, 503)))
 
-def is_stream_fail(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def is_stream_fail(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{(code, msg)}:
       is_stream_code(code)
     case Done{+resp}:
       0
 
-def score_echo(r: Result<&1, &1, U32 & String, HTTPX.Response>, +want: String) -> U32:
+def score_echo(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: String) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
-          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
-def after_sibling(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +s: U32) -> IO(U32):
+def after_sibling(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +s: U32) -> IO(U32):
   (sock, r, st) = got
   do IO<U32>:
     +s2 : U32 = (s + score_echo(r, "hi") : U32)
     x : Unit <- TLS.tls_close(sock)
     IO.pure(U32, s2)
 
-def after_cancel(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
+def after_cancel(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32) -> IO(U32):
   (sock, r, st) = got
   do IO<U32>:
     +s1 : U32 = is_stream_fail(r)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi")})
+    got2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hi")})
     after_sibling(got2, s1)
 
-def conn_cancel(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
+def conn_cancel(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTPX.Request{"POST", "/cancel", Nil{}, HTTPX.x_str_bytes("x")})
+        got1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTP.Request{"POST", "/cancel", Nil{}, HTTP.x_str_bytes("x")})
         after_cancel(got1, port)
 
 def client_cancel(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
     conn_cancel(conn, port)
 
-def score_ok(resp: HTTPX.Response) -> U32:
+def score_ok(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(U32.is_eq(status, 200))
 
-def reqs_pair() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("one")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("two")}]
+def reqs_pair() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("one")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("two")}]
 
 def pair_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
   match r:

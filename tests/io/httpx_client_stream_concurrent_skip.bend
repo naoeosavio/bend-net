@@ -26,6 +26,8 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18582
@@ -33,11 +35,11 @@ def PORT() -> U32:
 def HOST() -> String:
   "127.0.0.1"
 
-def OK_HDRS() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{":status", "200"}]
+def OK_HDRS() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{":status", "200"}]
 
-def TRAILER_HDRS() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"x-sum", "3"}]
+def TRAILER_HDRS() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"x-sum", "3"}]
 
 def Z_BYTES() -> List<&2, U32>:
   [90]
@@ -56,36 +58,36 @@ def b2u(b: Bool) -> U32:
 # head that is not a real response head (status 0, the shape a trailer
 # decodes to) is cancelled too. The status rule is what makes a wrong
 # trailer decision fail the golden instead of hanging it.
-def h_cli_real(is_real: Bool, +slot: U32) -> HTTPX.CStreamOut:
+def h_cli_real(is_real: Bool, +slot: U32) -> HTTP.CStreamOut:
   match is_real:
     case True{}:
-      HTTPX.CStreamContinue{slot}
+      HTTP.CStreamContinue{slot}
     case False{}:
-      HTTPX.CStreamCancel{slot}
+      HTTP.CStreamCancel{slot}
 
-def h_cli_status(head: HTTPX.Head, +slot: U32) -> HTTPX.CStreamOut:
+def h_cli_status(head: HTTP.Head, +slot: U32) -> HTTP.CStreamOut:
   match head:
-    case HTTPX.Head{+status, +headers}:
+    case HTTP.Head{+status, +headers}:
       h_cli_real(U32.is_eq(status, 200), slot)
 
-def h_cli_head(slot: U32, head: HTTPX.Head) -> HTTPX.CStreamOut:
+def h_cli_head(slot: U32, head: HTTP.Head) -> HTTP.CStreamOut:
   match slot:
     case 1:
-      HTTPX.CStreamCancel{1}
+      HTTP.CStreamCancel{1}
     case _:
       h_cli_status(head, slot)
 
-def h_cli(ev: HTTPX.CStreamEv) -> HTTPX.CStreamOut:
+def h_cli(ev: HTTP.CStreamEv) -> HTTP.CStreamOut:
   match ev:
-    case HTTPX.CStreamHead{slot, head}:
+    case HTTP.CStreamHead{slot, head}:
       h_cli_head(slot, head)
-    case HTTPX.CStreamData{slot, +chunk, fin}:
-      HTTPX.CStreamContinue{slot}
+    case HTTP.CStreamData{slot, +chunk, fin}:
+      HTTP.CStreamContinue{slot}
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"GET", "/one", Nil{}, Nil{}},
-    HTTPX.Request{"GET", "/three", Nil{}, Nil{}},
-    HTTPX.Request{"GET", "/five", Nil{}, Nil{}}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"GET", "/one", Nil{}, Nil{}},
+    HTTP.Request{"GET", "/three", Nil{}, Nil{}},
+    HTTP.Request{"GET", "/five", Nil{}, Nil{}}]
 
 def counts_ok(counts: U32 & U32) -> U32:
   (total, fins) = counts
@@ -124,20 +126,20 @@ def srv_ph(+heads2: U32) -> U32:
       0
 
 @unsafe
-def srv_idle(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>) -> IO(Unit):
+def srv_idle(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>) -> IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s0, buf)
+        got2 : Socket & HTTP.Got <- HTTP2.x_read_frame(s0, buf)
         srv_idle(1, got2, buf)
     case 1:
       (s1, g1) = got
       match g1:
-        case HTTPX.GotErr{code, msg}:
+        case HTTP.GotErr{code, msg}:
           TLS.tls_close(s1)
-        case HTTPX.GotOk{+frame, +buf2}:
-          srv_idle(0, (s1, HTTPX.GotOk{frame, buf2}), buf2)
+        case HTTP.GotOk{+frame, +buf2}:
+          srv_idle(0, (s1, HTTP.GotOk{frame, buf2}), buf2)
     case _:
       (s9, g9) = got
       TLS.tls_close(s9)
@@ -150,7 +152,7 @@ def srv_idle_from(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
     case Fail{e}:
       TLS.tls_close(s)
     case Done{u}:
-      srv_idle(0, (s, HTTPX.GotErr{0, "next"}), Nil{})
+      srv_idle(0, (s, HTTP.GotErr{0, "next"}), Nil{})
 
 # Frame 8 of 8: the trailer of stream 3 closes it.
 def srv_sent7(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
@@ -160,7 +162,7 @@ def srv_sent7(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), (HTTPX.x_f_end_headers() + HTTPX.x_f_end_stream() : U32), 3, HTTPX.x_block(TRAILER_HDRS()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 3, HTTP2.x_block(TRAILER_HDRS()))
         srv_idle_from(sent)
 
 # Frame 7 of 8: the data of stream 5, interleaved before stream 3 ends.
@@ -171,7 +173,7 @@ def srv_sent6(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 5, A_BYTES())
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_data(), HTTP2.x_f_end_stream(), 5, A_BYTES())
         srv_sent7(sent)
 
 # Frame 6 of 8: the head of stream 5.
@@ -182,7 +184,7 @@ def srv_sent5(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 5, HTTPX.x_block(OK_HDRS()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 5, HTTP2.x_block(OK_HDRS()))
         srv_sent6(sent)
 
 # Frame 5 of 8: the head of stream 3, which stays live.
@@ -193,7 +195,7 @@ def srv_sent4(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 3, HTTPX.x_block(OK_HDRS()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 3, HTTP2.x_block(OK_HDRS()))
         srv_sent5(sent)
 
 # Frame 4 of 8: the head block of the dropped stream 1, in flight after
@@ -206,7 +208,7 @@ def srv_sent3(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), (HTTPX.x_f_end_headers() + HTTPX.x_f_end_stream() : U32), 1, HTTPX.x_block(TRAILER_HDRS()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 1, HTTP2.x_block(TRAILER_HDRS()))
         srv_sent4(sent)
 
 # Frame 3 of 8: the data of the dropped stream 1, in flight after the
@@ -218,7 +220,7 @@ def srv_sent2(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 1, Z_BYTES())
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_data(), HTTP2.x_f_end_stream(), 1, Z_BYTES())
         srv_sent3(sent)
 
 # Frame 2 of 8: the head the client cancels on.
@@ -229,17 +231,17 @@ def srv_sent1(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
       TLS.tls_close(s)
     case Done{u}:
       do IO<Unit>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, HTTPX.x_block(OK_HDRS()))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.x_block(OK_HDRS()))
         srv_sent2(sent)
 
 # Frame 1 of 8: SETTINGS, then the script.
 def srv_play(sock: Socket) -> IO(Unit):
   do IO<Unit>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(sock, HTTPX.x_t_settings(), 0, 0, HTTPX.x_settings_initial_pay())
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_settings(), 0, 0, HTTP2.x_settings_initial_pay())
     srv_sent1(sent)
 
 @unsafe
-def srv(fuel: Nat, ph: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +heads: U32) -> IO(Unit):
+def srv(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +typ: U32, +heads: U32) -> IO(Unit):
   match fuel:
     case 0n:
       (s0, g0) = got
@@ -249,23 +251,23 @@ def srv(fuel: Nat, ph: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: 
         case 0:
           (s1, g1) = got
           do IO<Unit>:
-            got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s1, buf)
+            got2 : Socket & HTTP.Got <- HTTP2.x_read_frame(s1, buf)
             srv(p, 1, got2, buf, 0, heads)
         case 1:
           (s2, g2) = got
           match g2:
-            case HTTPX.GotErr{code, msg}:
+            case HTTP.GotErr{code, msg}:
               TLS.tls_close(s2)
-            case HTTPX.GotOk{+frame, +buf2}:
+            case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTPX.Frame{+typ2, +flags2, +sid2, +payload2}:
-                  srv(p, srv_ph(srv_heads(typ2, heads)), (s2, HTTPX.GotOk{frame, buf2}), buf2, typ2, srv_heads(typ2, heads))
+                case HTTP.Frame{+typ2, +flags2, +sid2, +payload2}:
+                  srv(p, srv_ph(srv_heads(typ2, heads)), (s2, HTTP.GotOk{frame, buf2}), buf2, typ2, srv_heads(typ2, heads))
         case 2:
           (s3, g3) = got
           srv_play(s3)
         case _:
           (s4, g4) = got
-          srv(p, 0, (s4, HTTPX.GotErr{0, "next"}), buf, 0, heads)
+          srv(p, 0, (s4, HTTP.GotErr{0, "next"}), buf, 0, heads)
 
 # The client preface is not a frame: consume its 24 bytes first (the
 # pattern tests/io/httpx_h2_trailers.bend uses), then hand the leftover to
@@ -280,7 +282,7 @@ def srv_pre(phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          srv_pre(1, (s0, Done{chunk}), acc2, HTTPX.x_preface_ok(acc2), U32.is_lt(HTTPX.x_len32(acc2), 24))
+          srv_pre(1, (s0, Done{chunk}), acc2, HTTP2.x_preface_ok(acc2), U32.is_lt(HTTP.x_len32(acc2), 24))
     case 1:
       (s1, r1) = rs
       match short:
@@ -294,7 +296,7 @@ def srv_pre(phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
       (s2, r2) = rs
       match ok:
         case 1:
-          srv(16n, 0, (s2, HTTPX.GotErr{0, "next"}), HTTPX.x_drop32(24, acc), 0, 0)
+          srv(16n, 0, (s2, HTTP.GotErr{0, "next"}), HTTP.x_drop32(24, acc), 0, 0)
         case _:
           TLS.tls_close(s2)
     case _:

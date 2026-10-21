@@ -34,6 +34,8 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -52,13 +54,13 @@ def bool_eq(a: Bool, b: Bool) -> Bool:
       False{}
 
 # close_want(hs, want): 1 iff conn_close(hs) matches the expected verdict.
-def close_want(hs: List<&2, HTTPX.Hdr>, want: Bool) -> U32:
-  b2u(bool_eq(HTTPX.x_h1.conn_close(hs), want))
+def close_want(hs: List<&2, HTTP.Hdr>, want: Bool) -> U32:
+  b2u(bool_eq(HTTP1.x_h1.conn_close(hs), want))
 
-def hdr(n: String, v: String) -> HTTPX.Hdr:
-  HTTPX.Hdr{n, v}
+def hdr(n: String, v: String) -> HTTP.Hdr:
+  HTTP.Hdr{n, v}
 
-def h1(n: String, v: String) -> List<&2, HTTPX.Hdr>:
+def h1(n: String, v: String) -> List<&2, HTTP.Hdr>:
   hdr(n, v) <> Nil{}
 
 # no Connection header at all: HTTP/1.1 default is keep-alive.
@@ -95,11 +97,11 @@ def v8() -> U32:
 
 # Raw head bytes -> the server's own head chain -> parsed List<Hdr>.
 def parse_head(raw: String) ->
-  Result<&1, &1, U32 & String, List<&2, HTTPX.Hdr>>:
-  +head = HTTPX.x_h1.split_head(HTTPX.x_h1.split(HTTPX.x_str_bytes(raw)))
-  HTTPX.x_h1.parse_hs(HTTPX.x_h1.rest_lines(HTTPX.x_h1.head_lines(head)))
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
+  +head = HTTP1.x_h1.split_head(HTTP1.x_h1.split(HTTP.x_str_bytes(raw)))
+  HTTP1.x_h1.parse_hs(HTTP1.x_h1.rest_lines(HTTP1.x_h1.head_lines(head)))
 
-def raw_close_go(r: Result<&1, &1, U32 & String, List<&2, HTTPX.Hdr>>, want: Bool) ->
+def raw_close_go(r: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>, want: Bool) ->
   U32:
   match r:
     case Fail{e}:
@@ -126,26 +128,26 @@ def vectors() -> U32:
 # Phase 2: the batch over one connection.
 # ---------------------------------------------------------------------
 
-def echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
-def score_echo(+want: String, r: Result<&1, &1, U32 & String, HTTPX.Response>) ->
+def score_echo(+want: String, r: Result<&1, &1, U32 & String, HTTP.Response>) ->
   U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           b2u(Bool.and(U32.is_eq(status, 200),
-            U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
+            U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
 def req_bytes(+port: U32, +body: String) ->
   Result<&1, &1, U32 & String, List<&2, U32>>:
-  HTTPX.x_h1.render_req("POST", "/echo", "127.0.0.1", port, Nil{},
-    HTTPX.x_str_bytes(body))
+  HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", port, Nil{},
+    HTTP.x_str_bytes(body))
 
 # One step of the sequential batch: score the response just read, then
 # either send the next request down the SAME socket (rest non-empty) or
@@ -153,7 +155,7 @@ def req_bytes(+port: U32, +body: String) ->
 # point of the golden. The step is split in three because this dialect
 # wants a match to head a def body (or follow only a destructuring), and
 # wants the score binding before the effect, not before a match.
-def batch_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +want: String, +sum: U32) ->
+def batch_end(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +want: String, +sum: U32) ->
   IO(U32):
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
@@ -162,17 +164,17 @@ def batch_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +want:
     IO.pure(U32, acc)
 
 @unsafe
-def batch_next(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port: U32, +want: String, +next: String, +more: List<String>, +sum: U32) ->
+def batch_next(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port: U32, +want: String, +next: String, +more: List<String>, +sum: U32) ->
   IO(U32):
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
-    out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, next), "POST")
+    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTP1.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, next), "POST")
     batch_step(out, port, next, more, acc)
 
 @unsafe
-def batch_step(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port: U32, +want: String, rest: List<String>, +sum: U32) ->
+def batch_step(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port: U32, +want: String, rest: List<String>, +sum: U32) ->
   IO(U32):
   match rest:
     case Nil{}:
@@ -187,8 +189,8 @@ def batch_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-          HTTPX.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, "hello-0"), "POST")
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+          HTTP1.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, "hello-0"), "POST")
         batch_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def batch_side(l: Listener) -> IO(U32):
@@ -209,9 +211,9 @@ def run_batch(b: Listener & U32) -> IO(U32):
 # closes after one request must still answer exactly 1.
 def once_client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <-
+    r : Result<&1, &1, U32 & String, HTTP.Response> <-
       HTTPX.client.once_insecure("127.0.0.1", port,
-        HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
+        HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
     IO.pure(U32, score_echo("hello", r))
 
 def once_side(l: Listener) -> IO(U32):
@@ -233,16 +235,16 @@ def run_once(b: Listener & U32) -> IO(U32):
 # second read must see an empty recv (EOF) — not another answer and not
 # a hang. That is the keep=False edge of x_h1.conn_close.
 def close_raw(+port: U32) -> List<&2, U32>:
-  HTTPX.x_str_bytes("GET /echo HTTP/1.1\r\nHost: 127.0.0.1:"
+  HTTP.x_str_bytes("GET /echo HTTP/1.1\r\nHost: 127.0.0.1:"
     ++ U32.show(port) ++ "\r\nConnection: close\r\n\r\n")
 
-def resp_200(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def resp_200(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           b2u(U32.is_eq(status, 200))
 
 def eof_part(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
@@ -257,16 +259,16 @@ def eof_part(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
           0
 
 def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Socket & Result<&1, &1, U32 & String, HTTPX.Response>):
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
   (s, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, HTTPX.Response>,
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>,
         (s, Fail{e}))
     case Done{u}:
-      do IO<Socket & Result<&1, &1, U32 & String, HTTPX.Response>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{}, False{})
-        IO.pure(Socket & Result<&1, &1, U32 & String, HTTPX.Response>, HTTPX.x_h1.cli.rest_drop(out))
+      do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response>>:
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{}, False{})
+        IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, HTTP1.x_h1.cli.rest_drop(out))
 
 def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans: U32) ->
   IO(U32):
@@ -276,7 +278,7 @@ def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans:
     x : Unit <- TLS.tls_close(s2)
     IO.pure(U32, U32.and(ans, eof))
 
-def close_eof(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +ans: U32) ->
+def close_eof(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +ans: U32) ->
   IO(U32):
   (s, r) = out
   +ok : U32 = U32.and(ans, resp_200(r))
@@ -294,7 +296,7 @@ def close_dial(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
       do IO<U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <-
           TLS.tls_send_bytes(sock, close_raw(port))
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
           close_sent(sent)
         close_eof(out, 1)
 
@@ -311,7 +313,7 @@ def run_close(b: Listener & U32) -> IO(U32):
 # x_h1.exch.send with the TCP triple — one grammar, two transports, so
 # this proves the TCP instantiation keeps alive instead of a copy
 # needing its own proof. A divergence would leave this at 1 instead of 3.
-def plain_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +want: String, +sum: U32) ->
+def plain_end(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +want: String, +sum: U32) ->
   IO(U32):
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
@@ -320,17 +322,17 @@ def plain_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +want:
     IO.pure(U32, acc)
 
 @unsafe
-def plain_next(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port: U32, +want: String, +next: String, +more: List<String>, +sum: U32) ->
+def plain_next(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port: U32, +want: String, +next: String, +more: List<String>, +sum: U32) ->
   IO(U32):
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
-    out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, next), "POST")
+    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTP1.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, next), "POST")
     plain_step(out, port, next, more, acc)
 
 @unsafe
-def plain_step(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response>, +port: U32, +want: String, rest: List<String>, +sum: U32) ->
+def plain_step(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port: U32, +want: String, rest: List<String>, +sum: U32) ->
   IO(U32):
   match rest:
     case Nil{}:
@@ -345,8 +347,8 @@ def plain_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> <-
-          HTTPX.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, "hello-0"), "POST")
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
+          HTTP1.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, "hello-0"), "POST")
         plain_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def plain_side(l: Listener) -> IO(U32):
@@ -367,13 +369,13 @@ def run_plain(b: Listener & U32) -> IO(U32):
 # branch that used to close the socket with Fail 615. The server is
 # once_h1 (ONE accept), so 3 responses can only come out if all three
 # requests rode that one connection.
-def resp_body_is(+want: String, resp: HTTPX.Response) -> U32:
+def resp_body_is(+want: String, resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200),
-        U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes(want)), 1)))
+        U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
-def batch_score_go(wants: List<String>, rs: List<&2, HTTPX.Response>, +sum: U32) ->
+def batch_score_go(wants: List<String>, rs: List<&2, HTTP.Response>, +sum: U32) ->
   U32:
   match wants:
     case Nil{}:
@@ -389,7 +391,7 @@ def batch_score_go(wants: List<String>, rs: List<&2, HTTPX.Response>, +sum: U32)
         case +r <> rt:
           batch_score_go(ws, rt, (sum + resp_body_is(w, r) : U32))
 
-def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) ->
+def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HTTP.Response>>) ->
   U32:
   match r:
     case Fail{e}:
@@ -397,14 +399,14 @@ def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HT
     case Done{+rs}:
       batch_score_go(wants, rs, 0)
 
-def batch_reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")},
-   HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")},
-   HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")}]
+def batch_reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")},
+   HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")},
+   HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")}]
 
 def api_batch(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <-
+    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <-
       HTTPX.client.on_insecure("127.0.0.1", port, batch_reqs())
     IO.pure(U32, batch_score(["hello-0", "hello-1", "hello-2"], r))
 
@@ -419,37 +421,37 @@ def run_api(b: Listener & U32) -> IO(U32):
 # must answer in request order and thread the state. The server is once_h1
 # (ONE accept), so a second dial would hang -- which is what makes 2 a proof
 # of reuse. Before Phase 3 this path wrote H2 frames onto the HTTP/1.1 socket.
-def keep_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +sum: U32) -> IO(U32):
+def keep_end(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +sum: U32) -> IO(U32):
   (s2, r2, st2) = got
   +acc : U32 = (sum + score_echo("hello-1", r2) : U32)
   do IO<U32>:
     x : Unit <- TLS.tls_close(s2)
     IO.pure(U32, acc)
 
-def keep_step(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
+def keep_step(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32) -> IO(U32):
   (s1, r1, st1) = got
   +a : U32 = score_echo("hello-0", r1)
   do IO<U32>:
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(s1, st1, "127.0.0.1", port,
-      HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")})
+    got2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(s1, st1, "127.0.0.1", port,
+      HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")})
     keep_end(got2, a)
 
-def keep_run(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
+def keep_run(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock, st) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port,
-          HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")})
+        got1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port,
+          HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")})
         keep_step(got1, port)
 
 def run_keep(b: Listener & U32) -> IO(U32):
   (l, +port) = b
   do IO<U32>:
     c : Chan(U32) <- IO.fork(U32, batch_side(l))
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <-
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <-
       HTTPX.client.connect_insecure("127.0.0.1", port)
     keep_run(conn, port)
 

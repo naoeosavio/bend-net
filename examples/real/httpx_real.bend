@@ -21,6 +21,7 @@
 #   bend examples/real/httpx_real.bend
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def emit(label: String, r: Result<&1, &1, U32 & String, String>) -> IO(Unit):
   match r:
@@ -33,7 +34,7 @@ def main() -> IO(Unit):
   do IO<Unit>:
     a : Result<&1, &1, U32 & String, String> <- HTTPX.fetch("https://example.com/")
     x : Unit <- emit("GET example.com (fetch)", a)
-    b : Result<&1, &1, U32 & String, String> <- HTTPX.request("example.com", 443, "/post", "POST", HTTPX.Hdr{"content-type", "text/plain"} <> Nil{}, "bend")
+    b : Result<&1, &1, U32 & String, String> <- HTTPX.request("example.com", 443, "/post", "POST", HTTP.Hdr{"content-type", "text/plain"} <> Nil{}, "bend")
     y : Unit <- emit("POST example.com/post (request)", b)
     c : Result<&1, &1, U32 & String, String> <- HTTPX.fetch("https://www.cloudflare.com/")
     z : Unit <- emit("GET cloudflare.com (fetch)", c)

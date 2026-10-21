@@ -18,7 +18,7 @@
 # Score: op 8 x payload [3, 241], golden 1.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
 def PORT() -> U32:
@@ -73,7 +73,7 @@ def cli_close(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32
       cli_dead(s2, 0)
     case Done{t}:
       (fin, op, pay) = t
-      cli_dead(s2, U32.mul(b2u(U32.is_eq(op, 8)), HTTPX.x_eq(pay, CLOSE_TOO_BIG())))
+      cli_dead(s2, U32.mul(b2u(U32.is_eq(op, 8)), HTTP.x_eq(pay, CLOSE_TOO_BIG())))
 
 # The header is on the wire: read the answer, whose rest seeds nothing
 # because the header is the last thing this peer writes.

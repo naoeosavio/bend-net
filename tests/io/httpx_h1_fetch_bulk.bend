@@ -15,6 +15,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 # Body size and the prefix length the client compares byte by byte.
 def BULK_LEN() -> U32:
@@ -41,7 +42,7 @@ def bulk_go(+n: Nat, +i: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       bulk_go(p, Nat.add(i, 1n), U32.from_nat(Nat.mod(i, 251n)) <> acc)
 
 def bulk(+n: Nat) -> List<&2, U32>:
-  HTTPX.x_cat(bulk_go(n, 0n, Nil{}))
+  HTTP.x_cat(bulk_go(n, 0n, Nil{}))
 
 # Sum of the same pattern without building it, for the checksum check.
 def pattern_sum_go(+n: Nat, +i: Nat, +acc: U32) -> U32:
@@ -62,8 +63,8 @@ def body_sum(+bs: List<&2, U32>, +acc: U32) -> U32:
       body_sum(t, U32.add(acc, b))
 
 def bulk_score(+body: List<&2, U32>) -> U32:
-  +len_ok = b2u(U32.is_eq(HTTPX.x_len32(body), BULK_LEN()))
-  +pre_ok = HTTPX.x_eq(HTTPX.x_take32(BULK_PREFIX(), body), bulk(U32.to_nat(BULK_PREFIX())))
+  +len_ok = b2u(U32.is_eq(HTTP.x_len32(body), BULK_LEN()))
+  +pre_ok = HTTP.x_eq(HTTP.x_take32(BULK_PREFIX(), body), bulk(U32.to_nat(BULK_PREFIX())))
   +sum_ok = b2u(U32.is_eq(body_sum(body, 0), pattern_sum(U32.to_nat(BULK_LEN()))))
   U32.add(U32.add(U32.mul(len_ok, 100), U32.mul(pre_ok, 10)), sum_ok)
 
@@ -75,10 +76,10 @@ def bulk_check(r: Result<&1, &1, (U32 & String), List<&2, U32>>) -> IO(U32):
       IO.pure(U32, bulk_score(body))
 
 # Server: one fixed 96 KB body per request, whatever was asked.
-def bulk_service(req: HTTPX.Request) -> IO(HTTPX.Response):
+def bulk_service(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, bulk(U32.to_nat(BULK_LEN()))})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, bulk(U32.to_nat(BULK_LEN()))})
 
 def listen_retry(port: U32, r: Result<&1, &1, (U32 & String), Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:

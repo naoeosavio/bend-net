@@ -18,7 +18,6 @@
 # Score: 1 when the second frame is refused (read fails), golden 1.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/wsm.bend as WSM
 
 def PORT() -> U32:

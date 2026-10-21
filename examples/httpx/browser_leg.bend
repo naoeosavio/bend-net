@@ -22,16 +22,17 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
-def cors() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Access-Control-Allow-Origin", "*"}]
+def cors() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Access-Control-Allow-Origin", "*"}]
 
-def close_hdrs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Access-Control-Allow-Origin", "*"}, HTTPX.Hdr{"Connection", "close"}]
+def close_hdrs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Access-Control-Allow-Origin", "*"}, HTTP.Hdr{"Connection", "close"}]
 
 def txt(s: String) -> List<&2, U32>:
-  HTTPX.x_str_bytes(s)
+  HTTP.x_str_bytes(s)
 
 def is_echo(path: String) -> Bool:
   String.eq(path, "/echo")
@@ -42,21 +43,21 @@ def is_chunk(path: String) -> Bool:
 def is_close(path: String) -> Bool:
   String.eq(path, "/close")
 
-def route_go(is_echo: Bool, is_chunk: Bool, is_close: Bool, +body: List<&2, U32>) -> HTTPX.Response:
+def route_go(is_echo: Bool, is_chunk: Bool, is_close: Bool, +body: List<&2, U32>) -> HTTP.Response:
   match is_echo is_chunk is_close:
     case True{} _ _:
-      HTTPX.Response{200, cors(), body}
+      HTTP.Response{200, cors(), body}
     case _ True{} _:
-      HTTPX.Response{200, cors(), txt("Wikipedia")}
+      HTTP.Response{200, cors(), txt("Wikipedia")}
     case _ _ True{}:
-      HTTPX.Response{200, close_hdrs(), txt("bye")}
+      HTTP.Response{200, close_hdrs(), txt("bye")}
     case _ _ _:
-      HTTPX.Response{404, cors(), Nil{}}
+      HTTP.Response{404, cors(), Nil{}}
 
-def h1_h(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h1_h(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, +path, headers, body}:
-      IO.pure(HTTPX.Response, route_go(is_echo(path), is_chunk(path), is_close(path), body))
+    case HTTP.Request{method, +path, headers, body}:
+      IO.pure(HTTP.Response, route_go(is_echo(path), is_chunk(path), is_close(path), body))
 
 def ws_h(ev: WSM.WSEv) -> IO(WSM.WSOut):
   match ev:

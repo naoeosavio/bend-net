@@ -1,12 +1,13 @@
 # lib (lib_httpx_hpack_huffman): HPACK string vectors (RFC 7541 Appendix B/C)
-# over the mini-H2 inside httpx.bend: C.4.1 ":authority" "www.example.com"
+# over the H2 codec in lib/http2.bend: C.4.1 ":authority" "www.example.com"
 # (f1 e3 ... f4 ff behind the 0x8c length byte), C.6.1 ":status" "302"
 # (64 02), a raw string with no Huffman bit set, and the three fail-closed
 # shapes (bad code, EOS in the middle, truncated). Pure layer, no IO.
 # Ported from hpack_huffman.bend (same RFC bytes, same expectations) when the
-# http2.bend codec was retired; golden 1 iff all 8 vectors score.
+# old H2 codec was retired; golden 1 iff all 8 vectors score.
 import Base
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -24,10 +25,10 @@ def str_is.go(r: Result<&1, &1, U32 & String, String & List<&2, U32>>, want: Str
       0
     case Done{p}:
       (s, rest) = p
-      b2u(Bool.and(String.eq(s, want), U32.is_eq(HTTPX.x_len32(rest), 0)))
+      b2u(Bool.and(String.eq(s, want), U32.is_eq(HTTP.x_len32(rest), 0)))
 
 def str_is(bs: List<&2, U32>, want: String) -> U32:
-  str_is.go(HTTPX.x_str.dec.go(bs), want)
+  str_is.go(HTTP2.x_str.dec.go(bs), want)
 
 def str_fails.go(r: Result<&1, &1, U32 & String, String & List<&2, U32>>) -> U32:
   match r:
@@ -37,7 +38,7 @@ def str_fails.go(r: Result<&1, &1, U32 & String, String & List<&2, U32>>) -> U32
       0
 
 def str_fails(bs: List<&2, U32>) -> U32:
-  str_fails.go(HTTPX.x_str.dec.go(bs))
+  str_fails.go(HTTP2.x_str.dec.go(bs))
 
 def v1_www() -> U32:
   str_is([140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255], "www.example.com")
@@ -63,26 +64,26 @@ def v6_truncated() -> U32:
 def req_blk() -> List<&2, U32>:
   [130, 134, 132, 65, 140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255]
 
-def req_head(head: HTTPX.ReqHead, ok: Bool) -> U32:
+def req_head(head: HTTP.ReqHead, ok: Bool) -> U32:
   match head:
-    case HTTPX.ReqHead{method, path, headers}:
+    case HTTP.ReqHead{method, path, headers}:
       b2u(Bool.and(ok, Bool.and(String.eq(method, "GET"), String.eq(path, "/"))))
 
 def v7_req_block() -> U32:
-  req_head(HTTPX.x_req.rh(HTTPX.x_req.decode(req_blk(), HTTPX.x_tab.empty())),
-    HTTPX.x_req.ok(HTTPX.x_req.decode(req_blk(), HTTPX.x_tab.empty())))
+  req_head(HTTP2.x_req.rh(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())),
+    HTTP2.x_req.ok(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
 
 # Indexed ":status 302" (0x48) plus the Huffman literal from v2: the response
 # side of the same two layers.
 
-def resp_head(head: HTTPX.Head, ok: Bool) -> U32:
+def resp_head(head: HTTP.Head, ok: Bool) -> U32:
   match head:
-    case HTTPX.Head{status, headers}:
+    case HTTP.Head{status, headers}:
       b2u(Bool.and(ok, U32.is_eq(status, 302)))
 
 def v8_resp_block() -> U32:
-  resp_head(HTTPX.x_resp.rh(HTTPX.x_resp.decode([72, 130, 100, 2], HTTPX.x_tab.empty())),
-    HTTPX.x_resp.ok(HTTPX.x_resp.decode([72, 130, 100, 2], HTTPX.x_tab.empty())))
+  resp_head(HTTP2.x_resp.rh(HTTP2.x_resp.decode([72, 130, 100, 2], HTTP2.x_tab.empty())),
+    HTTP2.x_resp.ok(HTTP2.x_resp.decode([72, 130, 100, 2], HTTP2.x_tab.empty())))
 
 law main:
   IO(U32)

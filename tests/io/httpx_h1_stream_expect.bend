@@ -14,6 +14,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -23,24 +24,24 @@ def b2u(b: Bool) -> U32:
       0
 
 # Handler: a non-200 head cancels (so an interim head cannot pass).
-def h_status(ok: Bool) -> HTTPX.StreamOut:
+def h_status(ok: Bool) -> HTTP.StreamOut:
   match ok:
     case True{}:
-      HTTPX.StreamContinue{}
+      HTTP.StreamContinue{}
     case False{}:
-      HTTPX.StreamCancel{}
+      HTTP.StreamCancel{}
 
-def head_ok(+hd: HTTPX.Head) -> Bool:
+def head_ok(+hd: HTTP.Head) -> Bool:
   match hd:
-    case HTTPX.Head{status, headers}:
+    case HTTP.Head{status, headers}:
       U32.is_eq(status, 200)
 
-def h(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+def h(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   match ev:
-    case HTTPX.StreamHead{head}:
+    case HTTP.StreamHead{head}:
       h_status(head_ok(head))
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
 def score(r: Result<&1, &1, (U32 & String), (U32 & U32)>) -> U32:
   match r:

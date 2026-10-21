@@ -8,6 +8,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
 def b2u(b: Bool) -> U32:
@@ -17,19 +18,19 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def up_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}]
+def up_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}]
 
 def req_bytes(+port: U32) -> List<&2, U32>:
-  List.append(&2, U32, HTTPX.x_str_bytes("GET /chat HTTP/1.1\r\nHost: 127.0.0.1:"), List.append(&2, U32, HTTPX.x_str_bytes(U32.show(port)), List.append(&2, U32, HTTPX.x_str_bytes("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n"), [129, 130, 1, 2, 3, 4, 73, 107])))
+  List.append(&2, U32, HTTP.x_str_bytes("GET /chat HTTP/1.1\r\nHost: 127.0.0.1:"), List.append(&2, U32, HTTP.x_str_bytes(U32.show(port)), List.append(&2, U32, HTTP.x_str_bytes("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n"), [129, 130, 1, 2, 3, 4, 73, 107])))
 
 def want_stream() -> List<&2, U32>:
-  List.append(&2, U32, HTTPX.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), [129, 2, 72, 105])
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), [129, 2, 72, 105])
 
-def srv_h(req: HTTPX.Request) -> IO(HTTPX.Response):
+def srv_h(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{101, [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}], Nil{}})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{101, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}], Nil{}})
 
 def srv_k(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   WSM.wsm_echo_one(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, rest)

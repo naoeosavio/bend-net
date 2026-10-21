@@ -9,6 +9,8 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -47,7 +49,7 @@ def is_400(r):
 # Host header lookup over the contract header list (case-insensitive,
 # first hit wins, default when absent).
 law host_of:
-  for hs: List<&2, HTTPX.Hdr>
+  for hs: List<&2, HTTP.Hdr>
   for dflt: String
   String
 
@@ -55,17 +57,17 @@ def host_of(hs, dflt):
   match hs:
     case Nil{}:
       dflt
-    case HTTPX.Hdr{name, value} <> t:
-      Bool.pick(String, HTTPX.x_h1.eq_ci(name, "host"), value, host_of(t, dflt))
+    case HTTP.Hdr{name, value} <> t:
+      Bool.pick(String, HTTP1.x_h1.eq_ci(name, "host"), value, host_of(t, dflt))
 
 law host_body:
-  for req: HTTPX.Request
-  IO(HTTPX.Response)
+  for req: HTTP.Request
+  IO(HTTP.Response)
 
 def host_body(req):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_utf8_encode(host_of(headers, ""))})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, HTTP.x_utf8_encode(host_of(headers, ""))})
 
 law listen_retry:
   for port: U32

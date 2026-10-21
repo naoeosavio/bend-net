@@ -19,7 +19,7 @@
 #
 # Answers: one per vector that matches. Golden 11.
 import Base
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -47,8 +47,8 @@ law same_verdict:
   U32
 
 def same_verdict(bs, want):
-  (b2u(String.eq(HTTPX.x_utf8_decode(bs), want))
-    * b2u(Bool.not(HTTPX.x_utf8_ok(bs))) : U32)
+  (b2u(String.eq(HTTP.x_utf8_decode(bs), want))
+    * b2u(Bool.not(HTTP.x_utf8_ok(bs))) : U32)
 
 # A non-continuation byte aborts a 2-byte sequence. It used to decode
 # to "Á": the byte 41 was read as a continuation.
@@ -105,32 +105,32 @@ law chk_trunc2:
   U32
 
 def chk_trunc2():
-  (b2u(String.is_empty(HTTPX.x_utf8_decode([195])))
-    * b2u(Bool.not(HTTPX.x_utf8_ok([195]))) : U32)
+  (b2u(String.is_empty(HTTP.x_utf8_decode([195])))
+    * b2u(Bool.not(HTTP.x_utf8_ok([195]))) : U32)
 
 # A truncated 3-byte sequence at the end is dropped, no U+FFFD.
 law chk_trunc3:
   U32
 
 def chk_trunc3():
-  (b2u(String.is_empty(HTTPX.x_utf8_decode([226, 130])))
-    * b2u(Bool.not(HTTPX.x_utf8_ok([226, 130]))) : U32)
+  (b2u(String.is_empty(HTTP.x_utf8_decode([226, 130])))
+    * b2u(Bool.not(HTTP.x_utf8_ok([226, 130]))) : U32)
 
 # A valid 2-byte sequence still answers é.
 law chk_valid2:
   U32
 
 def chk_valid2():
-  (b2u(String.eq(HTTPX.x_utf8_decode([195, 169]), "é"))
-    * b2u(HTTPX.x_utf8_ok([195, 169])) : U32)
+  (b2u(String.eq(HTTP.x_utf8_decode([195, 169]), "é"))
+    * b2u(HTTP.x_utf8_ok([195, 169])) : U32)
 
 # A valid 4-byte sequence still answers one character.
 law chk_valid4:
   U32
 
 def chk_valid4():
-  (b2u(String.eq(HTTPX.x_utf8_decode([240, 159, 152, 128]), "😀"))
-    * b2u(HTTPX.x_utf8_ok([240, 159, 152, 128])) : U32)
+  (b2u(String.eq(HTTP.x_utf8_decode([240, 159, 152, 128]), "😀"))
+    * b2u(HTTP.x_utf8_ok([240, 159, 152, 128])) : U32)
 
 law main:
   U32

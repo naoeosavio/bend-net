@@ -22,6 +22,8 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18569
@@ -58,10 +60,10 @@ def fill_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       fill_go(p, 46 <> acc)
 
 def fill(+n: U32) -> List<&2, U32>:
-  HTTPX.x_cat(fill_go(U32.to_nat(n), Nil{}))
+  HTTP.x_cat(fill_go(U32.to_nat(n), Nil{}))
 
 def head_block() -> List<&2, U32>:
-  HTTPX.x_block([HTTPX.Hdr{":status", "200"}])
+  HTTP2.x_block([HTTP.Hdr{":status", "200"}])
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -70,13 +72,13 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def h(resp: HTTPX.Response) -> U32:
+def h(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
-      U32.mul(b2u(U32.is_eq(status, 200)), b2u(U32.is_eq(HTTPX.x_len32(body), WANT_LEN())))
+    case HTTP.Response{+status, +headers, +body}:
+      U32.mul(b2u(U32.is_eq(status, 200)), b2u(U32.is_eq(HTTP.x_len32(body), WANT_LEN())))
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"GET", "/window", Nil{}, Nil{}}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"GET", "/window", Nil{}, Nil{}}]
 
 def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
   match r:
@@ -90,7 +92,7 @@ def client(port: U32) -> IO(U32):
     r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, HOST(), port, reqs())
     IO.pure(U32, client_score(r))
 
-def srv_sock(got: Socket & HTTPX.Got) -> Socket:
+def srv_sock(got: Socket & HTTP.Got) -> Socket:
   (s, g) = got
   s
 
@@ -104,20 +106,20 @@ def srv_close(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
 # write hits a dead socket, the peer answers RST and the frames still in
 # flight are lost.
 @unsafe
-def srv_idle(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>) -> IO(Unit):
+def srv_idle(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>) -> IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s0, buf)
+        got2 : Socket & HTTP.Got <- HTTP2.x_read_frame(s0, buf)
         srv_idle(1, got2, buf)
     case 1:
       (s1, g1) = got
       match g1:
-        case HTTPX.GotErr{code, msg}:
+        case HTTP.GotErr{code, msg}:
           TLS.tls_close(s1)
-        case HTTPX.GotOk{+frame, +buf2}:
-          srv_idle(0, (s1, HTTPX.GotOk{frame, buf2}), buf2)
+        case HTTP.GotOk{+frame, +buf2}:
+          srv_idle(0, (s1, HTTP.GotOk{frame, buf2}), buf2)
     case _:
       (s9, g9) = got
       TLS.tls_close(s9)
@@ -128,24 +130,24 @@ def srv_idle_from(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
     case Fail{e}:
       TLS.tls_close(s)
     case Done{u}:
-      srv_idle(0, (s, HTTPX.GotErr{0, "next"}), Nil{})
+      srv_idle(0, (s, HTTP.GotErr{0, "next"}), Nil{})
 
 
-def srv_acked(m: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTPX.Got:
+def srv_acked(m: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HTTP.Got:
   (s, r) = m
   match r:
     case Fail{e}:
-      (s, HTTPX.GotErr{616, "tls io"})
+      (s, HTTP.GotErr{616, "tls io"})
     case Done{u}:
-      (s, HTTPX.GotErr{0, "next"})
+      (s, HTTP.GotErr{0, "next"})
 
 # stage 0 waits for the request HEADERS (act 2), stage 1 waits for the
 # connection WINDOW_UPDATE (act 3); anything else keeps reading.
 def srv_is_head(+typ: U32) -> Bool:
-  U32.is_eq(typ, HTTPX.x_t_headers())
+  U32.is_eq(typ, HTTP2.x_t_headers())
 
 def srv_is_wu(+typ: U32, +sid: U32) -> Bool:
-  Bool.and(U32.is_eq(typ, HTTPX.x_t_wu()), U32.is_eq(sid, 0))
+  Bool.and(U32.is_eq(typ, HTTP2.x_t_wu()), U32.is_eq(sid, 0))
 
 def srv_act(stage: U32, is_head: Bool, is_wu: Bool) -> U32:
   match stage is_head is_wu:
@@ -162,31 +164,31 @@ def srv_act(stage: U32, is_head: Bool, is_wu: Bool) -> U32:
 # back to reading in stage 1. One self-recursive def, no forward
 # declaration needed.
 @unsafe
-def srv(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +sid: U32, +stage: U32, +left: U32, act: U32) -> IO(Unit):
+def srv(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +typ: U32, +sid: U32, +stage: U32, +left: U32, act: U32) -> IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
-        got2 : Socket & HTTPX.Got <- HTTPX.x_read_frame(s0, buf)
+        got2 : Socket & HTTP.Got <- HTTP2.x_read_frame(s0, buf)
         srv(1, got2, buf, 0, 0, stage, left, 4)
     case 1:
       (s1, g1) = got
       match g1:
-        case HTTPX.GotErr{code, msg}:
+        case HTTP.GotErr{code, msg}:
           TLS.tls_close(s1)
-        case HTTPX.GotOk{+frame, +buf2}:
+        case HTTP.GotOk{+frame, +buf2}:
           match frame:
-            case HTTPX.Frame{+typ2, +flags2, +sid2, +payload2}:
-              srv(2, (s1, HTTPX.GotOk{frame, buf2}), buf2, typ2, sid2, stage, left, srv_act(stage, srv_is_head(typ2), srv_is_wu(typ2, sid2)))
+            case HTTP.Frame{+typ2, +flags2, +sid2, +payload2}:
+              srv(2, (s1, HTTP.GotOk{frame, buf2}), buf2, typ2, sid2, stage, left, srv_act(stage, srv_is_head(typ2), srv_is_wu(typ2, sid2)))
     case 2:
       match act:
         case 2:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(srv_sock(got), HTTPX.x_t_headers(), HTTPX.x_f_end_headers(), 1, head_block())
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(srv_sock(got), HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, head_block())
             srv(3, srv_acked(sent), buf, 0, 0, 0, CHUNKS(), 4)
         case 3:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(srv_sock(got), HTTPX.x_t_data(), HTTPX.x_f_end_stream(), 1, fill(TAIL()))
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(srv_sock(got), HTTP2.x_t_data(), HTTP2.x_f_end_stream(), 1, fill(TAIL()))
             srv_idle_from(sent)
         case _:
           srv(0, got, buf, typ, sid, stage, left, 4)
@@ -196,16 +198,16 @@ def srv(phase: U32, got: Socket & HTTPX.Got, +buf: List<&2, U32>, +typ: U32, +si
           srv(0, got, buf, 0, 0, 1, 0, 4)
         case _:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(srv_sock(got), HTTPX.x_t_data(), 0, 1, fill(CHUNK()))
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(srv_sock(got), HTTP2.x_t_data(), 0, 1, fill(CHUNK()))
             srv(3, srv_acked(sent), buf, 0, 0, 0, (left - 1 : U32), 4)
     case _:
       (s9, g9) = got
       TLS.tls_close(s9)
 
-def srv_set(got: Socket & HTTPX.Got, +buf: List<&2, U32>) -> IO(Unit):
+def srv_set(got: Socket & HTTP.Got, +buf: List<&2, U32>) -> IO(Unit):
   (s, g) = got
   do IO<Unit>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTPX.x_send_frame(s, HTTPX.x_t_settings(), 0, 0, HTTPX.x_settings_initial_pay())
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_settings(), 0, 0, HTTP2.x_settings_initial_pay())
     srv(0, srv_acked(sent), buf, 0, 0, 0, 0, 4)
 
 @unsafe
@@ -218,7 +220,7 @@ def srv_pre(phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
           TLS.tls_close(s0)
         case Done{+chunk}:
           +acc2 = List.append(&2, U32, acc, chunk)
-          srv_pre(1, (s0, Done{chunk}), acc2, HTTPX.x_preface_ok(acc2), U32.is_lt(HTTPX.x_len32(acc2), 24))
+          srv_pre(1, (s0, Done{chunk}), acc2, HTTP2.x_preface_ok(acc2), U32.is_lt(HTTP.x_len32(acc2), 24))
     case 1:
       (s1, r1) = rs
       match short:
@@ -232,7 +234,7 @@ def srv_pre(phase: U32, rs: Socket & Result<&1, &1, U32 & String, List<&2, U32>>
       (s2, r2) = rs
       match ok:
         case 1:
-          srv_set((s2, HTTPX.GotErr{0, "next"}), HTTPX.x_drop32(24, acc))
+          srv_set((s2, HTTP.GotErr{0, "next"}), HTTP.x_drop32(24, acc))
         case _:
           do IO<Unit>:
             TLS.tls_close(s2)

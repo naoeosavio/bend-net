@@ -6,6 +6,7 @@
 #        /tmp/opencode/fetchbulk
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def report_fail(+c: U32, +e: String) -> IO(Unit):
   do IO<Unit>:
@@ -15,17 +16,17 @@ def report_fail(+c: U32, +e: String) -> IO(Unit):
 def report_body(+status: U32, +body: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
     _ : Unit <- IO.print("STATUS " ++ U32.show(status))
-    _ : Unit <- IO.print("LEN " ++ U32.show(HTTPX.x_len32(body)))
-    _ : Unit <- IO.print("HEAD " ++ HTTPX.x_bytes_str(HTTPX.x_take32(200, body)))
+    _ : Unit <- IO.print("LEN " ++ U32.show(HTTP.x_len32(body)))
+    _ : Unit <- IO.print("HEAD " ++ HTTP.x_bytes_str(HTTP.x_take32(200, body)))
     _ : Unit <- IO.print("DONE 3/3")
     IO.die(Unit, 0, "")
 
-def report_resp(resp: HTTPX.Response) -> IO(Unit):
+def report_resp(resp: HTTP.Response) -> IO(Unit):
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       report_body(status, body)
 
-def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
+def report(r: Result<&1, &1, U32 & String, HTTP.Response>) -> IO(Unit):
   match r:
     case Fail{(c, e)}:
       report_fail(c, e)
@@ -35,5 +36,5 @@ def report(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     _ : Unit <- IO.print("STEP dial api.binance.com:443")
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <- HTTPX.client.once("api.binance.com", 443, HTTPX.Request{"GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{}})
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTPX.client.once("api.binance.com", 443, HTTP.Request{"GET", "/api/v3/exchangeInfo?symbolStatus=TRADING&permissions=SPOT", Nil{}, Nil{}})
     report(r)

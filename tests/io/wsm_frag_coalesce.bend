@@ -20,7 +20,7 @@
 # Score: op 1 x payload "hello", golden 1.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
 def PORT() -> U32:
@@ -84,7 +84,7 @@ def cli_echo(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>
       cli_dead(s, 0)
     case Done{t}:
       (fin, op, pay) = t
-      cli_dead(s, U32.mul(b2u(U32.is_eq(op, 1)), HTTPX.x_eq(pay, TEXT_ALL())))
+      cli_dead(s, U32.mul(b2u(U32.is_eq(op, 1)), HTTP.x_eq(pay, TEXT_ALL())))
 
 # The close is out: read the first reply.
 def cli_close_sent(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):

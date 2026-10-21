@@ -6,7 +6,7 @@
 # Self-failing on purpose: check.sh reads only the exit status and bend
 # ignores the #| marker, so a wrong score halts with code 1 from contra_end.
 import Base
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
 def b2u(b: Bool) -> U32:
@@ -38,38 +38,38 @@ def contra_end(is_ok: Bool, +score: U32) -> IO(U32):
 
 # The pre-TASK-040 split path, copied as the reference answer.
 def old_got_go(+bs: List<&2, U32>, +total: U32, eq: Bool, +missing: U32) ->
-  HTTPX.UnitOut:
+  HTTP.UnitOut:
   match eq:
     case True{}:
-      HTTPX.Got{HTTPX.x_take32(total, bs), False{}, HTTPX.x_drop32(total, bs)}
+      HTTP.Got{HTTP.x_take32(total, bs), False{}, HTTP.x_drop32(total, bs)}
     case False{}:
-      HTTPX.NeedMore{missing, bs}
+      HTTP.NeedMore{missing, bs}
 
-def old_split_got(+bs: List<&2, U32>, +total: U32) -> HTTPX.UnitOut:
-  +got = HTTPX.x_len_upto(total, bs)
+def old_split_got(+bs: List<&2, U32>, +total: U32) -> HTTP.UnitOut:
+  +got = HTTP.x_len_upto(total, bs)
   old_got_go(bs, total, U32.is_eq(got, total), U32.sub(total, got))
 
 def old_split_res(bs: List<&2, U32>, need: Result<&1, &1, U32 & String, U32>) ->
-  HTTPX.UnitOut:
+  HTTP.UnitOut:
   match need:
     case Fail{(c, e)}:
-      HTTPX.Bad{c, e}
+      HTTP.Bad{c, e}
     case Done{total}:
       old_split_got(bs, total)
 
 def old_split_hd(+bs: List<&2, U32>, unmasked_ok: Bool, missing: U32) ->
-  HTTPX.UnitOut:
+  HTTP.UnitOut:
   match missing:
     case 0:
       old_split_res(bs, WSM.wsm_frame_need_go(bs, unmasked_ok))
     case _:
-      HTTPX.NeedMore{missing, bs}
+      HTTP.NeedMore{missing, bs}
 
-def old_split(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
+def old_split(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTP.UnitOut:
   old_split_hd(bs, unmasked_ok,
-    WSM.wsm_frame_hdr_go(bs, HTTPX.x_len_upto(10, bs)))
+    WSM.wsm_frame_hdr_go(bs, HTTP.x_len_upto(10, bs)))
 
-def new_split(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
+def new_split(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTP.UnitOut:
   match unmasked_ok:
     case True{}:
       WSM.wsm_frame_split_unmasked(bs)
@@ -77,18 +77,18 @@ def new_split(+bs: List<&2, U32>, unmasked_ok: Bool) -> HTTPX.UnitOut:
       WSM.wsm_frame_split(bs)
 
 # Structural equality of two split answers, 1 or 0.
-def out_eq(a: HTTPX.UnitOut, b: HTTPX.UnitOut) -> U32:
+def out_eq(a: HTTP.UnitOut, b: HTTP.UnitOut) -> U32:
   match a b:
-    case HTTPX.Got{u1, f1, r1} HTTPX.Got{u2, f2, r2}:
-      b2u(Bool.and(U32.is_eq(HTTPX.x_eq(u1, u2), 1),
+    case HTTP.Got{u1, f1, r1} HTTP.Got{u2, f2, r2}:
+      b2u(Bool.and(U32.is_eq(HTTP.x_eq(u1, u2), 1),
         Bool.and(U32.is_eq(same_bool(f1, f2), 1),
-          U32.is_eq(HTTPX.x_eq(r1, r2), 1))))
-    case HTTPX.NeedMore{m1, r1} HTTPX.NeedMore{m2, r2}:
-      b2u(Bool.and(U32.is_eq(m1, m2), U32.is_eq(HTTPX.x_eq(r1, r2), 1)))
-    case HTTPX.Bad{c1, s1} HTTPX.Bad{c2, s2}:
+          U32.is_eq(HTTP.x_eq(r1, r2), 1))))
+    case HTTP.NeedMore{m1, r1} HTTP.NeedMore{m2, r2}:
+      b2u(Bool.and(U32.is_eq(m1, m2), U32.is_eq(HTTP.x_eq(r1, r2), 1)))
+    case HTTP.Bad{c1, s1} HTTP.Bad{c2, s2}:
       b2u(Bool.and(U32.is_eq(c1, c2), String.eq(s1, s2)))
-    case HTTPX.End{r1} HTTPX.End{r2}:
-      HTTPX.x_eq(r1, r2)
+    case HTTP.End{r1} HTTP.End{r2}:
+      HTTP.x_eq(r1, r2)
     case _ _:
       0
 
@@ -131,25 +131,25 @@ def split_all() -> U32:
   vec_sum(vectors(), 0)
 
 # Explicit answers, so a wrong answer in both sides cannot pass silently.
-def want_got(out: HTTPX.UnitOut, +unit: List<&2, U32>, +rest: List<&2, U32>) ->
+def want_got(out: HTTP.UnitOut, +unit: List<&2, U32>, +rest: List<&2, U32>) ->
   Bool:
   match out:
-    case HTTPX.Got{u, f, r}:
-      Bool.and(U32.is_eq(HTTPX.x_eq(u, unit), 1),
-        U32.is_eq(HTTPX.x_eq(r, rest), 1))
+    case HTTP.Got{u, f, r}:
+      Bool.and(U32.is_eq(HTTP.x_eq(u, unit), 1),
+        U32.is_eq(HTTP.x_eq(r, rest), 1))
     case _:
       False{}
 
-def want_need(out: HTTPX.UnitOut, missing: U32, +rest: List<&2, U32>) -> Bool:
+def want_need(out: HTTP.UnitOut, missing: U32, +rest: List<&2, U32>) -> Bool:
   match out:
-    case HTTPX.NeedMore{m, r}:
-      Bool.and(U32.is_eq(m, missing), U32.is_eq(HTTPX.x_eq(r, rest), 1))
+    case HTTP.NeedMore{m, r}:
+      Bool.and(U32.is_eq(m, missing), U32.is_eq(HTTP.x_eq(r, rest), 1))
     case _:
       False{}
 
-def want_bad(out: HTTPX.UnitOut, code: U32) -> Bool:
+def want_bad(out: HTTP.UnitOut, code: U32) -> Bool:
   match out:
-    case HTTPX.Bad{c, s}:
+    case HTTP.Bad{c, s}:
       U32.is_eq(c, code)
     case _:
       False{}
@@ -164,18 +164,18 @@ def want_all() -> U32:
 
 # The peel against the two projections it replaces: unit and rest must be
 # the same bytes for n = 0, 2, 4, 6 over a six-byte buffer.
-def got_units(out: HTTPX.UnitOut, +unit: List<&2, U32>, +rest: List<&2, U32>) ->
+def got_units(out: HTTP.UnitOut, +unit: List<&2, U32>, +rest: List<&2, U32>) ->
   Bool:
   match out:
-    case HTTPX.Got{u, f, r}:
-      Bool.and(U32.is_eq(HTTPX.x_eq(u, unit), 1),
-        U32.is_eq(HTTPX.x_eq(r, rest), 1))
+    case HTTP.Got{u, f, r}:
+      Bool.and(U32.is_eq(HTTP.x_eq(u, unit), 1),
+        U32.is_eq(HTTP.x_eq(r, rest), 1))
     case _:
       False{}
 
 def peel_row(+bs: List<&2, U32>, +total: U32) -> U32:
   b2u(got_units(WSM.wsm_frame_take.got(WSM.wsm_frame_take(bs, total)),
-    HTTPX.x_take32(total, bs), HTTPX.x_drop32(total, bs)))
+    HTTP.x_take32(total, bs), HTTP.x_drop32(total, bs)))
 
 def peel_all() -> U32:
   +bs : List<&2, U32> = [1, 2, 3, 4, 5, 6]

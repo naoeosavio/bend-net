@@ -23,6 +23,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18581
@@ -61,57 +62,57 @@ def fill_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       fill_go(p, 46 <> acc)
 
 def big() -> List<&2, U32>:
-  HTTPX.x_cat(fill_go(U32.to_nat(BIG_LEN()), Nil{}))
+  HTTP.x_cat(fill_go(U32.to_nat(BIG_LEN()), Nil{}))
 
 # Server: answer at the head, by path. The handler is pure and holds no
 # state, so the path is the only key it can use.
-def srv_head(path: String) -> HTTPX.SrvOut:
+def srv_head(path: String) -> HTTP.SrvOut:
   match path:
     case "/big":
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, big()}}
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, big()}}
     case _:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, TWO()}}
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, TWO()}}
 
-def h_srv(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h_srv(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
+    case HTTP.SrvReqHead{slot, head}:
       match head:
-        case HTTPX.ReqHead{+method, +path, +headers}:
+        case HTTP.ReqHead{+method, +path, +headers}:
           srv_head(path)
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
+      HTTP.Continue{}
 
 # Client: cancel the first stream at its response head, continue the
 # others. The slot is the only key a pure client handler has.
-def h_cli_head(slot: U32) -> HTTPX.CStreamOut:
+def h_cli_head(slot: U32) -> HTTP.CStreamOut:
   match slot:
     case 1:
-      HTTPX.CStreamCancel{1}
+      HTTP.CStreamCancel{1}
     case _:
-      HTTPX.CStreamContinue{slot}
+      HTTP.CStreamContinue{slot}
 
-def h_cli(ev: HTTPX.CStreamEv) -> HTTPX.CStreamOut:
+def h_cli(ev: HTTP.CStreamEv) -> HTTP.CStreamOut:
   match ev:
-    case HTTPX.CStreamHead{slot, head}:
+    case HTTP.CStreamHead{slot, head}:
       h_cli_head(slot)
-    case HTTPX.CStreamData{slot, +chunk, fin}:
-      HTTPX.CStreamContinue{slot}
+    case HTTP.CStreamData{slot, +chunk, fin}:
+      HTTP.CStreamContinue{slot}
 
 # A handler bug: the answer names a slot that is not the event's slot.
-def h_wrong(ev: HTTPX.CStreamEv) -> HTTPX.CStreamOut:
+def h_wrong(ev: HTTP.CStreamEv) -> HTTP.CStreamOut:
   match ev:
-    case HTTPX.CStreamHead{slot, head}:
-      HTTPX.CStreamContinue{99}
-    case HTTPX.CStreamData{slot, +chunk, fin}:
-      HTTPX.CStreamContinue{99}
+    case HTTP.CStreamHead{slot, head}:
+      HTTP.CStreamContinue{99}
+    case HTTP.CStreamData{slot, +chunk, fin}:
+      HTTP.CStreamContinue{99}
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"GET", "/cancel", Nil{}, Nil{}},
-    HTTPX.Request{"GET", "/big", Nil{}, Nil{}},
-    HTTPX.Request{"GET", "/echo", Nil{}, Nil{}}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"GET", "/cancel", Nil{}, Nil{}},
+    HTTP.Request{"GET", "/big", Nil{}, Nil{}},
+    HTTP.Request{"GET", "/echo", Nil{}, Nil{}}]
 
-def reqs_one() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"GET", "/echo", Nil{}, Nil{}}]
+def reqs_one() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"GET", "/echo", Nil{}, Nil{}}]
 
 def counts_ok(counts: U32 & U32) -> U32:
   (total, fins) = counts

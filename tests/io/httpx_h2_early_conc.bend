@@ -19,6 +19,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18567
@@ -48,24 +49,24 @@ def body_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       body_go(p, 46 <> acc)
 
 def body(+n: Nat) -> List<&2, U32>:
-  HTTPX.x_cat(body_go(n, Nil{}))
+  HTTP.x_cat(body_go(n, Nil{}))
 
 # Server: answer the head early, never read the body.
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, EARLY_BODY()}}
-    case HTTPX.SrvReqData{slot, chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, EARLY_BODY()}}
+    case HTTP.SrvReqData{slot, chunk, fin}:
+      HTTP.Continue{}
 
 # Concurrent scorer: one point for the early response, nothing else.
-def hcl(resp: HTTPX.Response) -> U32:
+def hcl(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
-      U32.mul(b2u(U32.is_eq(status, 200)), HTTPX.x_eq(body, EARLY_BODY()))
+    case HTTP.Response{+status, +headers, +body}:
+      U32.mul(b2u(U32.is_eq(status, 200)), HTTP.x_eq(body, EARLY_BODY()))
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/early", Nil{}, body(BODY_LEN())}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"POST", "/early", Nil{}, body(BODY_LEN())}]
 
 def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
   match r:

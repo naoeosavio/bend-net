@@ -30,6 +30,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -40,10 +41,10 @@ def b2u(b: Bool) -> U32:
 
 # The handler: 200 with the request body echoed as text, so the raw client
 # can read the decoded body straight out of the response.
-def echo_body(req: HTTPX.Request) -> IO(HTTPX.Response):
+def echo_body(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_str_bytes("OK:" ++ HTTPX.x_bytes_str(body))})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, HTTP.x_str_bytes("OK:" ++ HTTP.x_bytes_str(body))})
 
 # The ~K of the upgrade lane: only a 101 would call it, and this handler
 # never answers 101, so it just closes (kept a plain def, not IO.die, so a
@@ -178,7 +179,7 @@ def filler.go(+n: U32, +acc: List<&2, U32>) -> List<&2, U32>:
       filler.go((n - 1 : U32), 65 <> acc)
 
 def filler(n: U32) -> String:
-  HTTPX.x_bytes_str(filler.go(n, Nil{}))
+  HTTP.x_bytes_str(filler.go(n, Nil{}))
 
 def req_over() -> String:
   "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4E20\r\n" ++ filler(20000) ++ "\r\n0\r\n\r\n"

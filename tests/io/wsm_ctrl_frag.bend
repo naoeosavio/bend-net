@@ -25,7 +25,7 @@
 # is 0.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/wsm.bend as WSM
 
 def PORT() -> U32:
@@ -93,7 +93,7 @@ def cli_echo(pong: U32, m: Socket & Result<&1, &1, U32 & String, Bool & U32 & Li
       cli_dead(s2, 0)
     case Done{t}:
       (fin, op, pay) = t
-      echo : U32 = U32.mul(b2u(U32.is_eq(op, 1)), HTTPX.x_eq(pay, TEXT_ALL()))
+      echo : U32 = U32.mul(b2u(U32.is_eq(op, 1)), HTTP.x_eq(pay, TEXT_ALL()))
       cli_dead(s2, U32.mul(pong, echo))
 
 # The continuation is out: read the echo.
@@ -117,7 +117,7 @@ def cli_cont(pong: U32, s: Socket) -> IO(Unit):
 # First reply: the pong the loop owes the mid-message ping.
 def cli_pong_ok(s: Socket, op: U32, pay: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
-    pong : U32 = U32.mul(b2u(U32.is_eq(op, 10)), HTTPX.x_eq(pay, PING_PAY()))
+    pong : U32 = U32.mul(b2u(U32.is_eq(op, 10)), HTTP.x_eq(pay, PING_PAY()))
     cli_cont(pong, s)
 
 def cli_pong(m: Socket & Result<&1, &1, U32 & String, Bool & U32 & List<&2, U32>> & List<&2, U32>) -> IO(Unit):

@@ -10,6 +10,7 @@
 #   bend examples/real/httpx_h1_real.bend
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def emit(label: String, r: Result<&1, &1, U32 & String, String>) -> IO(Unit):
   match r:
@@ -22,9 +23,9 @@ def main() -> IO(Unit):
   do IO<Unit>:
     a : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure("http://httpbin.org/get")
     x : Unit <- emit("GET httpbin.org/get (fetch, CL)", a)
-    b : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/post", "POST", [HTTPX.Hdr{"Content-Type", "application/x-www-form-urlencoded"}], "nome=bend&lang=affine")
+    b : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/post", "POST", [HTTP.Hdr{"Content-Type", "application/x-www-form-urlencoded"}], "nome=bend&lang=affine")
     y : Unit <- emit("POST httpbin.org/post (request)", b)
-    c : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/put", "PUT", [HTTPX.Hdr{"Content-Type", "text/plain"}], "affine")
+    c : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/put", "PUT", [HTTP.Hdr{"Content-Type", "text/plain"}], "affine")
     z : Unit <- emit("PUT httpbin.org/put (request)", c)
     g : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/delete", "DELETE", [], "")
     q : Unit <- emit("DELETE httpbin.org/delete (request)", g)
@@ -36,7 +37,7 @@ def main() -> IO(Unit):
     optx : Unit <- emit("OPTIONS httpbin.org/anything (request)", opt)
     trc : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/anything", "TRACE", [], "")
     trcx : Unit <- emit("TRACE httpbin.org/anything (request)", trc)
-    ptc : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/patch", "PATCH", [HTTPX.Hdr{"Content-Type", "text/plain"}], "affine")
+    ptc : Result<&1, &1, U32 & String, String> <- HTTPX.request_plain("httpbin.org", 80, "/patch", "PATCH", [HTTP.Hdr{"Content-Type", "text/plain"}], "affine")
     ptcx : Unit <- emit("PATCH httpbin.org/patch (request)", ptc)
     d : Result<&1, &1, U32 & String, String> <- HTTPX.fetch_insecure("http://info.cern.ch/")
     w : Unit <- emit("GET info.cern.ch (CL, first website)", d)

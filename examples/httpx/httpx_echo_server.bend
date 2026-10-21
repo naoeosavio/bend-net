@@ -7,13 +7,14 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h2_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      do IO<HTTPX.Response>:
-        x : Unit <- IO.print("SRV got " ++ U32.show(U32.from_nat(HTTPX.x_len(body))))
-        IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      do IO<HTTP.Response>:
+        x : Unit <- IO.print("SRV got " ++ U32.show(U32.from_nat(HTTP.x_len(body))))
+        IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 law server_side:
   for l: Listener

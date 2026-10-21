@@ -5,11 +5,12 @@
 # concurrent golden).
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -19,24 +20,24 @@ def b2u(b: Bool) -> U32:
       0
 
 def is_want(+body: List<&2, U32>) -> Bool:
-  Bool.or(Bool.or(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-0")), 1), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-1")), 1)), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello-2")), 1))
+  Bool.or(Bool.or(U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-0")), 1), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-1")), 1)), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello-2")), 1))
 
-def hit(+resp: HTTPX.Response) -> U32:
+def hit(+resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
+    case HTTP.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200), is_want(body)))
 
-def total(rs: List<&2, HTTPX.Response>) -> U32:
+def total(rs: List<&2, HTTP.Response>) -> U32:
   match rs:
     case Nil{}:
       0
     case +h <> t:
       (hit(h) + total(t) : U32)
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-0")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-1")}, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello-2")}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")}, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")}]
 
-def client_score(r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) -> U32:
+def client_score(r: Result<&1, &1, U32 & String, List<&2, HTTP.Response>>) -> U32:
   match r:
     case Fail{e}:
       0
@@ -45,7 +46,7 @@ def client_score(r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) -> U
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <- HTTPX.client.on_insecure("127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTPX.client.on_insecure("127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 law server_side:

@@ -11,11 +11,12 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -24,19 +25,19 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def status_body_is(+resp: HTTPX.Response, want: U32, expected: List<&2, U32>) -> U32:
+def status_body_is(+resp: HTTP.Response, want: U32, expected: List<&2, U32>) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
-      b2u(Bool.and(U32.is_eq(status, want), U32.is_eq(HTTPX.x_eq(body, expected), 1)))
+    case HTTP.Response{+status, +headers, +body}:
+      b2u(Bool.and(U32.is_eq(status, want), U32.is_eq(HTTP.x_eq(body, expected), 1)))
 
-def once_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def once_score(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
-      status_body_is(resp, 200, HTTPX.x_str_bytes("hello"))
+      status_body_is(resp, 200, HTTP.x_str_bytes("hello"))
 
-def echo_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def echo_score(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
@@ -45,13 +46,13 @@ def echo_score(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
 
 def once_client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <-
-      HTTPX.client.once_insecure("127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
+    r : Result<&1, &1, U32 & String, HTTP.Response> <-
+      HTTPX.client.once_insecure("127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
     IO.pure(U32, once_score(r))
 
 def echo_client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTPX.Response> <-
+    r : Result<&1, &1, U32 & String, HTTP.Response> <-
       HTTPX.client.echo_insecure("127.0.0.1", port, "/echo")
     IO.pure(U32, echo_score(r))
 

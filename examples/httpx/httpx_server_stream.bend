@@ -9,25 +9,26 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def cap() -> U32:
   3
 
 def over_cap(+chunk: List<&2, U32>) -> Bool:
-  U32.is_gt(U32.from_nat(HTTPX.x_len(chunk)), cap())
+  U32.is_gt(U32.from_nat(HTTP.x_len(chunk)), cap())
 
-def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
+def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTP.SrvOut:
   match is_over:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.Response{413, Nil{}, Nil{}}}
+      HTTP.RespondEarly{HTTP.Response{413, Nil{}, Nil{}}}
     case False{}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.Continue{}
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.Continue{}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 
 law server:

@@ -25,6 +25,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   49340
@@ -36,10 +37,10 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 # The head filler of the oversized case: one long header field, no blank
 # line until the end. @unsafe for the same reason the chunk test's filler
@@ -53,7 +54,7 @@ def filler.go(+n: U32, +acc: List<&2, U32>) -> List<&2, U32>:
       filler.go((n - 1 : U32), 65 <> acc)
 
 def filler(n: U32) -> String:
-  HTTPX.x_bytes_str(filler.go(n, Nil{}))
+  HTTP.x_bytes_str(filler.go(n, Nil{}))
 
 def req_no_host() -> String:
   "GET /a HTTP/1.1\r\n\r\n"
@@ -135,12 +136,12 @@ def raw_case(conn: Result<&1, &1, U32 & String, Socket>, +req: String, +want: St
 def k_close(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   Socket.close(sock)
 
-def sh(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def sh(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.Continue{}
-    case HTTPX.SrvReqData{slot, chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.Continue{}
+    case HTTP.SrvReqData{slot, chunk, fin}:
+      HTTP.Continue{}
 
 def server_side(l: Listener) -> IO(Unit):
   HTTPX.server.on_h1_plain(~echo, l)

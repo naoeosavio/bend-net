@@ -19,6 +19,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18562
@@ -48,41 +49,41 @@ def body_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       body_go(p, 46 <> acc)
 
 def body(+n: Nat) -> List<&2, U32>:
-  HTTPX.x_cat(body_go(n, Nil{}))
+  HTTP.x_cat(body_go(n, Nil{}))
 
 # Server: answer the head early, never read the body.
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, EARLY_BODY()}}
-    case HTTPX.SrvReqData{slot, chunk, fin}:
-      HTTPX.Continue{}
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, EARLY_BODY()}}
+    case HTTP.SrvReqData{slot, chunk, fin}:
+      HTTP.Continue{}
 
-def status_ok(+h: HTTPX.Head) -> Bool:
+def status_ok(+h: HTTP.Head) -> Bool:
   match h:
-    case HTTPX.Head{status, headers}:
+    case HTTP.Head{status, headers}:
       U32.is_eq(status, 200)
 
-def hcl_head(ok: Bool) -> HTTPX.StreamOut:
+def hcl_head(ok: Bool) -> HTTP.StreamOut:
   match ok:
     case True{}:
-      HTTPX.StreamContinue{}
+      HTTP.StreamContinue{}
     case False{}:
-      HTTPX.StreamCancel{}
+      HTTP.StreamCancel{}
 
 # Client handler: a non-200 head cancels the drain, so the counts that
 # follow cannot score.
-def hcl(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+def hcl(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   match ev:
-    case HTTPX.StreamHead{head}:
+    case HTTP.StreamHead{head}:
       hcl_head(status_ok(head))
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
 # Drain counts: total bytes and END_STREAMs seen.
 def counts_ok(counts: U32 & U32) -> U32:
   (total, fins) = counts
-  U32.mul(b2u(U32.is_eq(total, HTTPX.x_len32(EARLY_BODY()))), b2u(U32.is_eq(fins, 1)))
+  U32.mul(b2u(U32.is_eq(total, HTTP.x_len32(EARLY_BODY()))), b2u(U32.is_eq(fins, 1)))
 
 def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
   match r:

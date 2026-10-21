@@ -7,6 +7,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -20,26 +21,26 @@ def b2u(b):
       0
 
 law h_all:
-  for ev: HTTPX.StreamEv
-  HTTPX.StreamOut
+  for ev: HTTP.StreamEv
+  HTTP.StreamOut
 
 def h_all(ev):
   match ev:
-    case HTTPX.StreamHead{head}:
-      HTTPX.StreamContinue{}
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamHead{head}:
+      HTTP.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
 law h_cancel:
-  for ev: HTTPX.StreamEv
-  HTTPX.StreamOut
+  for ev: HTTP.StreamEv
+  HTTP.StreamOut
 
 def h_cancel(ev):
   match ev:
-    case HTTPX.StreamHead{head}:
-      HTTPX.StreamCancel{}
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamCancel{}
+    case HTTP.StreamHead{head}:
+      HTTP.StreamCancel{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamCancel{}
 
 law score_stream:
   for r: Result<&1, &1, (U32 & String), (U32 & U32)>
@@ -66,13 +67,13 @@ def score_cancel(r):
       0
 
 law echo_service:
-  for req: HTTPX.Request
-  IO(HTTPX.Response)
+  for req: HTTP.Request
+  IO(HTTP.Response)
 
 def echo_service(req):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 law client:
   for +port: U32
@@ -80,8 +81,8 @@ law client:
 
 def client(port):
   do IO<U32>:
-    r1 : Result<&1, &1, (U32 & String), (U32 & U32)> <- HTTPX.client.stream_plain(~h_all, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
-    r2 : Result<&1, &1, (U32 & String), (U32 & U32)> <- HTTPX.client.stream_plain(~h_cancel, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello"))
+    r1 : Result<&1, &1, (U32 & String), (U32 & U32)> <- HTTPX.client.stream_plain(~h_all, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r2 : Result<&1, &1, (U32 & String), (U32 & U32)> <- HTTPX.client.stream_plain(~h_cancel, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
     +total : U32 = (score_stream(r1) * 10 + score_cancel(r2) : U32)
     IO.pure(U32, total)
 

@@ -10,6 +10,7 @@
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -22,67 +23,67 @@ def cap() -> U32:
   3
 
 def over_cap(+chunk: List<&2, U32>) -> Bool:
-  U32.is_gt(HTTPX.x_len32(chunk), cap())
+  U32.is_gt(HTTP.x_len32(chunk), cap())
 
-def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTPX.SrvOut:
+def h_data_go(is_over: Bool, +chunk: List<&2, U32>) -> HTTP.SrvOut:
   match is_over:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.Response{413, Nil{}, Nil{}}}
+      HTTP.RespondEarly{HTTP.Response{413, Nil{}, Nil{}}}
     case False{}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
-def h(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.Continue{}
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.Continue{}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
       h_data_go(over_cap(chunk), chunk)
 
-def score_echo(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def score_echo(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
-          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hi")), 1)))
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hi")), 1)))
 
-def score_early(r: Result<&1, &1, U32 & String, HTTPX.Response>) -> U32:
+def score_early(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           b2u(U32.is_eq(status, 413))
 
-def req2(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +s1: U32) -> IO(U32):
+def req2(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +s1: U32) -> IO(U32):
   (sock2, r2, st2) = got
   do IO<U32>:
     +s12 : U32 = (s1 + score_early(r2) : U32)
     x : Unit <- TLS.tls_close(sock2)
     IO.pure(U32, s12)
 
-def req1(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
+def req1(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32) -> IO(U32):
   (sock1, r1, st1) = got
   do IO<U32>:
     +s1 : U32 = score_echo(r1)
-    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock1, st1, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")})
+    got2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock1, st1, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
     req2(got2, s1)
 
-def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
+def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock0, st0) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hi")})
+        got1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hi")})
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:

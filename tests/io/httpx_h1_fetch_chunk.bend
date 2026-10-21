@@ -22,6 +22,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -54,7 +55,7 @@ def bytes_len_is(r: Result<&1, &1, U32 & String, List<&2, U32>>, +want: U32) -> 
     case Fail{e}:
       0
     case Done{+bs}:
-      b2u(U32.is_eq(HTTPX.x_len32(bs), want))
+      b2u(U32.is_eq(HTTP.x_len32(bs), want))
 
 # The canned server: one accept, one read of the request, one write, close.
 def srv_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, l: Listener) -> IO(U32):
@@ -124,7 +125,7 @@ def pay.go(+n: U32, +acc: List<&2, U32>) -> List<&2, U32>:
 # values arrives with the wrong length and the framing check refuses it.
 # A real byte-lane vector would build the response with TCP.send_bytes.
 def pay(n: U32) -> String:
-  HTTPX.x_bytes_str(pay.go(n, Nil{}))
+  HTTP.x_bytes_str(pay.go(n, Nil{}))
 
 def chunk_text() -> String:
   "4000\r\n" ++ pay(16384) ++ "\r\n"

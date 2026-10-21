@@ -9,6 +9,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -17,10 +18,10 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def hello_service(req: HTTPX.Request) -> IO(HTTPX.Response):
+def hello_service(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, HTTPX.x_str_bytes("hello")})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, HTTP.x_str_bytes("hello")})
 
 def text_ok(r: Result<&1, &1, U32 & String, String>) -> U32:
   match r:
@@ -34,7 +35,7 @@ def bytes_ok(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
     case Fail{e}:
       0
     case Done{+body}:
-      b2u(U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hello")), 1))
+      b2u(U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hello")), 1))
 
 def client_text(port: U32) -> IO(U32):
   do IO<U32>:
@@ -57,7 +58,7 @@ def client_post(port: U32) -> IO(U32):
 def client_post_bytes(port: U32) -> IO(U32):
   do IO<U32>:
     r : Result<&1, &1, U32 & String, List<&2, U32>> <-
-      HTTPX.request_bytes_plain("127.0.0.1", port, "/hello", "POST", Nil{}, HTTPX.x_str_bytes("hi"))
+      HTTPX.request_bytes_plain("127.0.0.1", port, "/hello", "POST", Nil{}, HTTP.x_str_bytes("hi"))
     IO.pure(U32, bytes_ok(r))
 
 law plain_side:

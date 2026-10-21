@@ -24,6 +24,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18591
@@ -69,67 +70,67 @@ def eq2(p: U32 & U32, want_total: U32, want_fins: U32) -> U32:
 # Server: /cancel answers at the head with no body, every other path
 # buffers and echoes its first chunk. The Bool of the path test rides an
 # argument, because a match cannot scrutinize a call.
-def srv_head_act(is_cancel: Bool) -> HTTPX.SrvOut:
+def srv_head_act(is_cancel: Bool) -> HTTP.SrvOut:
   match is_cancel:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.Response{CANCEL_STATUS(), Nil{}, Nil{}}}
+      HTTP.RespondEarly{HTTP.Response{CANCEL_STATUS(), Nil{}, Nil{}}}
     case False{}:
-      HTTPX.Continue{}
+      HTTP.Continue{}
 
-def srv_head(path: String) -> HTTPX.SrvOut:
+def srv_head(path: String) -> HTTP.SrvOut:
   srv_head_act(String.eq(path, "/cancel"))
 
-def srv_data(chunk: List<&2, U32>) -> HTTPX.SrvOut:
-  HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+def srv_data(chunk: List<&2, U32>) -> HTTP.SrvOut:
+  HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
-def h_srv(ev: HTTPX.SrvEv) -> HTTPX.SrvOut:
+def h_srv(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
+    case HTTP.SrvReqHead{slot, head}:
       match head:
-        case HTTPX.ReqHead{+method, +path, +headers}:
+        case HTTP.ReqHead{+method, +path, +headers}:
           srv_head(path)
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
+    case HTTP.SrvReqData{slot, +chunk, fin}:
       srv_data(chunk)
 
 # Client: the status of the response head is the only key this pure
 # handler has. H1 carries no slot, and a template lane cannot take one
 # (discovery C13).
-def h_cli_status(status: U32) -> HTTPX.StreamOut:
+def h_cli_status(status: U32) -> HTTP.StreamOut:
   match status:
     case 418:
-      HTTPX.StreamCancel{}
+      HTTP.StreamCancel{}
     case _:
-      HTTPX.StreamContinue{}
+      HTTP.StreamContinue{}
 
-def h_cli(ev: HTTPX.StreamEv) -> HTTPX.StreamOut:
+def h_cli(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   match ev:
-    case HTTPX.StreamHead{head}:
+    case HTTP.StreamHead{head}:
       match head:
-        case HTTPX.Head{+status, +headers}:
+        case HTTP.Head{+status, +headers}:
           h_cli_status(status)
-    case HTTPX.StreamData{chunk, fin}:
-      HTTPX.StreamContinue{}
+    case HTTP.StreamData{chunk, fin}:
+      HTTP.StreamContinue{}
 
-def req_echo() -> HTTPX.Request:
-  HTTPX.Request{"POST", "/echo", Nil{}, HTTPX.x_str_bytes("hello")}
+def req_echo() -> HTTP.Request:
+  HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")}
 
-def req_cancel() -> HTTPX.Request:
-  HTTPX.Request{"POST", "/cancel", Nil{}, HTTPX.x_str_bytes("x")}
+def req_cancel() -> HTTP.Request:
+  HTTP.Request{"POST", "/cancel", Nil{}, HTTP.x_str_bytes("x")}
 
-def reqs_two() -> List<&2, HTTPX.Request>:
+def reqs_two() -> List<&2, HTTP.Request>:
   [req_echo(), req_cancel()]
 
-def reqs_peer() -> List<&2, HTTPX.Request>:
+def reqs_peer() -> List<&2, HTTP.Request>:
   [req_echo(), req_echo()]
 
-def reqs_empty() -> List<&2, HTTPX.Request>:
+def reqs_empty() -> List<&2, HTTP.Request>:
   Nil{}
 
 # A path with a space is not a valid request path (client.on.valid_path).
-def req_bad() -> HTTPX.Request:
-  HTTPX.Request{"POST", "/bad path", Nil{}, Nil{}}
+def req_bad() -> HTTP.Request:
+  HTTP.Request{"POST", "/bad path", Nil{}, Nil{}}
 
-def reqs_mixed() -> List<&2, HTTPX.Request>:
+def reqs_mixed() -> List<&2, HTTP.Request>:
   [req_echo(), req_bad()]
 
 # A free port at or above the asked one, walked upward while a bind fails.
@@ -152,7 +153,7 @@ def listen_any(tries: Nat, +port: U32) -> IO(Listener & U32):
 
 # A canned 200 with a 5-byte body, then close.
 def peer_resp() -> List<&2, U32>:
-  HTTPX.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+  HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
 
 # The peer dies on its own failure: a broken peer is a broken test, and a
 # silent one would make the client hang instead of failing.

@@ -19,6 +19,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 import ../../lib/static.bend as Static
 
 # Named constants: the site root (relative to the repo root), the read
@@ -63,33 +64,33 @@ def site_file(+path: String) -> String:
 
 # Headers of a served file: the lane stamps the length, the content type
 # comes from the extension.
-def site_headers(+path: String) -> List<&2, HTTPX.Hdr>:
-  HTTPX.Hdr{"content-type", Static.content_type(path)} <> Nil{}
+def site_headers(+path: String) -> List<&2, HTTP.Hdr>:
+  HTTP.Hdr{"content-type", Static.content_type(path)} <> Nil{}
 
-def site_error_headers() -> List<&2, HTTPX.Hdr>:
-  HTTPX.Hdr{"content-type", "text/html"} <> Nil{}
+def site_error_headers() -> List<&2, HTTP.Hdr>:
+  HTTP.Hdr{"content-type", "text/html"} <> Nil{}
 
 def site_error_body() -> List<&2, U32>:
-  HTTPX.x_str_bytes("<h1>404 not found</h1>\n")
+  HTTP.x_str_bytes("<h1>404 not found</h1>\n")
 
 # The answer for a file whose bytes are known, as a pure def. `file` —
 # never the request path — decides the content type: passing the path
 # here served "/" as application/octet-stream (task-040 D10).
-def site_response(+file: String, r: Result<&1, &1, U32 & String, List<&2, U32>>) -> HTTPX.Response:
+def site_response(+file: String, r: Result<&1, &1, U32 & String, List<&2, U32>>) -> HTTP.Response:
   match r:
     case Fail{(code, msg)}:
-      HTTPX.Response{code, site_error_headers(), site_error_body()}
+      HTTP.Response{code, site_error_headers(), site_error_body()}
     case Done{+body}:
-      HTTPX.Response{200, site_headers(file), body}
+      HTTP.Response{200, site_headers(file), body}
 
 # The mapped name is bound once and used for both the read and the answer.
-def site_handler(req: HTTPX.Request) -> IO(HTTPX.Response):
+def site_handler(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{method, +path, headers, body}:
-      do IO<HTTPX.Response>:
+    case HTTP.Request{method, +path, headers, body}:
+      do IO<HTTP.Response>:
         +file : String = site_file(path)
         r : Result<&1, &1, U32 & String, List<&2, U32>> <- Static.read_bytes(SITE_ROOT(), file, SITE_CAP())
-        IO.pure(HTTPX.Response, site_response(file, r))
+        IO.pure(HTTP.Response, site_response(file, r))
 
 def server_plain(l: Listener) -> IO(String):
   do IO<String>:

@@ -17,6 +17,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -25,13 +26,13 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def up_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}]
+def up_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}]
 
-def up_h(req: HTTPX.Request) -> IO(HTTPX.Response):
+def up_h(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{101, [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}], Nil{}})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{101, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}], Nil{}})
 
 def up_k_done(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
   (s2, r2) = sent
@@ -72,7 +73,7 @@ def cli_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc
     case Done{+part}:
       do IO<U32>:
         x : Unit <- TLS.tls_close(s)
-        IO.pure(U32, (acc + HTTPX.x_eq(part, [9]) : U32))
+        IO.pure(U32, (acc + HTTP.x_eq(part, [9]) : U32))
 
 def cli_echo_wait(sent: Socket & Result<&1, &1, U32 & String, Unit>, +acc: U32) -> IO(U32):
   (s, r) = sent
@@ -89,7 +90,7 @@ def cli_echo_wait(sent: Socket & Result<&1, &1, U32 & String, Unit>, +acc: U32) 
 # The greeting rides rest when the two server writes coalesce and the
 # socket when they do not — consume rest first either way.
 def cli_greet_byte(sock: Socket, +part: List<&2, U32>, +acc: U32) -> IO(U32):
-  +acc2 : U32 = (acc + HTTPX.x_eq(part, [5]) : U32)
+  +acc2 : U32 = (acc + HTTP.x_eq(part, [5]) : U32)
   do IO<U32>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, [9])
     cli_echo_wait(sent, acc2)
@@ -113,20 +114,20 @@ def cli_up_rest(sock: Socket, +rest: List<&2, U32>, +acc: U32) -> IO(U32):
     case h <> t:
       cli_greet_byte(sock, rest, acc)
 
-def cli_up(r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>) -> IO(U32):
+def cli_up(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
   match r:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{t}:
       (sock, resp, rest) = t
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           +acc : U32 = b2u(U32.is_eq(status, 101))
           cli_up_rest(sock, rest, acc)
 
 def cli_round(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open_insecure("127.0.0.1", port, HTTPX.Request{"GET", "/chat", up_hs(), Nil{}})
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open_insecure("127.0.0.1", port, HTTP.Request{"GET", "/chat", up_hs(), Nil{}})
     cli_up(r)
 
 def up_side(l: Listener) -> IO(U32):
@@ -140,22 +141,22 @@ def run_up(b: Listener & U32) -> IO(U32):
     c : Chan(U32) <- IO.fork(U32, up_side(l))
     cli_round(port)
 
-def ok_h(req: HTTPX.Request) -> IO(HTTPX.Response):
+def ok_h(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, Nil{}})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, Nil{}})
 
 # Unreached on the deny lane (anything else answers, never ~K): shut it.
 def never_k(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   TLS.tls_close(sock)
 
-def cli_deny_done(t: Socket & HTTPX.Response & List<&2, U32>) -> IO(U32):
+def cli_deny_done(t: Socket & HTTP.Response & List<&2, U32>) -> IO(U32):
   (sock, resp, rest) = t
   do IO<U32>:
     x : Unit <- TLS.tls_close(sock)
     IO.pure(U32, 0)
 
-def cli_deny(r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>) -> IO(U32):
+def cli_deny(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
   match r:
     case Fail{e}:
       (code, msg) = e
@@ -165,7 +166,7 @@ def cli_deny(r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, 
 
 def cli_round_deny(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open_insecure("127.0.0.1", port, HTTPX.Request{"GET", "/chat", up_hs(), Nil{}})
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open_insecure("127.0.0.1", port, HTTP.Request{"GET", "/chat", up_hs(), Nil{}})
     cli_deny(r)
 
 def deny_side(l: Listener) -> IO(U32):
@@ -181,7 +182,7 @@ def run_deny(b: Listener & U32) -> IO(U32):
     +b2 : U32 <- cli_round_deny(port)
     IO.pure(U32, (a + b2 : U32))
 
-def cli_rewrap_got(r: Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>>) -> IO(U32):
+def cli_rewrap_got(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
   match r:
     case Fail{e}:
       (code, msg) = e
@@ -198,7 +199,7 @@ def cli_rewrap(conn: Result<&1, &1, U32 & String, Socket>) -> IO(U32):
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        r : Result<&1, &1, U32 & String, Socket & HTTPX.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, (sock, Fail{(502, "t")}))
+        r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTPX.h1_open.rewrap(~Socket.close, (sock, Fail{(502, "t")}))
         cli_rewrap_got(r)
 
 def peer_eof_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(U32):

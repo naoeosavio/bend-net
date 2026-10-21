@@ -1,8 +1,8 @@
 # lib (lib_httpx_read_url): pure vectors for httpx_url.read_url (Phase 9)
 # plus the top-level read_url wrapper (task-036 phase 4).
-# No IO, no TLS: the URL layer ported from http.bend:653-840 must parse
-# exactly like the original (same splits, same defaults, same Fail 400
-# codes). Golden 1 iff all 12 vectors score (9th exercises trim).
+# No IO, no TLS: the URL layer ported from the retired HTTP/1.1 module
+# must parse exactly like the original (same splits, same defaults, same
+# Fail 400 codes). Golden 1 iff all 12 vectors score (9th exercises trim).
 import Base
 import ../../lib/httpx.bend as HTTPX
 

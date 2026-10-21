@@ -9,6 +9,7 @@
 #        /tmp/opencode/fetchbulk
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def report_fail(+c: U32, +e: String) -> IO(Unit):
   do IO<Unit>:
@@ -17,8 +18,8 @@ def report_fail(+c: U32, +e: String) -> IO(Unit):
 
 def report_body(+body: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
-    _ : Unit <- IO.print("LEN " ++ U32.show(HTTPX.x_len32(body)))
-    _ : Unit <- IO.print("HEAD " ++ HTTPX.x_bytes_str(HTTPX.x_take32(200, body)))
+    _ : Unit <- IO.print("LEN " ++ U32.show(HTTP.x_len32(body)))
+    _ : Unit <- IO.print("HEAD " ++ HTTP.x_bytes_str(HTTP.x_take32(200, body)))
     _ : Unit <- IO.print("DONE 2/2")
     IO.die(Unit, 0, "")
 

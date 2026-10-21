@@ -8,6 +8,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -59,13 +60,13 @@ def chk(r):
 
 # Echo handler on the httpx shape: status 200, no headers, body back.
 law echo_service:
-  for req: HTTPX.Request
-  IO(HTTPX.Response)
+  for req: HTTP.Request
+  IO(HTTP.Response)
 
 def echo_service(req):
   match req:
-    case HTTPX.Request{method, path, headers, body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 law listen_retry:
   for port: U32

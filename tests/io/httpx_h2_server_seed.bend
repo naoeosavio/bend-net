@@ -18,6 +18,7 @@ import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
   18573
@@ -35,7 +36,7 @@ def fill_go(+n: Nat, +acc: List<&2, U32>) -> List<&2, U32>:
       fill_go(p, 46 <> acc)
 
 def big() -> List<&2, U32>:
-  HTTPX.x_cat(fill_go(U32.to_nat(BIG_LEN()), Nil{}))
+  HTTP.x_cat(fill_go(U32.to_nat(BIG_LEN()), Nil{}))
 
 def small() -> List<&2, U32>:
   [46]
@@ -48,14 +49,14 @@ def b2u(b: Bool) -> U32:
       0
 
 # Server handler: the big body forces the sender to wait for credit.
-def h_srv(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h_srv(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
+    case HTTP.Request{+method, +path, +headers, +body}:
       match path:
         case "/big":
-          IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, big()})
+          IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, big()})
         case _:
-          IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, small()})
+          IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, small()})
 
 # Client scorer: one point per expected body length, nothing else.
 def len_score(n: U32, +status: U32) -> U32:
@@ -67,13 +68,13 @@ def len_score(n: U32, +status: U32) -> U32:
     case _:
       0
 
-def h_cli(resp: HTTPX.Response) -> U32:
+def h_cli(resp: HTTP.Response) -> U32:
   match resp:
-    case HTTPX.Response{+status, +headers, +body}:
-      len_score(HTTPX.x_len32(body), status)
+    case HTTP.Response{+status, +headers, +body}:
+      len_score(HTTP.x_len32(body), status)
 
-def reqs() -> List<&2, HTTPX.Request>:
-  [HTTPX.Request{"GET", "/big", Nil{}, Nil{}}, HTTPX.Request{"GET", "/small", Nil{}, Nil{}}]
+def reqs() -> List<&2, HTTP.Request>:
+  [HTTP.Request{"GET", "/big", Nil{}, Nil{}}, HTTP.Request{"GET", "/small", Nil{}, Nil{}}]
 
 def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
   match r:

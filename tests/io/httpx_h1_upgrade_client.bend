@@ -13,7 +13,8 @@
 # same three checks behind a 100 that must be discarded).
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
   match b:
@@ -22,27 +23,27 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-def up_hs() -> List<&2, HTTPX.Hdr>:
-  [HTTPX.Hdr{"Upgrade", "websocket"}, HTTPX.Hdr{"Connection", "Upgrade"}, HTTPX.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTPX.Hdr{"Sec-WebSocket-Version", "13"}]
+def up_hs() -> List<&2, HTTP.Hdr>:
+  [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}, HTTP.Hdr{"Sec-WebSocket-Version", "13"}]
 
 def rv.go(r: Result<&1, &1, U32 & String, List<&2, U32>>, +want: String) -> U32:
   match r:
     case Fail{e}:
       0
     case Done{+bs}:
-      HTTPX.x_eq(bs, HTTPX.x_str_bytes(want))
+      HTTP.x_eq(bs, HTTP.x_str_bytes(want))
 
 # upgrade=True keeps the handshake headers and claims no Content-Length.
 def rv.up() -> U32:
-  rv.go(HTTPX.x_h1.render_req.go(True{}, False{}, "GET", "/chat", "h", 80, up_hs(), Nil{}), "GET /chat HTTP/1.1\r\nHost: h:80\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+  rv.go(HTTP1.x_h1.render_req.go(True{}, False{}, "GET", "/chat", "h", 80, up_hs(), Nil{}), "GET /chat HTTP/1.1\r\nHost: h:80\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
 
 # upgrade=False is the old bytes: handshake headers stripped, Length 0.
 def rv.old() -> U32:
-  rv.go(HTTPX.x_h1.render_req.go(False{}, False{}, "GET", "/chat", "h", 80, up_hs(), Nil{}), "GET /chat HTTP/1.1\r\nHost: h:80\r\nContent-Length: 0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+  rv.go(HTTP1.x_h1.render_req.go(False{}, False{}, "GET", "/chat", "h", 80, up_hs(), Nil{}), "GET /chat HTTP/1.1\r\nHost: h:80\r\nContent-Length: 0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
 
 # upgrade=True with a body keeps the headers and still counts the bytes.
 def rv.body() -> U32:
-  rv.go(HTTPX.x_h1.render_req.go(True{}, False{}, "GET", "/chat", "h", 80, up_hs(), [104, 105]), "GET /chat HTTP/1.1\r\nHost: h:80\r\nContent-Length: 2\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\nhi")
+  rv.go(HTTP1.x_h1.render_req.go(True{}, False{}, "GET", "/chat", "h", 80, up_hs(), [104, 105]), "GET /chat HTTP/1.1\r\nHost: h:80\r\nContent-Length: 2\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\nhi")
 
 def rv.all() -> U32:
   (rv.up() + rv.old() + rv.body() : U32)
@@ -53,17 +54,17 @@ def frame_want() -> List<&2, U32>:
   [129, 2, 104, 105]
 
 def canned101() -> List<&2, U32>:
-  List.append(&2, U32, HTTPX.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), frame_want())
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), frame_want())
 
 # A 100 Continue before the 101 (RFC 9110 section 15.2): the client must
 # discard the interim head and read the next one. The plain lane always
 # did; TASK-055 Phase 6b gives the upgrade lane the same rule, because one
 # chain now serves both.
 def canned_info101() -> List<&2, U32>:
-  List.append(&2, U32, HTTPX.x_str_bytes("HTTP/1.1 100 Continue\r\n\r\n"), canned101())
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 100 Continue\r\n\r\n"), canned101())
 
 def canned200() -> List<&2, U32>:
-  HTTPX.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+  HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
 
 def cli_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: U32) -> IO(U32):
   (s, r) = got
@@ -75,7 +76,7 @@ def cli_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc
     case Done{+part}:
       do IO<U32>:
         x : Unit <- Socket.close(s)
-        IO.pure(U32, (acc + HTTPX.x_eq(part, [7]) : U32))
+        IO.pure(U32, (acc + HTTP.x_eq(part, [7]) : U32))
 
 def cli_echo_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +acc: U32) -> IO(U32):
   (s, r) = sent
@@ -94,7 +95,7 @@ def cli_echofy(sock: Socket, +acc: U32) -> IO(U32):
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(sock, [7])
     cli_echo_sent(sent, acc)
 
-def cli_score(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>>) -> IO(U32):
+def cli_score(out: Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>) -> IO(U32):
   (s2, r2) = out
   match r2:
     case Fail{e}:
@@ -104,8 +105,8 @@ def cli_score(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&
     case Done{pr}:
       (resp, rest) = pr
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
-          +acc : U32 = (b2u(U32.is_eq(status, 101)) + HTTPX.x_eq(rest, frame_want()) : U32)
+        case HTTP.Response{+status, +headers, +body}:
+          +acc : U32 = (b2u(U32.is_eq(status, 101)) + HTTP.x_eq(rest, frame_want()) : U32)
           cli_echofy(s2, acc)
 
 def cli_round(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32):
@@ -114,7 +115,7 @@ def cli_round(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32)
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
         cli_score(out)
 
 # The peer echoes the one post-handshake byte, proving the socket the
@@ -176,7 +177,7 @@ def peer_drain(phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U
             IO.pure(U32, 0)
         case Done{+part}:
           +acc2 : List<&2, U32> = List.append(&2, U32, acc, part)
-          peer_drain(2, (s1, Done{Nil{}}), acc2, fuel, HTTPX.x_h1.split_found(HTTPX.x_h1.split(acc2)), head)
+          peer_drain(2, (s1, Done{Nil{}}), acc2, fuel, HTTP1.x_h1.split_found(HTTP1.x_h1.split(acc2)), head)
     case 2:
       (s2, r2) = got
       match found:
@@ -232,7 +233,7 @@ def run_open(b: Listener & U32) -> IO(U32):
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
     cli_round(conn, port)
 
-def cli_reject(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>>) -> IO(U32):
+def cli_reject(out: Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>) -> IO(U32):
   (s2, r2) = out
   match r2:
     case Fail{e}:
@@ -252,7 +253,7 @@ def cli_round_reject(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> 
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response & List<&2, U32>> <- HTTPX.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
         cli_reject(out)
 
 def peer_denied(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):

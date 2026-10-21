@@ -4,11 +4,12 @@
 # HTTPX.request_insecure and checks the echo. Golden 1.
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
-def h2_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def h2_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
-      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def is_hello.go(same: Bool) -> U32:
   match same:

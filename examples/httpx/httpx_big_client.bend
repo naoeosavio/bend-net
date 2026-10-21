@@ -15,11 +15,12 @@
 import Base
 import ../../lib/tls.bend as TLS
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 def body_big() -> List<&2, U32>:
   List.replicate(U32, 102400n, 65)
 
-def report(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt) -> IO(Unit):
+def report(out: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt) -> IO(Unit):
   (s, r, st) = out
   match r:
     case Fail{(c, e)}:
@@ -29,15 +30,15 @@ def report(out: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.Cl
         IO.die(Unit, 1, "")
     case Done{+resp}:
       match resp:
-        case HTTPX.Response{+status, +headers, +body}:
+        case HTTP.Response{+status, +headers, +body}:
           do IO<Unit>:
             x : Unit <- TLS.tls_close(s)
             y : Unit <- IO.print("STATUS " ++ U32.show(status))
-            z : Unit <- IO.print("LEN " ++ U32.show(U32.from_nat(HTTPX.x_len(body))))
+            z : Unit <- IO.print("LEN " ++ U32.show(U32.from_nat(HTTP.x_len(body))))
             q : Unit <- IO.print("DONE big")
             IO.die(Unit, 0, "")
 
-def cli_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>) -> IO(Unit):
+def cli_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>) -> IO(Unit):
   match conn:
     case Fail{e}:
       do IO<Unit>:
@@ -46,12 +47,12 @@ def cli_conn(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>) -> IO(Uni
     case Done{value}:
       (sock, st) = value
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <-
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <-
           HTTPX.client.request(sock, st, "127.0.0.1", 19892,
-            HTTPX.Request{"POST", "/echo", Nil{}, body_big()})
+            HTTP.Request{"POST", "/echo", Nil{}, body_big()})
         report(out)
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", 19892)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", 19892)
     cli_conn(conn)

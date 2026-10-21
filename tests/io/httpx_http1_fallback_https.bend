@@ -9,6 +9,8 @@
 # answers 615 on both lanes (task-051 A7; code 614 is a verify failure).
 import Base
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http1.bend as HTTP1
+import ../../lib/http.bend as HTTP
 import ../../lib/tls.bend as TLS
 
 def b2u(value: Bool) -> U32:
@@ -30,37 +32,37 @@ def request_text(
     case Fail{e}:
       ""
     case Done{body}:
-      HTTPX.x_bytes_str(body)
+      HTTP.x_bytes_str(body)
 
 # The H1 wire text for a request whose header list still carries the H2-only
-# pseudo-header: HTTPX.x_h1.render_req is the renderer (it drops :authority
+# pseudo-header: HTTP1.x_h1.render_req is the renderer (it drops :authority
 # and synthesises Host), so the old HTTPS.h1_headers + HTTP1.http1_bytes pair
 # collapses into one call. A Fail renders as "" and every assertion below goes
 # to 0, so a rejected render cannot pass silently.
 def pure_h1_headers() -> U32:
-  headers : List<&2, HTTPX.Hdr> =
-    HTTPX.Hdr{":authority", "127.0.0.1:18640"}
-    <> HTTPX.Hdr{"connection", "keep-alive"}
-    <> HTTPX.Hdr{"x-test", "yes"}
+  headers : List<&2, HTTP.Hdr> =
+    HTTP.Hdr{":authority", "127.0.0.1:18640"}
+    <> HTTP.Hdr{"connection", "keep-alive"}
+    <> HTTP.Hdr{"x-test", "yes"}
     <> Nil{}
   +text : String = request_text(
-    HTTPX.x_h1.render_req("GET", "/probe", "127.0.0.1", 18640, headers, Nil{}))
+    HTTP1.x_h1.render_req("GET", "/probe", "127.0.0.1", 18640, headers, Nil{}))
   (b2u(String.contains(text, "Host: 127.0.0.1:18640"))
   * b2u(String.contains(text, "x-test: yes"))
   * b2u(Bool.not(String.contains(text, ":authority")))
   * b2u(Bool.not(String.contains(text, "keep-alive"))) : U32)
 
-def httpx_echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
-    case HTTPX.Request{+method, +path, +headers, +body}:
+    case HTTP.Request{+method, +path, +headers, +body}:
       # path ":" body as bytes, so the client sees the same "/echo:hello" the
       # old String-shaped h1_echo produced. `++` is String concat here and
-      # HTTPX.x_cat REVERSES a list (it un-reverses the reversed-accumulator
+      # HTTP.x_cat REVERSES a list (it un-reverses the reversed-accumulator
       # idiom), so byte lists join with nested List.append only.
       out : List<&2, U32> = List.append(&2, U32,
-        List.append(&2, U32, HTTPX.x_str_bytes(path), HTTPX.x_str_bytes(":")),
+        List.append(&2, U32, HTTP.x_str_bytes(path), HTTP.x_str_bytes(":")),
         body)
-      IO.pure(HTTPX.Response, HTTPX.Response{200, [HTTPX.Hdr{"X-HTTP1", "yes"}], out})
+      IO.pure(HTTP.Response, HTTP.Response{200, [HTTP.Hdr{"X-HTTP1", "yes"}], out})
 
 def server_side(listener: Listener) -> IO(String):
   do IO<String>:

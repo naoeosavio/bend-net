@@ -7,6 +7,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -30,53 +31,53 @@ law over_cap:
   Bool
 
 def over_cap(chunk):
-  U32.is_gt(HTTPX.x_len32(chunk), cap())
+  U32.is_gt(HTTP.x_len32(chunk), cap())
 
 law is_cancel:
   for chunk: List<&2, U32>
   Bool
 
 def is_cancel(chunk):
-  U32.is_eq(HTTPX.x_eq(chunk, HTTPX.x_str_bytes("cancel")), 1)
+  U32.is_eq(HTTP.x_eq(chunk, HTTP.x_str_bytes("cancel")), 1)
 
 law h_data_over:
   for over: Bool
   for chunk: List<&2, U32>
-  HTTPX.SrvOut
+  HTTP.SrvOut
 
 def h_data_over(over, chunk):
   match over:
     case True{}:
-      HTTPX.RespondEarly{HTTPX.Response{413, Nil{}, Nil{}}}
+      HTTP.RespondEarly{HTTP.Response{413, Nil{}, Nil{}}}
     case False{}:
-      HTTPX.RespondEarly{HTTPX.Response{200, Nil{}, chunk}}
+      HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
 law h_data:
   for cancel: Bool
   for over: Bool
   for chunk: List<&2, U32>
-  HTTPX.SrvOut
+  HTTP.SrvOut
 
 def h_data(cancel, over, chunk):
   match cancel:
     case True{}:
-      HTTPX.Cancel{}
+      HTTP.Cancel{}
     case False{}:
       h_data_over(over, chunk)
 
 law h:
-  for ev: HTTPX.SrvEv
-  HTTPX.SrvOut
+  for ev: HTTP.SrvEv
+  HTTP.SrvOut
 
 def h(ev):
   match ev:
-    case HTTPX.SrvReqHead{slot, head}:
-      HTTPX.Continue{}
-    case HTTPX.SrvReqData{slot, +chunk, fin}:
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.Continue{}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
       h_data(is_cancel(chunk), over_cap(chunk), chunk)
 
 law score_echo:
-  for r: Result<&1, &1, (U32 & String), HTTPX.Response>
+  for r: Result<&1, &1, (U32 & String), HTTP.Response>
   U32
 
 def score_echo(r):
@@ -85,11 +86,11 @@ def score_echo(r):
       0
     case Done{resp}:
       match resp:
-        case HTTPX.Response{status, headers, body}:
-          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTPX.x_eq(body, HTTPX.x_str_bytes("hi")), 1)))
+        case HTTP.Response{status, headers, body}:
+          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("hi")), 1)))
 
 law score_early:
-  for r: Result<&1, &1, (U32 & String), HTTPX.Response>
+  for r: Result<&1, &1, (U32 & String), HTTP.Response>
   U32
 
 def score_early(r):
@@ -98,11 +99,11 @@ def score_early(r):
       0
     case Done{resp}:
       match resp:
-        case HTTPX.Response{status, headers, body}:
+        case HTTP.Response{status, headers, body}:
           b2u(U32.is_eq(status, 413))
 
 law score_cancel:
-  for r: Result<&1, &1, (U32 & String), HTTPX.Response>
+  for r: Result<&1, &1, (U32 & String), HTTP.Response>
   U32
 
 def score_cancel(r):
@@ -118,9 +119,9 @@ law client:
 
 def client(port):
   do IO<U32>:
-    r1 : Result<&1, &1, (U32 & String), HTTPX.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTPX.x_str_bytes("hi"))
-    r2 : Result<&1, &1, (U32 & String), HTTPX.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTPX.x_str_bytes("hello"))
-    r3 : Result<&1, &1, (U32 & String), HTTPX.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTPX.x_str_bytes("cancel"))
+    r1 : Result<&1, &1, (U32 & String), HTTP.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTP.x_str_bytes("hi"))
+    r2 : Result<&1, &1, (U32 & String), HTTP.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTP.x_str_bytes("hello"))
+    r3 : Result<&1, &1, (U32 & String), HTTP.Response> <- HTTPX.request.plain("127.0.0.1", port, "POST", "/up", Nil{}, HTTP.x_str_bytes("cancel"))
     +total : U32 = (score_echo(r1) * 100 + score_early(r2) * 10 + score_cancel(r3) : U32)
     IO.pure(U32, total)
 

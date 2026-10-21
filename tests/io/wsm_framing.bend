@@ -4,7 +4,7 @@
 # more, invalid headers refused, and the unmasked client twins.
 import Base
 import ../../lib/wsm.bend as WSM
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http.bend as HTTP
 
 law b2u:
   for b: Bool
@@ -71,66 +71,66 @@ def is_fail400n(r):
       0
 
 law split_frame_eq:
-  for s: HTTPX.UnitOut
+  for s: HTTP.UnitOut
   for want: List<&2, U32>
   U32
 
 def split_frame_eq(s, want):
   match s:
-    case HTTPX.NeedMore{missing, rest}:
+    case HTTP.NeedMore{missing, rest}:
       0
-    case HTTPX.Got{unit, fin, rest}:
+    case HTTP.Got{unit, fin, rest}:
       eq_list(unit, want)
-    case HTTPX.Bad{code, msg}:
+    case HTTP.Bad{code, msg}:
       0
-    case HTTPX.End{rest}:
+    case HTTP.End{rest}:
       0
 
 law split_rest_eq:
-  for s: HTTPX.UnitOut
+  for s: HTTP.UnitOut
   for want: List<&2, U32>
   U32
 
 def split_rest_eq(s, want):
   match s:
-    case HTTPX.NeedMore{missing, rest}:
+    case HTTP.NeedMore{missing, rest}:
       0
-    case HTTPX.Got{unit, fin, rest}:
+    case HTTP.Got{unit, fin, rest}:
       eq_list(rest, want)
-    case HTTPX.Bad{code, msg}:
+    case HTTP.Bad{code, msg}:
       0
-    case HTTPX.End{rest}:
+    case HTTP.End{rest}:
       0
 
 law split_missing_eq:
-  for s: HTTPX.UnitOut
+  for s: HTTP.UnitOut
   for want: U32
   U32
 
 def split_missing_eq(s, want):
   match s:
-    case HTTPX.NeedMore{missing, rest}:
+    case HTTP.NeedMore{missing, rest}:
       b2u(U32.is_eq(missing, want))
-    case HTTPX.Got{unit, fin, rest}:
+    case HTTP.Got{unit, fin, rest}:
       0
-    case HTTPX.Bad{code, msg}:
+    case HTTP.Bad{code, msg}:
       0
-    case HTTPX.End{rest}:
+    case HTTP.End{rest}:
       0
 
 law is_bad:
-  for s: HTTPX.UnitOut
+  for s: HTTP.UnitOut
   U32
 
 def is_bad(s):
   match s:
-    case HTTPX.NeedMore{missing, rest}:
+    case HTTP.NeedMore{missing, rest}:
       0
-    case HTTPX.Got{unit, fin, rest}:
+    case HTTP.Got{unit, fin, rest}:
       0
-    case HTTPX.Bad{code, msg}:
+    case HTTP.Bad{code, msg}:
       1
-    case HTTPX.End{rest}:
+    case HTTP.End{rest}:
       0
 
 law pay_go:
