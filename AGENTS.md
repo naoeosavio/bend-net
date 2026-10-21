@@ -1,15 +1,31 @@
 # AGENTS.md
 
 bend-net: user-land HTTP/WS for Bend on top of the `Base.TCP.*` kit.
-Published bundle is `lib/package.bend` (httpx + wsm + tcp + dns + tls + sha1 + b64).
+Published bundle is `lib/package.bend` (http + http1 + http2 + httpx + wsm
++ tcp + dns + tls + sha1 + b64).
 
 ## Use this, not that
 
-- New code: `lib/httpx.bend` as `HTTPX` (H1 + H2 + HTTPS, client + server,
-  plain + TLS, ALPN split, streaming, H1 `101` upgrade lane) and
-  `lib/wsm.bend` as `WSM` (RFC 6455 `ws://` + `wss://` over the httpx upgrade lane).
-- Superseded, old callers only: `lib/http.bend`, `lib/http2.bend`,
-  `lib/https.bend`, `lib/https_http1.bend`, `lib/ws.bend`, `lib/wss.bend`.
+- New code: `lib/httpx.bend` as `HTTPX` (the facade: H1 + H2 + HTTPS,
+  client + server, plain + TLS, ALPN split, streaming, H1 `101` upgrade
+  lane) and `lib/wsm.bend` as `WSM` (RFC 6455 `ws://` + `wss://` over the
+  httpx upgrade lane).
+- The H2 wire is `lib/http2.bend` as `HTTP2`: the frames, the HPACK codec,
+  the flow pump and the H2 lanes. It does not dial or accept; the facade
+  calls it. A caller that names an H2 leaf imports this file too.
+- The H1 wire is `lib/http1.bend` as `HTTP1`: the request render, the head
+  and body parsers, the reason table, the chunked codec, the keep-alive
+  machine, the H1 stream lanes, the `101` upgrade machine and the
+  per-connection runners. It does not dial, does not accept and does not
+  name a transport (the facade passes `~recv`/`~send`/`~close`). A caller
+  that names an H1 leaf imports this file too.
+- The core is `lib/http.bend` as `HTTP`: the 25 Data types, the byte and text
+  leaves, the string checks and the request validation. A caller that names a
+  type or a leaf imports this file too, because Bend does not reexport.
+- Deleted, do not restore: `lib/https.bend`, `lib/https_http1.bend`,
+  `lib/ws.bend`, `lib/wss.bend`. HTTPX, WSM and the core superseded them.
+  The old `lib/http1.bend` and `lib/http2.bend` are gone; their names hold
+  the split modules of task-057 (all phases done).
 - Native code lives only in `lib/effs/` (C + JS twins; JS lane rides `tls_rt.js`).
   Everything else is pure Bend.
 
@@ -32,7 +48,10 @@ require break from any other directory. Bend 2.0.21+.
 
 ## Layout
 
-- `lib/httpx.bend` — the HTTP library. `lib/wsm.bend` — the WebSocket library.
+- `lib/http.bend` — the core: types, leaves, request validation.
+  `lib/http1.bend` — the H1 wire. `lib/http2.bend` — the H2 wire.
+  `lib/httpx.bend` — the HTTP library: dial, accept, ALPN and the entries.
+  `lib/wsm.bend` — the WebSocket library.
   `lib/tls.bend` — TLS dial/accept with ALPN modes. `lib/dns.bend` — A-record
   resolve. `lib/tcp.bend` — byte send/recv/frame effects.
 - `tests/io/` — goldens: pure codec vectors plus loopback IO (each asserts via `#|N`).

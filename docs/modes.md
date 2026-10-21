@@ -1,9 +1,14 @@
 # HTTPX: two delivery modes
 
-`lib/httpx.bend` holds one H2 codec and **two delivery disciplines**. Every
-public entry belongs to exactly one discipline; the handler signature shows
-which one. (A grep for `~H:` gives 124 hits, and every hit is a family
-below.)
+The H2 codec lives in `lib/http2.bend` and the public entries live in
+`lib/httpx.bend` (the facade). The entries follow **two delivery
+disciplines**. Every public entry belongs to exactly one discipline; the
+handler signature shows which one. (A grep for `~H:` gives 124 hits, and
+every hit is a family below.)
+
+The loop column names the def, not the file: the H2 loops are in
+`lib/http2.bend`, the H1 loops in `lib/http1.bend`, and the entries that
+pick a lane in `lib/httpx.bend`.
 
 ## Mode 1 — whole response ("on/once")
 
@@ -14,13 +19,13 @@ response. The handler can do IO (DB, upstream fetch, file reads):
 - Client (concurrent scorer): `~H: Response -> U32` — same family, one
   score per complete response
 
-| Entry | Loop (`lib/httpx.bend`) | Shape |
+| Entry | Loop | Shape |
 |---|---|---|
 | `server.concurrent[_alpn]` | `httpx` (slots + interleave) | N streams, any completion order |
 | `server.on[_alpn]` / `server.on_h2` | `httpx_seq` | one stream at a time (ALPN split with one `~H` for both lanes) |
 | `server.on_h1` / `server.once_h1` | `x_h1.srv.head` (phase 3 loops) | H1 keep-alive: answer, then read the next request on the same connection (`connection: close`, EOF, 413 and 502 close it) |
 | `client.once[_insecure]` | `client_seq` (one request) or `x_h1.exch` on an H1 connection | 1 dial, stream 1, full `Response` |
-| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client_seq` on h2 / `client_seq.h1` on http/1.1 | 1 dial, answers in order: sids 1,3,5… and the HPACK table on h2; the one socket reused sequentially on H1 |
+| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client_seq` on h2 / `client_seq.keep` + `client.on.h1_keep` on http/1.1 | 1 dial, answers in order: sids 1,3,5… and the HPACK table on h2; the one socket reused sequentially on H1 |
 | `client.concurrent[_insecure]` | `client_conc.drain` (slots) | pipelined N, scored |
 | `fetch[_bytes][_insecure]`, `request[_bytes][_insecure]` | `client.once` | URL / text conveniences |
 | `h1_once[_insecure]` | `x_h1.exch` | H1 one-shot (TLS) |
@@ -57,14 +62,14 @@ drain.
 
 ## Shared substrate (no `~H`)
 
-Both modes use the same pieces: the frame codec + HPACK, `x_read_frame`
-(:861), and the flow pump `x_send_data_flow` (:2266). The other pieces are
-WU credit, CONTINUATION (`client.on.cont_read`, :3167), the preface/accept
-code, and the slot ledgers (`httpxn.*`, `httpxc.*`). The H1 lane is
-`x_h1.*`; both transports use the `~recv`/`~send`/`~close` triple — see
-`docs/h1-transport.md`. A body accumulates in reverse (`x_rev_push`) and
-one `x_cat` un-reverses it, so a multi-MB transfer never overflows the
-interpreter stack.
+Both modes use the same pieces: the frame codec + HPACK (`x_frame*`,
+`x_read_frame`, `x_tab.*`, `x_huff*`), the flow pump `x_send_data_flow`,
+WU credit, CONTINUATION (`client.on.cont_read`), the preface/accept code
+and the slot ledgers (`httpxn.*`, `httpxc.*`) — all in `lib/http2.bend`.
+The H1 lane is `x_h1.*` in `lib/http1.bend`; both transports use the
+`~recv`/`~send`/`~close` triple — see `docs/h1-transport.md`. A body
+accumulates in reverse (`x_rev_push`) and one `x_cat` un-reverses it, so
+a multi-MB transfer never overflows the interpreter stack.
 
 ## Why a stream handler must be pure
 

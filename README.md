@@ -19,40 +19,26 @@ proves them.
 
 ```text
 lib/package.bend          # package entry (publish this file)
-lib/http.bend             # HTTP/1.1 library (~2350 lines, imports Base only)
+lib/http.bend             # the core: 25 Data types, byte/text leaves, validators
+lib/http1.bend            # the H1 wire: codec, chunked, keep-alive, stream + 101 lanes
+lib/http2.bend            # the H2 wire: frames, HPACK, flow pump, connection loops
+lib/httpx.bend            # the facade: entries, TLS/TCP dial, accept, ALPN split
 lib/wsm.bend              # WebSocket (WSM): ws:// + wss://, one implementation
-lib/ws.bend               # WebSocket server + client (SUPERSEDED by wsm.bend)
-lib/wss.bend              # WebSocket Secure: WS over TLS (SUPERSEDED by wsm.bend)
+lib/static.bend           # static-file handler on top of the core
 lib/sha1.bend             # SHA-1 (FIPS 180-4), for the handshake accept
 lib/b64.bend              # base64, for the handshake accept
-lib/static.bend           # static-file handler on top of HTTP
 lib/tcp.bend              # byte-level socket effects (C + JS twins)
 lib/dns.bend              # DNS resolve: A lookup for name hosts (C + JS twins)
 lib/tls.bend              # TLS client + server effects (C = OpenSSL, JS = portable)
 lib/effs/tls_rt.js        # the portable TLS runtime the JS twins load (TLS 1.2+1.3)
-lib/http2.bend            # HTTP/2 codec + client/server over TLS (pure Bend)
-lib/https.bend            # HTTPS facade: fetch/send_request + server_on over TLS+DNS+H2
-lib/https_http1.bend      # HTTP/1.1-only server module (chunked, ALPN http/1.1)
-lib/httpx.bend            # HTTPX: H1 + H2 + HTTPS in one module (Base+tls only)
 lib/effs/tcp_send_bytes.* # send List<&2, U32> over a Socket
 lib/effs/tcp_recv_bytes.* # receive bytes from a Socket
 lib/effs/tcp_recv_frame.* # isolate exactly one WS frame, rest preserved
 lib/effs/dns_resolve.*    # resolve a host to one IPv4 (getaddrinfo / UDP query)
 lib/effs/tls_*.{c,js}     # TLS connect/accept/send/recv/close (C: OpenSSL; JS: tls_rt.js)
-tests/io/tls_*.bend           # TLS loopback lanes + ALPN contracts (dual, none)
-tests/effs/                   # the effects lab: parity lint, TLS ladders, bridge probe, bench
-tests/io/httpx_h1_pure.bend   # pure layer: URL, headers, framing, chunked, UTF-8
-tests/io/httpx_h1_fetch.bend  # IO: real loopback fetch + fail-closed paths
-tests/io/httpx_h1_fetch_host.bend # IO: fetch by name over loopback, Host preserved
-tests/io/httpx_h1_sec.bend    # security: CRLF/NUL injection, oversize, bad status
-tests/io/tcp_bytes.bend       # IO: send_bytes/recv_bytes over loopback
-tests/io/tls_connect_close.bend # IO: TLS loopback echo + fail paths (611, refused dial)
-tests/io/h2_loopback.bend       # IO: HTTP/2 echo over TLS (Bend↔Bend)
-tests/io/httpx_*.bend       # HTTPX: client, server, H1/H2 lanes, codec
-tests/io/httpx_h1_*.bend    # the legacy lib/http.bend lane: pure, fetch, sec
-tests/io/httpx_*_https.bend # fetch, streams, mux, H1 fallback — all on httpx
-tests/io/wsm_*.bend         # WSM: the one WebSocket — crypto, codec, both lanes
-tests/io/dns_resolve.bend     # DNS fast paths + fail-closed host checks
+tests/io/                 # goldens: pure codec vectors + loopback IO (each ends in #|N)
+tests/effs/               # the effects lab: parity lint, TLS ladders, bridge probe, bench
+tests/rfc/                # RFC oracles: the JS peers and the matrix runner
 examples/{wsm,wss,httpx,real}/  # runnable interop programs, by lane (not published)
 docs/site/                # this library's own site (httpx_site serves it)
 tasks/                    # engineering log (decisions, discoveries, checklists)
@@ -65,54 +51,70 @@ tasks/                    # engineering log (decisions, discoveries, checklists)
 
 ## Use
 
-Local import (relative to your file):
+Local import (relative to your file). Import each module you name: Bend
+does not reexport a name through an import.
 
 ```bend
 import Base
+import ../../lib/httpx.bend as HTTPX
 import ../../lib/http.bend as HTTP
 
 def main() -> U32:
-  HTTP.content_length([("Content-Length", "5")])
+  HTTP.x_len32(HTTP.x_str_bytes("hello"))
 ```
 
-Hub import (after a publish, see below). Imports are not transitive. The
-entry only marks the bundle, so import the API from its own file:
+Hub import (after a publish, see below). The entry only marks the bundle,
+so import the API from its own file:
 
 ```bend
 import Base
-import 0x<hash>/http.bend as HTTP
+import 0x<hash>/httpx.bend as HTTPX
+import 0x<hash>/http.bend  as HTTP
 ```
 
-## API
+## Modules
 
-Pure layer (total, fail-closed — every parser answers `Result`):
+| Module | Import as | Holds |
+|---|---|---|
+| `lib/http.bend` | `HTTP` | the core: the 25 `Data` types, the byte and text leaves, the string checks and the request validators |
+| `lib/http1.bend` | `HTTP1` | the H1 wire: the codec, the reason table, chunked, keep-alive, the two stream lanes and the `101` upgrade machine |
+| `lib/http2.bend` | `HTTP2` | the H2 wire: frames, HPACK, the flow pump, the connection loops and the H2 lanes |
+| `lib/httpx.bend` | `HTTPX` | the facade: the public entries, the TLS/TCP dial, the accept and the ALPN split |
+
+The import rule:
+
+- `HTTPX` for an entry (`client.*`, `server.*`, `fetch*`, `h1_*`).
+- `HTTP` for a type or a pure leaf (`HTTP.Hdr`, `HTTP.x_str_bytes`).
+- `HTTP1` / `HTTP2` only when the file names a wire leaf: the H1
+  handshake helpers (`wsm.bend`) or the frame codec (the codec tests).
+
+The two wire modules do not dial and do not accept. `lib/http1.bend`
+takes the transport as the `~recv`/`~send`/`~close` triple
+(`docs/h1-transport.md`). `lib/http2.bend` names TLS directly, because H2
+has one transport and no `h2c` lane. The facade owns every dial and every
+accept.
+
+Core leaves (total, no IO):
 
 | Function | Description |
 |---|---|
-| `read_url` | Parse `http(s)://host[:port]/path` into `secure & host & port & path` |
-| `get_header` | Case-insensitive header lookup with default |
-| `show_request` / `read_request` | Render / parse an HTTP request |
-| `show_response` / `read_response` | Render / parse an HTTP response |
-| `read_head` | Parse a request head, reporting the HTTP/1.1 flag |
-| `keep_alive` / `with_connection` | Connection-persistence decision and stamping |
-| `content_length` | Numeric `Content-Length`, defaulting to `0` |
-| `unchunk` | `Transfer-Encoding: chunked` decoder (linear state machine) |
-| `encode` / `decode` | Total UTF-8 encode / decode (`decode` repairs with `U+FFFD`) |
-| `from_string` / `to_string` | Packed `U32 & bytes` conversions |
-| `no_body` / `ok` | Empty body and `200` response helpers |
+| `x_cat` / `x_rev_push` | Concatenate; push a fragment onto a reversed body (stack-safe accumulation) |
+| `x_len` / `x_len32` | Length with a `Nat` / `U32` accumulator |
+| `x_take32` / `x_drop32` / `x_len_upto` | Bounded take, drop and length, for the flow chunks |
+| `x_str_bytes` / `x_bytes_str` | `String` to bytes and back (ASCII / byte-faithful) |
+| `x_utf8_encode` / `x_utf8_decode` / `x_utf8_ok` | UTF-8, total: invalid input becomes `U+FFFD`, never a partial character |
+| `x_str_chunk` / `x_chunk_str` / `x_str_chunks` | The chunked text converters |
+| `has_crlf` / `has_crlf3` / `has_nul` / `nul1` / `all_digits` | The string checks the lanes share |
+| `client.on.valid_host` / `valid_port` / `valid_path` / `body_ok`, `client_conc.valid_all` | The request validators |
 
-IO layer (every path closes its socket):
-
-| Function | Description |
-|---|---|
-| `fetch` | `http://` GET with caps; `https://` is refused with `Fail 501` |
-| `serve_once` | Serve one connection with a caller-provided handler |
-| `echo.body` / `echo.serve` | Echo handler and its (unsafe) accept loop |
-| `dispatch` / `route_status` | Handler dispatch and status projection |
-
-Requests and responses are tuples. A request is
-`method & path & headers & body`; a response is
-`status & headers & body`. Headers are `List<&1, String & String>`.
+The `Data` types are the contract between the modules: `Hdr`, `ReqHead`,
+`H1Head`, `Request`, `Response`, `Head`, `BodyFrame`, `SlotHead`, `St`,
+`Frame`, `UnitOut`, `Got`, `Tab`, `HdrGot`, `Taken`, `FendTaken`, `Cont`,
+`CliSt`, `StreamEv`, `StreamOut`, `SrvEv`, `SrvOut`, `ChunkSt`,
+`CStreamEv`, `CStreamOut`. Every constructor lives in `lib/http.bend`:
+Bend keeps one constructor namespace per file. A request is
+`Request{method, path, headers, body}`; a response is
+`Response{status, headers, body}`; a header is `Hdr{name, value}`.
 
 Binary socket effects (`lib/tcp.bend`, import as `TCP`) — the byte-level
 twin of Base's `TCP.send`/`TCP.recv`, so frames never go through UTF-8:
@@ -161,7 +163,7 @@ NXDOMAIN, `603` on SERVFAIL, `604` when the answer carries no A record,
 only. The effect codes `602`–`605` are table-driven in the twins. The
 manual real-host example exercises them, not a golden.
 
-`fetch` and `send_request` connect by the resolved IP, but they send the
+`fetch` and the TLS dial connect by the resolved IP, but they send the
 ORIGINAL host in `Host`. Virtual hosting never changes.
 
 A host that is an address form but not a canonical dotted quad
@@ -237,24 +239,27 @@ bun TLS code refuses the cipher:
 
 ```sh
 bend tests/io/tls_connect_close.bend   # 111
-bend tests/io/tls_alpn_dual.bend       # 1
 bend tests/io/tls_alpn_none.bend       # 1111
+bend tests/io/httpx_server_alpn.bend   # 2 (the ALPN split over one TLS port)
 bash tests/effs/parity.sh              # 26 passed, 0 failed, 3 known
 bash tests/effs/eff-unit.sh            # 2 passed, 0 failed (hermetic twin units: DNS codes, recv clamp)
 ```
 
-## HTTP/2
+## HTTP/2 (the wire)
 
-`lib/http2.bend` (import as `H2`) is a native HTTP/2 (RFC 7540/7541)
-client and server on the TLS lane. Frames and HPACK are pure Bend, with
-no nghttp2/node:http2:
+`lib/http2.bend` (import as `HTTP2`) is the H2 wire of RFC 9113/7541:
+every frame (`x_frame*`, `x_read_frame`), the HPACK codec (`x_tab.*`,
+`x_huff*`, `x_int.*`, `x_hdr.*`), the flow pump (`x_send_data_flow`,
+`x_flow*` and the WU credit), the three connection loops (`httpx`,
+`httpx_seq`, `httpx_stream`), the slot ledgers (`httpxn.*`, `httpxc.*`)
+and the H2 lanes of client and server. The public entries stay in the
+facade (`## HTTPX` below); a file imports this module only when it names a
+wire leaf (the codec tests).
 
-| Function | Description |
-|---|---|
-| `h2_connect(host, port)` / `h2_connect_insecure` | TLS dial, magic preface + SETTINGS |
-| `h2_request(sock, sid, method, path, headers, body)` | One request/response exchange on stream `sid` (1, 3, 5, ...); the socket and next sid thread back |
-| `h2_serve_once(sock, handler)` | Serve one request stream: preface, SETTINGS, HEADERS/DATA → `handler(H2Request) -> IO(H2Response)` → response frames |
-| `h2_serve_next(sock, handler)` | Serve one more stream on an established connection (no preface); thread for sequential keep-alive (sid 1, 3, 5, ...) without a new handshake |
+It does not dial and does not accept. H2 has one transport, so the module
+names TLS directly for the socket (`TLS.tls_recv_bytes`,
+`TLS.tls_send_bytes`, `TLS.tls_close`). The dial, the accept and the ALPN
+dispatch are the facade's.
 
 HPACK decodes the full RFC 7541 subset. It reads literal (all three
 modes), static-table indexed (1–61) and dynamic-table indexed references,
@@ -265,65 +270,20 @@ updates.
 Integer continuations past 5 bytes fail closed with `502` (RFC 7541 §7.4
 implementation limit). The encoder stays literal without huffman. That
 output is valid HPACK every peer decodes, so Bend→Node needs no huffman
-encoder. Header blocks that split across CONTINUATION, and frames over
-16384, still fail closed (`400`/`413`, backlog).
+encoder. Header blocks survive CONTINUATION in both directions; a frame
+larger than `MAX_FRAME_SIZE` fails closed (`400`/`413`, backlog).
 
-`examples/real/httpx_real.bend` is a manual smoke against live hosts.
-Observed 2026-09-28: example.com GET/POST OK, cloudflare.com `fetch` OK
-on ~1.3 MB, info.cern.ch OK through H1. It is never part of the gate.
+**Contract:**
 
-Multi-stream keep-alive clients against huffman peers stay on single-shot
-`request` (fresh table per connection, always correct). Per-connection
-decode state threads through the server loops and the concurrent mux.
-
-```sh
-bend tests/io/h2_loopback.bend         # 1
-```
-
-## HTTPS
-
-`lib/https.bend` (import as `HTTPS`) is the public HTTPS facade over
-TLS + DNS + the HTTP/2 codec. It gives request/response/fetch and generic
-keep-alive servers, like `lib/http.bend`:
-
-| Function | Description |
-|---|---|
-| `request(host, port, method, path, hs, body)` / `request_insecure` | Single-shot exchange on stream 1 (connect + request + close); answers the full `H2Response` (status + headers + byte body) |
-| `send_request(host, port, path, method, hs, body)` / `send_request_insecure` | Same exchange with a `String` body; answers the response body as `String` |
-| `fetch(url)` / `fetch_insecure` | `https://` GET by URL (with `HTTP.read_url`); `http://` refused with `Fail 400`; answers the body as `String` |
-| `fetch_bytes(url)` / `fetch_bytes_insecure` | Same GET answering raw `List<&2, U32>` bytes |
-| `server_on(~H, l, cert, key)` | Generic keep-alive server (like `HTTP.server_on`): unbounded TLS accept loop with `IO.spawn` per connection, unlimited sequential streams per connection until GOAWAY/EOF; `~H` is `H2Request -> IO(H2Response)` |
-| `server_on_concurrent(~H, l, cert, key)` | Same accept loop; per connection an unbounded interleaved mux (open streams tracked in a `List<H2SrvSt>` by sid, answered in any completion order; header fragments parked until CONTINUATION completes the block) |
-| `server_on_alpn(~H2, ~H1, l, cert, key)` | Same, but ALPN splits the port: `h2` to the H2 codec, `http/1.1` to `lib/https_http1.bend` (same `IO.spawn` per connection) |
-| `server_on_concurrent_alpn(~H2, ~H1, l, cert, key)` | ALPN split + unbounded interleaved mux |
-| `mux_start(~H, sock)` | One-shot concurrent serve on an established TLS socket (the test entry of the mux) |
-| `server_on_http1(~H, l, cert, key)` | HTTP/1.1-only server (the module of `lib/https_http1.bend`, ALPN `http/1.1` only) |
-
-Bodies are byte-faithful `List<&2, U32>` at the core (`encode_body` /
-`decode_body` wrap `H2.str_bytes` / `H2.bytes_str`). Headers are
-`List<H2Hdr>` (`pairs_to_h2` / `h2_to_pairs` convert http-style pairs).
-Fail codes surface unchanged: `400/413/502/503` (codec), `601-605` (DNS),
-`611-616` (TLS).
-
-**Contract (2026-09-25, task-020):**
-
-- `server_on` has **no fuel**: one accept loop serves streams until
+- `server.on` has **no fuel**: one accept loop serves streams until
   GOAWAY/EOF, the same contract `node:http2` expects.
-- The client offers `h2` **and** `http/1.1` (ALPN mode 2) and speaks
-  whichever the server picks; a peer without ALPN gets HTTP/1.1. The H1
-  lane lives in `lib/https_http1.bend`. It uses the pure codec of
-  `lib/http.bend` again, with TLS as the only transport change, and
-  answers byte-faithful (chunked and binary included).
-- The server side splits on ALPN too: `tls_accept` is strict `h2`
-  (legacy contract), `tls_accept_alpn` is dual, `tls_accept_http1` is
-  H1-only.
-- Flow control: the codec announces `INITIAL_WINDOW_SIZE=6 MB` and
-  `MAX_FRAME_SIZE=65535`. It replenishes the connection and stream
-  windows on every inbound DATA, and it slices uploads into
+- The client offers `h2` **and** `http/1.1` and speaks whichever the
+  server picks; a peer without ALPN gets HTTP/1.1. Both answers dispatch
+  from one `client.request`.
+- Flow control: the codec announces `INITIAL_WINDOW_SIZE=65535` and
+  `MAX_FRAME_SIZE=65535` (the RFC defaults). It replenishes the connection
+  and stream windows on every inbound DATA, and it slices uploads into
   `WINDOW_UPDATE`-paced frames. Bodies are not capped at 64 KB.
-- Header blocks survive `CONTINUATION` in both directions, and they
-  carry a per-response HPACK dynamic table on the client. The 64-header
-  fuel cap is gone (`512` fields, `512` HPACK tokens).
 - `RST_STREAM`, `GOAWAY`, `PING` and `WINDOW_UPDATE` are handled as
   protocol events, not as skips. Housekeeping frames are answered with a
   fresh-only `ACK` (never an ACK-of-an-ACK, which ping-pongs between two
@@ -333,30 +293,49 @@ Fail codes surface unchanged: `400/413/502/503` (codec), `601-605` (DNS),
   deliver ~1.4 KB per record) no longer answers `400 eof`.
 
 ```sh
-bend tests/io/httpx_fetch_https.bend   # 1
-bend tests/io/httpx_streams.bend       # 1
-bend tests/io/httpx_server_on.bend     # 1
-bend tests/io/httpx_mux.bend           # 1
-bend tests/io/httpx_http1_module.bend  # 1
-bend tests/io/tls_alpn_dual.bend      # 1
-bend tests/io/h2_frame_read.bend      # 8
-bend examples/real/httpx_real.bend    # manual live smoke
+bend tests/io/httpx_frame_read.bend    # 1 (frame parse + write roundtrip)
+bend tests/io/httpx_hpack_huffman.bend # 1 (Appendix B code, decode)
+bend tests/io/httpx_tab_dyn.bend       # 1 (dynamic table + eviction)
+bend tests/io/httpx_flow.bend          # 1 (25 KB up+down through the pump)
+bend tests/io/httpx_miniunit.bend      # 1 (preface + SETTINGS, pure)
 ```
 
-## HTTPX (isolation)
+`examples/real/httpx_real.bend` is a manual smoke against live hosts.
+Observed 2026-09-28: example.com GET/POST OK, cloudflare.com `fetch` OK
+on ~1.3 MB, info.cern.ch OK through H1. It is never part of the gate.
 
-`lib/httpx.bend` (import as `HTTPX`) is a standalone server + client with
-a mini-H2 codec inside. It imports `Base` + `tls` only, never
-`http2`/`https`. It exists to isolate overhead (no Huffman rebuild per
-probe on the hot path, no per-hop dynamic table, no flow-credit sends on
-the server). The `## HTTPS` contract above is unchanged and keeps the
-full codec. Architecture (the two delivery modes, why streaming handlers
-are pure): `docs/modes.md`.
+## HTTPS
+
+There is no separate HTTPS module: HTTPS is `HTTPX` over TLS. The short
+entry names are the TLS ones (`client.once`, `server.on`, ...);
+`_insecure` means "no chain verification" (loopback, self-signed);
+`_plain` means cleartext and takes no certificate. The dial offers ALPN
+`h2` + `http/1.1`, `client.request` dispatches both answers, and
+`server.on_alpn` splits one port the same way. See the entry table under
+`## HTTPX` and the TLS lane above.
+
+Fail codes surface unchanged: `400/413/502/503` (the HTTP codec; `503`
+means the peer may not have processed the stream), `601-605` (DNS),
+`611-616` (TLS).
+
+```sh
+bend tests/io/httpx_fetch_https.bend  # 1 (fetch by URL over TLS)
+bend tests/io/httpx_server_alpn.bend  # 2 (ALPN split, H2 + H1 clients)
+bend tests/io/httpx_client_request.bend # 7 (chained exchanges, H2 + H1 reuse)
+```
+
+## HTTPX (the facade)
+
+`lib/httpx.bend` (import as `HTTPX`) is the facade: the public entries,
+the TLS/TCP dial, the accept and the ALPN split. The wire lives in
+`http1.bend` and `http2.bend`; the types live in `http.bend`. This is the
+one module a consumer imports to call the library. Architecture (the two
+delivery modes, why streaming handlers are pure): `docs/modes.md`.
 
 | Function | Description |
 |---|---|
 | `server.on(~H, l, cert, key)` / `server.on_alpn` | Sequential generic server (one stream at a time; pipelined HEADERS gets `RST_STREAM` 7) / ALPN split with one handler for both lanes |
-| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (H1 lane is a local port of `http.bend` shapes: `Content-Length` **and** `Transfer-Encoding: chunked` framing, **keep-alive** — the server answers and reads the next request on the same connection until `connection: close`, EOF or a terminal 413/502) |
+| `server.on_h2(~H, l, cert, key)` / `server.on_h1(~H, l, cert, key)` | Mono-protocol forks: H2-only / H1-only (the H1 lane uses the `http1.bend` shapes: `Content-Length` **and** `Transfer-Encoding: chunked` framing, **keep-alive** — the server answers and reads the next request on the same connection until `connection: close`, EOF or a terminal 413/502) |
 | `server.on_h1_plain(~H, l)` / `server.echo_h1_plain(l)` | The same keep-alive H1 server over plain TCP (`TCP.listen`/`accept`), no cert/key — the `http://` peer |
 | `server.once(~H, l, cert, key)` / `server.once_h1(~H, l, cert, key)` | Accepts **one** connection and stops (no recursion) — the entry a test or single-shot server wants; `once_h1` is the `http/1.1` pair |
 | `server.echo(l, cert, key)` / `server.echo_alpn` | The fixed echo server: status 200, no headers, the request body back (`echo_body`) |
@@ -364,7 +343,7 @@ are pure): `docs/modes.md`.
 | `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` resets that stream with `RST_STREAM` 8 and the siblings continue. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
 | `server.stream_concurrent(~H, l, cert, key)` / `server.stream_concurrent_alpn` | The same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (2026-10-16, task-054). The `_alpn` variant adds the H1 leg on the same port; H1 has no multiplexing, so each connection serves one request. `server.stream_concurrent_plain(~H, l)` is the plaintext `http://` alias of `server.stream_plain`, which is the same loop |
 | `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
-| `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.h1`) |
+| `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.keep` + `client.on.h1_keep`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
 | `client.connect(_insecure)(host, port)` | Hands back `Socket & CliSt{sid, tab, is_h2}`. `client.request(sock, st, host, port, req)` is **one** exchange on it, both ALPN answers, and it **never closes**: the caller closes (`client.on`/`client.once` do) or calls again for the next request, threading the socket and the state — the returned `CliSt` carries the advanced sid and the HPACK table the next response decodes against. N requests are that loop at the call site |
 | `client.concurrent(_insecure)(~H, host, port, reqs)` | Pipelined N requests (sids 1, 3, 5, 7, ...) drained through slots, scored by `~H: Response -> U32` |
@@ -373,14 +352,13 @@ are pure): `docs/modes.md`.
 | `client.stream_concurrent_plain(~H, host, port, reqs)` | The plaintext `http://` peer of the row above: one connection for each request through `client.stream_plain`, with all dials in flight at the same time. H1 has no multiplexing, and a template handler cannot capture a runtime slot, so this entry keeps `~H: StreamEv -> StreamOut` and the answer counts the finished connections (task-054) |
 | `request(_insecure)` | Any method with headers and a `String` body over `client.once`; answers the response body as `String` |
 | `request_bytes(_insecure)` | Same with raw-bytes body in and out |
-| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `read_url` (ported from `http.bend`, no import); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
+| `fetch(_insecure)` / `fetch_bytes(_insecure)` | GET by URL over `read_url` (which lives in this module); `http://` is served by `_insecure` over the plaintext H1 lane, and refused `400` when verifying |
 | `h1_once(_insecure)` | Single-shot over the H1 lane (no-ALPN dial, WSS-style) |
 
-Surface (TASK-036, kept different by decision): the `lib/core` +
-`lib/utils` toolkit (`str_bytes`, `len`, `take`, `valid_host`, `code_*`,
-and more) stays in the tree. It has zero production callers, and HTTPX
-already owns the equivalents internally (`x_*`, `client.on.valid_*`).
-Only `read_url` is top-level here.
+Surface (TASK-036, kept different by decision): `read_url` is the only
+URL helper at the top level; every other leaf is namespaced
+(`httpx_url.*`, `fetch.*`, `client.*`, `server.*`). The core's leaves are
+namespaced `x_*` and live in `lib/http.bend`.
 
 Retired text lane (TASK-036 phase 7): the 4-String handler shape
 (`serve_once(sock, handler)`, `echo.body`/`echo.serve`, the 25
@@ -407,9 +385,8 @@ Limits (fail-closed, by design):
   asked for.
 
 The H1 lane decodes `Transfer-Encoding: chunked` in **both** directions
-(TASK-033). One step machine (`x_h1.chunk_step`, ported from
-`lib/web/http/main.bend`'s `h1_chunk_step`) feeds the client body reader
-and the two server request readers. Bodies are copied in blocks instead
+(TASK-033). One step machine (`x_h1.chunk_step`) feeds the client body
+reader and the two server request readers. Bodies are copied in blocks instead
 of byte by byte. The caps are the lane's own: client fuel (413
 `response too long`), server fuel (413 `request too long`) and the
 server's 16384-byte body cap (413). A truncated chunk, a non-hex size, a
@@ -443,8 +420,8 @@ One validator serves the three server lanes: keep-alive
 (`stream_plain`).
 
 A head past **16384 bytes** is `431 Request Header Fields Too Large`.
-That number is the one `lib/http.bend` documents for its lane and the
-default of `node --max-http-header-size`. The read fuel is only the
+That number is the H1 lane's own (`lib/http1.bend`) and the default of
+`node --max-http-header-size`. The read fuel is only the
 slow-drip backstop. Every terminal failure whose code is `400..599` is
 **rendered as a response before the connection ends**. TASK-033 set that
 rule for the chunk reader. The `(0, "close")` and the `6xx` transport
@@ -476,7 +453,7 @@ CStreamData}` / `CStreamOut{CStreamContinue{slot}, CStreamCancel{slot}}`
 (task-054): the slot names the stream, so one pure handler serves several
 streams of one H2 connection.
 
-`lib/core/type.bend` speaks one 3+3 family,
+An older tree speaks one 3+3 family,
 `CT.StreamEv{StreamReq, StreamHead, StreamData}` /
 `CT.StreamOut{Continue, RespondEarly, Cancel}` with
 `frame: Maybe<BodyFrame>`. The families are **not interchangeable**: a `~H`
@@ -572,15 +549,13 @@ a bug (TASK-042, phase 7):
 ## WebSocket (WSM)
 
 `lib/wsm.bend` (import as `WSM`) is **one** RFC 6455 implementation for
-both schemes. The handshake rides the H1 upgrade lane of `lib/httpx.bend`
-(the `101` detaches the socket: `h1_open` on the client, `on_h1_open` on
-the server). The frames ride `lib/tls.bend` / `lib/tcp.bend` directly
-once the socket is handed over. Nothing in the module imports `ws.bend`,
-`wss.bend` or `http.bend`: the codec (frames, mask, close, ping/pong,
-fragments, UTF-8) and the handshake live in the module. `lib/ws.bend` and
-`lib/wss.bend` are **superseded**. They stay for old callers only. The
-whole loop, handshake and split existed twice there (once over `TCP.*`,
-once over `TLS.*`), which is the cost this module removes.
+both schemes. The handshake rides the H1 upgrade lane (`h1_open` on the
+client, `on_h1_open` on the server, both entries of `lib/httpx.bend`; the
+`101` detaches the socket). The frames ride `lib/tls.bend` /
+`lib/tcp.bend` directly once the socket is handed over. The module imports
+the facade for the upgrade entries, `./http1.bend` for the handshake text
+helpers and `./http.bend` for the types and the byte leaves. The codec
+(frames, mask, close, ping/pong, fragments, UTF-8) lives in the module.
 
 **Lanes are picked by name.** TLS keeps the short name, cleartext gets
 `_plain`, and `_insecure` always means "does not verify" — never "no
@@ -609,8 +584,8 @@ Handshake (pure):
 |---|---|
 | `wsm_accept_of` | `Sec-WebSocket-Accept` = base64(SHA1(key ++ GUID)) |
 | `wsm_validate` / `wsm_validate_sub` | Validate parsed headers (GET, `Upgrade`, `Connection`, `Version`, `Key`) and pick a subprotocol |
-| `wsm_accept_hdrs` / `_sub` | The `101` headers as `HTTPX.Hdr` (the lane renders the head) |
-| `wsm_client_request` / `_sub` | The client upgrade request as `HTTPX.Request` (the lane injects the `Host`, always `host:port`) |
+| `wsm_accept_hdrs` / `_sub` | The `101` headers as `HTTP.Hdr` (the lane renders the head) |
+| `wsm_client_request` / `_sub` | The client upgrade request as `HTTP.Request` (the lane injects the `Host`, always `host:port`) |
 | `wsm_client_ok` / `_sub` | Validate the `101` plus the echoed `Accept` (and the picked subprotocol) |
 | `wsm_handshake` / `_sub`, `wsm_show_101` / `_sub`, `wsm_client_head` / `_sub` | Text surface over the same rules, for callers that speak the head as `String` |
 
@@ -620,7 +595,7 @@ Frame codec (pure, bytes are `List<&2, U32>`):
 |---|---|
 | `wsm_read_frame` / `wsm_read_frame_unmasked` | Parse one frame into `fin & op & payload`; masked / unmasked |
 | `wsm_show_frame` / `wsm_show_masked` (`_key`, `_random`) | Render an unmasked frame / a client-masked frame |
-| `wsm_frame_need` / `wsm_frame_split` (+ `_unmasked`) | Length-prefix size, and incremental split into `HTTPX.UnitOut` (`Got` / `NeedMore` / `Bad` / `End`); a partial frame is never materialized |
+| `wsm_frame_need` / `wsm_frame_split` (+ `_unmasked`) | Length-prefix size, and incremental split into `HTTP.UnitOut` (`Got` / `NeedMore` / `Bad` / `End`); a partial frame is never materialized |
 | `wsm_unmask` | XOR a payload with the four mask bytes |
 | `wsm_utf8_encode` / `_decode` / `_ok` | The `WSText` lane (RFC 3629, strict) |
 
@@ -628,8 +603,8 @@ Messages and events: `WSMessage` is `WSText{text}` or `WSBin{data}`.
 `WSOut` is `OutMsg` / `OutOp` / `OutRaw`. `WSIn` is `InMsg` / `InOp`.
 `WSEv` is the lifecycle event (`EvOpen`, `EvMsg`, `EvPing`, `EvPong`,
 `EvClose`, `EvError`). `WsStep` and `MsgAcc` are loop internals, and
-`WSMask` is the client key. The names mirror `lib/websocket/type.bend`,
-so the move between the two trees is a requalification, not a redesign.
+`WSMask` is the client key. The names are the old WebSocket tree's, so the
+move was a requalification, not a redesign.
 
 IO — the template defs take the transport as `~recv` / `~send`, and the
 instances pin one lane (never an `is_tls` flag):
@@ -642,7 +617,7 @@ instances pin one lane (never an `is_tls` flag):
 | `wsm_send_bytes(~send, m)` | Ship a framed-bytes result verbatim |
 | `send_msg_plain` / `send_op_plain` / `send_msg_tls` / `send_op_tls` | Masked client send, one line per lane |
 | `wsm_ship_plain` / `wsm_ship_tls` | Send-and-close, the shape the old `ws.send_bytes` had |
-| `recv_op[_client]_framed_plain`, `recv_msg[_client]_framed_plain`, `send_open_{op,msg,bytes}_plain`, `recv_bytes_plain` | The retired `lib/ws.bend` vocabulary, one line each over the templates (compat for importers) |
+| `recv_op[_client]_framed_plain`, `recv_msg[_client]_framed_plain`, `send_open_{op,msg,bytes}_plain`, `recv_bytes_plain` | The retired WS vocabulary, one line each over the templates (compat for importers) |
 | `client_scan_len`, `ws_host_port` | Pure compat helpers: the head length up to the CRLFCRLF terminator, and the **retired** `Host` rule (default port omitted — the wire always renders `host:port`) |
 
 **Close state (2026-09-25, task-020):** the close handshake is complete.
@@ -689,7 +664,7 @@ bend examples/wss/wsm_binance_bookticker.bend | head   # live public peer
 grouped by lane. `wsm/` has the `ws://` session: five server/client pairs,
 Bend and Node, hand-driven and event-driven. `wss/` has the `wss://`
 peers plus the saturate driver and the live probe. `httpx/` has the
-`lib/httpx.bend` peers: mini-H2, ALPN split, the H1 lanes and the site
+`lib/httpx.bend` peers: H2 echo, ALPN split, the H1 lanes and the site
 launcher. `real/` has live public hosts, by name. `examples/README.md`
 indexes every pair with its port and command; the gate only typechecks
 them (`check.sh --checks`).
@@ -707,7 +682,7 @@ bid/ask price and size) until the 15 s sleep in `main` halts the run.
 Pipe it through `head`.
 
 HTTPX interop (`lib/httpx.bend`, manual only, never in the gate):
-`httpx/httpx_echoserv.bend` serves the mini-H2 echo on an ephemeral port
+`httpx/httpx_echoserv.bend` serves the H2 echo on an ephemeral port
 (printed to stdout; binary builds in <45s).
 `httpx/httpx_server_stream.bend` serves the streaming-upload cap-3 handler
 on an ephemeral port. `httpx/httpx_client_once.bend` dials a node echo
@@ -764,17 +739,17 @@ Interop matrix (loopback, test PEMs; measured 2026-09-22/23 in
 | WSS node ↔ node / bun ↔ bun / node ↔ bun / bun → node | **4/4 PASS** |
 | Bend `httpx_echo_client` → Node `https_server.js` | **PASS** (`DONE 3/3` / `DONE 1/1`) |
 | Node `https_client.js` → Bend `httpx_echo_server.bend` | **PASS** (`DONE 4/4`; was `502 huffman refused` before HPACK-full) |
-| Bend ↔ Bend HTTPS | **PASS** (golden `tests/io/httpx_*_https.bend`, 4/4) |
-| HPACK vectors (RFC C.4.1/C.6.1) + dynamic-table unit | **PASS** (`tests/io/hpack_huffman.bend` 11111111, `hpack_dyntab.bend` 11111111) |
+| Bend ↔ Bend HTTPS | **PASS** (golden `tests/io/httpx_fetch_https.bend`, 1/1) |
+| HPACK vectors (RFC C.4.1/C.6.1) + dynamic-table unit | **PASS** (`tests/io/httpx_hpack_huffman.bend` 1, `httpx_tab_dyn.bend` 1) |
 
 ## Security policy
 
 - `show_*` rejects CRLF in every field with `Fail 400` (injection).
 - `read_*` caps the head at 16 KB; oversize is `Fail 413`.
 - Ports must be 1–65535; hosts reject whitespace, controls and NUL.
-- `fetch` reads at most 8 × 8192 bytes (64 KB cap), then truncates. The
-  HTTPS lane (`lib/https.bend`) has no such cap: it streams with HTTP/2
-  flow control and a 16 MB WebSocket payload cap.
+- `fetch` has no 64 KB cap. The H1 lane answers `413` when its read fuel
+  runs out and never serves a truncated body; the H2 lane paces the body
+  with flow control. The 16 MB cap belongs to the WebSocket payload.
 - Client WebSocket frames are masked with a key drawn from the host
   entropy pool (`IO.random_u32` → `getrandom`/`arc4random`, RFC 6455
   §5.3). `show_masked(fin, op, payload, k0..k3)` stays public for tests
@@ -799,11 +774,16 @@ effects carry their `.c`/`.js` twins.
 ```sh
 bend lib/package.bend --publish
 # 0x<hash>
-# import 0x<hash>/http.bend as HTTP
-# import 0x<hash>/ws.bend   as WS
-# import 0x<hash>/sha1.bend as SHA1
-# import 0x<hash>/b64.bend  as B64
-# import 0x<hash>/tcp.bend  as TCP
+# import 0x<hash>/http.bend  as HTTP
+# import 0x<hash>/http1.bend as HTTP1
+# import 0x<hash>/http2.bend as HTTP2
+# import 0x<hash>/httpx.bend as HTTPX
+# import 0x<hash>/wsm.bend   as WSM
+# import 0x<hash>/sha1.bend  as SHA1
+# import 0x<hash>/b64.bend   as B64
+# import 0x<hash>/tcp.bend   as TCP
+# import 0x<hash>/dns.bend   as DNS
+# import 0x<hash>/tls.bend   as TLS
 ```
 
 The first run of an importer fetches the package from the hub into
@@ -814,88 +794,27 @@ pastes the new line.
 ## Tests
 
 ```sh
-bend tests/io/httpx_h1_pure.bend        # 481441153
-bend tests/io/httpx_h1_sec.bend         # 15
-bend tests/io/httpx_h1_fetch.bend       # 111
-bend tests/io/httpx_h1_fetch_cl.bend    # 111
-bend tests/io/httpx_h1_fetch_post.bend  # 111
-bend tests/io/httpx_h1_fetch_head.bend  # 11111
-bend tests/io/httpx_h1_fetch_host.bend  # 111
-bend tests/io/httpx_h1_server_on.bend   # 111
-bend tests/io/tcp_bytes.bend          # 11
-bend tests/io/tcp_bytes_loopback.bend # 11 (two lanes, one line each)
-bend tests/io/dns_resolve.bend        # 11111111111111
-bend tests/io/dns_addr_form.bend      # 11111111 (pure addr_form vectors, incl. beef1.cafe)
-bend tests/io/tls_connect_close.bend  # 111
-bend tests/io/h2_loopback.bend        # 1
-bend tests/io/httpx_fetch_https.bend   # 1
-bend tests/io/httpx_streams.bend       # 1
-bend tests/io/httpx_server_on.bend     # 1
-bend tests/io/httpx_mux.bend           # 1
-bend tests/io/wsm_crypto.bend          # 8
-bend tests/io/wsm_handshake.bend       # 4
-bend tests/io/wsm_frame.bend           # 6
-bend tests/io/wsm_unmasked.bend        # 4
-bend tests/io/wsm_loopback_plain.bend  # 111
-bend tests/io/wsm_msg.bend             # 1111
-bend tests/io/wsm_framing.bend         # 13
-bend tests/io/wsm_got_contra.bend      # 25 (got contra-proof: one-walk peel vs take/drop)
-bend tests/io/wsm_framed.bend          # 4
-bend tests/io/h2_flow.bend            # 11
-bend tests/io/h2_rst.bend             # 13
-bend tests/io/hpack_continuation.bend # 30
-bend tests/io/h2_frame_read.bend      # 8
-bend tests/io/httpx_http1_module.bend # 1
-bend tests/io/tls_alpn_dual.bend      # 1
-bend tests/io/wsm_close.bend            # 10
-bend tests/io/wsm_fragments.bend        # 9
-bend tests/io/wsm_handshake_sub.bend    # 12
-bend tests/io/wsm_mask.bend             # 19
-bend tests/io/wsm_client_coalesce.bend  # 1
-bend tests/io/wsm_loopback.bend         # 3   (plain + TLS session + one-shot TLS)
-bend tests/io/wsm_upgrade_rest.bend     # 3   (101 + first frame in one write)
-bend tests/io/wsm_surface.bend          # 29  (pure text surface + UTF-8)
-bend tests/io/wsm_compat.bend           # 9   (the _plain compat instances)
-bend tests/io/wsm_got_contra.bend           # 25 (got contra-proof: peel vs take/drop)
-bend tests/io/httpx_miniunit.bend           # 1
-bend tests/io/httpx_client.bend             # 1
-bend tests/io/httpx_interop.bend            # 1
-bend tests/io/httpx_client_once.bend        # 1
-bend tests/io/httpx_client_keepalive.bend   # 3
-bend tests/io/httpx_client_request.bend     # 7   (4 chained + reset + H1 reuse)
-bend tests/io/httpx_client_concurrent.bend  # 4
-bend tests/io/httpx_client_stream.bend      # 1
-bend tests/io/httpx_server_stream.bend      # 2
-bend tests/io/httpx_stream_concurrent.bend  # 4 (cancel resets one stream, siblings continue)
-bend tests/io/httpx_client_stream_concurrent.bend  # 3 (client slots: cancel one, siblings finish)
-bend tests/io/httpx_client_stream_concurrent_skip.bend  # 1 (frames in flight of a dropped stream)
-bend tests/io/httpx_client_stream_concurrent_plain.bend  # 5 (N clear H1 connections at once, alias server)
-bend tests/io/httpx_read_url.bend           # 1 (pure URL vectors)
-bend tests/io/httpx_fetch.bend              # 1 (fetch by URL vs mini server)
-bend tests/io/httpx_client_seq.bend         # 3 (batch entry vs mini server)
-bend tests/io/httpx_server_seq.bend         # 2 (terminal requests vs sequential server)
-bend tests/io/httpx_http1_fallback.bend     # 1 (dual client vs H1 server)
-bend tests/io/httpx_server_alpn.bend        # 2 (ALPN split, H2 + H1 clients)
-bend tests/io/httpx_flow.bend               # 1 (25 KB up+down through pump v2 + WU credit)
-bend tests/io/httpx_client_cont.bend        # 1 (fragmented HEADERS+CONT vs once drain)
-bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
-bend tests/io/httpx_client_cont_conc.bend   # 1 (same peer vs concurrent drain)
-bend tests/io/httpx_concurrent_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx loop)
-bend tests/io/httpx_h1_keepalive.bend       # 14 (H1 close policy + reuse + client batch + terminal)
-bend tests/io/httpx_got_contra.bend         # 52 (got contra-proof: split arms, projections, taken)
-bend tests/io/httpx_h1_chunk.bend           # 35 (pure chunked decoder: vectors, step, reference equivalence)
-bend tests/io/httpx_h1_fetch_chunk.bend     # 8 (chunked response end to end, truncated -> 400)
-bend tests/io/httpx_h1_server_chunk.bend    # 6 (chunked request end to end: 200, 400, 413, keep-alive, upgrade lane)
-bend tests/io/httpx_h1_upgrade.bend         # 7 (101 detaches the socket: server + client)
-bend tests/io/httpx_h1_upgrade_client.bend  # 7 (renderer + raw peer + 200 -> 502)
-bend tests/io/tcp_listen_backlog.bend       # 20 (20-client burst through the deep listener + fail-closed paths)
-bend tests/io/tls_alpn_none.bend            # 1111 (no-ALPN client vs strict + dual servers)
-bend tests/io/httpx_h2_goaway.bend          # 6 (typed stream verdicts: goaway/rst shapes)
-bend tests/io/httpx_utf8_str.bend           # 31 (stack-safe text lanes: 64 KB ASCII, 20 K multi-byte)
+bash check.sh --all                # the full gate: lib checks + examples + tests
+bash check.sh http_bytes           # one file by pattern
+bash check.sh --checks lib/        # typecheck only
+bash check.sh --tests              # run only
 
-bend tests/io/httpx_request.bend       # 2 (String + bytes bodies vs mini server)
-bend tests/io/core_contract.bend          # 1 (core contract + header helpers + Fail codes)
-bend tests/io/core_read_url.bend          # 1 (core URL vectors + valid_* gates)
+bend tests/io/http_bytes.bend                 # 10  the core leaves
+bend tests/io/httpx_h1_reason.bend            # 12  the reason table
+bend tests/io/dns_resolve.bend                # 11111111111111
+bend tests/io/dns_addr_form.bend              # 11111111 (pure addr_form vectors, incl. beef1.cafe)
+bend tests/io/tcp_bytes.bend                  # 11
+bend tests/io/tls_connect_close.bend          # 111
+bend tests/io/httpx_miniunit.bend             # 1   H2 preface + SETTINGS
+bend tests/io/httpx_client.bend               # 1
+bend tests/io/httpx_h1_fetch.bend             # 111
+bend tests/io/httpx_h1_fetch_bulk.bend        # 111 (96 KB body over several recvs)
+bend tests/io/httpx_h1_upgrade.bend           # 7   the 101 detaches the socket
+bend tests/io/httpx_fetch_scheme.bend         # 2   http:// without insecure
+bend tests/io/httpx_utf8_invalid.bend         # 11  the invalid-UTF-8 policy
+bend tests/io/wsm_surface.bend                # 29
+bend tests/io/wsm_msg.bend                    # 1111
+bend tests/rfc/rfc_httpx.bend                 # 1
 ```
 
 Each file ends with a `#|` line that holds the expected output. That line
@@ -909,19 +828,20 @@ echo server's `@unsafe` annotation is expected.
 JS and C lanes:
 
 ```sh
-bend tests/io/httpx_h1_pure.bend -o /tmp/pure.js && bun /tmp/pure.js
-bend tests/io/httpx_h1_pure.bend -o /tmp/purebin && /tmp/purebin
+bend tests/io/http_bytes.bend -o /tmp/pure.js && bun /tmp/pure.js
+bend tests/io/http_bytes.bend -o /tmp/purebin && /tmp/purebin
 ```
 
 ## Note on the byte effects and `lib/tcp.bend` / `lib/dns.bend`
 
-`lib/wsm.bend` and `lib/ws.bend` import `./tcp.bend as TCPB` / `as TCP`
-and call `TCP.send_bytes` / `TCP.recv_bytes` / `TCP.recv_frame`;
-`lib/http.bend` imports `./dns.bend as DNS` and calls `DNS.resolve`. The
-effects stay in the package (not in `Base`). That choice makes the bundle
-self-contained. A hub consumer with a stock Base can
-`import 0x<hash>/lib/wsm.bend as WSM` (or the superseded
-`0x<hash>/lib/ws.bend as WS`) and compile.
+`lib/wsm.bend` imports `./tcp.bend as TCPB` and calls `TCP.send_bytes` /
+`TCP.recv_bytes` / `TCP.recv_frame`. `lib/httpx.bend` imports
+`./dns.bend as DNS` and calls `DNS.resolve`, and `./tcp.bend as TCP` for
+the plaintext dial. The core imports neither: `lib/dns.bend` imports
+`./http.bend` for the text checks, not the other way. The effects stay in
+the package (not in `Base`). That choice makes the bundle self-contained.
+A hub consumer with a stock Base can `import 0x<hash>/wsm.bend as WSM`
+and compile.
 
 The effect host symbols are the defs' local names:
 `send_bytes_run`, `recv_bytes_run`, `recv_frame_run`, and the JS
@@ -1002,9 +922,7 @@ The server examples under `examples/` all listen deep now
 Base's `TCP.listen`: they dial one connection at a time, so the listener
 choice does not move a number there. The one test that drives a burst
 (`tests/io/tcp_listen_backlog.bend`) uses the deep one and fails if the
-burst misses its budget. `examples/httpx/h2_big_loopback.bend` also keeps
-Base's: it rides the superseded `lib/http2.bend` and opens exactly one
-connection.
+burst misses its budget.
 
 The C side targets the Bend 2.0.21 runtime: `io_wait_on(w, fd, evts,
 time, more)` takes the deadline word (pass `0`), and `io_node` takes

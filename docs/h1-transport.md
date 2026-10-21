@@ -1,10 +1,11 @@
 # H1 transport templates (`~recv` / `~send` / `~close`)
 
-`lib/httpx.bend` speaks HTTP/1.1 over **two transports**: TLS sockets
+`lib/http1.bend` speaks HTTP/1.1 over **two transports**: TLS sockets
 (`wss://`, `https://`) and plain TCP (`ws://`, `http://`). One grammar
-serves both transports. The grammar lives in `x_h1.*`. The transport
-arrives as three template parameters. Every def that touches the wire
-receives these parameters:
+serves both transports. The grammar lives in `x_h1.*` inside that module;
+the facade (`lib/httpx.bend`) owns every dial and every accept and
+instantiates the triple there. The transport arrives as three template
+parameters. Every def that touches the wire receives these parameters:
 
 | Template | Type | TLS instance | TCP instance |
 |---|---|---|---|
@@ -12,24 +13,26 @@ receives these parameters:
 | `~send` | `Socket -> List<&2,U32> -> IO(Socket & Result<&1,&1,U32 & String, Unit>)` | `TLS.tls_send_bytes` | `TCP.send_bytes` |
 | `~close` | `Socket -> IO(Unit)` | `TLS.tls_close` | `Socket.close` |
 
-A caller instantiates the triple one time, at the edge. All defs below the
-edge only forward the triple:
+A caller instantiates the triple one time, at the edge, in the facade. All
+defs below the edge only forward the triple:
 
-| Edge | Triple |
-|---|---|
-| `h1_once.conn`, `h1_open.conn` (TLS one-shot dials), `x_h1.cli.exch` (through `client.on.h1_keep`) | TLS |
-| `x_h1.cli.stream.exch` (stream download, through `client_stream.dispatched` on the ALPN H1 answer) | TLS |
-| `x_h1.stream.spawn` (stream upload, through the `httpxs_alpn_go` False arm) | TLS |
-| `h1_conn` (through `server.on_h1` / `server.once_h1`, through `httpxa_alpn_go`) | TLS |
-| `h1_once.conn` (through `fetch.plain` / `fetch_bytes.plain`, after `TCP.connect`) | TCP |
-| `x_h1.cli.stream.exch` (through `client.stream_plain`, after `plain.dial`) | TCP |
-| `h1_conn` (through `server.on_h1_plain`, after `TCP.accept`) | TCP |
-| `x_h1.stream.conn` (through `server.stream_plain`, after `TCP.accept`) | TCP |
+| Facade call site | Triple | Grammar |
+|---|---|---|
+| `h1_once.conn` (`h1_once`, `h1_once_insecure`) | TLS | `x_h1.exch` |
+| `h1_once.conn` (`fetch.plain`, `fetch_bytes.plain`, `request_plain`, after `TCP.connect`) | TCP | `x_h1.exch` |
+| `h1_open.conn` (`h1_open`, `h1_open_insecure`) | TLS | `x_h1.cli.exch.open` |
+| `HTTP1.x_h1.cli.exch` (`client.on.h1_keep`, the H1 leg of `client.request`) | TLS | `x_h1.cli.exch` |
+| `HTTP1.x_h1.cli.stream.exch` (through `x_h1.cli.stream.tls`, stream download) | TLS | `x_h1.cli.stream.*` |
+| `HTTP1.x_h1.cli.stream.exch` (`client.stream_plain`, after `plain.dial`) | TCP | `x_h1.cli.stream.*` |
+| `HTTP1.h1_spawn` / `HTTP1.x_h1.stream.spawn` (H1 keep-alive and stream upload behind TLS) | TLS | `x_h1.srv.*` / `x_h1.stream.*` |
+| `HTTP1.h1_conn` / `HTTP1.h1_open_conn` (`server.on_h1`, `server.once_h1`, `server.on_h1_open*`) | TLS | `x_h1.srv.*` |
+| `HTTP1.h1_conn` / `HTTP1.h1_open_conn` (`server.on_h1_plain`, `server.on_h1_open_plain`) | TCP | `x_h1.srv.*` |
+| `HTTP1.x_h1.stream.conn` (`server.stream_plain`, after `TCP.accept`) | TCP | `x_h1.stream.*` |
 
-## Why not two copies (like `ws.bend` / `wss.bend`)?
+## Why not two copies (one per transport)?
 
-`lib/ws.bend` and `lib/wss.bend` each hardcode the transport. The loop, the
-handshake and the split exist two times, once over `TCP.*` and once over
+The retired WebSocket modules each hardcoded the transport. The loop, the
+handshake and the split existed two times, once over `TCP.*` and once over
 `TLS.*`. That design works, but every fix lands two times. The WebSocket
 unification (`lib/wsm.bend`, task-028 Phase 4) needs **one** handshake lane
 for `ws://` and `wss://`, not two lanes to choose between.
@@ -123,5 +126,5 @@ the only caller of the upgrade lane. The client side goes through
 `on_h1_open_plain`; their `~K` runs the frame loop on the socket that the
 lane handed over. The documentation of the WSM surface is in `README.md`
 (`## WebSocket (WSM)`) and in the task file (Phase 6). This surface holds
-the `_plain` / TLS name map, the compat instances and the name/type
-contract with the new tree (`lib/websocket/main.bend`).
+the `_plain` / TLS name map, the compat instances and the `HTTP.Hdr` /
+`HTTP.Request` shapes it takes from the core.
