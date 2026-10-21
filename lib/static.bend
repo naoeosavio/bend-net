@@ -1,7 +1,7 @@
 # Static files pure in Bend (no net, File only).
 #
 # Import as: import ./static.bend as Static
-# Reuses Base and HTTP (has_crlf, has_nul) for validation.
+# Reuses Base and HTTP (has_crlf, has_nul, x_utf8_decode) for validation.
 #
 # Policy: reject .., absolute paths, empty, CRLF and NUL.
 # Content-Type is minimal; missing files are Fail{404}.
@@ -12,7 +12,7 @@
 # - every callee is defined ABOVE its caller; only self-recursion.
 # - match scrutinees are params or pattern-bound vars, never computed.
 import Base
-import ./http1.bend as HTTP
+import ./http.bend as HTTP
 
 # True when the path is safe to join under a root.
 
@@ -88,7 +88,7 @@ def ctype_json(is_json: Bool, is_txt: Bool, is_js: Bool, is_css: Bool, is_html: 
 def content_type(+p: String) -> String:
   ctype_json(String.contains(p, ".json"), String.contains(p, ".txt"), String.contains(p, ".js"), String.contains(p, ".css"), Bool.or(String.contains(p, ".html"), String.contains(p, ".htm")))
 
-# File IO: open, size, read, close on every path (mold HTTP.fetch).
+# File IO: open, size, read, close on every path (mold HTTPX.fetch).
 # Caps are named, and every read is fail closed.
 
 # Text read cap for safe_read: the historical 8 KB.
@@ -172,7 +172,7 @@ def safe_read.decoded(read: Result<&1, &1, U32 & String, List<&2, U32>>) ->
     case Fail{(code, msg)}:
       IO.pure(Result<&1, &1, U32 & String, String>, Fail{(code, msg)})
     case Done{+bs}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Done{HTTP.decode(bs)})
+      IO.pure(Result<&1, &1, U32 & String, String>, Done{HTTP.x_utf8_decode(bs)})
 
 def safe_read(+root: String, +path: String) ->
   IO(Result<&1, &1, U32 & String, String>):

@@ -30,6 +30,7 @@
 # fetch/send_request) connects by IP but sends the ORIGINAL host in
 # the Host header; virtual hosting never changes.
 import Base
+import ./http.bend as HTTP
 
 # The effect: real name resolution only (the pure layer above this
 # comment never reaches it with a quad, "localhost" or an invalid
@@ -41,20 +42,8 @@ def dns_lookup(host: String) -> IO(Result<&1, &1, U32 & String, String>):
 
 # A canonical dotted quad — the shape Base's TCP.connect itself
 # accepts: four octets of 1-3 digits, no leading zero, each 0-255.
-
-def all_digits.put(is_dig: Bool, rest: Bool) -> Bool:
-  match is_dig:
-    case True{}:
-      rest
-    case False{}:
-      False{}
-
-def all_digits(s: String) -> Bool:
-  match s:
-    case SNil{}:
-      True{}
-    case SCon{+h, +t}:
-      all_digits.put(Char.is_digit(h), all_digits(t))
+# all_digits lives in the core: the H1 Content-Length check needs the
+# same decimal test.
 
 def no_lead0.put(multi: Bool, lead0: Bool) -> Bool:
   match multi:
@@ -73,7 +62,7 @@ def octet_len(+s: String) -> Bool:
   Bool.and(Nat.is_ge(String.length(s), 1n), Nat.is_le(String.length(s), 3n))
 
 def octet_ok(+s: String) -> Bool:
-  Bool.and(octet_len(s), Bool.and(all_digits(s), Bool.and(no_lead0(s), octet_val(s))))
+  Bool.and(octet_len(s), Bool.and(HTTP.all_digits(s), Bool.and(no_lead0(s), octet_val(s))))
 
 def quad_all.put(ok: Bool, rest: Bool) -> Bool:
   match ok:
