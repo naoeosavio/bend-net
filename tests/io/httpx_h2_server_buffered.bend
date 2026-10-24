@@ -1,0 +1,192 @@
+# io (httpx_h2_server_buffered): the buffered form of the server loop
+# (task-060). Three listeners, one lane for each, all from http2.bend:
+#   - server.on: two connections, two complete requests in order on each.
+#   - server.once: one accept, one connection, two requests.
+#   - server.concurrent: two requests in flight on one connection.
+# Every point is a 200 answer that echoes the two-byte body. The form is
+# the one the legacy facade served, so the goldens must match its tests.
+#
+# Score: on +4, once +2, concurrent +2, golden 8.
+import Base
+import ../../lib/tcp.bend as TCP
+import ../../lib/tls.bend as TLS
+import ../../lib/http2.bend as HTTP2
+import ../../lib/http.bend as HTTP
+
+def HOST() -> String:
+  "127.0.0.1"
+
+def CERT() -> String:
+  "tests/io/tls_test_cert.pem"
+
+def KEY() -> String:
+  "tests/io/tls_test_key.pem"
+
+def b2u(b: Bool) -> U32:
+  match b:
+    case True{}:
+      1
+    case False{}:
+      0
+
+def hi_bytes() -> List<&2, U32>:
+  HTTP.x_str_bytes("hi")
+
+def echo_req() -> HTTP.Request:
+  HTTP.Request{"POST", "/echo", Nil{}, hi_bytes()}
+
+# The buffered handler: the whole request in, the whole response out.
+def echo(req: HTTP.Request) -> IO(HTTP.Response):
+  match req:
+    case HTTP.Request{method, path, headers, body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
+
+def score(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+resp}:
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_eq(body, hi_bytes()), 1)))
+
+def conn_c(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +acc: U32) -> IO(U32):
+  (sock, r, st) = got
+  do IO<U32>:
+    +a : U32 = (acc + score(r) : U32)
+    x : Unit <- TLS.tls_close(sock)
+    IO.pure(U32, a)
+
+def conn_b(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32, +acc: U32) -> IO(U32):
+  (sock, r, st) = got
+  do IO<U32>:
+    +a : U32 = (acc + score(r) : U32)
+    g2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTP2.client.request(sock, st, HOST(), port, echo_req())
+    conn_c(g2, a)
+
+def conn_a(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32, +acc: U32) -> IO(U32):
+  match conn:
+    case Fail{e}:
+      IO.pure(U32, acc)
+    case Done{value}:
+      (sock, st) = value
+      do IO<U32>:
+        g1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTP2.client.request(sock, st, HOST(), port, echo_req())
+        conn_b(g1, port, acc)
+
+def conns(n: Nat, +port: U32, +acc: U32) -> IO(U32):
+  match n:
+    case 0n:
+      IO.pure(U32, acc)
+    case 1n+t:
+      do IO<U32>:
+        conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTP2.client.connect_insecure(HOST(), port)
+        a2 : U32 <- conn_a(conn, port, acc)
+        conns(t, port, a2)
+
+def w(resp: HTTP.Response) -> U32:
+  match resp:
+    case HTTP.Response{status, headers, body}:
+      b2u(U32.is_eq(status, 200))
+
+def conc_done(r: Result<&1, &1, U32 & String, U32>) -> IO(U32):
+  match r:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{+n}:
+      IO.pure(U32, n)
+
+def client_conc(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~w, HOST(), port, [echo_req(), echo_req()])
+    conc_done(r)
+
+law server_on:
+  for l: Listener
+  IO(String)
+
+def server_on(l):
+  do IO<String>:
+    x : Unit <- HTTP2.server.on(~echo, l, CERT(), KEY())
+    return "up"
+
+law server_once:
+  for l: Listener
+  IO(String)
+
+def server_once(l):
+  do IO<String>:
+    x : Unit <- HTTP2.server.once(~echo, l, CERT(), KEY())
+    return "up"
+
+law server_conc:
+  for l: Listener
+  IO(String)
+
+def server_conc(l):
+  do IO<String>:
+    x : Unit <- HTTP2.server.concurrent(~echo, l, CERT(), KEY())
+    return "up"
+
+law listen_retry:
+  for port: U32
+  for r: Result<&1, &1, (U32 & String), Listener>
+  for rest: IO(Listener & U32)
+  IO(Listener & U32)
+
+def listen_retry(port, r, rest):
+  match r:
+    case Done{l}:
+      IO.pure(Listener & U32, (l, port))
+    case Fail{e}:
+      rest
+
+law listen_any:
+  for tries: Nat
+  for +port: U32
+  IO(Listener & U32)
+
+def listen_any(tries, port):
+  match tries:
+    case 0n:
+      IO.die(Listener & U32, 1, "no free tcp port")
+    case 1n+t:
+      rest = listen_any(t, (port + 1 : U32))
+      do IO<Listener & U32>:
+        r : Result<&1, &1, (U32 & String), Listener> <- TCP.listen(port)
+        listen_retry(port, r, rest)
+
+law main_go:
+  for b: Listener & U32
+  for b2: Listener & U32
+  for b3: Listener & U32
+  IO(U32)
+
+def main_go(b, b2, b3):
+  (l1, port1) = b
+  (l2, port2) = b2
+  (l3, port3) = b3
+  do IO<U32>:
+    c1 : Chan(String) <- IO.fork(String, server_on(l1))
+    c2 : Chan(String) <- IO.fork(String, server_once(l2))
+    c3 : Chan(String) <- IO.fork(String, server_conc(l3))
+    +s1 : U32 <- conns(2n, port1, 0)
+    +s2 : U32 <- conns(1n, port2, 0)
+    +s3 : U32 <- client_conc(port3)
+    +total : U32 = (s1 + s2 + s3 : U32)
+    w : Unit <- IO.print(U32.show(total))
+    z : Unit <- IO.die(Unit, 0, "")
+    return total
+
+law main:
+  IO(U32)
+
+def main():
+  do IO<U32>:
+    b : Listener & U32 <- listen_any(32n, 18750)
+    b2 : Listener & U32 <- listen_any(32n, 18760)
+    b3 : Listener & U32 <- listen_any(32n, 18770)
+    x : U32 <- main_go(b, b2, b3)
+    return x
+
+#|8

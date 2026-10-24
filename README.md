@@ -250,8 +250,8 @@ bash tests/effs/eff-unit.sh            # 2 passed, 0 failed (hermetic twin units
 `lib/http2.bend` (import as `HTTP2`) is the H2 wire of RFC 9113/7541:
 every frame (`x_frame*`, `x_read_frame`), the HPACK codec (`x_tab.*`,
 `x_huff*`, `x_int.*`, `x_hdr.*`), the flow pump (`x_send_data_flow`,
-`x_flow*` and the WU credit), the three connection loops (`httpx`,
-`httpx_seq`, `httpx_stream`), the slot ledgers (`httpxn.*`, `httpxc.*`)
+`x_flow*` and the WU credit), the three H2 connection loops (`httpx`,
+`httpx_seq`, `server.loop`), the slot ledgers (`httpxn.*`, `httpxc.*`)
 and the H2 lanes of client and server. The public entries stay in the
 facade (`## HTTPX` below); a file imports this module only when it names a
 wire leaf (the codec tests).
@@ -342,6 +342,9 @@ delivery modes, why streaming handlers are pure): `docs/modes.md`.
 | `server.concurrent(~H, l, cert, key)` / `server.concurrent_alpn` | Interleaved httpx echoing `Request -> IO(Response)` (slots by sid, any completion order; `_alpn` is H2-only, non-H2 closes — use `server.on_alpn` for the H1 split) |
 | `server.stream(~H, l, cert, key)` / `server.stream_alpn` | Upload streaming with `SrvReqHead`/`SrvReqData` events to a pure `~H`: `Continue` buffers, `RespondEarly` answers without draining, `Cancel` resets that stream with `RST_STREAM` 8 and the siblings continue. `stream_alpn` dispatches H2/HTTP-1.1 by ALPN (`server.stream` stays H2-only behind `tls_accept`); `server.stream_plain(~H, l)` is the plaintext `http://` peer (one request per connection, then close) |
 | `server.stream_concurrent(~H, l, cert, key)` / `server.stream_concurrent_alpn` | The same contract with the H2 interleave loop: several uploads stay open on one connection, and each event carries its slot (2026-10-16, task-054). The `_alpn` variant adds the H1 leg on the same port; H1 has no multiplexing, so each connection serves one request. `server.stream_concurrent_plain(~H, l)` is the plaintext `http://` alias of `server.stream_plain`, which is the same loop |
+| `server.stream.concurrent(~H, l, cert, key)` | The explicit name of the interleave lane above: one line over `server.stream`, no behavior change (task-059) |
+| `server.stream.on(~H, l, cert, key)` | Accept loop, one stream at a time for each connection: the order of the requests is preserved, and a second `HEADERS` that arrives while a stream is open is refused with `RST_STREAM` 7 (`REFUSED_STREAM`) after its block is decoded, so the connection HPACK table stays in sync. The connection that already serves a stream lives on (task-059) |
+| `server.stream.once(~H, l, cert, key)` | One accept and stop, then that connection serves N streams in order. `once` counts connections on the server, as `server.once` does (task-059) |
 | `client.once(_insecure)(host, port, Request)` | One-shot: dial + one `client.request` + close. `client.request` dispatches both ALPN answers, so the H1 leg needs nothing of its own |
 | `client.on(_insecure)(host, port, reqs)` | Sequential batch entry: one dial, N requests, answers in order; first `Fail` aborts. H2 keeps sids 1, 3, 5, ... and the HPACK table; an `http/1.1` connection reuses the one socket through the H1 lane (`client_seq.keep` + `client.on.h1_keep`) |
 | `client.echo(_insecure)(host, port, path)` | A disposable `GET` over `client.once` |
@@ -375,7 +378,7 @@ Limits (fail-closed, by design):
 - `WINDOW_UPDATE` credit flows both directions (server per DATA,
   streaming-download client per non-final DATA, else >64 KB stalls).
 - Fragmented header blocks (CONTINUATION) reassemble inline-blocking on
-  all three client drains and on `httpx_stream` (RFC 9113 §6.10 forbids
+  all three client drains and on `server.loop` (RFC 9113 §6.10 forbids
   interleave mid-sequence, so no per-stream ledger).
 - Huffman/dynamic-table peers decode (static 1–61, literal, Huffman
   strings, minimal dyn table), which is what `node:http2` needs.
@@ -501,7 +504,10 @@ bend tests/io/httpx_client_cont.bend      # 1 (fragmented HEADERS+CONT vs once d
 bend tests/io/httpx_client_cont_stream.bend # 1 (same peer vs streaming drain, no double-Head)
 bend tests/io/httpx_client_cont_conc.bend # 1 (same peer vs concurrent drain)
 bend tests/io/httpx_concurrent_cont.bend  # 1 (fragmented HEADERS+CONT vs httpx loop)
-bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs httpx_stream)
+bend tests/io/httpx_server_cont.bend      # 1 (fragmented HEADERS+CONT vs server.loop)
+bend tests/io/httpx_h2_server_stream_order.bend # 3 (ordered lane: stream 3 refused RST 7, 1 and 5 answered)
+bend tests/io/httpx_h2_server_stream_lanes.bend # 8 (server.stream once 2 + on 4 + concurrent 2)
+bend tests/io/httpx_h2_server_seq_hpack.bend # 3 (refused block still updates the HPACK table)
 bend tests/io/httpx_request.bend     # 2 (String + bytes bodies vs mini server)
 bend tests/io/httpx_site.bend         # 5 (docs/site/: 3 routes + 2 handler vectors)
 bend tests/io/httpx_got_contra.bend   # 52 (got contra-proof: split arms, projections, taken)
