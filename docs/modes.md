@@ -8,7 +8,10 @@ hits on 2026-10-23, and every hit is a family below.)
 
 The loop column names the def, not the file: the H2 loops are in
 `lib/http2.bend`, the H1 loops in `lib/http1.bend`, and the entries that
-pick a lane in `lib/httpx.bend`.
+pick a lane in `lib/httpx.bend`. The client has one loop, `client.loop`,
+and the mode picks the act table: `on` runs one exchange (and `client.on`
+repeats it), `concurrent` keeps N streams in flight. The server loop
+works the same way: one machine, two forms and two admission modes.
 
 ## Mode 1 — whole response ("on/once")
 
@@ -24,9 +27,9 @@ response. The handler can do IO (DB, upstream fetch, file reads):
 | `server.concurrent[_alpn]` | `httpx` (slots + interleave) | N streams, any completion order |
 | `server.on[_alpn]` / `server.on_h2` | `httpx_seq` | one stream at a time (ALPN split with one `~H` for both lanes); a pipelined `HEADERS` gets `RST_STREAM` 7 after its block is decoded, so the connection HPACK table stays in sync (task-059) |
 | `server.on_h1` / `server.once_h1` | `x_h1.srv.head` (phase 3 loops) | H1 keep-alive: answer, then read the next request on the same connection (`connection: close`, EOF, 413 and 502 close it) |
-| `client.once[_insecure]` | `client_seq` (one request) or `x_h1.exch` on an H1 connection | 1 dial, stream 1, full `Response` |
-| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client_seq` on h2 / `client_seq.keep` + `client.on.h1_keep` on http/1.1 | 1 dial, answers in order: sids 1,3,5… and the HPACK table on h2; the one socket reused sequentially on H1 |
-| `client.concurrent[_insecure]` | `client_conc.drain` (slots) | pipelined N, scored |
+| `client.once[_insecure]` | `client.loop` (mode `on`) on h2, `x_h1.exch` on an H1 connection | 1 dial, stream 1, full `Response` |
+| `client.connect[_insecure]` + `client.request`, `client.on` batch | `client.loop` (mode `on`, one exchange at a time) on h2; the H1 keep-alive lane on http/1.1 | 1 dial, answers in order: sids 1,3,5… and the HPACK table on h2; the one socket reused sequentially on H1 |
+| `client.concurrent[_insecure]` | `client.loop` (mode `concurrent`, collect) | pipelined N, scored |
 | `fetch[_bytes][_insecure]`, `request[_bytes][_insecure]` | `client.once` | URL / text conveniences |
 | `h1_once[_insecure]` | `x_h1.exch` | H1 one-shot (TLS) |
 | `fetch[_bytes]_insecure("http://…")` | `x_h1.exch` (TCP triple) | the same one-shot over plain TCP, no TLS |
@@ -58,8 +61,8 @@ drain.
 | `server.stream.on` | `server.loop` (mode `on`) | accept loop, one stream at a time for each connection: the order is preserved, and a second `HEADERS` that arrives while a stream is open is refused with `RST_STREAM` 7 (`REFUSED_STREAM`) after its block is decoded. The connection that already serves a stream lives on (task-059) |
 | `server.stream.once` | `server.loop` (mode `on`) | one accept and stop, then the connection serves N streams in order. `once` counts connections on the server, as `server.once` does (task-059) |
 | `server.stream_plain` | `x_h1.stream.go` (TCP triple) | plaintext H1 upload over `TCP.accept`, one request per connection, then close. `server.stream_concurrent_plain` is the alias of this loop |
-| `client.stream[_insecure]` | `client.on.sdrop` (H2); `x_h1.cli.stream.go` (H1) | download events to a pure `~H`; dispatches on `CliSt.is_h2` (`client_stream.dispatched`) |
-| `client.stream_concurrent[_insecure]` | `client_cstream.drain` (slot ledger) | H2 only: N requests pipelined on one connection, every event and every answer carries the slot, `CStreamCancel{slot}` resets that stream. The answer is `(bytes, finished streams)` |
+| `client.stream[_insecure]` | `client.loop` (mode `on`) on H2; `x_h1.cli.stream.go` (H1) | download events to a pure `~H`; dispatches on `CliSt.is_h2` (`client_stream.dispatched`) |
+| `client.stream_concurrent[_insecure]` | `client.loop` (mode `concurrent`, slot ledger) | H2 only: N requests pipelined on one connection, every event and every answer carries the slot, `CStreamCancel{slot}` resets that stream. The answer is `(bytes, finished streams)` |
 | `client.stream_plain` | `x_h1.cli.stream.go` (TCP triple) | plaintext H1 download over `plain.dial`, then close |
 | `client.stream_concurrent_plain` | `client_cstream_plain.fan` over `client.stream_plain` | plaintext H1: one connection for each request, all dials at the same time, no slot. The batch is validated before the first dial, and the answer counts the finished connections |
 

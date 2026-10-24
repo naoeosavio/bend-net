@@ -1,7 +1,7 @@
 # lib (httpx_client_cont_stream): fragmented response HEADERS against the
 # streaming client (mold httpx_client_cont: server raw, client real).
 # Server answers HEADERS (sid 1, no END_HEADERS) + CONT (END_HEADERS) +
-# DATA (END_STREAM "hello"). Client is HTTPX.client.stream_insecure
+# DATA (END_STREAM "hello"). Client is HTTP2.client.stream.once_insecure
 # POST "hello" with a pure Continue handler. Golden 1 iff total bytes 5
 # and fins 1 — proves client.on.sdrop reassembles CONT without
 # re-delivering StreamHead (phase 7 rejoins phase 4 handler-free).
@@ -9,7 +9,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -52,7 +51,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.once_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, hello_bytes())
     IO.pure(U32, client_score(r))
 
 # Raw server: preface (magic 24 via tls_recv_bytes) + SETTINGS send, then

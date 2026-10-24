@@ -1,7 +1,7 @@
 # io (httpx_client_stream_concurrent): the client's concurrent streaming
 # lane (task-054 phase 3) against the library's own concurrent server.
 #
-# The client is HTTPX.client.stream_concurrent_insecure with three
+# The client is HTTP2.client.stream.concurrent_insecure with three
 # pipelined requests on one H2 connection: /cancel, /big and /echo. The
 # server answers each request at its head: /big answers 70000 bytes,
 # which is more than the 65535-byte stream and connection windows, so the
@@ -22,7 +22,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
@@ -145,17 +145,17 @@ def mismatch_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def batch(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_concurrent_insecure(~h_cli, HOST(), port, reqs())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.concurrent_insecure(~h_cli, HOST(), port, reqs())
     IO.pure(U32, counts_score(r))
 
 def empty_batch(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_concurrent_insecure(~h_cli, HOST(), port, Nil{})
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.concurrent_insecure(~h_cli, HOST(), port, Nil{})
     IO.pure(U32, empty_score(r))
 
 def mismatch_batch(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_concurrent_insecure(~h_wrong, HOST(), port, reqs_one())
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.concurrent_insecure(~h_wrong, HOST(), port, reqs_one())
     IO.pure(U32, mismatch_score(r))
 
 def clients(+port: U32) -> IO(U32):
@@ -171,7 +171,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server.stream_concurrent(~h_srv, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTP2.server.stream.concurrent(~h_srv, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

@@ -27,7 +27,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -89,7 +88,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, HOST(), port, reqs())
+    r : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~h, HOST(), port, reqs())
     IO.pure(U32, client_score(r))
 
 def srv_close(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):

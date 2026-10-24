@@ -19,7 +19,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -249,12 +248,12 @@ def client_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: 
     case Done{value}:
       (sock, st) = value
       do IO<U32>:
-        got : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock, st, HOST(), port, HTTP.Request{"GET", "/trailer", Nil{}, Nil{}})
+        got : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTP2.client.request(sock, st, HOST(), port, HTTP.Request{"GET", "/trailer", Nil{}, Nil{}})
         client_done(got)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure(HOST(), port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTP2.client.connect_insecure(HOST(), port)
     client_conn(conn, port)
 
 def listen_retry(port: U32, r: Result<&1, &1, (U32 & String), Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):

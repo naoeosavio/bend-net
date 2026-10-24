@@ -1,11 +1,12 @@
 # lib (lib_httpx_client_concurrent): pipelined N=4 POSTs on one TLS+H2
-# connection against HTTPX.server.concurrent. Client sends 4 requests
+# connection against HTTP2.server.concurrent. Client sends 4 requests
 # (sids 1,3,5,7) back-to-back, then drains 4 responses in any order
 # via slots (no per-sid sequential wait). Handler scores 1 per echo
 # body in hello-0..3. Golden 4 (sum).
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
 def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
@@ -40,7 +41,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 law server_side:
@@ -49,7 +50,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTP2.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

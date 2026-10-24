@@ -30,7 +30,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -140,12 +139,12 @@ def sc(resp: HTTP.Response) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r0 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTPX.client.once_insecure(HOST(), port, req("/g1"))
-    r1 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTPX.client.once_insecure(HOST(), port, req("/g0"))
-    r2 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTPX.client.once_insecure(HOST(), port, req("/r7"))
-    r3 : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTPX.client.on_insecure(HOST(), port, [req("/a"), req("/b")])
-    r4 : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~sh, HOST(), port, "GET", "/sg", Nil{}, Nil{})
-    r5 : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~sc, HOST(), port, [req("/c")])
+    r0 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP2.client.once_insecure(HOST(), port, req("/g1"))
+    r1 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP2.client.once_insecure(HOST(), port, req("/g0"))
+    r2 : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP2.client.once_insecure(HOST(), port, req("/r7"))
+    r3 : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTP2.client.on_insecure(HOST(), port, [req("/a"), req("/b")])
+    r4 : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.once_insecure(~sh, HOST(), port, "GET", "/sg", Nil{}, Nil{})
+    r5 : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~sc, HOST(), port, [req("/c")])
     +s0 : U32 = want_resp(r0, MAYBE_PROCESSED(), "goaway NO_ERROR(0) last=1 sid=1")
     +s1 : U32 = want_resp(r1, NOT_PROCESSED(), "goaway REFUSED_STREAM(7) last=0 sid=1")
     +s2 : U32 = want_resp(r2, NOT_PROCESSED(), "rst_stream REFUSED_STREAM(7)")

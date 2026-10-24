@@ -1,10 +1,12 @@
 # lib (lib_httpx_client_stream): streaming download against mini-H2 server.
-# Server is HTTPX.server.concurrent echoing the body; client is
-# HTTPX.client.stream_insecure POST "hello" with a pure Continue
+# Server is HTTP2.server.concurrent echoing the body; client is
+# HTTP2.client.stream.once_insecure POST "hello" with a pure Continue
 # handler (no body accumulation, O(1) per chunk). Golden 1 iff total
 # bytes 5 and fins 1 (one HEADERS + one DATA with END_STREAM).
 import Base
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/tcp.bend as TCP
+import ../../lib/tls.bend as TLS
+import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
 def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
@@ -39,7 +41,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32 & U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTPX.client.stream_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP2.client.stream.once_insecure(~h, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
     IO.pure(U32, client_score(r))
 
 law server_side:
@@ -48,7 +50,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTP2.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:

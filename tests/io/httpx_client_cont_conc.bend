@@ -2,14 +2,13 @@
 # concurrent client (mold httpx_client_cont: server raw, client real).
 # Server answers HEADERS (sid 1, no END_HEADERS) + CONT (END_HEADERS) +
 # DATA (END_STREAM "hello"). Client is
-# HTTPX.client.concurrent_insecure with 1 request (sid 1, pending 1).
+# HTTP2.client.concurrent_insecure with 1 request (sid 1, pending 1).
 # Golden 1 iff the single echo scores — proves client_conc.drain
 # reassembles CONT inline-blocking (no per-stream ledger, RFC 9113
 # §6.10 forbids interleave mid-sequence). Pre-fix: Fail 502.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -49,7 +48,7 @@ def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~h, "127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 # Raw server: preface (magic 24 via tls_recv_bytes) + SETTINGS send, then

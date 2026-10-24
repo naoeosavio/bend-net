@@ -2,9 +2,9 @@
 # connection window must still read an early answer (task-042 follow-up
 # of phase 2b, the lane phase 2b left with an explicit discard).
 #
-# The server is HTTPX.server.stream answering RespondEarly on the head
+# The server is HTTP2.server.stream.on answering RespondEarly on the head
 # (200 plus a short body) and Continue on data; the client is
-# HTTPX.client.concurrent_insecure POSTing 70000 bytes on one stream, so
+# HTTP2.client.concurrent_insecure POSTing 70000 bytes on one stream, so
 # the flow sender runs out of the default 65535-byte window while the
 # response is already on the wire. client_conc.send_kept dropped the
 # frames the sender had read: the early HEADERS never reached
@@ -18,7 +18,7 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
 def PORT() -> U32:
@@ -77,12 +77,12 @@ def client_score(r: Result<&1, &1, U32 & String, U32>) -> U32:
 
 def client(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32> <- HTTPX.client.concurrent_insecure(~hcl, "127.0.0.1", port, reqs())
+    r : Result<&1, &1, U32 & String, U32> <- HTTP2.client.concurrent_insecure(~hcl, "127.0.0.1", port, reqs())
     IO.pure(U32, client_score(r))
 
 def server_side(l: Listener) -> IO(String):
   do IO<String>:
-    x : Unit <- HTTPX.server.stream(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTP2.server.stream.on(~h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 def listen_retry(port: U32, r: Result<&1, &1, (U32 & String), Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):

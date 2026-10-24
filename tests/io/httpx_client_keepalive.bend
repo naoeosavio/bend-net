@@ -1,11 +1,12 @@
 # lib (lib_httpx_client_keepalive): keep-alive sequential on one TLS+H2
-# connection against HTTPX.server.concurrent. Client connects once
+# connection against HTTP2.server.concurrent. Client connects once
 # (insecure) then POSTs 3 bodies ("hello-0/1/2") on sids 1,3,5, one
 # client.request per request, threading (sock, sid, tab) via CliSt. Golden 3
 # (sum of three 1s).
 import Base
+import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
+import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
 def httpx_echo(req: HTTP.Request) -> IO(HTTP.Response):
@@ -45,7 +46,7 @@ def req2(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt,
   do IO<U32>:
     +s12 : U32 = (s1 + score_one("hello-1", r2) : U32)
     got3 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <-
-      HTTPX.client.request(sock2, st2, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")})
+      HTTP2.client.request(sock2, st2, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")})
     req3(got3, s12)
 
 def req1(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32) -> IO(U32):
@@ -53,7 +54,7 @@ def req1(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt,
   do IO<U32>:
     +s1 : U32 = score_one("hello-0", r1)
     got2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <-
-      HTTPX.client.request(sock1, st1, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")})
+      HTTP2.client.request(sock1, st1, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")})
     req2(got2, s1, port)
 
 def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
@@ -64,12 +65,12 @@ def go_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32)
       (sock0, st0) = value
       do IO<U32>:
         got1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <-
-          HTTPX.client.request(sock0, st0, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")})
+          HTTP2.client.request(sock0, st0, "127.0.0.1", port, HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")})
         req1(got1, port)
 
 def client(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure("127.0.0.1", port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTP2.client.connect_insecure("127.0.0.1", port)
     go_conn(conn, port)
 
 law server_side:
@@ -78,7 +79,7 @@ law server_side:
 
 def server_side(l):
   do IO<String>:
-    x : Unit <- HTTPX.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    x : Unit <- HTTP2.server.concurrent(~httpx_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     return "up"
 
 law listen_retry:
