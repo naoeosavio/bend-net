@@ -316,11 +316,16 @@ Bend reaches 86% of node on small answers and 5.6% on big bodies.
 
 The limits, measured:
 
-- Download and upload saturate near 17 MB/s. The cost is one cons cell per
-  byte plus the TLS effect; more concurrency does not raise it.
-- A buffered lane holds the whole body: 100 MB costs about 2.4 GB of RSS.
-  The stream lanes stay flat (14 MB for 100 MB), so use `server.stream*`
-  and `client.stream*` for big bodies.
+- Download and upload saturate near 17 MB/s. More concurrency does not
+  raise it: 10 connections answer 17.1 MB/s and 100 streams 17.5 MB/s. The
+  send path costs 49 to 54 ms of server CPU per MiB. About 9 ms is
+  transport, 6 to 10 ms the split, 12 ms the TLS effect, and about 30 ms
+  is loop and runtime work that is not attributed yet. A profiler is the
+  next step.
+- A buffered lane holds the whole body: 100 MB costs about 2.4 GB of RSS,
+  and the reversed accumulator plus its flatten holds a 16 MiB receive
+  body at 800 MB. The stream lanes stay flat: 11.9 MB for 100 MB. Use
+  `server.stream*` and `client.stream*` for big bodies.
 - The buffered receive of the H2 server caps one request body at 16 MiB
   (`HTTP2.x_max_body()`). A body past the cap answers `RST_STREAM 8`
   (CANCEL) and the handler never runs. The cap counts the declared DATA
@@ -332,6 +337,21 @@ The limits, measured:
   a header block past 64 KiB answers `GOAWAY 11`. The server keeps serving
   other connections after each of them.
 - 200 sockets closed in the middle of a body leave the server alive.
+
+Limits by design, which the load does not change:
+
+- No tunnel and no request trailer. A request head needs `:method` and
+  `:path` (RFC 9113 8.3.1). A CONNECT block and a request trailer block
+  fail the decode with `502`. No lane serves a tunnel.
+- The send pump of `lib/http2.bend` credits a DATA frame before it stashes
+  the frame, so a connection moves both directions at the same time. Two
+  endpoints of the wire module that send large bodies at once finish
+  (`tests/io/http2_duplex_credit.bend`). `lib/httpx.bend` still carries its
+  own H2 copy with the old shape, and task-064 removes that copy.
+- A SETTINGS frame read in the middle of a send moves that send's window
+  by the difference of the two announced sizes. It does not reach the
+  loop ledger, so a stream that opens after it starts from the previous
+  initial size.
 
 The micro-bench (`examples/httpx/bench_h2.bend`, 1 MiB, 5 runs) gives the
 levers, in the `test.bend` shape:

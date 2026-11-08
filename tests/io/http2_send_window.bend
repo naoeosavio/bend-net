@@ -119,19 +119,19 @@ def is_end(+flags: U32) -> Bool:
 # The seed the send hands back: the frames it read while it waited for
 # credit. A SETTINGS and a WINDOW_UPDATE are acted on, not stashed, so an
 # honest send hands nothing back.
-def snd_end(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32) -> IO(U32):
-  match sent:
-    case (s, r, seed, cw):
-      do IO<U32>:
-        x : Unit <- TLS.tls_close(s)
-        +cw_ok : Bool = U32.is_eq(cw, 0)
-        IO.pure(U32, U32.add(b2u(cw_ok), b2u(list_nil(seed))))
+def snd_end(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +cw: U32) -> IO(U32):
+  (s, r, seed) = sent
+  do IO<U32>:
+    x : Unit <- TLS.tls_close(s)
+    +cw_ok : Bool = U32.is_eq(cw, 0)
+    IO.pure(U32, U32.add(b2u(cw_ok), b2u(list_nil(seed))))
 
+@unsafe
 def snd_go(sock: Socket) -> IO(U32):
   do IO<U32>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <-
-      HTTP2.x_send_data_start(sock, 1, snd_body(), CW(), HTTP2.x_init_window(), HTTP2.x_init_window(), Nil{})
-    snd_end(sent)
+    +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <-
+      HTTP2.x_send_data_start(sock, 1, snd_body(), CW(), HTTP2.x_init_window(), HTTP2.x_init_window(), Nil{}, 0)
+    snd_end(HTTP2.httpx.sent3(sent), HTTP2.httpx.sent_cw(sent))
 
 def snd_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>) -> IO(U32):
   match conn:

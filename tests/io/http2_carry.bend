@@ -50,7 +50,8 @@ def main() -> IO(U32):
     # 7. WINDOW_UPDATE: the sender handles it, nothing to hand back.
     g : U32 = route_ok(8, 0, 7, 2, 12)
     # 8. the seed keeps wire order: accumulated, then the frame, then the
-    #    rest of the recv.
+    #    rest of the recv. The count of credited DATA frames travels beside
+    #    the seed, so the bytes carry no marker (TASK-068).
     h : U32 = list_ok(HTTP2.x_flow.seed_add([1], 0, 0, 3, [7], [9]), [1, 0, 0, 1, 0, 0, 0, 0, 0, 3, 7, 9])
     # 9. the RST_STREAM of the stream being sent stops it (typed error).
     i : U32 = route_ok(3, 7, 7, 3, 12)

@@ -444,3 +444,66 @@ if (MODE === "hughead") {
   sock.on("error", (e) => done(false, `socket ${e.message}`));
   setTimeout(() => done(false, "hughead timeout"), 10000).unref();
 }
+
+// Full-duplex credit cell (task-068). The peer asks for A MiB on stream 1
+// and grants no window until it sees our WINDOW_UPDATE for an upload frame
+// that it sends at the 65535-byte mark. The frame carries flag A: 16 is
+// the undefined DATA flag that marks a paid seed frame, 0 is a plain DATA
+// frame.
+//   node examples/httpx/stress_h2.js pumpcredit <port> <flag> <mb>
+// A server that does not credit the stashed frame never sends the update,
+// so the peer never grants and the cell stops at the 20-second ceiling.
+if (MODE === "pumpcredit") {
+  const FLAG = A;
+  const MB = B;
+  const want = MB * 1024 * 1024;
+  const small = Buffer.from("hello");
+  const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b; };
+  const sock = tls.connect({
+    host: "127.0.0.1", port: PORT, ALPNProtocols: ["h2"], rejectUnauthorized: false,
+  });
+  let got = 0;
+  let sent = false;
+  let granted = false;
+  const onFrame = (typ, flags, sid, pay) => {
+    if (process.env.VERBOSE) say(`  < ${T[typ] ?? typ} flags=${flags} sid=${sid} len=${pay.length}`);
+    if (typ === 4 && (flags & 1) === 0) { sock.write(frame(4, 1, 0, Buffer.alloc(0))); return; }
+    if (typ === 6 && (flags & 1) === 0) { sock.write(frame(6, 1, 0, pay)); return; }
+    if (typ === 7) { done(false, `pumpcredit goaway code=${pay.readUInt32BE(4)}`); return; }
+    if (typ === 3) { done(false, `pumpcredit reset sid=${sid} code=${pay.readUInt32BE(0)}`); return; }
+    if (typ === 8) {
+      if (sent && !granted) {
+        granted = true;
+        sock.write(frame(8, 0, 1, u32(want)));
+        sock.write(frame(8, 0, 0, u32(want)));
+      }
+      return;
+    }
+    if (typ !== 0 || sid !== 1) return;
+    got += pay.length;
+    if (!sent && got >= 65535) {
+      sent = true;
+      const blk3 = Buffer.concat([
+        lit(":method", "POST"), lit(":path", "/echo"), lit(":scheme", "https"),
+        lit(":authority", `127.0.0.1:${PORT}`), lit("content-length", String(small.length)),
+      ]);
+      sock.write(frame(1, 4, 3, blk3));
+      sock.write(frame(0, FLAG | 1, 3, small));
+    }
+    if ((flags & 1) === 1) {
+      done(granted && got === want, `pumpcredit flag=${FLAG} mb=${MB} bytes=${got} want=${want} wu=${granted}`);
+    }
+  };
+  sock.on("secureConnect", () => {
+    sock.write(PREFACE);
+    sock.write(frame(4, 0, 0, Buffer.alloc(0)));
+    const blk = Buffer.concat([
+      lit(":method", "GET"), lit(":path", "/big"), lit(":scheme", "https"),
+      lit(":authority", `127.0.0.1:${PORT}`),
+    ]);
+    sock.write(frame(1, 5, 1, blk));
+  });
+  sock.on("data", parse(onFrame, false));
+  sock.on("error", (e) => done(false, `pumpcredit socket ${e.message}`));
+  setTimeout(() => done(false, `pumpcredit timeout flag=${FLAG} bytes=${got} sent=${sent} wu=${granted}`), 20000).unref();
+}
