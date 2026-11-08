@@ -130,7 +130,7 @@ def snd_end(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & 
 def snd_go(sock: Socket) -> IO(U32):
   do IO<U32>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <-
-      HTTP2.x_send_data_start(sock, 1, snd_body(), CW(), Nil{})
+      HTTP2.x_send_data_start(sock, 1, snd_body(), CW(), HTTP2.x_init_window(), HTTP2.x_init_window(), Nil{})
     snd_end(sent)
 
 def snd_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>) -> IO(U32):

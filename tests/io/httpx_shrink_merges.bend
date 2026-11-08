@@ -101,13 +101,13 @@ def t_huff() -> U32:
 # Phase 4a: one slot type for both engines. The head rides a tag, so a
 # fresh list per check keeps the linear value legal.
 def t_slot.req() -> HTTP.St:
-  HTTP.St{Some{HTTP.SlotReq{HTTP.ReqHead{"POST", "/x", Nil{}}}}, Nil{}, 3}
+  HTTP.St{Some{HTTP.SlotReq{HTTP.ReqHead{"POST", "/x", Nil{}}}}, Nil{}, 3, 0}
 
 def t_slot.resp() -> HTTP.St:
-  HTTP.St{Some{HTTP.SlotResp{HTTP.Head{200, Nil{}}}}, Nil{}, 5}
+  HTTP.St{Some{HTTP.SlotResp{HTTP.Head{200, Nil{}}}}, Nil{}, 5, 0}
 
 def t_slot.slots() -> List<&2, HTTP.St>:
-  [HTTP.St{None{}, Nil{}, 1}, t_slot.req()]
+  [HTTP.St{None{}, Nil{}, 1, 0}, t_slot.req()]
 
 # Phase 4b: the client twins are gone; the httpxn walkers serve both lanes.
 def t_slot.has() -> U32:
@@ -117,7 +117,7 @@ def t_slot.has_some() -> U32:
   (b2u(HTTP2.httpxn.has_some(t_slot.slots(), 1)) * b2u(Bool.not(HTTP2.httpxn.has_some(t_slot.slots(), 3))) : U32)
 
 def t_slot.del_put() -> U32:
-  (b2u(Bool.not(HTTP2.httpxn.has(HTTP2.httpxn.del(t_slot.slots(), 1), 1))) * b2u(HTTP2.httpxn.has(HTTP2.httpxn.put(t_slot.slots(), HTTP.St{None{}, Nil{}, 7}), 7)) : U32)
+  (b2u(Bool.not(HTTP2.httpxn.has(HTTP2.httpxn.del(t_slot.slots(), 1), 1))) * b2u(HTTP2.httpxn.has(HTTP2.httpxn.put(t_slot.slots(), HTTP.St{None{}, Nil{}, 7, 0}), 7)) : U32)
 
 def t_slot.take_st(p: HTTP.Taken) -> U32:
   b2u(U32.is_eq(HTTP2.httpx.sid_of(HTTP2.httpxn.taken_st(p)), 3))

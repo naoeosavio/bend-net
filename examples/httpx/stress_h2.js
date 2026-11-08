@@ -3,6 +3,7 @@
 //   node examples/httpx/stress_h2.js conns   <port> <n> <reqs>
 //   node examples/httpx/stress_h2.js waves   <port> <waves> <streams>
 //   node examples/httpx/stress_h2.js bigdown <port> <mb> <times>
+//   node examples/httpx/stress_h2.js bigup  <port> <mb> <server-pid>
 //   node examples/httpx/stress_h2.js flood   <port> <n>
 //   node examples/httpx/stress_h2.js pings   <port> <n>
 //   node examples/httpx/stress_h2.js abort   <port> <n>
@@ -243,6 +244,46 @@ if (MODE === "bigdown") {
   s.close();
   const secs = (Date.now() - t0) / 1000;
   done(ok, `bigdown mb=${MB} times=${TIMES} bytes=${total} mbps=${(total / 1048576 / secs).toFixed(1)}`);
+}
+
+// Streams A MiB to the drain server (examples/httpx/stress_h2.bend drain)
+// and prints the server's peak RSS from B, the server pid. The cell is
+// the stream lane's memory proof: one chunk in flight, never the body.
+// shortcut: the pid must not be reused while the cell runs, so start the
+// server from a shell that writes its own pid.
+if (MODE === "bigup") {
+  const MB = A;
+  const PID = B;
+  const total = MB * 1024 * 1024;
+  const chunk = Buffer.alloc(16384, 97);
+  const s = session();
+  s.on("error", (e) => done(false, `session ${e.message}`));
+  let written = 0;
+  let status = 0;
+  const req = s.request({ ":method": "POST", ":path": "/up", "content-length": total });
+  req.on("response", (h) => { status = Number(h[":status"]); });
+  req.on("error", (e) => done(false, `req ${e.message}`));
+  req.on("end", () => {
+    let hwm = 0;
+    try {
+      const m = readFileSync(`/proc/${PID}/status`, "utf8").match(/^VmHWM:\s+(\d+) kB/m);
+      hwm = m ? Number(m[1]) : 0;
+    } catch (e) {
+      // A gone pid reads as zero, and the row fails below: no silent pass.
+    }
+    s.close();
+    done(status === 200 && hwm > 0 && hwm < 65536,
+      `bigup mb=${MB} status=${status} server_vmhwm_kb=${hwm}`);
+  });
+  const pump = () => {
+    while (written < total) {
+      const n = Math.min(chunk.length, total - written);
+      written += n;
+      if (!req.write(chunk.subarray(0, n))) { req.once("drain", pump); return; }
+    }
+    req.end();
+  };
+  pump();
 }
 
 if (MODE === "bigconc") {

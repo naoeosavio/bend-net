@@ -117,7 +117,7 @@ def t_keep() -> U32:
 
 # Dead httpxc.body_of + client.on.st_h2: sid ledger + next sid + has_head.
 def t_clst() -> U32:
-  st: HTTP.St = HTTP.St{None{}, Nil{}, 7}
+  st: HTTP.St = HTTP.St{None{}, Nil{}, 7, 0}
   b2u(Bool.and(Bool.and(U32.is_eq(HTTP2.httpx.sid_of(st), 7), U32.is_eq(HTTP2.client.on.next_sid(1), 3)), HTTP2.client.on.has_head(HTTP.Head{200, Nil{}})))
 
 # Dead httpxc.resp_of via live twin client.on.resp_of: status rides through.

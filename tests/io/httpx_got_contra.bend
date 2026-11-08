@@ -173,12 +173,12 @@ def slots_head_sid(slots: List<&2, HTTP.St>, +want_sid: U32) -> U32:
       0
     case h <> t:
       match h:
-        case HTTP.St{head, body, sid}:
+        case HTTP.St{head, body, sid, n}:
           b2u(U32.is_eq(sid, want_sid))
 
 def st_sid(st: HTTP.St, +want_sid: U32) -> U32:
   match st:
-    case HTTP.St{head, body, sid}:
+    case HTTP.St{head, body, sid, n}:
       b2u(U32.is_eq(sid, want_sid))
 
 # The taken slot must be the one asked for, and the leftover list must hold
@@ -190,8 +190,8 @@ def taken_score(p: List<&2, HTTP.St> & HTTP.St, +want_sid: U32,
       (slots_head_sid(slots, rest_sid) + st_sid(st, want_sid) : U32)
 
 def taken_all() -> U32:
-  +slots : List<&2, HTTP.St> = [HTTP.St{None{}, Nil{}, 7},
-    HTTP.St{None{}, Nil{}, 9}]
+  +slots : List<&2, HTTP.St> = [HTTP.St{None{}, Nil{}, 7, 0},
+    HTTP.St{None{}, Nil{}, 9, 0}]
   taken_score(taken_got(HTTP2.httpxn.take_del(slots, 7)), 7, 9)
 
 law main:

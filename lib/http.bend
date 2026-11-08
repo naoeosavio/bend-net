@@ -520,8 +520,11 @@ type SlotHead is Data:
   SlotReq{rh: ReqHead}
   SlotResp{h: Head}
 
+# One stream slot. n is the count of buffered body bytes the stream
+# received. The buffered receive adds each declared DATA length to it and
+# refuses the stream past x_max_body (TASK-066 phase 2).
 type St is Data:
-  St{head: Maybe<&2, SlotHead>, body: List<&2, U32>, sid: U32}
+  St{head: Maybe<&2, SlotHead>, body: List<&2, U32>, sid: U32, n: U32}
 
 # One frame: the type, the flags, the stream id, the declared length of the
 # payload (the length field of the 9-byte header, RFC 9113 section 4.1) and

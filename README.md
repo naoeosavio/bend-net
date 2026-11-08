@@ -321,6 +321,10 @@ The limits, measured:
 - A buffered lane holds the whole body: 100 MB costs about 2.4 GB of RSS.
   The stream lanes stay flat (14 MB for 100 MB), so use `server.stream*`
   and `client.stream*` for big bodies.
+- The buffered receive of the H2 server caps one request body at 16 MiB
+  (`HTTP2.x_max_body()`). A body past the cap answers `RST_STREAM 8`
+  (CANCEL) and the handler never runs. The cap counts the declared DATA
+  length, so it bounds the memory the peer can make the server hold.
 - The stream cap is 100 and it is enforced: 105 open streams answer exactly
   five `RST_STREAM 7`.
 - 1000 PINGs answer 1000 ACKs with no extra ACK. A bad WINDOW_UPDATE

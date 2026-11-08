@@ -2,7 +2,8 @@
 # the gate: it binds 127.0.0.1:18960 and serves until Ctrl-C.
 #   bend examples/httpx/stress_h2.bend <mode> [mb]
 # Modes: echo (echo the body), drop (read the body, answer empty),
-#        big (answer [mb] MiB), early (answer at the first DATA chunk).
+#        big (answer [mb] MiB), early (answer at the first DATA chunk),
+#        drain (read the whole body as events, answer at the end).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http2.bend as HTTP2
@@ -62,6 +63,20 @@ def big_h(req: HTTP.Request) -> IO(HTTP.Response):
     xs : List<String> <- args_of()
     IO.pure(HTTP.Response, big_body(arg_n(xs)))
 
+# The stream form of a whole-body read: each chunk goes to the handler
+# and is forgotten, and the final one answers 200. The server holds one
+# chunk, not the body, so a 100 MB upload keeps a flat RSS.
+def drain_h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
+  match ev:
+    case HTTP.SrvReqHead{slot, head}:
+      HTTP.Continue{}
+    case HTTP.SrvReqData{slot, +chunk, fin}:
+      match fin:
+        case True{}:
+          HTTP.RespondEarly{HTTP.Response{200, Nil{}, Nil{}}}
+        case False{}:
+          HTTP.Continue{}
+
 def secho_h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
   match ev:
     case HTTP.SrvReqHead{slot, head}:
@@ -83,7 +98,8 @@ def mode_code(+m: String) -> U32:
   mk(m, "echo", 1,
     mk(m, "drop", 2,
       mk(m, "big", 3,
-        mk(m, "early", 4, 0))))
+        mk(m, "early", 4,
+          mk(m, "drain", 5, 0)))))
 
 def run(code: U32, l: Listener) -> IO(Unit):
   match code:
@@ -95,6 +111,8 @@ def run(code: U32, l: Listener) -> IO(Unit):
       HTTP2.server.concurrent(~big_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     case 4:
       HTTP2.server.stream.concurrent(~secho_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    case 5:
+      HTTP2.server.stream.concurrent(~drain_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     case _:
       IO.die(Unit, 2, "bad mode")
 

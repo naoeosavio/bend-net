@@ -250,7 +250,7 @@ def probe_all(xs: List<&2, U32>) -> U32:
 # The shipped probe: the walk stops at x_send_probe, the smaller of the
 # cap and the caller window plus one (task-063 phase 7d and phase 8).
 def probe_cap(xs: List<&2, U32>) -> U32:
-  HTTP.x_len_upto(HTTP2.x_send_probe(HTTP2.x_init_window()), xs)
+  HTTP.x_len_upto(HTTP2.x_send_probe(HTTP2.x_init_window(), HTTP2.x_init_window()), xs)
 
 @unsafe
 def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>, +nc: U32, +flen: U32) -> U32:

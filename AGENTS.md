@@ -88,6 +88,10 @@ require break from any other directory. Bend 2.0.21+.
   travels in 16384-byte slices (HEADERS plus CONTINUATION). A request
   copy drops `connection`, `keep-alive`, `proxy-connection`,
   `transfer-encoding`, `upgrade` and `te` before it reaches the wire.
+  A buffered server request body is capped at 16 MiB (`x_max_body()`).
+  Past the cap the lane answers `RST_STREAM 8` (CANCEL) and the handler
+  never runs. For a bigger body use the stream lanes, which hold one
+  chunk.
 - A request head needs `:method` and `:path` (RFC 9113 8.3.1), so a
   CONNECT block and a request trailer block fail the decode; no lane
   serves tunnels or request trailers.
