@@ -1886,8 +1886,15 @@ def x_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H
     case Done{u}:
       (s, HTTP.GotErr{0, "next"})
 
+# The room a stream window gives: a window below zero gives none (RFC 9113
+# section 6.9.2). The window rides in a U32, so bit 31 is its sign.
+# shortcut: a peer that grants past 2^31-1 flips the sign and the send
+# stalls; the lane does not check that limit.
+def x_win_room(+sw: U32) -> U32:
+  x_pick(U32.is_eq(U32.shrn(sw, 31n), 0), sw, 0)
+
 def x_chunk_of(+cw: U32, +sw: U32, +blen: U32) -> U32:
-  x_flow_min(x_flow_min(x_flow_min(cw, sw), x_max_send()), blen)
+  x_flow_min(x_flow_min(x_flow_min(cw, x_win_room(sw)), x_max_send()), blen)
 
 def x_chunk_pos(+chunk: U32) -> Bool:
   U32.is_gt(chunk, 0)
@@ -1992,23 +1999,13 @@ def x_flow.tail(long: Bool, +h: List<&2, U32>, +t: List<&2, List<&2, U32>>, s4: 
 # Peer SETTINGS ledger (mold h2_settings.iw_of): current INITIAL_WINDOW_SIZE
 # (id 4) or the running default when the peer never announces it.
 # A peer INITIAL_WINDOW_SIZE replaces the value the peer announced before.
-# An open stream window moves by the difference of the two values. It never
-# goes below zero (RFC 9113 section 6.9.2). The old shape measured the
-# difference against the 65535 default. A second SETTINGS of one session
-# therefore shifted the window by the wrong amount (TASK-067 phase 8).
-def x_settings.iw_cut(under: Bool, +sw: U32, +cut: U32) -> U32:
-  match under:
-    case True{}:
-      0
-    case False{}:
-      (sw - cut : U32)
-
-def x_settings.iw_delta_go(grow: Bool, +old: U32, +iw: U32, +sw: U32) -> U32:
-  match grow:
-    case True{}:
-      (sw + (iw - old : U32) : U32)
-    case False{}:
-      x_settings.iw_cut(U32.is_lt(sw, (old - iw : U32)), sw, (old - iw : U32))
+# An open stream window moves by the difference of the two values (RFC 9113
+# section 6.9.2). A shrink past zero leaves the window negative, so the
+# value rides as a signed U32: the subtraction wraps and x_win_room reads
+# the sign. The old shape measured the difference against the 65535
+# default, and it clamped the result at zero (TASK-067 phase 8).
+def x_settings.iw_delta_go(+old: U32, +iw: U32, +sw: U32) -> U32:
+  (sw + (iw - old : U32) : U32)
 
 def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
   match pay:
@@ -2043,7 +2040,7 @@ def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
 # phase 8).
 def x_settings.iw_step(+pay: List<&2, U32>, +sw: U32, +cur: U32) -> U32 & U32:
   +iw : U32 = x_settings.iw_of(pay, cur)
-  (iw, x_settings.iw_delta_go(U32.is_ge(iw, cur), cur, iw, sw))
+  (iw, x_settings.iw_delta_go(cur, iw, sw))
 
 # The step of a frame the pump reads while it waits for credit: a SETTINGS
 # moves the peer base and the open stream window, and any other frame
@@ -2468,7 +2465,7 @@ def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: 
 # and the window, so this send costs at most x_max_send() + 1 list cells
 # instead of the whole body (TASK-063 phase 8).
 def x_send_probe(+cw: U32, +sw: U32) -> U32:
-  (U32.min(U32.min(cw, sw), x_max_send()) + 1 : U32)
+  (U32.min(U32.min(cw, x_win_room(sw)), x_max_send()) + 1 : U32)
 
 def x_send_single(+cw: U32, +sw: U32, body: List<&2, U32>) -> Bool:
   Bool.not(HTTP.x_has_at_least(x_send_probe(cw, sw), body))

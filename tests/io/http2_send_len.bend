@@ -107,8 +107,11 @@ def main() -> IO(U32):
     z2 : U32 = framed_hdr_ok(16384)
     a3 : U32 = facade_equiv_ok(0)
     b3 : U32 = facade_equiv_ok(1000)
-    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w + x + y2 + z2 + a3 + b3 : U32)
+    +neg : U32 = U32.sub(0, 500)
+    c3 : U32 = b2u(U32.is_eq(HTTP2.x_chunk_of(65535, neg, HTTP2.x_max_send()), 0))
+    d3 : U32 = b2u(U32.is_eq(HTTP2.x_win_room(neg), 0))
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w + x + y2 + z2 + a3 + b3 + c3 + d3 : U32)
     y : Unit <- IO.print(U32.show(total))
     return total
 
-#|28
+#|30

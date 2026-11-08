@@ -89,23 +89,24 @@ def bit_ok(+acc: U32, +bit: U32) -> Bool:
 def set_pay(+v: U32) -> List<&2, U32>:
   List.append(&2, U32, HTTP2.x_be16(4), HTTP.x_be32(v))
 
-# Checks the new base and the new window of one SETTINGS step.
-def pair_ok(p: U32 & U32, +want_base: U32, +want_sw: U32) -> U32:
+# Checks the new base, the new window and the room it gives of one
+# SETTINGS step.
+def pair_ok(p: U32 & U32, +want_base: U32, +want_sw: U32, +want_room: U32) -> U32:
   match p:
-    case (b, w):
-      U32.mul(b2u(U32.is_eq(b, want_base)), b2u(U32.is_eq(w, want_sw)))
+    case (b, +w):
+      U32.mul(U32.mul(b2u(U32.is_eq(b, want_base)), b2u(U32.is_eq(w, want_sw))), b2u(U32.is_eq(HTTP2.x_win_room(w), want_room)))
 
-def shift_ok(+pay: List<&2, U32>, +sw: U32, +cur: U32, +want_base: U32, +want_sw: U32) -> U32:
-  pair_ok(HTTP2.x_settings.iw_step(pay, sw, cur), want_base, want_sw)
+def shift_ok(+pay: List<&2, U32>, +sw: U32, +cur: U32, +want_base: U32, +want_sw: U32, +want_room: U32) -> U32:
+  pair_ok(HTTP2.x_settings.iw_step(pay, sw, cur), want_base, want_sw, want_room)
 
 # Grow from 1024 to 4096, shrink from 4096 to 1024, a shrink past the
 # window, the same value, and a payload without the setting.
 def pure_score() -> U32:
-  +grow : U32 = shift_ok(set_pay(4096), 1000, 1024, 4096, 4072)
-  +shrink : U32 = shift_ok(set_pay(1024), 5000, 4096, 1024, 1928)
-  +cut : U32 = shift_ok(set_pay(1024), 100, 4096, 1024, 0)
-  +same : U32 = shift_ok(set_pay(1024), 777, 1024, 1024, 777)
-  +none : U32 = shift_ok(Nil{}, 777, 1024, 1024, 777)
+  +grow : U32 = shift_ok(set_pay(4096), 1000, 1024, 4096, 4072, 4072)
+  +shrink : U32 = shift_ok(set_pay(1024), 5000, 4096, 1024, 1928, 1928)
+  +cut : U32 = shift_ok(set_pay(1024), 100, 4096, 1024, U32.sub(0, 2972), 0)
+  +same : U32 = shift_ok(set_pay(1024), 777, 1024, 1024, 777, 777)
+  +none : U32 = shift_ok(Nil{}, 777, 1024, 1024, 777, 777)
   U32.add(grow, U32.add(shrink, U32.add(cut, U32.add(same, none))))
 
 # --- live: the raw peer ------------------------------------------------
