@@ -168,7 +168,7 @@ def peer_read(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +
               IO.pure(Socket & U32, stop_at(got, acc))
             case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                case HTTP.Frame{+typ, +flags, +sid,+flen, +payload}:
                   +acc2 : U32 = U32.or(acc, acc_add(acc, typ, sid, payload))
                   peer_read(p, next_phase(is_full(acc2)), (s1, HTTP.GotOk{frame, buf2}), buf2, acc2)
         case _:

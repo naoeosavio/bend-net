@@ -39,28 +39,28 @@ def bytes_eq(a: List<&2, U32>, b: List<&2, U32>) -> U32:
 # cls_fix demoting an already-acked SETTINGS to the skip class.
 
 def v_rst() -> U32:
-  b2u(U32.is_eq(HTTP2.httpx.cls_fix(HTTP2.x_classify(HTTP.Frame{3, 0, 1, [0, 0, 0, 8]}), 0), 2))
+  b2u(U32.is_eq(HTTP2.httpx.cls_fix(HTTP2.x_classify(HTTP.Frame{3, 0, 1, 0, [0, 0, 0, 8]}), 0), 2))
 
 def v_goaway() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{7, 0, 0, [0, 0, 0, 3, 0, 0, 0, 0]}), 5))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{7, 0, 0, 0, [0, 0, 0, 3, 0, 0, 0, 0]}), 5))
 
 def v_ping() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{6, 0, 0, [1, 2, 3, 4, 5, 6, 7, 8]}), 4))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{6, 0, 0, 0, [1, 2, 3, 4, 5, 6, 7, 8]}), 4))
 
 def v_settings_ack() -> U32:
-  b2u(U32.is_eq(HTTP2.httpx.cls_fix(HTTP2.x_classify(HTTP.Frame{4, 1, 0, Nil{}}), 1), 0))
+  b2u(U32.is_eq(HTTP2.httpx.cls_fix(HTTP2.x_classify(HTTP.Frame{4, 1, 0, 0, Nil{}}), 1), 0))
 
 def v_cont() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{9, 0, 1, [1, 2, 3]}), 8))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{9, 0, 1, 0, [1, 2, 3]}), 8))
 
 # A control frame that needs a stream id but arrives with 0 is skipped, not
 # acted on: RST_STREAM and CONTINUATION on sid 0 are both connection errors.
 
 def v_rst_sid0() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{3, 0, 0, [0, 0, 0, 8]}), 0))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{3, 0, 0, 0, [0, 0, 0, 8]}), 0))
 
 def v_cont_sid0() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{9, 0, 0, [1, 2, 3]}), 0))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{9, 0, 0, 0, [1, 2, 3]}), 0))
 
 # WINDOW_UPDATE: the increment field is exactly 4 bytes and strictly inside
 # (0, 2^31); anything else is class 9 = fail-closed 502 (RFC 9113 6.9). The
@@ -68,31 +68,31 @@ def v_cont_sid0() -> U32:
 # and ignore the tail, letting a 5-byte frame through as a valid credit.
 
 def v_wu_ok() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, [0, 0, 0, 1]}), 7))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, 0, [0, 0, 0, 1]}), 7))
 
 def v_wu_zero() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, [0, 0, 0, 0]}), 9))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, 0, [0, 0, 0, 0]}), 9))
 
 def v_wu_short() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, [0, 0, 1]}), 9))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, 0, [0, 0, 1]}), 9))
 
 def v_wu_long() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, [0, 0, 0, 1, 0]}), 9))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, 0, [0, 0, 0, 1, 0]}), 9))
 
 def v_wu_reserved_bit() -> U32:
-  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, [255, 255, 255, 255]}), 9))
+  b2u(U32.is_eq(HTTP2.x_classify(HTTP.Frame{8, 0, 0, 0, [255, 255, 255, 255]}), 9))
 
 # Client side: the drain only treats a stream frame as actionable when the sid
 # is the one it opened, so a multiplexed RST of a sibling stays invisible.
 
 def v_mine_rst() -> U32:
-  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{3, 0, 1, [0, 0, 0, 8]}), 1, 1), 2))
+  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{3, 0, 1, 0, [0, 0, 0, 8]}), 1, 1), 2))
 
 def v_mine_data() -> U32:
-  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{0, 1, 1, [104, 105]}), 1, 1), 6))
+  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{0, 1, 1, 0, [104, 105]}), 1, 1), 6))
 
 def v_foreign_data() -> U32:
-  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{0, 1, 3, [104, 105]}), 3, 1), 0))
+  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{0, 1, 3, 0, [104, 105]}), 3, 1), 0))
 
 # A sibling's RST_STREAM is legitimate (node:http2 resets a stream it
 # already answered while the request body is still coming; a pushed stream
@@ -101,7 +101,7 @@ def v_foreign_data() -> U32:
 # covered DATA/HEADERS and a sibling RST failed the request with a bare
 # 502 "rst_stream".
 def v_foreign_rst() -> U32:
-  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{3, 0, 3, [0, 0, 0, 8]}), 3, 1), 0))
+  b2u(U32.is_eq(HTTP2.client.on.mine_cls(HTTP2.x_classify(HTTP.Frame{3, 0, 3, 0, [0, 0, 0, 8]}), 3, 1), 0))
 
 # Wire shapes: RST_STREAM carries the 4-byte error code, GOAWAY the last-sid
 # then the code (RFC 9113 section 6.8 / 6.9).

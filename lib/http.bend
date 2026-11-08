@@ -529,8 +529,14 @@ type SlotHead is Data:
 type St is Data:
   St{head: Maybe<&2, SlotHead>, body: List<&2, U32>, sid: U32}
 
+# One frame: the type, the flags, the stream id, the declared length of the
+# payload (the length field of the 9-byte header, RFC 9113 section 4.1) and
+# the payload. A DATA frame keeps its padding, so len is its payload size;
+# a padded HEADERS frame loses the padding here, so len is the count before
+# the strip. The receive path credits len, so it never walks the payload
+# (TASK-063 phase 5).
 type Frame is Data:
-  Frame{typ: U32, flags: U32, sid: U32, payload: List<&2, U32>}
+  Frame{typ: U32, flags: U32, sid: U32, len: U32, payload: List<&2, U32>}
 
 # One step of the frame decoder: a unit came out, the bytes are not all
 # here yet, the message ended, or the bytes are invalid (TASK-026 Phase 3,

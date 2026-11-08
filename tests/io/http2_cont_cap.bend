@@ -145,7 +145,7 @@ def peer_read(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>) -
               IO.pure(Socket & U32, stop_at(got, 0))
             case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                case HTTP.Frame{+typ, +flags, +sid,+flen, +payload}:
                   peer_read(p, route(typ, flags), (s1, HTTP.GotOk{frame, buf2}), buf2)
         case 2:
           (s2, g2) = got
@@ -154,7 +154,7 @@ def peer_read(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>) -
               IO.pure(Socket & U32, stop_at(got, 0))
             case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                case HTTP.Frame{+typ, +flags, +sid,+flen, +payload}:
                   IO.pure(Socket & U32, stop_at((s2, HTTP.GotOk{frame, buf2}), stop_goaway(payload)))
         case 3:
           (s3, g3) = got

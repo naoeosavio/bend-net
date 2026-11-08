@@ -132,7 +132,7 @@ def coll(phase: U32, got: Socket & HTTP.Got, +n: U32, fin: Bool, +buf: List<&2, 
               IO.pure(Socket & U32, (s1, coll.score(n)))
         case HTTP.GotOk{+frame, +buf2}:
           match frame:
-            case HTTP.Frame{+typ2, +flags2, +sid22, +payload2}:
+            case HTTP.Frame{+typ2, +flags2, +sid22,+flen, +payload2}:
               coll(2, (s1, HTTP.GotOk{frame, buf2}), n, fin, buf2, coll.setact(typ2, flags2), flags2, sid22, payload2, HTTP.Head{0, Nil{}}, False{}, 0)
     case 2:
       (s2, g2) = got

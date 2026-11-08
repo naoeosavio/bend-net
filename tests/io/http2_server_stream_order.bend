@@ -126,7 +126,7 @@ def collect(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +score: U32
                 IO.pure(U32, score)
         case HTTP.GotOk{+frame1, +buf1}:
           match frame1:
-            case HTTP.Frame{+typ1, +flags1, +sid1, +payload1}:
+            case HTTP.Frame{+typ1, +flags1, +sid1,+flen, +payload1}:
               dispatch(act_of(typ1, flags1), (s1, HTTP.GotOk{frame1, buf1}), buf1, typ1, flags1, sid1, payload1, score, tab)
     case 9:
       (s9, g9) = got

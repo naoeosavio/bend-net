@@ -288,7 +288,7 @@ def srv(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +typ: U32, +fla
           TLS.tls_close(s1)
         case HTTP.GotOk{+frame, +buf2}:
           match frame:
-            case HTTP.Frame{+typ2, +flags2, +sid2, +payload2}:
+            case HTTP.Frame{+typ2, +flags2, +sid2,+flen, +payload2}:
               srv(2, (s1, HTTP.GotOk{frame, buf2}), buf2, typ2, flags2, sid2, payload2, U32.and(flags2, HTTP2.x_f_end_stream()), srv_act(typ2, flags2, U32.and(flags2, HTTP2.x_f_end_stream())), stage)
     case 2:
       match act:

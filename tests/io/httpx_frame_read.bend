@@ -53,12 +53,12 @@ def is_bad_413(out: HTTP.UnitOut) -> U32:
 
 def frame_payload_len(frame: HTTP.Frame) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       HTTP.x_len32(payload)
 
 def frame_sid_of(frame: HTTP.Frame) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       sid
 
 def frame_len(out: HTTP.UnitOut) -> U32:
@@ -111,7 +111,7 @@ def v_over_cap() -> U32:
 # strips the padding where the body is read (task-062 phase 6).
 def data_body_of(frame: HTTP.Frame) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       HTTP.x_len32(HTTP2.x_data_body(payload, flags))
 
 def data_body_len(out: HTTP.UnitOut) -> U32:

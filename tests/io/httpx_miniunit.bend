@@ -15,7 +15,7 @@ def b2u(b: Bool) -> U32:
 
 def frame_score_frame(frame: HTTP.Frame, rest: List<&2, U32>) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       b2u(Bool.and(Bool.and(U32.is_eq(typ, 1), U32.is_eq(flags, 4)),
         Bool.and(U32.is_eq(sid, 1),
           Bool.and(U32.is_eq(HTTP.x_eq(payload, [10, 20]), 1), U32.is_eq(HTTP.x_len32(rest), 0)))))
@@ -68,7 +68,7 @@ def resp_t() -> U32:
 # MAX_FRAME_SIZE).
 def settings_score(frame: HTTP.Frame, rest: List<&2, U32>) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       b2u(Bool.and(U32.is_eq(typ, 4),
         Bool.and(U32.is_eq(flags, 0),
           Bool.and(U32.is_eq(sid, 0),

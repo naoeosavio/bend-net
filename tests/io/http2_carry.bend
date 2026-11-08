@@ -28,7 +28,7 @@ def list_ok(got: List<&2, U32>, +want: List<&2, U32>) -> U32:
 
 # The synthetic Got the response sender builds: no frame, bytes in buf.
 def synth(+b: List<&2, U32>) -> HTTP.Got:
-  HTTP.GotOk{HTTP.Frame{0, 0, 0, Nil{}}, b}
+  HTTP.GotOk{HTTP.Frame{0, 0, 0, 0, Nil{}}, b}
 
 def route_ok(+typ: U32, +sid29: U32, +sid: U32, +cls: U32, +want: U32) -> U32:
   b2u(U32.is_eq(HTTP2.x_flow.route(typ, sid29, sid, cls), want))

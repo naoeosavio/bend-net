@@ -280,7 +280,7 @@ def srv(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +acc: L
               TLS.tls_close(s1)
             case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                case HTTP.Frame{+typ, +flags, +sid,+flen, +payload}:
                   srv(p, srv_route(typ, flags), (s1, HTTP.GotOk{frame, buf2}), buf2,
                     srv_acc(typ, payload, acc), srv_count(typ, n), srv_endh(typ, flags, endh), srv_big(typ, payload, first_big))
         case _:

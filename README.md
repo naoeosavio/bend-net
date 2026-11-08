@@ -305,6 +305,43 @@ bend tests/io/httpx_miniunit.bend      # 1 (preface + SETTINGS, pure)
 Observed 2026-09-28: example.com GET/POST OK, cloudflare.com `fetch` OK
 on ~1.3 MB, info.cern.ch OK through H1. It is never part of the gate.
 
+**Load and throughput** (task-063). The harness is `examples/httpx/stress_h2.bend`
+(server modes `echo`, `drop`, `big`, `early`) and
+`examples/httpx/stress_h2.js` (generators). On
+loopback, one Bend server answers 1000 requests of 1 KB in 0.48 s (2096/s),
+100 concurrent connections, and 20 waves of 100 streams. A 100 MB download
+takes 6.3 s (16 MB/s) and a 100 MB upload 18 s. A node server answers
+2410 req/s for the same echo cell and 298 MB/s for the same download, so
+Bend reaches 86% of node on small answers and 5.6% on big bodies.
+
+The limits, measured:
+
+- Download and upload saturate near 17 MB/s. The cost is one cons cell per
+  byte plus the TLS effect; more concurrency does not raise it.
+- A buffered lane holds the whole body: 100 MB costs about 2.4 GB of RSS.
+  The stream lanes stay flat (14 MB for 100 MB), so use `server.stream*`
+  and `client.stream*` for big bodies.
+- The stream cap is 100 and it is enforced: 105 open streams answer exactly
+  five `RST_STREAM 7`.
+- 1000 PINGs answer 1000 ACKs with no extra ACK. A bad WINDOW_UPDATE
+  answers `GOAWAY 1`, a frame past `MAX_FRAME_SIZE` answers `GOAWAY 6`, and
+  a header block past 64 KiB answers `GOAWAY 11`. The server keeps serving
+  other connections after each of them.
+- 200 sockets closed in the middle of a body leave the server alive.
+
+The micro-bench (`examples/httpx/bench_h2.bend`, 1 MiB, 5 runs) gives the
+levers, in the `test.bend` shape:
+
+- Pre-split the body once into 16 KiB chunks, then pop one chunk per turn:
+  54 ms against 537 ms for `x_take32` plus `x_drop32` per chunk.
+- Test the `PADDED` flag before the length walk in `x_data_body`: 22 ms
+  against 74 ms. `x_data_body.dec` does this today.
+- Inside a per-chunk loop, use `x_len_upto` at the cap and never `x_len32`
+  of the rest: the second walks the whole body on every chunk.
+- Keep the counters in `U32` (about twice a `Nat` while the walk
+  dominates), keep the walk tail-recursive, and do not rebuild the list
+  that you just walked.
+
 ## HTTPS
 
 There is no separate HTTPS module: HTTPS is `HTTPX` over TLS. The short

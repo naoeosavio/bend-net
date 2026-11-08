@@ -176,7 +176,7 @@ def cc(phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +typ: U32, +flag
               IO.pure(Socket & U32, (s5, cc_score(n, bokn)))
         case HTTP.GotOk{+frame5, +buf5}:
           match frame5:
-            case HTTP.Frame{+typ5, +flags5, +sid5, +payload5}:
+            case HTTP.Frame{+typ5, +flags5, +sid5,+flen, +payload5}:
               cc_dispat(cc_act(typ5, flags5), (s5, HTTP.GotOk{frame5, buf5}), buf5, typ5, flags5, sid5, payload5, n, bokn, fin)
     case _:
       (s8, g8) = got

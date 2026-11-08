@@ -237,7 +237,7 @@ def coll(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, acc: A
               IO.pure(Socket & U32, stop_at(got, acc))
             case HTTP.GotOk{+frame, +buf2}:
               match frame:
-                case HTTP.Frame{+typ, +flags, +sid, +payload}:
+                case HTTP.Frame{+typ, +flags, +sid,+flen, +payload}:
                   coll(p, act_of(typ, sid, flags), (s1, HTTP.GotOk{frame, buf2}), buf2, acc)
         case 2:
           (s2, g2) = got
@@ -260,7 +260,7 @@ def coll(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, acc: A
               IO.pure(Socket & U32, stop_at(got, acc))
             case HTTP.GotOk{+frame, +buf6}:
               match frame:
-                case HTTP.Frame{+typ6, +flags6, +sid6, +payload6}:
+                case HTTP.Frame{+typ6, +flags6, +sid6,+flen, +payload6}:
                   coll(p, 0, (s6, HTTP.GotErr{0, "next"}), buf6, bump_wu(acc, payload6))
         case 7:
           (s7, g7) = got
@@ -269,7 +269,7 @@ def coll(fuel: Nat, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, acc: A
               IO.pure(Socket & U32, stop_at(got, acc))
             case HTTP.GotOk{+frame, +buf7}:
               match frame:
-                case HTTP.Frame{+typ7, +flags7, +sid7, +payload7}:
+                case HTTP.Frame{+typ7, +flags7, +sid7,+flen, +payload7}:
                   do IO<Socket & U32>:
                     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s7, HTTP2.x_t_ping(), HTTP2.x_f_ack(), 0, payload7)
                     coll(p, 0, sent_seed(sent), buf7, acc)

@@ -58,7 +58,7 @@ def t_resp() -> U32:
 # Dead x_send_resp_body: DATA frame write->parse roundtrip still holds.
 def t_frame.of(frame: HTTP.Frame) -> U32:
   match frame:
-    case HTTP.Frame{typ, flags, sid, payload}:
+    case HTTP.Frame{typ, flags, sid,+flen, payload}:
       b2u(Bool.and(Bool.and(U32.is_eq(typ, 1), U32.is_eq(sid, 1)), U32.is_eq(HTTP.x_len32(payload), 2)))
 
 def t_frame.rest(+unit: List<&2, U32>) -> U32:
