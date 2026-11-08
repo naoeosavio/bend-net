@@ -1,19 +1,19 @@
-# io (http2_window_cap): a peer that grants past the window cap does not
-# stop the send (task-068 phase 9).
+# io (http2_window_cap): a peer that grants past the window cap answers the
+# flow-control error (task-069 phase 4).
 #
-# The window rides signed in a U32, so a grant that crosses 2^31 turned the
-# sign and the send waited for a debt the peer never owed. The lane now
-# caps every grant at x_max_window(), the maximum of RFC 9113 section
-# 6.9.1, so the send keeps the credit it holds.
+# RFC 9113 section 6.9.1 sends RST_STREAM FLOW_CONTROL_ERROR when a
+# WINDOW_UPDATE makes a stream window pass 2^31-1 octets. The send used to
+# cap the grant in silence (task-068 phase 9). It now answers the error and
+# stops, so no DATA goes out after it.
 #
-# Three pure checks pin the sum: a grant past the cap answers the cap, a
-# grant under it adds, and a real debt keeps its wrap. The wire check
-# spends the first window of a BODY-byte upload, grants the maximum four
-# times and sends a PING. A capped send finishes the body and answers the
-# PING; a send that took the wrap stalls after the first window and never
-# ends the stream.
+# Five pure checks pin the sum and the check: a grant past the cap answers
+# the cap, a grant under it adds, a real debt keeps its wrap, a grant that
+# fits says so, and a grant past the cap says so. The wire check spends the
+# first window of a BODY-byte upload, grants the maximum four times and
+# waits. The second stream grant passes the cap, so the client sends
+# RST_STREAM with code 3 on stream 1 and the body never ends.
 #
-# Golden 5.
+# Golden 8.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -85,13 +85,15 @@ def set_pay(+v: U32) -> List<&2, U32>:
 
 # --- the pure part -----------------------------------------------------
 
-# A grant past the cap answers the cap, a grant under it adds, and a debt
-# keeps its wrap.
+# A grant past the cap answers the cap, a grant under it adds, a debt
+# keeps its wrap, and x_win_fits reads both grants.
 def pure_score() -> U32:
   +cap : U32 = b2u(U32.is_eq(HTTP2.x_win_add(HTTP2.x_max_window(), 1), HTTP2.x_max_window()))
   +add : U32 = b2u(U32.is_eq(HTTP2.x_win_add(100, 50), 150))
   +debt : U32 = b2u(U32.is_eq(HTTP2.x_win_add(U32.sub(0, 10), 5), U32.sub(0, 5)))
-  U32.add(cap, U32.add(add, debt))
+  +fit : U32 = b2u(HTTP2.x_win_fits(100, 50))
+  +over : U32 = b2u(Bool.not(HTTP2.x_win_fits(U32.sub(HTTP2.x_max_window(), 100), 101)))
+  U32.add(cap, U32.add(add, U32.add(debt, U32.add(fit, over))))
 
 # --- the live part: the library client uploads, the raw peer serves -----
 
@@ -165,8 +167,26 @@ def peer_finish(s: Socket, +total: U32, +ends: U32) -> IO(U32):
     w : Unit <- IO.print(U32.show(score))
     IO.pure(U32, score)
 
+# The answer: the client sends RST_STREAM code 3 on stream 1 and stops the
+# body, so the peer sees a short body, the error code and the stream id.
+def peer_finish_rst(s: Socket, +total: U32, +sid: U32, +payload: List<&2, U32>) -> IO(U32):
+  do IO<U32>:
+    x : Unit <- TLS.tls_close(s)
+    +stop_bit : U32 = b2u(U32.is_lt(total, BODY()))
+    +code_bit : U32 = b2u(U32.is_eq(HTTP2.x_rst.code(payload), HTTP2.x_h2_err.flow()))
+    +sid_bit : U32 = b2u(U32.is_eq(sid, 1))
+    p0 : Unit <- peer_bit("cap.stopped", stop_bit)
+    p1 : Unit <- peer_bit("cap.code", code_bit)
+    p2 : Unit <- peer_bit("cap.sid", sid_bit)
+    +live : U32 = U32.add(stop_bit, U32.add(code_bit, sid_bit))
+    +pure : U32 = pure_score()
+    +score : U32 = U32.add(live, pure)
+    w : Unit <- IO.print(U32.show(score))
+    IO.pure(U32, score)
+
 # The action of one frame: 1 acknowledges a fresh SETTINGS, 2 counts a
-# DATA frame, 3 closes on our PING answer and 0 ignores the frame.
+# DATA frame, 3 closes on our PING answer, 4 closes on the RST_STREAM the
+# over-grant must answer, and 0 ignores the frame.
 def peer_act_set(fresh: Bool) -> U32:
   match fresh:
     case True{}:
@@ -190,6 +210,8 @@ def peer_act(+typ: U32, +flags: U32) -> U32:
       peer_act_set(U32.is_eq(U32.and(flags, HTTP2.x_f_ack()), 0))
     case 0:
       2
+    case 3:
+      4
     case 6:
       peer_act_ping(is_ack_flag(flags))
     case _:
@@ -256,6 +278,8 @@ def peer(ph: U32, fuel: Nat, got: Socket & HTTP.Got, +buf: List<&2, U32>, +total
           peer_data(end, fuel, s_of(got), buf, (total + len : U32), ends, stage)
         case 3:
           peer_finish(s_of(got), total, ends)
+        case 4:
+          peer_finish_rst(s_of(got), total, sid, payload)
         case _:
           peer(0, fuel, got, buf, total, ends, stage, 0, 0, 0, Nil{}, 0, 4)
     case _:
@@ -347,4 +371,4 @@ def main() -> IO(U32):
     b : Listener & U32 <- listen_any(32n, PORT())
     main_go(b)
 
-#|5
+#|8

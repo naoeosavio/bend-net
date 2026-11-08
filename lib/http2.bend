@@ -122,9 +122,10 @@ def x_max_streams() -> U32:
 # spine, so the peer controls the total. The total needs a bound. Past the
 # cap the lane answers RST_STREAM 8 (CANCEL) and drops the stream. The
 # handler never sees the request. A body past the cap belongs on the
-# stream lane.
-# shortcut: the count is the declared DATA length, padding included; use
-# the stream lanes for a body past the cap.
+# stream lane. The count is the body without padding: the ledger keeps the
+# body, and the padding never reaches memory (RFC 9113 section 6.1).
+# shortcut: the cap counts the body, and the stream lanes hold one chunk;
+# use them for a body past the cap.
 def x_max_body() -> U32:
   16777216
 
@@ -1390,15 +1391,30 @@ def x_req.step(empty: Bool, +st: HTTP.ReqHead, +name: String, +value: String, is
 
 # A request head needs :method and :path (RFC 9113 section 8.3.1). A block
 # without them is a decode failure, never a request with empty fields.
-# shortcut: CONNECT carries :authority and no :path, so a CONNECT block
-# fails here; add the CONNECT arm when the library serves tunnels.
+# A CONNECT block carries :method CONNECT and :authority and no :path
+# (RFC 9113 section 8.5), so the missing path is legal there. The lane
+# serves no tunnel: it answers 501 and keeps the connection.
+# shortcut: the decode keeps no :authority, so a CONNECT head carries no
+# tunnel target; keep it when the lane serves a tunnel.
+def x_req.conn_path.go(is_conn: Bool, +method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  match is_conn:
+    case True{}:
+      Done{(HTTP.ReqHead{method, path, headers}, tab)}
+    case False{}:
+      Fail{(502, "no :path")}
+
+def x_req.conn_path(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  x_req.conn_path.go(String.eq(method, "CONNECT"), method, path, headers, tab)
+
 def x_req.done_go(is_meth_empty: Bool, is_path_empty: Bool, +method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +tab: HTTP.Tab) ->
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
   match is_meth_empty is_path_empty:
     case True{} _:
       Fail{(502, "no :method")}
     case _ True{}:
-      Fail{(502, "no :path")}
+      x_req.conn_path(method, path, headers, tab)
     case _ _:
       Done{(HTTP.ReqHead{method, path, headers}, tab)}
 
@@ -1723,6 +1739,11 @@ def x_h2_err.text(+code: U32) -> String:
 def x_h2_err.frame_size() -> U32:
   6
 
+# RFC 9113 section 7.1: FLOW_CONTROL_ERROR. Section 6.9.1 sends this code
+# when a WINDOW_UPDATE makes a flow-control window pass x_max_window().
+def x_h2_err.flow() -> U32:
+  3
+
 # The Fail code of a control-frame error: 503 when the peer said the
 # stream was not processed (safe to repeat), 502 when it may have been.
 def x_fail_status(is_retry: Bool) -> U32:
@@ -1895,6 +1916,72 @@ def x_win_add_go(neg: Bool, +w: U32, +inc: U32) -> U32:
 
 def x_win_add(+w: U32, +inc: U32) -> U32:
   x_win_add_go(x_win_neg(w), w, inc)
+
+# RFC 9113 section 6.9.1: "A sender MUST NOT allow a flow-control window
+# to exceed 2^31-1 octets. If a sender receives a WINDOW_UPDATE that
+# causes a flow-control window to exceed this maximum, it MUST terminate
+# either the stream or the connection, as appropriate. For streams, the
+# sender sends a RST_STREAM with an error code of FLOW_CONTROL_ERROR; for
+# the connection, a GOAWAY frame with an error code of FLOW_CONTROL_ERROR
+# is sent." The check reads the window before the add: two legal grants
+# wrap the signed window, so a sum cannot show the overflow.
+def x_win_fits_go(neg: Bool, +w: U32, +inc: U32) -> Bool:
+  match neg:
+    case True{}:
+      True{}
+    case False{}:
+      U32.is_le((w + inc : U32), x_max_window())
+
+# True when a grant of INC keeps a window W at or below the cap.
+def x_win_fits(+w: U32, +inc: U32) -> Bool:
+  x_win_fits_go(x_win_neg(w), w, inc)
+
+# True when a WINDOW_UPDATE that grants INC to the window of SID2 fits.
+# The pump tracks the connection window and its own stream window; a grant
+# to another stream belongs to a lane that this send does not hold.
+def x_win_target.mine(is_mine: Bool, +cw: U32, +sw: U32, +inc: U32) -> Bool:
+  match is_mine:
+    case True{}:
+      x_win_fits(sw, inc)
+    case False{}:
+      True{}
+
+def x_win_target.go(is_conn: Bool, is_mine: Bool, +cw: U32, +sw: U32, +inc: U32) -> Bool:
+  match is_conn:
+    case True{}:
+      x_win_fits(cw, inc)
+    case False{}:
+      x_win_target.mine(is_mine, cw, sw, inc)
+
+def x_win_target(+cw: U32, +sw: U32, +sid: U32, +sid2: U32, +inc: U32) -> Bool:
+  x_win_target.go(U32.is_eq(sid2, 0), U32.is_eq(sid2, sid), cw, sw, inc)
+
+# The credit step of a loop for a WINDOW_UPDATE that passed the shape
+# test: the connection window the loop tracks. A stream WU refills one
+# stream, and that stream's pump reads it itself.
+def x_win_credit.go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
+  match is_conn:
+    case True{}:
+      x_win_add(cw, x_be32_rd(payload))
+    case False{}:
+      cw
+
+def x_win_credit(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
+  x_win_credit.go(U32.is_eq(sid, 0), cw, payload)
+
+# The WU class with the window state. Class 10 means the grant passes the
+# cap. The loop answers the flow-control error where the window lives, and
+# not in the pure classifier x_cls.
+def x_win_cls.go(+cls: U32, over: Bool) -> U32:
+  match cls:
+    case 7:
+      x_pick(over, 10, 7)
+    case _:
+      cls
+
+def x_win_cls(+cls: U32, +cw: U32, +sid2: U32, +payload: List<&2, U32>) -> U32:
+  +conn : Bool = U32.is_eq(sid2, 0)
+  x_win_cls.go(cls, Bool.and(conn, Bool.not(x_win_fits(cw, x_be32_rd(payload)))))
 
 def x_flow_credit.mine(+cw: U32, +sw: U32, +inc: U32, is_mine: Bool) -> U32 & U32:
   match is_mine:
@@ -2136,6 +2223,24 @@ def x_flow_wu_bad(got: Socket & HTTP.Got, +seed: List<&2, U32>, +cw: U32, +pdc: 
   Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32:
   (s, g) = got
   (s, Fail{(502, "bad window_update")}, seed, cw, pdc)
+
+# The answer to a WINDOW_UPDATE that passes the window cap (RFC 9113
+# section 6.9.1): RST_STREAM FLOW_CONTROL_ERROR for a stream window and
+# GOAWAY FLOW_CONTROL_ERROR for the connection window.
+def x_flow_err_frame(sock: Socket, +sid2: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  match sid2:
+    case 0:
+      x_send_goaway(sock, 0, x_h2_err.flow())
+    case _:
+      x_send_frame(sock, x_t_rst(), 0, sid2, HTTP.x_be32(x_h2_err.flow()))
+
+# The lane answer after the flow-control error frame: the same shape and
+# the same stable fail code as x_flow_wu_bad.
+def x_flow_win_bad(got: Socket & HTTP.Got, +seed: List<&2, U32>, +cw: U32, +pdc: U32) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32:
+  (s, g) = got
+  (s, Fail{(502, "window overflow")}, seed, cw, pdc)
 
 def x_flow.pair(got: Socket & HTTP.Got) -> Socket & HTTP.Got:
   (s, g) = got
@@ -2477,13 +2582,28 @@ def x_flow.do_act(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, 
     case _:
       x_send_data_flow(4, (s, HTTP.GotErr{0, "next"}), sid, chunks, cw, sw, piw, buf, 0, 0, Nil{}, True{}, sid2p, seed, pdc)
 
+# The credit of a WINDOW_UPDATE that passed the shape test. A grant past
+# the cap sends the flow-control error and stops the send, so no DATA goes
+# out after it (RFC 9113 section 6.9.1).
+@unsafe
+def x_flow.wu_go(fits: Bool, got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +piw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, +seed: List<&2, U32>, +pdc: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32):
+  match fits:
+    case True{}:
+      +cream = x_flow_credit.go(cw, sw, sid, sid2p, inc, True{})
+      x_send_data_flow(4, x_flow.pair(got), sid, chunks, x_flow_cw(cream), x_flow_sw(cream), piw, buf, 0, 0, Nil{}, True{}, sid2p, seed, pdc)
+    case False{}:
+      (s, g) = got
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_flow_err_frame(s, sid2p)
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, x_flow_win_bad(x_flow_sent(sent), seed, cw, pdc))
+
 @unsafe
 def x_flow.wu(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +piw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool, +seed: List<&2, U32>, +pdc: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32):
   match ok:
     case True{}:
-      +cream = x_flow_credit.go(cw, sw, sid, sid2p, inc, True{})
-      x_send_data_flow(4, x_flow.pair(got), sid, chunks, x_flow_cw(cream), x_flow_sw(cream), piw, buf, 0, 0, Nil{}, True{}, sid2p, seed, pdc)
+      x_flow.wu_go(x_win_target(cw, sw, sid, sid2p, inc), got, sid, chunks, cw, sw, piw, buf, sid2p, inc, seed, pdc)
     case False{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, x_flow_wu_bad(got, seed, cw, pdc))
 
@@ -3645,6 +3765,15 @@ def client.loop.fail_t(got: Socket & HTTP.Got, +code: U32, +msg: String, +tab: H
   (s, g) = got
   client.loop.fail_s(s, code, msg, tab, head, rev)
 
+# A connection window that passed the cap: send GOAWAY FLOW_CONTROL_ERROR
+# (RFC 9113 section 6.9.1) and fail the lane with a stable code.
+def client.loop.win_bad(got: Socket & HTTP.Got, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
+  (s, g) = got
+  do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s, 0, x_h2_err.flow())
+    client.loop.fail_t(x_flow_sent(sent), 502, "window overflow", tab, head, rev)
+
 def client.loop.done_t(got: Socket & HTTP.Got, +total: U32, +fins: U32, +slots: List<&2, HTTP.St>, +cw: U32, +piw: U32, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   (s, g) = got
@@ -4299,7 +4428,7 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
         case HTTP.GotErr{code1, msg1} Act{+a1, +r1, +c1}:
           client.loop.fail_s(s1, code1, msg1, tab, head, r1)
         case HTTP.GotOk{HTTP.Frame{+typ2, +flags2, +sid22, +flen2, +payload2}, +buf2} Act{+a1, +r1, +c1}:
-          client.loop(~S, ~C, mode, 2, (s1, HTTP.GotOk{HTTP.Frame{typ2, flags2, sid22, flen2, payload2}, buf2}), buf2, tab, exp, slots, cpend, spend, cw, piw, pending, high, head, ok, total, fins, typ2, flags2, sid22, payload2, flen2, client.loop.cls_of(mode, typ2, flags2, sid22, payload2, sid22, exp), x_fin(flags2), Act{4, r1, c1}, pdc)
+          client.loop(~S, ~C, mode, 2, (s1, HTTP.GotOk{HTTP.Frame{typ2, flags2, sid22, flen2, payload2}, buf2}), buf2, tab, exp, slots, cpend, spend, cw, piw, pending, high, head, ok, total, fins, typ2, flags2, sid22, payload2, flen2, x_win_cls(client.loop.cls_of(mode, typ2, flags2, sid22, payload2, sid22, exp), cw, sid22, payload2), x_fin(flags2), Act{4, r1, c1}, pdc)
     case 2:
       match cls act:
         case 1 Act{+a2, +r2, +c2}:
@@ -4313,7 +4442,9 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
         case 5 Act{+a2, +r2, +c2}:
           client.loop.fail_t(got, x_goaway.status(payload, exp), x_goaway.reason(payload, exp), tab, head, r2)
         case 7 Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, client.loop.wu_cw(cw, sid2, payload), piw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2}, pdc)
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, x_win_credit(cw, sid2, payload), piw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2}, pdc)
+        case 10 Act{+a2, +r2, +c2}:
+          client.loop.win_bad(got, tab, head, r2)
         case 9 Act{+a2, +r2, +c2}:
           client.loop.fail_t(got, 502, "bad window_update", tab, head, r2)
         case 8 Act{+a2, +r2, +c2}:
@@ -5429,21 +5560,34 @@ def server.data_act.buffered(has: Bool, over: Bool, +end: U32) -> U32:
     case _ _ _:
       0
 
+# The answer of a CONNECT block: the lane serves no tunnel, so it answers
+# 501 with no body (RFC 9113 section 8.5). The handler never runs, so the
+# answer is a constant and not an event.
+def server.conn_resp() -> HTTP.Response:
+  HTTP.Response{501, Nil{}, Nil{}}
+
 def server.head_resp.stream(~H: HTTP.SrvEv -> HTTP.SrvOut, act: U32, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> HTTP.Response:
   match act:
     case 9:
       HTTP.Response{0, Nil{}, Nil{}}
+    case 11:
+      server.conn_resp()
     case _:
       httpxs.head_resp_of(~H, ok, need, end, nh, nt, sid)
 
-# The buffered form has no answer before the IO handler runs.
-def server.head_resp.buffered() -> HTTP.Response:
-  HTTP.Response{0, Nil{}, Nil{}}
+# The buffered form has no answer before the IO handler runs, and the
+# CONNECT reply is constant in both forms.
+def server.head_resp.buffered(act: U32) -> HTTP.Response:
+  match act:
+    case 11:
+      server.conn_resp()
+    case _:
+      HTTP.Response{0, Nil{}, Nil{}}
 
 def server.head_resp(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, act: U32, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> HTTP.Response:
   match form:
     case 0:
-      server.head_resp.buffered()
+      server.head_resp.buffered(act)
     case _:
       server.head_resp.stream(~H, act, ok, need, end, nh, nt, sid)
 
@@ -5545,12 +5689,27 @@ def server.admit.stream(~H: HTTP.SrvEv -> HTTP.SrvOut, mode: U32, slots: List<&2
     case _:
       server.admit.stream_act(~H, server.admit.capped(slots), ok, need, end, nh, nt, sid)
 
+def server.admit.go(~H: HTTP.SrvEv -> HTTP.SrvOut, is_conn: Bool, +form: U32, mode: U32, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> U32:
+  match is_conn:
+    case True{}:
+      11
+    case False{}:
+      match form:
+        case 0:
+          server.admit.buffered(mode, slots, ok, need, end)
+        case _:
+          server.admit.stream(~H, mode, slots, ok, need, end, nh, nt, sid)
+
+# A CONNECT block answers act 11 (the 501 reply) and never reaches the
+# handler. The stream does not enter the ledger, so the connection stays
+# open for the next HEADERS (RFC 9113 section 8.5).
+def server.is_connect(h: HTTP.ReqHead) -> Bool:
+  match h:
+    case HTTP.ReqHead{+method, path, headers}:
+      String.eq(method, "CONNECT")
+
 def server.admit(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, mode: U32, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> U32:
-  match form:
-    case 0:
-      server.admit.buffered(mode, slots, ok, need, end)
-    case _:
-      server.admit.stream(~H, mode, slots, ok, need, end, nh, nt, sid)
+  server.admit.go(~H, server.is_connect(nh), form, mode, slots, ok, need, end, nh, nt, sid)
 
 # The head answer of an admitted stream: a refused stream (act 9) never
 # reaches the handler, so its answer is a dummy.
@@ -5561,30 +5720,10 @@ def server.admit(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, mode: U32, slots: Li
 # (httpx.wu_er) takes the count instead of the payload.
 # The client side of the same counter (TASK-063 phase 7c): a connection
 # WINDOW_UPDATE raises the send window the client loop tracks, so the
-# next request body seeds from the honest remaining window.
-def client.loop.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
-  match is_conn:
-    case True{}:
-      x_win_add(cw, x_be32_rd(payload))
-    case False{}:
-      cw
-
-def client.loop.wu_cw(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
-  client.loop.wu_cw_go(U32.is_eq(sid, 0), cw, payload)
-
-# A connection WINDOW_UPDATE raises the send window the server loop
-# tracks (RFC 9113 section 6.9.1). A stream WU only refills one stream,
-# and the flow pump of that stream reads it itself, so the loop counts
-# the connection frames only.
-def server.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
-  match is_conn:
-    case True{}:
-      x_win_add(cw, x_be32_rd(payload))
-    case False{}:
-      cw
-
-def server.wu_cw(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
-  server.wu_cw_go(U32.is_eq(sid, 0), cw, payload)
+# next request body seeds from the honest remaining window. A stream WU
+# only refills one stream, and the flow pump of that stream reads it
+# itself, so the loop counts the connection frames only. x_win_wu_step
+# is that credit for both loops.
 
 @unsafe
 def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), +form: U32, +mode: U32, phase: U32, got: Socket & HTTP.Got, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +iw: U32, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, +rh: HTTP.ReqHead, act: U32, +resp: HTTP.Response, +tab: HTTP.Tab, +drt: HTTP.ReqHead & Bool & HTTP.Tab, +pdc: U32) ->
@@ -5603,7 +5742,7 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
         case HTTP.GotOk{+frame, +buf2}:
           match frame:
             case HTTP.Frame{+typ2, +flags2, +sid22, +flen2, +payload2}:
-              server.loop(~H, ~B, form, mode, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, cw, iw, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_cls_of(frame, flags2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+              server.loop(~H, ~B, form, mode, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, cw, iw, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_win_cls(x_cls_of(frame, flags2), cw, sid22, payload2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case 2:
       match cls:
         case 1:
@@ -5620,7 +5759,9 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
         case 2:
           server.loop(~H, ~B, form, mode, 0, got, ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 7:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, server.wu_cw(cw, sid2, payload), iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, x_win_credit(cw, sid2, payload), iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+        case 10:
+          x_fatal_got(got, x_h2_err.flow())
         case 9:
           x_fatal_got(got, x_goaway.protocol())
         case 8:
@@ -5641,7 +5782,7 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
           +has3 : Bool = ledger.has(slots, sid2)
           +fin3 : Bool = U32.is_eq(end, 1)
           +body3 : List<&2, U32> = x_data_body(payload, flags)
-          +over3 : Bool = x_body_over(ledger.n_of(slots, sid2), flen)
+          +over3 : Bool = x_body_over(ledger.n_of(slots, sid2), HTTP.x_len32(body3))
           server.loop(~H, ~B, form, mode, 5, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, server.data_act(~H, form, has3, body3, fin3, end, sid2, over3), server.data_resp(~H, form, has3, body3, fin3, sid2), tab, x_req.no_got(), pdc)
         case _:
           server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
@@ -5661,6 +5802,10 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
           do IO<Unit>:
             req : HTTP.Request = httpx.req_of(rh, Nil{})
             resp : HTTP.Response <- B(req)
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp, cw, iw, iw, buf, pdc)
+            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+        case 11:
+          do IO<Unit>:
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp, cw, iw, iw, buf, pdc)
             server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 9:
@@ -5684,9 +5829,10 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)
             +pay : Bool = x_pdc.paid(pdc)
+            +body5 : List<&2, U32> = x_data_body(payload, flags)
             +wb : List<&2, U32> = x_wu.bytes_skip(pay, cpend, spend, sid2, flen, fin)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb)
-            server.loop(~H, ~B, form, mode, 0, got2, server.data_slots(form, slots, sid2, x_data_body(payload, flags), flen), x_wu.next_cpend_skip(pay, cpend, flen, fin), x_wu.spend_skip(pay, spend, sid2, flen, fin), cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+            server.loop(~H, ~B, form, mode, 0, got2, server.data_slots(form, slots, sid2, body5, HTTP.x_len32(body5)), x_wu.next_cpend_skip(pay, cpend, flen, fin), x_wu.spend_skip(pay, spend, sid2, flen, fin), cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
         case 1:
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)

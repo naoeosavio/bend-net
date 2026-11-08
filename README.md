@@ -284,7 +284,10 @@ larger than `MAX_FRAME_SIZE` fails closed (`400`/`413`, backlog).
 - Flow control: the codec announces `INITIAL_WINDOW_SIZE=65535` and
   `MAX_FRAME_SIZE=65535` (the RFC defaults). It replenishes the connection
   and stream windows on every inbound DATA, and it slices uploads into
-  `WINDOW_UPDATE`-paced frames. Bodies are not capped at 64 KB.
+  `WINDOW_UPDATE`-paced frames. Bodies are not capped at 64 KB. A
+  `WINDOW_UPDATE` that makes a window pass 2^31-1 fails closed. A stream
+  window answers `RST_STREAM` 3 and the connection window answers `GOAWAY`
+  3 (RFC 9113 section 6.9.1). No more DATA goes out.
 - `RST_STREAM`, `GOAWAY`, `PING` and `WINDOW_UPDATE` are handled as
   protocol events, not as skips. Housekeeping frames are answered with a
   fresh-only `ACK` (never an ACK-of-an-ACK, which ping-pongs between two
