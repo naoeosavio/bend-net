@@ -1,17 +1,19 @@
 # io (httpx_h2_credit_pad): the receive side credits the DECLARED length
 # of a frame, not the stripped body (task-063 phase 5, RFC 9113 section
-# 6.9.1).
+# 6.9.1), and it batches that credit (task-063 phase 6b).
 #
 # The peer is a raw H2 client and the server is HTTP2.server.concurrent.
 # The peer uploads 100 padded DATA frames: pad length 50, a 100-byte body
 # and 50 padding octets, so each frame declares 151 bytes while its body
-# is 100. The server must answer two WINDOW_UPDATE frames per frame (the
-# connection and the stream), each with increment 151, and its handler
-# must see 10000 body bytes (the padding stripped). A sender that
-# credited the body instead would answer 100 and stall the upload.
+# is 100. The batch holds 15100 bytes, below x_wu_half(), so the server
+# answers one connection WINDOW_UPDATE of 15100 at the END_STREAM and no
+# stream WINDOW_UPDATE at all. Its handler must see 10000 body bytes
+# (the padding stripped). A sender that credited the body instead would
+# answer 10000 and stall the upload.
 #
-# Checks: 200 WUs, 100 of them on the stream, the increment sum 30200,
-# every increment 151, the 200 head, the 10000-byte body. Golden 6.
+# Checks: 1 WU, on the connection, the increment sum 15100, the
+# increment 15100, 0 stream WUs, the 200 head, the 10000-byte body.
+# Golden 6.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -52,11 +54,15 @@ def DECLARED() -> U32:
 def BODY_ALL() -> U32:
   10000
 
+# The bytes the batch holds at the last frame: every declared length.
 def WU_ALL() -> U32:
-  200
+  1
 
 def WU_SUM() -> U32:
-  30200
+  15100
+
+def WU_INC() -> U32:
+  15100
 
 # Acc bits, one per check.
 def ACC_INC() -> U32:
@@ -115,8 +121,11 @@ def send_all(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- send_go(U32.to_nat(U32.sub(FRAMES(), 1)), sock)
     HTTP2.x_send_frame(sock_of(sent), HTTP2.x_t_data(), (PADDED() + HTTP2.x_f_end_stream() : U32), 1, padded())
 
-def wu_bit(+payload: List<&2, U32>) -> U32:
-  weigh(U32.is_eq(HTTP2.x_be32_rd(payload), DECLARED()), ACC_INC())
+# The one WU of this body credits the whole batch to the connection.
+def wu_bit(+sid: U32, +payload: List<&2, U32>) -> U32:
+  +is_conn : Bool = U32.is_eq(sid, 0)
+  +is_inc : Bool = U32.is_eq(HTTP2.x_be32_rd(payload), WU_INC())
+  weigh(Bool.and(is_conn, is_inc), ACC_INC())
 
 def head_bit_go(dec: Result<&1, &1, U32 & String, HTTP.Head & HTTP.Tab>) -> U32:
   match dec:
@@ -135,10 +144,10 @@ def body_bit(+flags: U32, +flen: U32, +payload: List<&2, U32>) -> U32:
   +end : Bool = U32.is_eq(U32.and(flags, HTTP2.x_f_end_stream()), HTTP2.x_f_end_stream())
   weigh(Bool.and(end, U32.is_eq(flen, 4)), weigh(U32.is_eq(HTTP2.x_be32_rd(payload), BODY_ALL()), ACC_BODY()))
 
-def frame_bits(+typ: U32, +flags: U32, +flen: U32, +payload: List<&2, U32>) -> U32:
+def frame_bits(+typ: U32, +flags: U32, +flen: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
   match typ:
     case 8:
-      wu_bit(payload)
+      wu_bit(sid, payload)
     case 1:
       head_bit(payload)
     case 0:
@@ -146,11 +155,11 @@ def frame_bits(+typ: U32, +flags: U32, +flen: U32, +payload: List<&2, U32>) -> U
     case _:
       0
 
-# One more WU frame on the stream (sid 1) or the connection (sid 0).
+# One more WU frame on the connection (sid 0).
 def wu_count(+typ: U32, +sid: U32) -> U32:
   match typ:
     case 8:
-      1
+      weigh(U32.is_eq(sid, 0), 1)
     case _:
       0
 
@@ -182,7 +191,7 @@ def peer_stop(s: Socket, +wus: U32, +wus1: U32, +wsum: U32, +acc: U32) -> IO(U32
   do IO<U32>:
     x : Unit <- TLS.tls_close(s)
     +bits : U32 = U32.add(weigh(bit_ok(acc, ACC_INC()), 1), U32.add(weigh(bit_ok(acc, ACC_HEAD()), 1), weigh(bit_ok(acc, ACC_BODY()), 1)))
-    +counts : U32 = U32.add(weigh(U32.is_eq(wus, WU_ALL()), 1), U32.add(weigh(U32.is_eq(wus1, FRAMES()), 1), weigh(U32.is_eq(wsum, WU_SUM()), 1)))
+    +counts : U32 = U32.add(weigh(U32.is_eq(wus, WU_ALL()), 1), U32.add(weigh(U32.is_eq(wus1, 0), 1), weigh(U32.is_eq(wsum, WU_SUM()), 1)))
     IO.pure(U32, (bits + counts : U32))
 
 # Phase 0 reads one frame, phase 1 scores it and picks the next phase, and
@@ -208,7 +217,7 @@ def peer_read(ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +wus: U32, +
               +wus2 : U32 = (wus + wu_count(typ, sid) : U32)
               +wus12 : U32 = (wus1 + wu_stream(typ, sid) : U32)
               +wsum2 : U32 = (wsum + wu_sum_of(typ, payload) : U32)
-              +acc2 : U32 = U32.or(acc, frame_bits(typ, flags, flen, payload))
+              +acc2 : U32 = U32.or(acc, frame_bits(typ, flags, flen, sid, payload))
               peer_read(ph_of(is_end(typ, flags)), (s1, HTTP.GotOk{frame, buf2}), buf2, wus2, wus12, wsum2, acc2)
     case _:
       (s2, g2) = got

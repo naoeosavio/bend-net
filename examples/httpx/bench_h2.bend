@@ -10,6 +10,8 @@
 #   send_chunks_td   take32/drop32 split inside the timer (loses, kept)
 #   strip_eager      x_data_body today: x_len32(payload) even when unpadded
 #   strip_lazy       branch on the PADDED flag first, no length walk
+#   wu_each          receive credit before 6b: a pair of frames per DATA frame
+#   wu_batch         shipped credit: one step per frame, flush at the half
 import Base
 import ../../lib/http.bend as HTTP
 import ../../lib/http2.bend as HTTP2
@@ -26,6 +28,10 @@ def MAX_SEND() -> U32:
 # Bytes a DATA frame adds in front of the payload.
 def FRAME_HDR() -> U32:
   9
+
+# The payload of one DATA frame of the credit rows.
+def FLEN() -> U32:
+  16384
 
 def CHECK_WIDTH() -> Nat:
   22n
@@ -162,6 +168,43 @@ def strip_count(n: U32, +frame: List<&2, U32>) -> U32:
     case _:
       (HTTP.x_len32(strip_eager(frame)) + strip_count((n - 1 : U32), frame) : U32)
 
+# The bytes each credit row writes: the old shape writes 13 bytes twice
+# per DATA frame, the batch writes 13 bytes per pair and one frame at the
+# end (an even frame count leaves 819 for 64 frames).
+def wu_want_each(+n: U32) -> U32:
+  U32.mul(U32.mul(2, nchunks(n)), 13)
+
+def wu_want_batch(+n: U32) -> U32:
+  U32.mul(U32.sub(nchunks(n), 1), 13)
+
+# --- receive credit: one pair per DATA frame against the batch --------
+# The old shape built both frames and wrote them on every DATA frame.
+# The shipped shape adds the length to the batch and builds the frames
+# only when a window reaches the half.
+
+def wu_each_go(+n: Nat, +sent: U32) -> U32:
+  match n:
+    case 0n:
+      sent
+    case 1n+m:
+      +b : List<&2, U32> = List.append(&2, U32, HTTP2.x_wu_frame(0, FLEN()), HTTP2.x_wu_frame(1, FLEN()))
+      wu_each_go(m, (sent + HTTP.x_len32(b) : U32))
+
+def wu_batch_go(+n: Nat, +cpend: U32, +spend: List<&2, HTTP2.Pnd>, +sent: U32) -> U32:
+  match n:
+    case 0n:
+      (sent + cpend : U32)
+    case 1n+m:
+      +fin : Bool = Nat.is_eq(m, 0n)
+      +b : List<&2, U32> = HTTP2.x_wu.bytes(cpend, spend, 1, FLEN(), fin)
+      wu_batch_go(m, HTTP2.x_wu.next_cpend(cpend, FLEN(), fin), HTTP2.x_wu.next_spend(spend, 1, FLEN(), fin), (sent + HTTP.x_len32(b) : U32))
+
+def wu_each(+n: U32) -> U32:
+  wu_each_go(U32.to_nat(n), 0)
+
+def wu_batch(+n: U32) -> U32:
+  wu_batch_go(U32.to_nat(n), 0, Nil{}, 0)
+
 @unsafe
 def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>) -> U32:
   match tag:
@@ -175,8 +218,12 @@ def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +fram
       send_chunks_td(xs, 0)
     case 4:
       strip_count(32, frame)
-    case _:
+    case 5:
       strip_count_lazy(32, frame)
+    case 6:
+      wu_each(nchunks(HTTP.x_len32(xs)))
+    case _:
+      wu_batch(nchunks(HTTP.x_len32(xs)))
 
 def fold_go(+el: Nat, mn: Nat, rest: Nat & Nat) -> Nat & (Nat & Nat):
   match rest:
@@ -229,13 +276,17 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     r3 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 3, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     r4 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 4, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     r5 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 5, xs, chunks, frame, (600000n, (0n, 0n)), 0)
+    r6 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 6, xs, chunks, frame, (600000n, (0n, 0n)), 0)
+    r7 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 7, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     a : Unit <- report("send_take_drop", want, r0)
     b : Unit <- report("send_chunks", want, r1)
     c : Unit <- report("send_chunks_e2e", want, r2)
     d : Unit <- report("send_chunks_td", want, r3)
     e : Unit <- report("strip_eager", (MAX_SEND() * 32 * U32.from_nat(RUNS()) : U32), r4)
     f : Unit <- report("strip_lazy", (MAX_SEND() * 32 * U32.from_nat(RUNS()) : U32), r5)
-    IO.pure(Unit, f)
+    g : Unit <- report("wu_each", (wu_want_each(n) * U32.from_nat(RUNS()) : U32), r6)
+    h : Unit <- report("wu_batch", (wu_want_batch(n) * U32.from_nat(RUNS()) : U32), r7)
+    IO.pure(Unit, h)
 
 def u32_go(m: Maybe<&2, U32>, +dflt: U32) -> U32:
   match m:

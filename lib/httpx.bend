@@ -56,6 +56,7 @@ import Base
 import ./tls.bend as TLS
 import ./tcp.bend as TCP
 import ./dns.bend as DNS
+import ./http.bend as HTTP
 
 # Bytes
 # -----
@@ -4278,7 +4279,7 @@ def x_h1.cl_count(hs: List<&2, Hdr>) -> U32:
 def x_h1.cl_bad_at(is_cl: Bool, +v: String) -> Bool:
   match is_cl:
     case True{}:
-      Bool.or(String.is_empty(v), Bool.not(DNS.all_digits(v)))
+      Bool.or(String.is_empty(v), Bool.not(HTTP.all_digits(v)))
     case False{}:
       False{}
 
