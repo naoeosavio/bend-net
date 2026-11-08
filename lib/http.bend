@@ -575,8 +575,12 @@ type FendTaken is Data:
 type Cont is Data:
   Cont{block: List<&2, U32>, rest: List<&2, U32>, end: U32}
 
+# sid, the HPACK table, the H2 flag and cw: the connection send window
+# the client has left (task-063 phase 7a). cw starts at x_init_window()
+# and the send pump seeds from it, so two bodies on one connection never
+# pass the credit the peer granted.
 type CliSt is Data:
-  CliSt{sid: U32, tab: Tab, is_h2: Bool}
+  CliSt{sid: U32, tab: Tab, is_h2: Bool, cw: U32}
 
 type StreamEv is Data:
   StreamHead{head: Head}

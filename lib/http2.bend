@@ -1955,15 +1955,23 @@ def x_flow.ack(got: Socket & HTTP.Got, buf: List<&2, U32>) -> IO(Socket & HTTP.G
 # those bytes instead of losing the frames. A send that read nothing else
 # carries the empty seed. x_flow_drop is the explicit discard for the
 # sequential lane, which answers one request at a time by design.
-def x_flow_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +seed: List<&2, U32>) ->
-  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
-  (s, r) = sent
-  (s, r, seed)
+# Tail append for the read seed: List.append recurses on its first list,
+# and a seed holds the frames stashed while a big response waited for
+# credit (one whole 64 KiB body per stream), so the plain append died with
+# a machine stack overflow. Reverse the seed and push it onto the tail:
+# two tail passes, the same bytes (TASK-063 phase 7d).
+def x_flow_join(+seed: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
+  HTTP.x_cat.go(List.reverse(&2, U32, seed), buf)
 
-def x_flow_wu_bad(got: Socket & HTTP.Got, +seed: List<&2, U32>) ->
-  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
+def x_flow_keep(sent: Socket & Result<&1, &1, U32 & String, Unit>, +seed: List<&2, U32>, +cw: U32) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32:
+  (s, r) = sent
+  (s, r, seed, cw)
+
+def x_flow_wu_bad(got: Socket & HTTP.Got, +seed: List<&2, U32>, +cw: U32) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32:
   (s, g) = got
-  (s, Fail{(502, "bad window_update")}, seed)
+  (s, Fail{(502, "bad window_update")}, seed, cw)
 
 def x_flow.pair(got: Socket & HTTP.Got) -> Socket & HTTP.Got:
   (s, g) = got
@@ -1971,7 +1979,7 @@ def x_flow.pair(got: Socket & HTTP.Got) -> Socket & HTTP.Got:
 
 @unsafe
 def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match phase:
     case 0:
       (s0, g0) = got
@@ -1981,13 +1989,13 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
             case 0:
               match chunks:
                 case Nil{}:
-                  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+                  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
                     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s0, x_t_data(), x_f_end_stream(), sid, Nil{})
-                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, List.append(&2, U32, seed, buf)))
+                    IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_keep(sent, x_flow_join(seed, buf), cw))
                 case +b <> r:
                   x_send_data_flow(4, (s0, HTTP.GotErr{0, "next"}), sid, b <> r, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
             case _:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s0, Fail{(code0, msg0)}, seed))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s0, Fail{(code0, msg0)}, seed, cw))
         case HTTP.GotOk{+frame0, +buf0}:
           x_send_data_flow(0, (s0, HTTP.GotErr{0, "next"}), sid, chunks, cw, sw, buf0, 0, 0, Nil{}, True{}, sid2p, seed)
     case 4:
@@ -2008,7 +2016,7 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
       (s9, g9) = got
       match g9:
         case HTTP.GotErr{code9, msg9}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s9, Fail{(code9, msg9)}, seed))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s9, Fail{(code9, msg9)}, seed, cw))
         case HTTP.GotOk{+frame9, +buf9}:
           match frame9:
             case HTTP.Frame{+typ9, +flags9, +sid29, +flen9, +payload9}:
@@ -2020,23 +2028,23 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
       (s13, g13) = got
       match g13:
         case HTTP.GotErr{code13, msg13}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(code13, msg13)}, seed))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s13, Fail{(code13, msg13)}, seed, cw))
         case HTTP.GotOk{+frame13, +buf13}:
           match frame13:
             case HTTP.Frame{+typ13, +flags13, +sid213, +flen13, +payload13}:
-              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Done{Unit{}}, x_flow.seed_add(seed, typ13, flags13, sid213, payload13, buf13)))
+              IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s13, Done{Unit{}}, x_flow.seed_add(seed, typ13, flags13, sid213, payload13, buf13), cw))
     case 14:
       (s14, g14) = got
       match g14:
         case HTTP.GotErr{code14, msg14}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s14, Fail{(code14, msg14)}, seed))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s14, Fail{(code14, msg14)}, seed, cw))
         case HTTP.GotOk{+frame14, +buf14}:
           match frame14:
             case HTTP.Frame{+typ14, +flags14, +sid214, +flen14, +payload14}:
               x_send_data_flow(4, (s14, HTTP.GotErr{0, "next"}), sid, chunks, cw, sw, buf14, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, Nil{}))
     case _:
       (s13, g13) = got
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s13, Fail{(502, "flow bad phase")}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s13, Fail{(502, "flow bad phase")}, Nil{}, cw))
 
 # PADDED (0x8) and PRIORITY (0x20): x_frame_of strips both fields out of
 # the payload but leaves the bits in the flags it answers, so a frame
@@ -2103,7 +2111,8 @@ def x_flow.route(+typ: U32, +sid29: U32, +sid: U32, +cls: U32) -> U32:
 # the recv (which may hold more frames). The accumulated seed comes first;
 # it holds bytes that arrived earlier on the wire.
 def x_flow.seed_add(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, seed, List.append(&2, U32, x_frame_write(typ, x_f_seed(flags), sid, payload), buf))
+  +frag : List<&2, U32> = x_frame_write(typ, x_f_seed(flags), sid, payload)
+  x_flow_join(seed, HTTP.x_cat.go(List.reverse(&2, U32, frag), buf))
 
 def x_flow.cls_typ(+typ: U32) -> U32:
   match typ:
@@ -2158,7 +2167,7 @@ def x_flow_rest(full: Bool, +chunk: U32, +h: List<&2, U32>, +t: List<&2, List<&2
       HTTP.x_drop32(chunk, h) <> t
 
 def x_flow.chunker(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   (s5, g5) = got
   match chunks:
     case Nil{}:
@@ -2167,93 +2176,108 @@ def x_flow.chunker(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2,
       match ok:
         case True{}:
           +chunk : U32 = x_chunk_of(cw, sw, ful)
-          do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s5, x_t_data(), 0, sid, x_flow_part(U32.is_eq(chunk, ful), chunk, h))
             x_send_data_flow(6, x_flow_sent(sent), sid, x_flow_rest(U32.is_eq(chunk, ful), chunk, h, t), (cw - chunk : U32), (sw - chunk : U32), buf, 0, 0, Nil{}, True{}, sid2p, seed)
         case False{}:
-          do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+          do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
             got2 : Socket & HTTP.Got <- x_read_frame(s5, buf)
             x_send_data_flow(9, got2, sid, h <> t, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
 
 def x_flow.reste(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, +ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   (s6, g6) = got
   match chunks:
     case Nil{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s6, x_t_data(), x_f_end_stream(), sid, Nil{})
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, List.append(&2, U32, seed, buf)))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_keep(sent, x_flow_join(seed, buf), cw))
     case +b <> r:
       x_send_data_flow(0, (s6, HTTP.GotErr{0, "next"}), sid, b <> r, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
 
 @unsafe
 def x_flow.do_act(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +sid2p: U32, +pay2: List<&2, U32>, +seed: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   (s, g) = got
   match cl:
     case 2:
       x_flow.wu(got, sid, chunks, cw, sw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2), seed)
     case 4:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
         got2 : Socket & HTTP.Got <- x_flow.ack(got, buf)
         x_send_data_flow(4, got2, sid, chunks, cw, x_settings.iw_apply(pay2, sw), buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case 6:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)
         x_send_data_flow(4, x_flow_sent(sent), sid, chunks, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case 3:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(x_rst.status(pay2), x_rst.reason(pay2))}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s, Fail{(x_rst.status(pay2), x_rst.reason(pay2))}, Nil{}, cw))
     case 7:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(x_goaway.status(pay2, sid), x_goaway.reason(pay2, sid))}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s, Fail{(x_goaway.status(pay2, sid), x_goaway.reason(pay2, sid))}, Nil{}, cw))
     case 9:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{(502, "continuation")}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s, Fail{(502, "continuation")}, Nil{}, cw))
     case _:
       x_send_data_flow(4, (s, HTTP.GotErr{0, "next"}), sid, chunks, cw, sw, buf, 0, 0, Nil{}, True{}, sid2p, seed)
 
 @unsafe
 def x_flow.wu(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, U32>>, +cw: U32, +sw: U32, +buf: List<&2, U32>, +sid2p: U32, +inc: U32, ok: Bool, +seed: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match ok:
     case True{}:
       +cream = x_flow_credit.go(cw, sw, sid, sid2p, inc, True{})
       x_send_data_flow(4, x_flow.pair(got), sid, chunks, x_flow_cw(cream), x_flow_sw(cream), buf, 0, 0, Nil{}, True{}, sid2p, seed)
     case False{}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_wu_bad(got, seed))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_wu_bad(got, seed, cw))
 
-# shortcut: the flow seeds both windows at 65535 on every send, so a
-# second large body on one connection can overrun the peer connection
-# window; seed it from the CliSt when a caller sends big bodies in a row.
-def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+# The send takes the connection window from its caller and seeds the
+# stream window at the default, because a stream opens with the peer's
+# initial window and no lane reads a new initial size for it (TASK-063
+# phase 7e). The caller carries the connection window across sends.
+def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: Bool, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match single:
     case True{}:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_data_frame(sock, sid, body)
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, Nil{}))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_keep(sent, buf, (cw - HTTP.x_len32(body) : U32)))
     case False{}:
-      x_send_data_flow(0, (sock, HTTP.GotErr{0, "next"}), sid, x_chunks(body), x_init_window(), x_init_window(), Nil{}, 0, 0, Nil{}, True{}, 0, Nil{})
+      x_send_data_flow(0, (sock, HTTP.GotErr{0, "next"}), sid, x_chunks(body), cw, x_init_window(), buf, 0, 0, Nil{}, True{}, 0, Nil{})
 
-def x_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
-  x_send_data_start.go(sock, sid, body, U32.is_le(HTTP.x_len32(body), x_max_send()))
+# The single-frame lane question: the body fits one DATA frame and the
+# caller's connection window covers it. The lane writes the whole body at
+# once and answers `cw - len`, so a body past the caller window overran
+# the peer window and the answer wrapped below zero in U32; such a body
+# takes the pump path, which sends what the window allows and waits for
+# credit (TASK-063 phase 7d). The probe stops at the smaller of the cap
+# and the window, so this send costs at most x_max_send() + 1 list cells
+# instead of the whole body (TASK-063 phase 8).
+def x_send_probe(+cw: U32) -> U32:
+  (U32.min(cw, x_max_send()) + 1 : U32)
+
+def x_send_single(+cw: U32, body: List<&2, U32>) -> Bool:
+  Bool.not(HTTP.x_has_at_least(x_send_probe(cw), body))
+
+def x_send_data_start(sock: Socket, +sid: U32, +body: List<&2, U32>, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
+  x_send_data_start.go(sock, sid, body, x_send_single(cw, body), cw, buf)
 
 # The server's response sender hands the read seed out like the client's
 # does (TASK-042 phase 2e): the flow sender stashes every frame it reads
 # while waiting for credit (a pipelined request HEADERS, the DATA of
 # another stream) instead of dropping it, and the server loop reads those
 # bytes first.
-def x_send_resp_head(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+def x_send_resp_head(sent: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U32, +body: List<&2, U32>, is_empty: Bool, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Fail{e}, Nil{}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (sock, Fail{e}, Nil{}, cw))
     case Done{u}:
       match is_empty:
         case True{}:
-          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, Nil{}))
+          IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_keep((sock, Done{Unit{}}), buf, cw))
         case False{}:
-          x_send_data_start(sock, sid, body)
+          x_send_data_start(sock, sid, body, cw, buf)
 
 # The socket of a sent pair, for the chains that carry only the last
 # Result and keep sending on the same connection.
@@ -2290,20 +2314,20 @@ def x_send_block(sock: Socket, +sid: U32, +blk: List<&2, U32>, +end_stream: U32)
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   x_send_block.step(sock, sid, blk, x_send_block.fuel(HTTP.x_len32(blk)), x_t_headers(), end_stream)
 
-def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+def x_send_resp.go(sock: Socket, +sid: U32, +status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   hs = List.append(&2, HTTP.Hdr, [HTTP.Hdr{":status", U32.show(status)}], headers)
   blk = x_block(hs)
   +empty = List.is_empty(&2, U32, body)
-  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_block(sock, sid, blk, x_b2u(empty))
-    x_send_resp_head(sent, sid, body, empty)
+    x_send_resp_head(sent, sid, body, empty, cw, buf)
 
-def x_send_resp(sock: Socket, +sid: U32, +resp: HTTP.Response) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+def x_send_resp(sock: Socket, +sid: U32, +resp: HTTP.Response, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match resp:
     case HTTP.Response{+status, +headers, +body}:
-      x_send_resp.go(sock, sid, status, headers, body)
+      x_send_resp.go(sock, sid, status, headers, body, cw, buf)
 
 # Httpx slots (unbounded List<St>; single-traversal take in Data wrapper)
 # -----------------------------------------------------------------------
@@ -2344,10 +2368,27 @@ def httpx.sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & HT
   (s2, r) = sent
   httpx.again(s2)
 
-# The read seed a response send hands back (TASK-042 phase 2e) rides in
-# the Got's buffer: it comes after the loop's own leftover on the wire, so
-# the two are appended in that order. A Fail keeps the GotErr (the loop
-# closes on it and the seed is moot).
+# The read seed a send hands back (TASK-042 phase 2e) rides in the Got's
+# buffer. The send started from the caller's buffer, so the seed already
+# holds every byte the caller did not read; the caller passes an empty
+# prefix and takes the seed as its new buffer (TASK-063 phase 7d). A Fail
+# keeps the GotErr (the loop closes on it and the seed is moot).
+# The first three fields of a flow-pump answer: the socket, the result and
+# the read seed. The fourth field is the connection window the pump has
+# left (TASK-063 phase 7b); a caller that does not seed the next send drops
+# it here.
+def httpx.sent3(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32) ->
+  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
+  match sent:
+    case (s, r, seed, cw):
+      (s, r, seed)
+
+# The connection window the pump has left (TASK-063 phase 7c).
+def httpx.sent_cw(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32) -> U32:
+  match sent:
+    case (s, r, seed, cw):
+      cw
+
 def httpx.sent_seed(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +buf: List<&2, U32>) -> Socket & HTTP.Got:
   (s2, r, seed) = sent
   match r:
@@ -3057,7 +3098,7 @@ def client.conn_of(pre: Result<&1, &1, U32 & String, Socket>) ->
       IO.pure(Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, Fail{e})
     case Done{sock}:
       IO.pure(Result<&1, &1, U32 & String, Socket & HTTP.CliSt>,
-        Done{(sock, HTTP.CliSt{1, x_tab.empty(), True{}})})
+        Done{(sock, HTTP.CliSt{1, x_tab.empty(), True{}, x_init_window()})})
 
 def client.conn_h2(conn: Result<&1, &1, U32 & String, Socket>) ->
   IO(Result<&1, &1, U32 & String, Socket & HTTP.CliSt>):
@@ -3091,13 +3132,16 @@ def client.req.send_head(sock: Socket, +sid: U32, +block: List<&2, U32>, is_empt
 
 # The request send hands back the read seed a flow body may have left
 # (TASK-042 phase 2b): an empty body or a one-frame body never stops on
-# a frame, a body that outruns the window can stop on the response.
-def client.req.send(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+# a frame, a body that outruns the window can stop on the response. The
+# fourth field is the connection window the pump has left, and `buf` is
+# the bytes an earlier send of the same pipeline already read (TASK-063
+# phase 7e): the pump must parse them before it reads the socket.
+def client.req.send(sock: Socket, +sid: U32, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>, +cw: U32, +buf: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   +empty = List.is_empty(&2, U32, body)
-  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
+  do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- client.req.send_head(sock, sid, client.req.block(host, port, method, path, hs), empty)
-    x_send_resp_head(sent, sid, body, empty)
+    x_send_resp_head(sent, sid, body, empty, cw, buf)
 
 # Streaming download (Phase E): H2 HEADERS/DATA to a pure handler, O(1)
 # per chunk (counts only, no body accumulation). WU per non-fin DATA
@@ -3155,14 +3199,14 @@ def client.stream.head_act(~H: HTTP.StreamEv -> HTTP.StreamOut, ev: HTTP.StreamE
 # fails 8, and the credit and send helpers answer the socket beside the
 # counts. The merged loop attaches the table and the sink below.
 def client.loop.cancel_done(rst: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>):
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes>):
   (s2, r2) = rst
-  IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, (s2, Fail{(8, "cancelled")}))
+  IO.pure(Socket & Result<&1, &1, U32 & String, LoopRes>, (s2, Fail{(8, "cancelled")}))
 
 def client.loop.cancelled(got: Socket & HTTP.Got, +sid: U32) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>):
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes>):
   (s, g) = got
-  do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>>:
+  do IO<Socket & Result<&1, &1, U32 & String, LoopRes>>:
     rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s, sid, 8)
     client.loop.cancel_done(rst)
 
@@ -3179,13 +3223,13 @@ def client.loop.next_got(s: Socket) -> Socket & HTTP.Got:
   (s, HTTP.GotErr{0, "next"})
 
 def client.loop.sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>):
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes>):
   (s, r) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, (s, Fail{e}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, LoopRes>, (s, Fail{e}))
     case Done{u}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, (s, Fail{(502, "continuation")}))
+      IO.pure(Socket & Result<&1, &1, U32 & String, LoopRes>, (s, Fail{(502, "continuation")}))
 
 # The loop result carries the HPACK table beside the counts: the next
 # request on the same connection decodes against it (TASK-058 phase 1).
@@ -3195,6 +3239,13 @@ def client.loop.sendfail(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
 
 type Sink is Data:
   Sink{head: HTTP.Head, rev: List<&2, U32>}
+
+# The answer of the merged client loop: the body byte count, the finished
+# stream count, the ledger and the connection send window the loop has
+# left (TASK-063 phase 7c). A four-field & chain cannot ride inside
+# Result as a type argument, so it is a Data type.
+type LoopRes is Data:
+  LoopRes{t: U32, f: U32, ss: List<&2, HTTP.St>, cw: U32}
 
 # act + the body being built + the collect flag ride in one Data: the
 # checker refuses a second match after a tuple destructure.
@@ -3220,48 +3271,48 @@ def client.loop.push(is_on: Bool, +payload: List<&2, U32>, +rev: List<&2, U32>) 
 
 # The once lane answers counts only: this def drops the ledger of the
 # merged loop answer.
-def client.loop.counts(r: Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>) ->
+def client.loop.counts(r: Result<&1, &1, U32 & String, LoopRes>) ->
   Result<&1, &1, U32 & String, U32 & U32>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{c}:
       match c:
-        case (+t, (+f, ss)):
+        case LoopRes{+t, +f, ss, +cw2}:
           Done{(t, f)}
 
 # The merged loop answers the wide shape, so each terminal attaches the
 # table and the sink of the once lane; the concurrent lane drops both in
 # its projection.
-def client.loop.attach(out: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
+def client.loop.attach(out: Socket & Result<&1, &1, U32 & String, LoopRes>, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   (s, r) = out
-  IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink, (s, r, tab, Sink{head, rev}))
+  IO.pure(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink, (s, r, tab, Sink{head, rev}))
 
 def client.loop.fail_s(s: Socket, +code: U32, +msg: String, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   client.loop.attach((s, Fail{(code, msg)}), tab, head, rev)
 
 def client.loop.fail_t(got: Socket & HTTP.Got, +code: U32, +msg: String, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   (s, g) = got
   client.loop.fail_s(s, code, msg, tab, head, rev)
 
-def client.loop.done_t(got: Socket & HTTP.Got, +total: U32, +fins: U32, +slots: List<&2, HTTP.St>, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
+def client.loop.done_t(got: Socket & HTTP.Got, +total: U32, +fins: U32, +slots: List<&2, HTTP.St>, +cw: U32, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   (s, g) = got
-  client.loop.attach((s, Done{(total, fins, slots)}), tab, head, rev)
+  client.loop.attach((s, Done{LoopRes{total, fins, slots, cw}}), tab, head, rev)
 
 def client.loop.cancelled_t(got: Socket & HTTP.Got, +sid: U32, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
-  do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
-    out : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> <- client.loop.cancelled(got, sid)
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
+  do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
+    out : Socket & Result<&1, &1, U32 & String, LoopRes> <- client.loop.cancelled(got, sid)
     client.loop.attach(out, tab, head, rev)
 
 def client.loop.sendfail_t(sent: Socket & Result<&1, &1, U32 & String, Unit>, +tab: HTTP.Tab, +head: HTTP.Head, +rev: List<&2, U32>) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
-  do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
-    out : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> <- client.loop.sendfail(sent)
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
+  do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
+    out : Socket & Result<&1, &1, U32 & String, LoopRes> <- client.loop.sendfail(sent)
     client.loop.attach(out, tab, head, rev)
 
 # Stream-lane close helpers: they drop the loop shape each lane needs
@@ -3283,28 +3334,46 @@ def client_stream.drained(drained: Socket & Result<&1, &1, U32 & String, U32 & U
 
 # The concurrent mode answers counts beside the ledger; this lane counts
 # and closes (one loop serves both concurrent lanes).
-def client_stream.counted(out: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>) ->
+def client_stream.counted(out: Socket & Result<&1, &1, U32 & String, LoopRes>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   (s, r) = out
   client_stream.drained((s, client.loop.counts(r)))
 
 def client.loop.st_sid(+st: HTTP.CliSt) -> U32:
   match st:
-    case HTTP.CliSt{+sid, tab, h2}:
+    case HTTP.CliSt{+sid, tab, h2, cw}:
       sid
 
 def client.loop.st_tab(+st: HTTP.CliSt) -> HTTP.Tab:
   match st:
-    case HTTP.CliSt{sid, +tab, h2}:
+    case HTTP.CliSt{sid, +tab, h2, cw}:
       tab
 
 def client.loop.next_sid(+sid: U32) -> U32:
   (sid + 2 : U32)
 
+# The connection window the client has left, and the setter the send
+# chain uses to store what the pump of the last body returned
+# (TASK-063 phase 7c).
+def client.loop.st_cw(+st: HTTP.CliSt) -> U32:
+  match st:
+    case HTTP.CliSt{sid, tab, h2, cw}:
+      cw
+
+def client.loop.st_set_cw(+st: HTTP.CliSt, +cw: U32) -> HTTP.CliSt:
+  match st:
+    case HTTP.CliSt{+sid, tab, +h2, old}:
+      HTTP.CliSt{sid, tab, h2, cw}
+
 def client.loop.next_st(+st: HTTP.CliSt, +tab: HTTP.Tab) -> HTTP.CliSt:
   match st:
-    case HTTP.CliSt{+sid, old, +h2}:
-      HTTP.CliSt{client.loop.next_sid(sid), tab, h2}
+    case HTTP.CliSt{+sid, old, +h2, cw}:
+      HTTP.CliSt{client.loop.next_sid(sid), tab, h2, cw}
+
+# The CliSt after one exchange: the next sid, the loop table and the
+# window the loop has left (TASK-063 phase 7c). Both fold paths call it.
+def client.loop.st_after(+st: HTTP.CliSt, +tab: HTTP.Tab, +cw: U32) -> HTTP.CliSt:
+  client.loop.st_set_cw(client.loop.next_st(st, tab), cw)
 
 # Concurrent slots (Phase D): response assembly per sid. The client lane
 # keeps one ledger entry for each open stream, in the shared St type: its
@@ -3376,25 +3445,31 @@ def httpxc.data_cont_slots(p: HTTP.Taken, +payload: List<&2, U32>) -> List<&2, H
 # in wire order: bytes read during an earlier send are always ahead of the
 # ones read during a later one.
 @unsafe
-def client_conc.send_next(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>) ->
+def client_conc.send_next(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
-  (s, r, rest) = sent
-  match r:
-    case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{e}, acc))
-    case Done{u}:
-      client_conc.send_all(s, (sid + 2 : U32), host, port, reqs, List.append(&2, U32, acc, rest))
+  (s, r, rest, cw2) = sent
+  client_conc.send_after(r, s, sid, host, port, reqs, acc, rest, cw2)
 
 @unsafe
-def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>) ->
+def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
   match reqs:
     case Nil{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (sock, Done{Unit{}}, acc))
     case HTTP.Request{+method, +path, +headers, +body} <> t:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.req.send(sock, sid, host, port, method, path, headers, body)
-        client_conc.send_next(sent, sid, host, port, t, acc)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client.req.send(sock, sid, host, port, method, path, headers, body, cw, acc)
+        client_conc.send_next(sent, sid, host, port, t, acc, cw)
+
+# The answer of the last send picks the next step: a Fail keeps it, a
+# Done hands the read seed and the window the pump left to the next send.
+def client_conc.send_after(r: Result<&1, &1, U32 & String, Unit>, s: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +rest: List<&2, U32>, +cw2: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, (s, Fail{e}, acc))
+    case Done{u}:
+      client_conc.send_all(s, (sid + 2 : U32), host, port, reqs, rest, cw2)
 
 # Concurrent leaf of the loop: the phase a finished stream leaves it on
 # (7 when it was the last one, else 0).
@@ -3837,47 +3912,47 @@ def client.loop.rst_act(+mode: U32, +slots: List<&2, HTTP.St>, +sid2: U32, is_op
 # 6.9.1), so the loop never walks the payload to count it. A hop that
 # carries no frame passes 0.
 @unsafe
-def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.CStreamOut, +mode: U32, phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +tab: HTTP.Tab, +exp: U32, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +pending: U32, +high: U32, +head: HTTP.Head, +ok: Bool, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, act: Act) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink):
+def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.CStreamOut, +mode: U32, phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +tab: HTTP.Tab, +exp: U32, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +pending: U32, +high: U32, +head: HTTP.Head, +ok: Bool, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, act: Act) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink):
   match phase:
     case 0:
       (s0, g0) = got
-      do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+      do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
         got2 : Socket & HTTP.Got <- x_read_frame(s0, buf)
-        client.loop(~S, ~C, mode, 1, got2, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, act)
+        client.loop(~S, ~C, mode, 1, got2, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, act)
     case 1:
       (s1, g1) = got
       match g1 act:
         case HTTP.GotErr{code1, msg1} Act{+a1, +r1, +c1}:
           client.loop.fail_s(s1, code1, msg1, tab, head, r1)
         case HTTP.GotOk{HTTP.Frame{+typ2, +flags2, +sid22, +flen2, +payload2}, +buf2} Act{+a1, +r1, +c1}:
-          client.loop(~S, ~C, mode, 2, (s1, HTTP.GotOk{HTTP.Frame{typ2, flags2, sid22, flen2, payload2}, buf2}), buf2, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ2, flags2, sid22, payload2, flen2, client.loop.cls_of(mode, typ2, flags2, sid22, payload2, sid22, exp), x_fin(flags2), Act{4, r1, c1})
+          client.loop(~S, ~C, mode, 2, (s1, HTTP.GotOk{HTTP.Frame{typ2, flags2, sid22, flen2, payload2}, buf2}), buf2, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ2, flags2, sid22, payload2, flen2, client.loop.cls_of(mode, typ2, flags2, sid22, payload2, sid22, exp), x_fin(flags2), Act{4, r1, c1})
     case 2:
       match cls act:
         case 1 Act{+a2, +r2, +c2}:
-          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+          do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             got2 : Socket & HTTP.Got <- httpx.ack(got)
-            client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
+            client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
         case 4 Act{+a2, +r2, +c2}:
-          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+          do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             gotp : Socket & HTTP.Got <- httpx.ack_ping(got, payload)
-            client.loop(~S, ~C, mode, 0, gotp, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
+            client.loop(~S, ~C, mode, 0, gotp, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
         case 5 Act{+a2, +r2, +c2}:
           client.loop.fail_t(got, x_goaway.status(payload, exp), x_goaway.reason(payload, exp), tab, head, r2)
         case 7 Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, client.loop.wu_cw(cw, sid2, payload), pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
         case 9 Act{+a2, +r2, +c2}:
           client.loop.fail_t(got, 502, "bad window_update", tab, head, r2)
         case 8 Act{+a2, +r2, +c2}:
           client.loop.fail_t(got, 502, "continuation", tab, head, r2)
         case 2 Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 9, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.rst_act(mode, slots, sid2, client_conc.opened(sid2, high)), r2, c2})
+          client.loop(~S, ~C, mode, 9, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.rst_act(mode, slots, sid2, client_conc.opened(sid2, high)), r2, c2})
         case 6 Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 3, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{4, r2, c2})
+          client.loop(~S, ~C, mode, 3, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{4, r2, c2})
         case 0 Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
         case _ Act{+a2, +r2, +c2}:
-          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2})
     case 3:
       match typ act:
         case 1 Act{+a3, +r3, +c3}:
@@ -3888,41 +3963,41 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
           +ok3 : Bool = client.resp.head_ok(x_resp.ok(dr), is_tr, client.resp.status(nh))
           +need : U32 = ledger.need_u(typ, flags)
           +a3x : U32 = client.loop.head_act3(~S, mode, c3, slots, sid2, nh, need, ok3, end, is_tr, client_conc.opened(sid2, high))
-          client.loop(~S, ~C, mode, 4, got, buf, nt, exp, slots, cpend, spend, pending, high, client.loop.head3_keep(mode, head, nh, is_tr), ok3, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{a3x, r3, c3})
+          client.loop(~S, ~C, mode, 4, got, buf, nt, exp, slots, cpend, spend, cw, pending, high, client.loop.head3_keep(mode, head, nh, is_tr), ok3, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{a3x, r3, c3})
         case 0 Act{+a3, +r3, +c3}:
           +body3 : List<&2, U32> = x_data_body(payload, flags)
-          client.loop(~S, ~C, mode, client.loop.data_phase(mode), got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.data_act3(~S, mode, slots, sid2, head, body3, end), r3, c3})
+          client.loop(~S, ~C, mode, client.loop.data_phase(mode), got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.data_act3(~S, mode, slots, sid2, head, body3, end), r3, c3})
         case _ Act{+a3, +r3, +c3}:
-          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r3, c3})
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r3, c3})
     case 4:
       match act:
         case Act{+a4, +r4, +c4}:
           match a4:
             case 1:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +wbz : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, 0, True{})
                 gotz : Socket & HTTP.Got <- x_wu.send(got, buf, wbz)
-                client.loop.done_t(gotz, total, (fins + 1 : U32), Nil{}, tab, head, r4)
+                client.loop.done_t(gotz, total, (fins + 1 : U32), Nil{}, cw, tab, head, r4)
             case 4:
-              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
+              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
             case 5:
               client.loop.fail_t(got, 502, "head decode", tab, head, r4)
             case 6:
-              client.loop(~S, ~C, mode, 6, client.loop.next_got(httpx.wo(got)), buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, HTTP.x_cat(payload), flen, 0, end, Act{0, r4, c4})
+              client.loop(~S, ~C, mode, 6, client.loop.next_got(httpx.wo(got)), buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, HTTP.x_cat(payload), flen, 0, end, Act{0, r4, c4})
             case 7:
               client.loop.cancelled_t(got, sid2, tab, head, r4)
             case 8:
               client.loop.fail_t(got, 502, "slot mismatch", tab, head, r4)
             case 9:
-              client.loop(~S, ~C, mode, 4, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_act(client_cstream.head_out_go(sid2, C(HTTP.CStreamHead{sid2, head}), ok, end)), r4, c4})
+              client.loop(~S, ~C, mode, 4, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_act(client_cstream.head_out_go(sid2, C(HTTP.CStreamHead{sid2, head}), ok, end)), r4, c4})
             case 10:
-              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, ledger.put(slots, HTTP.St{Some{HTTP.SlotResp{head}}, Nil{}, sid2}), cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
+              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, ledger.put(slots, HTTP.St{Some{HTTP.SlotResp{head}}, Nil{}, sid2}), cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
             case 11:
-              client.loop(~S, ~C, mode, client_conc.finish_next(pending), got, buf, tab, exp, client.concurrent.finish_slots(c4, slots, head, sid2), cpend, spend, client_conc.pending_dec(pending), high, head, ok, total, (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
+              client.loop(~S, ~C, mode, client_conc.finish_next(pending), got, buf, tab, exp, client.concurrent.finish_slots(c4, slots, head, sid2), cpend, spend, cw, client_conc.pending_dec(pending), high, head, ok, total, (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
             case 17:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got), sid2, 8)
-                client.loop(~S, ~C, mode, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, exp, client_cstream.tombstone(slots, sid2), cpend, x_wu.del(spend, sid2), client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
+                client.loop(~S, ~C, mode, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, exp, client_cstream.tombstone(slots, sid2), cpend, x_wu.del(spend, sid2), cw, client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r4, c4})
             case _:
               client.loop.fail_t(got, 502, "head", tab, head, r4)
     case 5:
@@ -3930,17 +4005,17 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
         case Act{+a5, +r5, +c5}:
           match a5:
             case 0:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +fin : Bool = U32.is_eq(end, 1)
                 +wb : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin)
                 got2 : Socket & HTTP.Got <- x_wu.send(got, buf, wb)
-                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), pending, high, head, ok, (total + flen : U32), fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, client.loop.push(c5, payload, r5), c5})
+                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), cw, pending, high, head, ok, (total + flen : U32), fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, client.loop.push(c5, payload, r5), c5})
             case 1:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +fin1 : Bool = U32.is_eq(end, 1)
                 +wb1 : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin1)
                 got2 : Socket & HTTP.Got <- x_wu.send(got, buf, wb1)
-                client.loop.done_t(got2, (total + flen : U32), (fins + 1 : U32), Nil{}, tab, head, client.loop.push(c5, payload, r5))
+                client.loop.done_t(got2, (total + flen : U32), (fins + 1 : U32), Nil{}, cw, tab, head, client.loop.push(c5, payload, r5))
             case 4:
               client.loop.fail_t(got, 502, "stray data", tab, head, r5)
             case 7:
@@ -3948,36 +4023,36 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
             case 8:
               client.loop.fail_t(got, 502, "slot mismatch", tab, head, r5)
             case 13:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +fin13 : Bool = U32.is_eq(end, 1)
                 +wb13 : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin13)
                 got2 : Socket & HTTP.Got <- x_wu.send(got, buf, wb13)
-                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, client.concurrent.data_slots(c5, slots, sid2, x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin13), x_wu.next_spend(spend, sid2, flen, fin13), pending, high, head, ok, (total + flen : U32), fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
+                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, client.concurrent.data_slots(c5, slots, sid2, x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin13), x_wu.next_spend(spend, sid2, flen, fin13), cw, pending, high, head, ok, (total + flen : U32), fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
             case 14:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +fin14 : Bool = U32.is_eq(end, 1)
                 +wb14 : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin14)
                 got2 : Socket & HTTP.Got <- x_wu.send(got, buf, wb14)
-                client.loop(~S, ~C, mode, client_conc.finish_next(pending), got2, buf, tab, exp, client.concurrent.end_slots(c5, slots, sid2, x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin14), x_wu.next_spend(spend, sid2, flen, fin14), client_conc.pending_dec(pending), high, head, ok, (total + flen : U32), (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
+                client.loop(~S, ~C, mode, client_conc.finish_next(pending), got2, buf, tab, exp, client.concurrent.end_slots(c5, slots, sid2, x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin14), x_wu.next_spend(spend, sid2, flen, fin14), cw, client_conc.pending_dec(pending), high, head, ok, (total + flen : U32), (fins + 1 : U32), 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
             case 17:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +wb17 : List<&2, U32> = x_wu.stray_bytes(cpend, flen)
                 got17 : Socket & HTTP.Got <- x_wu.send(got, buf, wb17)
                 rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got17), sid2, 8)
-                client.loop(~S, ~C, mode, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, exp, client_cstream.tombstone(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
+                client.loop(~S, ~C, mode, client_conc.finish_next(pending), httpx.sent(rst), buf, tab, exp, client_cstream.tombstone(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), cw, client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r5, c5})
             case _:
               client.loop.fail_t(got, 502, "data", tab, head, r5)
     case 6:
       (s6, g6) = got
       match g6 act:
         case HTTP.GotErr{0, msg6} Act{+a6, +r6, +c6}:
-          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+          do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             got6 : Socket & HTTP.Got <- x_read_frame(s6, buf)
-            client.loop(~S, ~C, mode, 6, got6, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, sid2, payload, flen, 0, end, Act{0, r6, c6})
+            client.loop(~S, ~C, mode, 6, got6, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, sid2, payload, flen, 0, end, Act{0, r6, c6})
         case HTTP.GotErr{code6, msg6} Act{+a6, +r6, +c6}:
           client.loop.fail_s(s6, code6, msg6, tab, head, r6)
         case HTTP.GotOk{HTTP.Frame{+typ6, +flags6, +sid6, +flen6, +pay6}, +buf6} Act{+a6, +r6, +c6}:
-          client.loop(~S, ~C, mode, 7, (s6, HTTP.GotOk{HTTP.Frame{typ6, flags6, sid6, flen6, pay6}, buf6}), buf6, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ6, flags6, sid2, HTTP.x_rev_push(pay6, payload), flen6, client.cont.cls_of(typ6, sid6, client.loop.cont_sid(mode, exp, sid2), flags6, x_block_over(payload, pay6)), x_fin(flags6), Act{0, r6, c6})
+          client.loop(~S, ~C, mode, 7, (s6, HTTP.GotOk{HTTP.Frame{typ6, flags6, sid6, flen6, pay6}, buf6}), buf6, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ6, flags6, sid2, HTTP.x_rev_push(pay6, payload), flen6, client.cont.cls_of(typ6, sid6, client.loop.cont_sid(mode, exp, sid2), flags6, x_block_over(payload, pay6)), x_fin(flags6), Act{0, r6, c6})
     case 7:
       (s7, g7) = got
       match cls act:
@@ -3987,13 +4062,13 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
           +is_tr7 : Bool = client.loop.is_tr(mode, slots, head, sid2, nh7)
           +ok7 : Bool = client.resp.head_ok(x_resp.ok(dr7), is_tr7, client.resp.status(nh7))
           +a7x : U32 = client.loop.cont_act(mode, c7, slots, sid2, nh7, ok7, end, is_tr7, client_conc.opened(sid2, high))
-          client.loop(~S, ~C, mode, 4, client.loop.next_got(s7), buf, x_resp.tab(dr7), exp, slots, cpend, spend, pending, high, client.loop.head3_keep(mode, head, nh7, is_tr7), ok7, total, fins, typ, flags, sid2, Nil{}, 0, cls, end, Act{a7x, r7, c7})
+          client.loop(~S, ~C, mode, 4, client.loop.next_got(s7), buf, x_resp.tab(dr7), exp, slots, cpend, spend, cw, pending, high, client.loop.head3_keep(mode, head, nh7, is_tr7), ok7, total, fins, typ, flags, sid2, Nil{}, 0, cls, end, Act{a7x, r7, c7})
         case 1 Act{+a7, +r7, +c7}:
-          client.loop(~S, ~C, mode, 6, client.loop.next_got(s7), buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, sid2, payload, flen, 0, end, Act{0, r7, c7})
+          client.loop(~S, ~C, mode, 6, client.loop.next_got(s7), buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, sid2, payload, flen, 0, end, Act{0, r7, c7})
         case 3 Act{+a7, +r7, +c7}:
           client.loop.fail_s(s7, 431, "header block too large", tab, head, r7)
         case _ Act{+a7, +r7, +c7}:
-          do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+          do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_goaway(s7, 0, 1)
             client.loop.sendfail_t(sent, tab, head, r7)
     case 9:
@@ -4001,13 +4076,13 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
         case Act{+a9, +r9, +c9}:
           match a9:
             case 0:
-              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r9, c9})
+              client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r9, c9})
             case 8:
               client.loop.fail_t(got, 502, "slot mismatch", tab, head, r9)
             case 18:
               client.loop.fail_t(got, x_rst.status(payload), x_rst.reason(payload), tab, head, r9)
             case _:
-              client.loop(~S, ~C, mode, client_conc.finish_next(pending), got, buf, tab, exp, client_cstream.tombstone(slots, sid2), cpend, x_wu.del(spend, sid2), client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r9, c9})
+              client.loop(~S, ~C, mode, client_conc.finish_next(pending), got, buf, tab, exp, client_cstream.tombstone(slots, sid2), cpend, x_wu.del(spend, sid2), cw, client_conc.pending_dec(pending), high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r9, c9})
     case 10:
       match act:
         case Act{+a10, +r10, +c10}:
@@ -4015,19 +4090,19 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
             case 0:
               match c10:
                 case True{}:
-                  client.loop(~S, ~C, mode, 5, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_data(ledger.decide_data(True{}, end)), r10, c10})
+                  client.loop(~S, ~C, mode, 5, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_data(ledger.decide_data(True{}, end)), r10, c10})
                 case False{}:
-                  client.loop(~S, ~C, mode, 5, got, buf, tab, exp, slots, cpend, spend, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_data(client_cstream.data_out_go(sid2, C(HTTP.CStreamData{sid2, x_data_body(payload, flags), U32.is_eq(end, 1)}), end)), r10, c10})
+                  client.loop(~S, ~C, mode, 5, got, buf, tab, exp, slots, cpend, spend, cw, pending, high, head, ok, total, fins, typ, flags, sid2, payload, flen, cls, end, Act{client.loop.conc_data(client_cstream.data_out_go(sid2, C(HTTP.CStreamData{sid2, x_data_body(payload, flags), U32.is_eq(end, 1)}), end)), r10, c10})
             case _:
-              do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+              do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
                 +wb10 : List<&2, U32> = x_wu.stray_bytes(cpend, flen)
                 got2 : Socket & HTTP.Got <- x_wu.send(got, buf, wb10)
-                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r10, c10})
+                client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), cw, pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r10, c10})
     case 11:
-      do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink>:
+      do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
         +wbz : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, 0, True{})
         gotz : Socket & HTTP.Got <- x_wu.send(got, buf, wbz)
-        client.loop.done_t(gotz, total, fins, slots, tab, head, Nil{})
+        client.loop.done_t(gotz, total, fins, slots, cw, tab, head, Nil{})
     case _:
       client.loop.fail_t(got, 502, "bad phase", tab, head, Nil{})
 
@@ -4040,16 +4115,16 @@ def client.no_cstream(ev: HTTP.CStreamEv) -> HTTP.CStreamOut:
 
 # N in flight: the merged loop with mode concurrent and the pure handler
 # idle. The table and the sink the wide answer carries are dropped here.
-def client.loop.wide_t(out: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>):
+def client.loop.wide_t(out: Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes>):
   (s, r, tab, k) = out
-  IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, (s, r))
+  IO.pure(Socket & Result<&1, &1, U32 & String, LoopRes>, (s, r))
 
-def client.loop.concurrent(~H: HTTP.CStreamEv -> HTTP.CStreamOut, phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +tab: HTTP.Tab, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +pending: U32, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +head: HTTP.Head, +ok: Bool, act: Act) ->
-  IO(Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>):
-  do IO<Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>>:
-    out : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink <-
-      client.loop(~client.no_event, ~H, x_mode.concurrent(), phase, got, buf, tab, client_conc.first_sid(), slots, cpend, spend, pending, client_conc.high(pending, 0), head, ok, total, fins, typ, flags, sid2, payload, 0, cls, end, act)
+def client.loop.concurrent(~H: HTTP.CStreamEv -> HTTP.CStreamOut, phase: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +tab: HTTP.Tab, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +pending: U32, +total: U32, +fins: U32, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +cls: U32, +end: U32, +head: HTTP.Head, +ok: Bool, act: Act) ->
+  IO(Socket & Result<&1, &1, U32 & String, LoopRes>):
+  do IO<Socket & Result<&1, &1, U32 & String, LoopRes>>:
+    out : Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink <-
+      client.loop(~client.no_event, ~H, x_mode.concurrent(), phase, got, buf, tab, client_conc.first_sid(), slots, cpend, spend, cw, pending, client_conc.high(pending, 0), head, ok, total, fins, typ, flags, sid2, payload, 0, cls, end, act)
     client.loop.wide_t(out)
 
 # Sequential lane over the merged loop (TASK-058 phase 1, form A of E1):
@@ -4058,11 +4133,22 @@ def client.loop.concurrent(~H: HTTP.CStreamEv -> HTTP.CStreamOut, phase: U32, go
 # one CliSt for each request; it pays nothing for each frame.
 # ---------------------------------------------------------------------
 
-def client.loop.exch.tabbed(out: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink, +st: HTTP.CliSt) ->
+# The same fold for the sequential lane: counts plus the next CliSt.
+def client.loop.exch.out(s: Socket, r: Result<&1, &1, U32 & String, LoopRes>, +tab: HTTP.Tab, +st: HTTP.CliSt) ->
+  Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt:
+  match r:
+    case Fail{e}:
+      (s, Fail{e}, st)
+    case Done{+done}:
+      match done:
+        case LoopRes{+t, +f, ss, +cw}:
+          (s, Done{(t, f)}, client.loop.st_after(st, tab, cw))
+
+def client.loop.exch.tabbed(out: Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink, +st: HTTP.CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt):
   (s, r, tab, k) = out
   IO.pure(Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt,
-    (s, client.loop.counts(r), client.loop.next_st(st, tab)))
+    client.loop.exch.out(s, r, tab, st))
 
 def client.loop.exch.sent(~H: HTTP.StreamEv -> HTTP.StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +st: HTTP.CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt):
@@ -4073,8 +4159,8 @@ def client.loop.exch.sent(~H: HTTP.StreamEv -> HTTP.StreamOut, sent: Socket & Re
         (sock, Fail{e}, st))
     case Done{u}:
       do IO<Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt>:
-        out : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink <-
-          client.loop(~H, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), seed, client.loop.st_tab(st), client.loop.st_sid(st), Nil{}, 0, Nil{}, 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, False{}})
+        out : Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink <-
+          client.loop(~H, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), seed, client.loop.st_tab(st), client.loop.st_sid(st), Nil{}, 0, Nil{}, client.loop.st_cw(st), 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, False{}})
         client.loop.exch.tabbed(out, st)
 
 def client.loop.exch(~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +st: HTTP.CliSt, +host: String, +port: U32, req: HTTP.Request) ->
@@ -4082,10 +4168,10 @@ def client.loop.exch(~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +st: HTT
   match req:
     case HTTP.Request{method, path, headers, body}:
       do IO<Socket & Result<&1, &1, U32 & String, U32 & U32> & HTTP.CliSt>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <-
+        sent4 : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <-
           client.req.send(sock, client.loop.st_sid(st), host, port,
-            method, path, headers, body)
-        client.loop.exch.sent(~H, sent, st)
+            method, path, headers, body, client.loop.st_cw(st), Nil{})
+        client.loop.exch.sent(~H, httpx.sent3(sent4), st)
 
 # Streaming entries (TASK-058 phase 2): one, N in order and N in flight.
 # Each dials, runs its loop and closes on every exit.
@@ -4199,7 +4285,7 @@ def client_cstream.after_send(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sent: Socke
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> <- client.loop.concurrent(~H, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, False{}})
+        drained : Socket & Result<&1, &1, U32 & String, LoopRes> <- client.loop.concurrent(~H, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, False{}})
         client_stream.counted(drained)
 
 # N in flight (phase 2): send the batch, run the collect=false loop and
@@ -4214,7 +4300,7 @@ def client.stream.concurrent.conn(~H: HTTP.CStreamEv -> HTTP.CStreamOut, conn: R
     case Done{value}:
       (sock, st) = value
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window())
         client_cstream.after_send(~H, sent, HTTP.client_conc.count(reqs))
 
 # An empty batch answers Done{(0, 0)} with no dial, the contract the
@@ -4251,49 +4337,60 @@ def client.stream.concurrent_insecure(~H: HTTP.CStreamEv -> HTTP.CStreamOut, +ho
 def client.sink.drop(ev: HTTP.StreamEv) -> HTTP.StreamOut:
   HTTP.StreamContinue{}
 
-# This def puts the Sink beside the counts of a good answer.
-def client.loop.fuse(r: Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>, +sink: Sink) ->
-  Result<&1, &1, U32 & String, Sink & U32 & U32>:
+# The buffered answer of the loop: the Sink, the two counts and the
+# connection window the loop has left. A Data type and not a four-field
+# pair, because a pair cannot ride inside Result as a type argument
+# (TASK-063 phase 7c).
+type SinkOut is Data:
+  SinkOut{sink: Sink, t: U32, f: U32, cw: U32}
+
+# This def puts the Sink beside the counts and the window.
+def client.loop.fuse(r: Result<&1, &1, U32 & String, LoopRes>, +sink: Sink) ->
+  Result<&1, &1, U32 & String, SinkOut>:
   match r:
     case Fail{e}:
       Fail{e}
     case Done{counts}:
       match counts:
-        case (+t, (+f, ss)):
-          Done{(sink, (t, f))}
+        case LoopRes{+t, +f, ss, +cw2}:
+          Done{SinkOut{sink, t, f, cw2}}
 
-def client.loop.sink_in(out: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink) ->
-  IO(Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab):
+def client.loop.sink_in(out: Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink) ->
+  IO(Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab):
   (s, r, tab, k) = out
-  IO.pure(Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab, (s, client.loop.fuse(r, k), tab))
+  IO.pure(Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab, (s, client.loop.fuse(r, k), tab))
 
-# This def turns a good answer into the Response the buffered lane wants.
-def client.request.map(r: Result<&1, &1, U32 & String, Sink & U32 & U32>) -> Result<&1, &1, U32 & String, HTTP.Response>:
+# One match folds the answer into the Response and the next CliSt: the
+# loop table, the next sid and the window the loop has left (TASK-063
+# phase 7c). A Fail keeps the old CliSt: the connection is gone, and a
+# zero window would park the next send.
+def client.request.out(s: Socket, r: Result<&1, &1, U32 & String, SinkOut>, +tab: HTTP.Tab, +st: HTTP.CliSt) ->
+  Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt:
   match r:
     case Fail{e}:
-      Fail{e}
-    case Done{done}:
+      (s, Fail{e}, st)
+    case Done{+done}:
       match done:
-        case (sink, counts):
-          Done{client.sink.resp(sink)}
+        case SinkOut{+sink, t, f, +cw}:
+          (s, Done{client.sink.resp(sink)}, client.loop.st_after(st, tab, cw))
 
-def client.request.tabbed(out: Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab, +st: HTTP.CliSt) ->
+def client.request.tabbed(out: Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab, +st: HTTP.CliSt) ->
   IO(Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt):
   (s, r, tab) = out
   IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt,
-    (s, client.request.map(r), client.loop.next_st(st, tab)))
+    client.request.out(s, r, tab, st))
 
 def client.request.sent(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +st: HTTP.CliSt) ->
-  IO(Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab):
+  IO(Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab):
   (sock, r, seed) = sent
   match r:
     case Fail{e}:
-      IO.pure(Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab,
+      IO.pure(Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab,
         (sock, Fail{e}, client.loop.st_tab(st)))
     case Done{u}:
-      do IO<Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab>:
-        out : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink <-
-          client.loop(~client.sink.drop, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), seed, client.loop.st_tab(st), client.loop.st_sid(st), Nil{}, 0, Nil{}, 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, True{}})
+      do IO<Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab>:
+        out : Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink <-
+          client.loop(~client.sink.drop, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), seed, client.loop.st_tab(st), client.loop.st_sid(st), Nil{}, 0, Nil{}, client.loop.st_cw(st), 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, True{}})
         client.loop.sink_in(out)
 
 # One exchange on a connection the caller owns: it never closes, and the
@@ -4303,11 +4400,11 @@ def client.request(sock: Socket, +st: HTTP.CliSt, +host: String, +port: U32, +re
   match req:
     case HTTP.Request{method, path, headers, body}:
       do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <-
+        sent4 : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <-
           client.req.send(sock, client.loop.st_sid(st), host, port,
-            method, path, headers, body)
+            method, path, headers, body, client.loop.st_cw(st), Nil{})
         do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt>:
-          out : Socket & Result<&1, &1, U32 & String, Sink & U32 & U32> & HTTP.Tab <- client.request.sent(sent, st)
+          out : Socket & Result<&1, &1, U32 & String, SinkOut> & HTTP.Tab <- client.request.sent(httpx.sent3(sent4), st)
           client.request.tabbed(out, st)
 
 # One-shot buffered exchange: dial, one request, close. It is the shared
@@ -4755,7 +4852,7 @@ def client.concurrent.fold(~H: HTTP.Response -> U32, slots: List<&2, HTTP.St>, +
               # A tombstone: a dropped stream was never answered.
               client.concurrent.fold(~H, t, acc)
 
-def client.concurrent.drained(~H: HTTP.Response -> U32, drained: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>>) ->
+def client.concurrent.drained(~H: HTTP.Response -> U32, drained: Socket & Result<&1, &1, U32 & String, LoopRes>) ->
   IO(Result<&1, &1, U32 & String, U32>):
   (s, r) = drained
   match r:
@@ -4765,7 +4862,7 @@ def client.concurrent.drained(~H: HTTP.Response -> U32, drained: Socket & Result
         IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
     case Done{c}:
       match c:
-        case (+t, (+f, ss)):
+        case LoopRes{+t, +f, ss, +cw2}:
           do IO<Result<&1, &1, U32 & String, U32>>:
             x : Unit <- TLS.tls_close(s)
             IO.pure(Result<&1, &1, U32 & String, U32>, Done{client.concurrent.fold(~H, ss, 0)})
@@ -4780,8 +4877,8 @@ def client.concurrent.after_send(~H: HTTP.Response -> U32, sent: Socket & Result
         IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> <-
-          client.loop.concurrent(~client.concurrent.drop, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, True{}})
+        drained : Socket & Result<&1, &1, U32 & String, LoopRes> <-
+          client.loop.concurrent(~client.concurrent.drop, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, True{}})
         client.concurrent.drained(~H, drained)
 
 # N in flight on one connection: pipeline N requests, let the loop collect
@@ -4794,7 +4891,7 @@ def client.concurrent.conn(~H: HTTP.Response -> U32, conn: Result<&1, &1, U32 & 
     case Done{value}:
       (sock, st) = value
       do IO<Result<&1, &1, U32 & String, U32>>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window())
         client.concurrent.after_send(~H, sent, HTTP.client_conc.count(reqs))
 
 def client.concurrent(~H: HTTP.Response -> U32, +host: String, +port: U32, +reqs: List<&2, HTTP.Request>) ->
@@ -4877,7 +4974,7 @@ def httpxs.rst_early.go(sock: Socket, +sid: U32, +end: U32, no_body: Bool, +seed
     case False{}:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(sock, sid, 8)
-        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, x_flow_keep(sent, seed))
+        IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, httpx.sent3(x_flow_keep(sent, seed, x_init_window())))
 
 def httpxs.rst_early(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +sid: U32, +end: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>):
@@ -5056,15 +5153,42 @@ def server.admit(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, mode: U32, slots: Li
 # phases, the HPACK, the flow pump and the event tables are shared.
 # The same declared length rides the server loop, and its credit leaf
 # (httpx.wu_er) takes the count instead of the payload.
+# The client side of the same counter (TASK-063 phase 7c): a connection
+# WINDOW_UPDATE raises the send window the client loop tracks, so the
+# next request body seeds from the honest remaining window.
+def client.loop.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
+  match is_conn:
+    case True{}:
+      (cw + x_be32_rd(payload) : U32)
+    case False{}:
+      cw
+
+def client.loop.wu_cw(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
+  client.loop.wu_cw_go(U32.is_eq(sid, 0), cw, payload)
+
+# A connection WINDOW_UPDATE raises the send window the server loop
+# tracks (RFC 9113 section 6.9.1). A stream WU only refills one stream,
+# and the flow pump of that stream reads it itself, so the loop counts
+# the connection frames only.
+def server.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
+  match is_conn:
+    case True{}:
+      (cw + x_be32_rd(payload) : U32)
+    case False{}:
+      cw
+
+def server.wu_cw(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
+  server.wu_cw_go(U32.is_eq(sid, 0), cw, payload)
+
 @unsafe
-def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), +form: U32, +mode: U32, phase: U32, got: Socket & HTTP.Got, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, +rh: HTTP.ReqHead, act: U32, +resp: HTTP.Response, +tab: HTTP.Tab, +drt: HTTP.ReqHead & Bool & HTTP.Tab) ->
+def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), +form: U32, +mode: U32, phase: U32, got: Socket & HTTP.Got, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, +rh: HTTP.ReqHead, act: U32, +resp: HTTP.Response, +tab: HTTP.Tab, +drt: HTTP.ReqHead & Bool & HTTP.Tab) ->
   IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
         got2 : Socket & HTTP.Got <- x_read_frame(s0, httpx.carry(g0, buf))
-        server.loop(~H, ~B, form, mode, 1, got2, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+        server.loop(~H, ~B, form, mode, 1, got2, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 1:
       (s1, g1) = got
       match g1:
@@ -5073,76 +5197,76 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
         case HTTP.GotOk{+frame, +buf2}:
           match frame:
             case HTTP.Frame{+typ2, +flags2, +sid22, +flen2, +payload2}:
-              server.loop(~H, ~B, form, mode, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_cls_of(frame, flags2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+              server.loop(~H, ~B, form, mode, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, cw, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_cls_of(frame, flags2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
             got2 : Socket & HTTP.Got <- httpx.ack(got)
-            server.loop(~H, ~B, form, mode, 0, got2, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, got2, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 4:
           do IO<Unit>:
             gotp : Socket & HTTP.Got <- httpx.ack_ping(got, payload)
-            server.loop(~H, ~B, form, mode, 0, gotp, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, gotp, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
           httpx.close_got(got)
         case 2:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.del(slots, sid2), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, ledger.del(slots, sid2), cpend, spend, cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, server.wu_cw(cw, sid2, payload), fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 9:
           x_fatal_got(got, x_goaway.protocol())
         case 8:
           +body8 : List<&2, U32> = httpx.body_of(ledger.taken_st(ledger.take_del(slots, sid2)))
           +over8 : Bool = x_block_over(body8, payload)
-          server.loop(~H, ~B, form, mode, 6, got, slots, cpend, spend, fends, buf, typ, flags, sid2, payload, flen, cls, x_fin_hdr(flags), HTTP.ReqHead{"", "", Nil{}}, ledger.decide_cont(over8, ledger.frag_has(slots, sid2), x_fin_hdr(flags)), HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 6, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, payload, flen, cls, x_fin_hdr(flags), HTTP.ReqHead{"", "", Nil{}}, ledger.decide_cont(over8, ledger.frag_has(slots, sid2), x_fin_hdr(flags)), HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
-          server.loop(~H, ~B, form, mode, 3, got, slots, cpend, spend, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 3, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case _:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 3:
       match typ:
         case 1:
-          server.loop(~H, ~B, form, mode, 7, got, slots, cpend, spend, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.got(x_req.decode(payload, tab)))
+          server.loop(~H, ~B, form, mode, 7, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.got(x_req.decode(payload, tab)))
         case 0:
           +has3 : Bool = ledger.has(slots, sid2)
           +fin3 : Bool = U32.is_eq(end, 1)
           +body3 : List<&2, U32> = x_data_body(payload, flags)
-          server.loop(~H, ~B, form, mode, 5, got, slots, cpend, spend, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, server.data_act(~H, form, has3, body3, fin3, end, sid2), server.data_resp(~H, form, has3, body3, fin3, sid2), tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 5, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, server.data_act(~H, form, has3, body3, fin3, end, sid2), server.data_resp(~H, form, has3, body3, fin3, sid2), tab, x_req.no_got())
         case _:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{Some{HTTP.SlotReq{rh}}, Nil{}, sid2}), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{Some{HTTP.SlotReq{rh}}, Nil{}, sid2}), cpend, spend, cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           do IO<Unit>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(s4, sid2, resp)
-            rst : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- httpxs.rst_early(sent, sid2, end)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(rst, buf), ledger.del(slots, sid2), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- x_send_resp(s4, sid2, resp, cw, buf)
+            rst : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- httpxs.rst_early(httpx.sent3(sent), sid2, end)
+            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(rst, Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 6:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{None{}, HTTP.x_cat(payload), sid2}), cpend, spend, ledger.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{None{}, HTTP.x_cat(payload), sid2}), cpend, spend, cw, ledger.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 10:
           do IO<Unit>:
             req : HTTP.Request = httpx.req_of(rh, Nil{})
             resp : HTTP.Response <- B(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(s4, sid2, resp)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(sent, buf), ledger.del(slots, sid2), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- x_send_resp(s4, sid2, resp, cw, buf)
+            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 9:
-          server.loop(~H, ~B, form, mode, 8, got, slots, cpend, spend, fends, buf, typ, flags, sid2, Nil{}, 0, cls, end, rh, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 8, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, Nil{}, 0, cls, end, rh, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 2:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s4, sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 5:
           TLS.tls_close(s4)
         case 7:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s4, sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case _:
           TLS.tls_close(s4)
     case 5:
@@ -5153,14 +5277,14 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             +fin : Bool = U32.is_eq(end, 1)
             +wb : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb)
-            server.loop(~H, ~B, form, mode, 0, got2, ledger.data_cont_slots(ledger.take_del(slots, sid2), x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, got2, ledger.data_cont_slots(ledger.take_del(slots, sid2), x_data_body(payload, flags)), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)
             +wb : List<&2, U32> = x_wu.bytes(cpend, spend, sid2, flen, fin)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(sent, buf), ledger.taken_slots(ledger.take_del(slots, sid2)), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- x_send_resp(httpx.wo(got2), sid2, resp, cw, buf)
+            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(ledger.take_del(slots, sid2)), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), httpx.sent_cw(sent), ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 10:
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)
@@ -5169,39 +5293,39 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             +tp : HTTP.Taken = ledger.take_del(slots, sid2)
             req : HTTP.Request = httpx.req_of_st(ledger.taken_st(tp), x_data_body(payload, flags))
             resp : HTTP.Response <- B(req)
-            sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- x_send_resp(httpx.wo(got2), sid2, resp)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(sent, buf), ledger.taken_slots(tp), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- x_send_resp(httpx.wo(got2), sid2, resp, cw, buf)
+            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(tp), x_wu.next_cpend(cpend, flen, fin), x_wu.next_spend(spend, sid2, flen, fin), httpx.sent_cw(sent), ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 8:
           do IO<Unit>:
             +wb8 : List<&2, U32> = x_wu.stray_bytes(cpend, flen)
             got8 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb8)
-            server.loop(~H, ~B, form, mode, 0, got8, slots, x_wu.stray_cpend(cpend, flen), spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, got8, slots, x_wu.stray_cpend(cpend, flen), spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 2:
           do IO<Unit>:
             +wb2 : List<&2, U32> = x_wu.stray_bytes(cpend, flen)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb2)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got2), sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 7:
           do IO<Unit>:
             +wb7 : List<&2, U32> = x_wu.stray_bytes(cpend, flen)
             got7 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb7)
             rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got7), sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(rst), ledger.del(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, httpx.sent(rst), ledger.del(slots, sid2), x_wu.stray_cpend(cpend, flen), x_wu.del(spend, sid2), cw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case _:
           httpx.close_got((sb2, gb2))
     case 6:
       (s6, g6) = got
       match act:
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.frag_cont_slots(ledger.take_del(slots, sid2), payload), cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+          server.loop(~H, ~B, form, mode, 0, got, ledger.frag_cont_slots(ledger.take_del(slots, sid2), payload), cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
         case 1:
           +tp2 : HTTP.Taken = ledger.take_del(slots, sid2)
           +full : List<&2, U32> = HTTP.x_cat(HTTP.x_rev_push(payload, httpx.body_of(ledger.taken_st(tp2))))
           +dr6 : Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab> = x_req.decode(full, tab)
           +fp : HTTP.FendTaken = ledger.fdel_flag(fends, sid2)
           +ff : U32 = ledger.ftaken_flag(fp)
-          server.loop(~H, ~B, form, mode, 7, got, ledger.taken_slots(tp2), cpend, spend, ledger.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, 0, cls, ff, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6))
+          server.loop(~H, ~B, form, mode, 7, got, ledger.taken_slots(tp2), cpend, spend, cw, ledger.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, 0, cls, ff, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6))
         case 2:
           x_fatal(s6, x_goaway.calm())
         case _:
@@ -5213,14 +5337,14 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             case (+ok, +t):
               +nu = ledger.need_u(typ, flags)
               +a7 = server.admit(~H, form, mode, slots, ok, nu, end, h, t, sid2)
-              server.loop(~H, ~B, form, mode, 4, got, slots, cpend, spend, fends, buf, typ, flags, sid2, payload, flen, cls, end, h, a7, server.head_resp(~H, form, a7, ok, nu, end, h, t, sid2), t, x_req.no_got())
+              server.loop(~H, ~B, form, mode, 4, got, slots, cpend, spend, cw, fends, buf, typ, flags, sid2, payload, flen, cls, end, h, a7, server.head_resp(~H, form, a7, ok, nu, end, h, t, sid2), t, x_req.no_got())
     case 8:
       (s8, g8) = got
       do IO<Unit>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s8, sid2, 7)
-        server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+        server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
     case _:
-      server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
+      server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got())
 
 # Streaming accept plumbing: the accept is H2 only behind tls_accept, which
 # asks for h2 at the handshake -- a peer whose offered list has no overlap
@@ -5256,7 +5380,7 @@ def server.pre(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respon
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.no_slots(), 0, Nil{}, ledger.no_fends(), HTTP.x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got())
+            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.no_slots(), 0, Nil{}, x_init_window(), ledger.no_fends(), HTTP.x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got())
         case _:
           TLS.tls_close(s2)
     case _:
@@ -5414,7 +5538,7 @@ def client.resp.head_flags(is_empty: Bool) -> U32:
 
 # The loop answers the counts beside the table; a one-shot lane drops the
 # table and closes through the same helper every other lane uses.
-def client_stream.drained_t(drained: Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink) ->
+def client_stream.drained_t(drained: Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   (s, r, t, k) = drained
   client_stream.drained((s, client.loop.counts(r)))
@@ -5461,19 +5585,19 @@ def client_stream.sent(~H: HTTP.StreamEv -> HTTP.StreamOut, sent: Socket & Resul
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{u}:
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, U32 & U32 & List<&2, HTTP.St>> & HTTP.Tab & Sink <- client.loop(~H, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), rest, x_tab.empty(), 1, Nil{}, 0, Nil{}, 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, False{}})
+        drained : Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink <- client.loop(~H, ~client.no_cstream, x_mode.on(), 0, (sock, HTTP.GotErr{0, "next"}), rest, x_tab.empty(), 1, Nil{}, 0, Nil{}, x_init_window(), 1, client_conc.first_sid(), HTTP.Head{0, Nil{}}, False{}, 0, 0, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, Nil{}, False{}})
         client_stream.drained_t(drained)
 
 def client_stream.exch(~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client.req.send(sock, 1, host, port, method, path, hs, body)
-    client_stream.sent(~H, sent)
+    sent4 : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client.req.send(sock, 1, host, port, method, path, hs, body, x_init_window(), Nil{})
+    client_stream.sent(~H, httpx.sent3(sent4))
 
 def client_cstream.exch(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window())
     client_cstream.after_send(~H, sent, pending)
 
 # The facade leg keeps the name and the socket: it sends the batch on a
@@ -5481,7 +5605,7 @@ def client_cstream.exch(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sock: Socket, +ho
 def client_conc.exch(~H: HTTP.Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
   do IO<Result<&1, &1, U32 & String, U32>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{})
+    sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window())
     client.concurrent.after_send(~H, sent, pending)
 
 # Old helper names (tests and the facade): one line each over the live

@@ -146,6 +146,84 @@ if (MODE === "upwaves") {
   done(bad === 0, `upwaves w=${W} streams=${S} kb=${KB} ok=${ok} bad=${bad} mbps=${((ok * KB) / 1024 / ((Date.now() - t0) / 1000)).toFixed(1)}`);
 }
 
+// Credit peer: N concurrent POSTs on one connection, raw H2, and the peer
+// counts the windows it grants. The cell fails when the server sends a
+// DATA byte past the credit it gave (RFC 9113 section 6.9.1). The peer
+// grants at half of the initial window, like node:http2, and sends its own
+// bodies inside the windows the server announces.
+if (MODE === "credit") {
+  const N = A;
+  const KB = B;
+  const BODY2 = Buffer.alloc(KB * 1024, 97);
+  const sids = Array.from({ length: N }, (_, i) => 1 + 2 * i);
+  const sock = tls.connect({
+    host: "127.0.0.1", port: PORT, ALPNProtocols: ["h2"], rejectUnauthorized: false,
+  });
+  const streams = new Map();
+  for (const sid of sids) streams.set(sid, { off: 0, win: 65535, grant: 65535, got: 0, pend: 0, end: false });
+  let connSend = 65535;
+  let connGrant = 65535;
+  let connGot = 0;
+  let connPend = 0;
+  let ended = 0;
+  let bad = "";
+  const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b; };
+  const fail = (s) => { if (bad === "") { bad = s; } done(false, `credit ${s} bytes=${connGot} ended=${ended}`); };
+  const pump = () => {
+    for (const sid of sids) {
+      const s = streams.get(sid);
+      while (s.off < BODY2.length) {
+        const room = Math.min(connSend, s.win, 16384, BODY2.length - s.off);
+        if (room <= 0) break;
+        const fin = s.off + room === BODY2.length;
+        sock.write(frame(0, fin ? 1 : 0, sid, BODY2.subarray(s.off, s.off + room)));
+        s.off += room; s.win -= room; connSend -= room;
+      }
+    }
+  };
+  const onFrame = (typ, flags, sid, pay) => {
+    if (process.env.VERBOSE) say(`  < ${T[typ] ?? typ} flags=${flags} sid=${sid} len=${pay.length}`);
+    if (typ === 4 && (flags & 1) === 0) { sock.write(frame(4, 1, 0, Buffer.alloc(0))); return; }
+    if (typ === 6 && (flags & 1) === 0) { sock.write(frame(6, 1, 0, pay)); return; }
+    if (typ === 7) { fail(`session goaway code=${pay.readUInt32BE(4)}`); return; }
+    if (typ === 3) { fail(`stream ${sid} reset code=${pay.readUInt32BE(0)}`); return; }
+    if (typ === 8) {
+      const inc = pay.readUInt32BE(0);
+      if (sid === 0) { connSend += inc; } else if (streams.has(sid)) { streams.get(sid).win += inc; }
+      pump();
+      return;
+    }
+    if (typ !== 0) return;
+    const s = streams.get(sid);
+    connGot += pay.length;
+    connPend += pay.length;
+    if (s) { s.got += pay.length; s.pend += pay.length; }
+    if (connGot > connGrant) fail(`connection DATA ${connGot} past granted ${connGrant}`);
+    if (s && s.got > s.grant) fail(`stream ${sid} DATA ${s.got} past granted ${s.grant}`);
+    if (connPend >= 32768) { sock.write(frame(8, 0, 0, u32(connPend))); connGrant += connPend; connPend = 0; }
+    if (s && s.pend >= 32768) { sock.write(frame(8, 0, sid, u32(s.pend))); s.grant += s.pend; s.pend = 0; }
+    if (flags & 1) {
+      s.end = true;
+      ended += 1;
+      if (s.got !== BODY2.length) fail(`stream ${sid} ended at ${s.got} bytes, want ${BODY2.length}`);
+      if (ended === N) done(bad === "" && connGot === N * BODY2.length, `credit streams=${N} kb=${KB} bytes=${connGot} ended=${ended} ${bad}`);
+    }
+  };
+  sock.on("secureConnect", () => {
+    sock.write(PREFACE);
+    sock.write(frame(4, 0, 0, Buffer.alloc(0)));
+    const blk = Buffer.concat([
+      lit(":method", "POST"), lit(":path", "/echo"), lit(":scheme", "https"),
+      lit(":authority", `127.0.0.1:${PORT}`), lit("content-length", String(BODY2.length)),
+    ]);
+    for (const sid of sids) sock.write(frame(1, 4, sid, blk));
+    pump();
+  });
+  sock.on("data", parse(onFrame, false));
+  sock.on("error", (e) => done(false, `credit socket ${e.message}`));
+  setTimeout(() => done(false, `credit timeout bytes=${connGot} ended=${ended} ${bad}`), 20000).unref();
+}
+
 if (MODE === "bigdown") {
   const MB = A;
   const TIMES = B;

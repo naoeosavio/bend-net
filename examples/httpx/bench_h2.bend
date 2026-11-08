@@ -12,6 +12,8 @@
 #   strip_lazy       branch on the PADDED flag first, no length walk
 #   wu_each          receive credit before 6b: a pair of frames per DATA frame
 #   wu_batch         shipped credit: one step per frame, flush at the half
+#   probe_all        the single-frame question before phase 8: x_len32
+#   probe_cap        shipped: x_len_upto stops at x_max_send + 1
 import Base
 import ../../lib/http.bend as HTTP
 import ../../lib/http2.bend as HTTP2
@@ -205,6 +207,15 @@ def wu_each(+n: U32) -> U32:
 def wu_batch(+n: U32) -> U32:
   wu_batch_go(U32.to_nat(n), 0, Nil{}, 0)
 
+# The old single-frame question: the whole body for its length.
+def probe_all(xs: List<&2, U32>) -> U32:
+  HTTP.x_len32(xs)
+
+# The shipped probe: the walk stops at x_send_probe, the smaller of the
+# cap and the caller window plus one (task-063 phase 7d and phase 8).
+def probe_cap(xs: List<&2, U32>) -> U32:
+  HTTP.x_len_upto(HTTP2.x_send_probe(HTTP2.x_init_window()), xs)
+
 @unsafe
 def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>) -> U32:
   match tag:
@@ -222,8 +233,12 @@ def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +fram
       strip_count_lazy(32, frame)
     case 6:
       wu_each(nchunks(HTTP.x_len32(xs)))
-    case _:
+    case 7:
       wu_batch(nchunks(HTTP.x_len32(xs)))
+    case 8:
+      probe_all(xs)
+    case _:
+      probe_cap(xs)
 
 def fold_go(+el: Nat, mn: Nat, rest: Nat & Nat) -> Nat & (Nat & Nat):
   match rest:
@@ -278,6 +293,8 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     r5 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 5, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     r6 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 6, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     r7 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 7, xs, chunks, frame, (600000n, (0n, 0n)), 0)
+    r8 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 8, xs, chunks, frame, (600000n, (0n, 0n)), 0)
+    r9 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 9, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     a : Unit <- report("send_take_drop", want, r0)
     b : Unit <- report("send_chunks", want, r1)
     c : Unit <- report("send_chunks_e2e", want, r2)
@@ -286,7 +303,9 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     f : Unit <- report("strip_lazy", (MAX_SEND() * 32 * U32.from_nat(RUNS()) : U32), r5)
     g : Unit <- report("wu_each", (wu_want_each(n) * U32.from_nat(RUNS()) : U32), r6)
     h : Unit <- report("wu_batch", (wu_want_batch(n) * U32.from_nat(RUNS()) : U32), r7)
-    IO.pure(Unit, h)
+    i : Unit <- report("probe_all", (n * U32.from_nat(RUNS()) : U32), r8)
+    j : Unit <- report("probe_cap", ((MAX_SEND() + 1 : U32) * U32.from_nat(RUNS()) : U32), r9)
+    IO.pure(Unit, j)
 
 def u32_go(m: Maybe<&2, U32>, +dflt: U32) -> U32:
   match m:
