@@ -1,0 +1,20 @@
+# The known failures of h2spec 2.6.0 against examples/httpx/stress_h2.bend
+# in the mode ok, as read from the JUnit report: one line per test, in the
+# form "<package> | <test case>". A line that passes today prints "now
+# passing" and does not fail the gate. A failure with no line here fails
+# the gate.
+#
+# Use the official h2spec 2.6.0 release. A binary built from the same
+# commit with a newer Go shows 7 failures a more (task-073 records the
+# measure).
+#
+# Each line is an accepted deviation, with a reason in docs/h2spec.md and
+# a test that fixes the real limit.
+#
+# 4.2.3: the module announces MAX_FRAME_SIZE 65535, so a 20 KiB HEADERS
+# frame is legal. The limit is fixed by tests/io/http2_frame_over.bend.
+http2/4.2 | Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE
+# 5.1.2.1: the buffered server answers and closes each stream before it
+# reads the next HEADERS, so no two streams stay open. The cap is real and
+# is fixed by tests/io/http2_stream_cap.bend.
+http2/5.1.2 | Sends HEADERS frames that causes their advertised concurrent stream limit to be exceeded

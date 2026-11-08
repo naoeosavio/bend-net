@@ -43,6 +43,11 @@ require break from any other directory. Bend 2.0.21+.
   overrides the 150 s per-file ceiling.
 - Typecheck only: `bend <file> --check-only`.
 - Twin lint + units: `bash tests/effs/parity.sh`, `bash tests/effs/eff-unit.sh`.
+- H2 conformance: `bash tests/conformance/h2spec.sh` builds the stress
+  server, runs h2spec 2.6.0 and compares the failed tests with
+  `tests/conformance/h2spec.expected`. Exit 0 = no new failure. A known
+  failure that passes prints a line and does not fail. `H2SPEC=<bin>` and
+  `H2SPEC_PORT=<port>` override the tool and the port.
 - Publish: `bend lib/package.bend --publish` (imports are not transitive;
   import each API from its own file).
 
@@ -87,10 +92,10 @@ require break from any other directory. Bend 2.0.21+.
   "no TLS". `_plain` means cleartext (`ws://`, `http://`) and takes no cert.
   No `is_tls` flags anywhere.
 - H2 conformance is measured, not assumed: `docs/h2spec.md` holds the
-  `h2spec` 2.6.0 run (143 of 146) and the two accepted deviations. The
-  request head checks the field rules of RFC 9113 8.2/8.3; a trailer
-  block that ends the request answers it, and the trailer fields are
-  dropped.
+  `h2spec` 2.6.0 run and the accepted deviations, and
+  `tests/conformance/h2spec.sh` repeats the run. The request head checks
+  the field rules of RFC 9113 8.2/8.3; a trailer block that ends the
+  request answers it, and the trailer fields are dropped.
 - H2 limits are announced and enforced, not advisory. `lib/http2.bend`
   announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 100 and the two
   65535 sizes in its initial SETTINGS; a header block past 64 KiB

@@ -4,7 +4,7 @@
 # Modes: echo (echo the body), drop (read the body, answer empty),
 #        big (answer [mb] MiB), early (answer at the first DATA chunk),
 #        drain (read the whole body as events, answer at the end),
-#        ok (answer a 2-byte body, the h2spec mode).
+#        ok (answer an 8-byte body, the h2spec mode).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http2.bend as HTTP2
@@ -56,10 +56,12 @@ def echo_h(req: HTTP.Request) -> IO(HTTP.Response):
 def drop_h(req: HTTP.Request) -> IO(HTTP.Response):
   IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, Nil{}})
 
-# The conformance answer: a 2-byte body, so every response carries a DATA
-# frame and a peer sees the stream end. h2spec needs it (task-070 phase 1).
+# The conformance answer: an 8-byte body, so every response carries a
+# DATA frame and a peer sees the stream end. h2spec needs it (task-070
+# phase 1). The body holds 5 octets or more, because h2spec skips the
+# negative-window test 6.9.2.2 below that size (task-071 phase 3).
 def ok_h(req: HTTP.Request) -> IO(HTTP.Response):
-  IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, [111, 107]})
+  IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, [104, 50, 115, 112, 101, 99, 111, 107]})
 
 def big_body(mb: U32) -> HTTP.Response:
   HTTP.Response{200, Nil{}, body_of(mb)}

@@ -4,9 +4,10 @@
 #
 # Act codes: 0 ignore, 1 settings ack, 2 rst_stream, 4 ping ack, 5 close,
 # 6 stream frame, 7 credit, 8 continuation, 9 goaway protocol, 12 goaway
-# frame size, 13 rst_stream stream closed.
+# frame size, 13 rst_stream stream closed, 20 apply the settings base
+# without an ACK.
 #
-# Score: one point per case, golden 77.
+# Score: one point per case, golden 85.
 import Base
 import ../../lib/http.bend as HTTP
 import ../../lib/http2.bend as HTTP2
@@ -43,6 +44,9 @@ def ACT_FRAME_SIZE() -> U32:
 
 def ACT_STREAM_CLOSED() -> U32:
   13
+
+def ACT_SETTLED() -> U32:
+  20
 
 def LAST() -> U32:
   1
@@ -217,7 +221,15 @@ def run() -> U32:
   +s74 : U32 = point(9, dec_code([130, 32, 0]))
   +s75 : U32 = point(9, act(5, 4, 2, 0, nil(), LAST(), False{}, False{}))
   +s76 : U32 = point(16, HTTP2.server.data_act.buffered(False{}, False{}, 0, False{}))
-  +total : U32 = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18 + s19 + s20 + s21 + s22 + s23 + s24 + s25 + s26 + s27 + s28 + s29 + s30 + s31 + s32 + s33 + s34 + s35 + s36 + s37 + s38 + s39 + s40 + s41 + s42 + s43 + s44 + s45 + s46 + s47 + s48 + s49 + s50 + s51 + s52 + s53 + s54 + s55 + s56 + s57 + s58 + s59 + s60 + s61 + s62 + s63 + s64 + s65 + s66 + s67 + s68 + s69 + s70 + s71 + s72 + s73 + s74 + s75 + s76 : U32)
+  +s77 : U32 = point(ACT_SETTLED(), act(4, 16, 0, 6, [0, 4, 0, 0, 4, 0], LAST(), False{}, False{}))
+  +s78 : U32 = point(ACT_ACK(), act(4, 0, 0, 6, [0, 4, 0, 0, 4, 0], LAST(), False{}, False{}))
+  +s79 : U32 = point(1, b2u(HTTP2.x_settled(16)))
+  +s80 : U32 = point(16, HTTP2.x_f_seed(16))
+  +s81 : U32 = point(16, HTTP2.x_f_seed_settled(0))
+  +s82 : U32 = point(ACT_SETTLED(), HTTP2.x_cls(4, 0, 16, nil()))
+  +s83 : U32 = point(ACT_ACK(), HTTP2.x_cls(4, 0, 0, nil()))
+  +s84 : U32 = point(ACT_IGNORE(), HTTP2.x_cls(4, 0, 1, nil()))
+  +total : U32 = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18 + s19 + s20 + s21 + s22 + s23 + s24 + s25 + s26 + s27 + s28 + s29 + s30 + s31 + s32 + s33 + s34 + s35 + s36 + s37 + s38 + s39 + s40 + s41 + s42 + s43 + s44 + s45 + s46 + s47 + s48 + s49 + s50 + s51 + s52 + s53 + s54 + s55 + s56 + s57 + s58 + s59 + s60 + s61 + s62 + s63 + s64 + s65 + s66 + s67 + s68 + s69 + s70 + s71 + s72 + s73 + s74 + s75 + s76 + s77 + s78 + s79 + s80 + s81 + s82 + s83 + s84 : U32)
   total
 
 def main() -> IO(U32):
@@ -226,4 +238,4 @@ def main() -> IO(U32):
     x : Unit <- IO.print(U32.show(total))
     IO.pure(U32, total)
 
-#|77
+#|85

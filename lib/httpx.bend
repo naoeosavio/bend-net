@@ -565,9 +565,11 @@ def x_be32(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 24n), 255), U32.and(U32.shrn(v, 16n), 255), U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
 
 # Initial SETTINGS we announce (RFC 9113 section 6.5): INITIAL_WINDOW_SIZE
-# 65535 + MAX_FRAME_SIZE 65535 (dono decision; Chrome announces 6MB but
-# 65535 is the RFC default and what node uses). Sent at all 4 preface
-# points; ACKs stay empty (ack-with-payload would be a protocol error).
+# 65535 (the RFC 9113 section 6.5.2 initial value) + MAX_FRAME_SIZE 65535
+# (a dono decision: the RFC 9113 section 6.5.2 initial value is 16384, and
+# node, Chrome and Firefox keep it; the change to 16384 is task-062 phase
+# 8). Sent at all 4 preface points; ACKs stay empty (ack-with-payload
+# would be a protocol error).
 def x_be16(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
 

@@ -118,12 +118,9 @@ def is_end(+flags: U32) -> Bool:
 # --- the sender: dial and send BODY with CW bytes of credit -----------
 
 # The seed the send hands back: the frames it read while it waited for
-# credit. A SETTINGS and a WINDOW_UPDATE are acted on, not stashed, so an
-# honest send hands nothing back.
-# The seed the send hands back: the frames it read while it waited for
-# credit. A SETTINGS is left to the loop (it acks it and takes its window),
-# so the seed is empty or holds exactly that frame; a WINDOW_UPDATE is
-# acted on and never stashed.
+# credit. The pump answers a SETTINGS and stores it with the settled flag
+# (task-071), so the seed is empty or holds exactly that frame; a
+# WINDOW_UPDATE is acted on and never stashed.
 def seed_ok(+seed: List<&2, U32>) -> Bool:
   match seed:
     case Nil{}:

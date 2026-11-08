@@ -54,6 +54,21 @@ def x_f_end_stream() -> U32:
 def x_f_end_headers() -> U32:
   4
 
+# The internal flag of a SETTINGS that the flow pump answered itself. The
+# pump stores the frame in the read seed with this bit set. The loop then
+# applies the new base and sends no second ACK (act 20).
+# shortcut: the bit rides in the frame, and x_f_seed keeps an unknown peer
+# flag. A peer that sets 0x10 on a SETTINGS that the loop reads directly
+# then reaches act 20 and gets no ACK. The pump answers every fresh
+# SETTINGS it reads, so no legal peer frame needs the shortcut. Move the
+# marker out of the frame when a peer tests undefined flags on SETTINGS.
+def x_f_settled() -> U32:
+  16
+
+# True when a stored SETTINGS carries the internal settled flag.
+def x_settled(flags: U32) -> Bool:
+  U32.is_eq(U32.and(flags, x_f_settled()), x_f_settled())
+
 # The flag tests of the frame loops, named.
 def x_fin(flags: U32) -> U32:
   U32.and(flags, x_f_end_stream())
@@ -176,9 +191,11 @@ def x_preface() -> List<&2, U32>:
 # Initial SETTINGS we announce (RFC 9113 section 6.5), in ascending id
 # order: ENABLE_PUSH 0 (this library serves no pushed stream, and a peer
 # must not push), MAX_CONCURRENT_STREAMS 100 (the cap server.admit
-# enforces), INITIAL_WINDOW_SIZE 65535 and MAX_FRAME_SIZE 65535 (dono
-# decision; Chrome announces 6MB but 65535 is the RFC default and what node
-# uses). Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 at all 4 preface points; ACKs stay empty (ack-with-payload
+# enforces), INITIAL_WINDOW_SIZE 65535 (the RFC 9113 section 6.5.2
+# initial value) and MAX_FRAME_SIZE 65535 (a dono decision: the RFC 9113
+# section 6.5.2 initial value is 16384, and node, Chrome and Firefox keep
+# it; 65535 is legal, because the range ends at 2^24-1. The change to
+# 16384 is task-062 phase 8). Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 at all 4 preface points; ACKs stay empty (ack-with-payload
 # would be a protocol error).
 def x_be16(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
@@ -1951,6 +1968,23 @@ def x_cls.ping_ack(fresh: Bool) -> U32:
     case False{}:
       0
 
+# The class of a SETTINGS frame of the loop: 20 when the pump answered it
+# (the loop applies the base and sends no second ACK), 1 when it is fresh
+# and 0 when it is an ACK.
+def x_cls_set.fresh(fresh: Bool) -> U32:
+  match fresh:
+    case True{}:
+      1
+    case False{}:
+      0
+
+def x_cls_set(settled: Bool, fresh: Bool) -> U32:
+  match settled:
+    case True{}:
+      20
+    case False{}:
+      x_cls_set.fresh(fresh)
+
 def x_cls3(+typ: U32) -> U32:
   match typ:
     case 4:
@@ -1990,7 +2024,7 @@ def x_cls_wu(+typ: U32, +payload: List<&2, U32>) -> U32:
 def x_conn_cls(+typ: U32, +flags: U32, +payload: List<&2, U32>) -> U32:
   match typ:
     case 4:
-      x_b2u(U32.is_eq(U32.and(flags, x_f_ack()), 0))
+      x_cls_set(x_settled(flags), U32.is_eq(U32.and(flags, x_f_ack()), 0))
     case 6:
       x_cls.ping_ack(U32.is_eq(U32.and(flags, x_f_ack()), 0))
     case 7:
@@ -2188,7 +2222,7 @@ def x_send_data_frame(sock: Socket, +sid: U32, +body: List<&2, U32>) ->
 # Phases: 0 pump, 4 slice (blen = head chunk length, chunk = x_chunk_of),
 # 5 send|park, 6 continue/END_STREAM, 9 parked read, 12 service (WU
 # credit / SETTINGS ack+IW / PING ack / consume / RST-GOAWAY-CONT
-# fail-closed).
+# fail-closed), 20 answer a SETTINGS, 21 store it unanswered.
 # The body arrives as x_chunks() slices of x_max_send() bytes, so the
 # steady path pops one chunk per turn: it keeps the head chunk whole when
 # the two windows cover it (no take32 copy, no drop32 walk) and takes a
@@ -2430,9 +2464,22 @@ def server.cls_head(+sid: U32, last: U32, has: Bool) -> U32:
 def server.cls_rst(+sid: U32, last: U32) -> U32:
   x_pick(x_sid_bad(sid), 9, x_pick(x_sid_new(sid, last), 9, 2))
 
-# SETTINGS rides stream 0 only. An ACK carries no payload.
-def server.cls_set_val(flags: U32, +pay: List<&2, U32>) -> U32:
-  x_pick(U32.is_eq(U32.and(flags, x_f_ack()), 0), x_settings.act(pay), x_pick(List.is_empty(&2, U32, pay), 0, 12))
+# SETTINGS rides stream 0 only. An ACK carries no payload. A frame the
+# pump answered carries the settled flag: the loop applies the base and
+# sends no second ACK (act 20).
+def server.cls_set_go(settled: Bool, fresh: Bool, +pay: List<&2, U32>) -> U32:
+  match settled:
+    case True{}:
+      20
+    case False{}:
+      match fresh:
+        case True{}:
+          x_settings.act(pay)
+        case False{}:
+          x_pick(List.is_empty(&2, U32, pay), 0, 12)
+
+def server.cls_set_val(+flags: U32, +pay: List<&2, U32>) -> U32:
+  server.cls_set_go(x_settled(flags), U32.is_eq(U32.and(flags, x_f_ack()), 0), pay)
 
 def server.cls_set(sid: U32, flags: U32, pay: List<&2, U32>) -> U32:
   x_pick(U32.is_eq(sid, 0), server.cls_set_val(flags, pay), 9)
@@ -2979,6 +3026,15 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
                 +p14 : Socket & HTTP.Got = x_flow.paid_got(paid)
                 +step : U32 & U32 = x_settings.typ_step(typ14, payload14, sw, piw)
                 x_send_data_flow(4, p14, sid, chunks, cw, x_settings.iw_win(step), x_settings.iw_base(step), buf14, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, Nil{}), x_pdc.step(typ14, pdc))
+    case 20:
+      (s20, g20) = got
+      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
+        sent20 : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s20, x_t_settings(), x_f_ack(), 0, Nil{})
+        +step20 : U32 & U32 = x_settings.typ_step(x_t_settings(), pay2, sw, piw)
+        x_send_data_flow(4, x_flow_sent(sent20), sid, chunks, cw, x_settings.iw_win(step20), x_settings.iw_base(step20), buf, 0, 0, Nil{}, True{}, sid2p, x_flow.seed_settled(seed, x_t_settings(), 0, sid2p, pay2, Nil{}), pdc)
+    case 21:
+      (s21, g21) = got
+      x_send_data_flow(4, (s21, HTTP.GotErr{0, "next"}), sid, chunks, cw, sw, piw, buf, 0, 0, Nil{}, True{}, sid2p, x_flow.seed_add(seed, x_t_settings(), 0, sid2p, pay2, Nil{}), pdc)
     case _:
       (s13, g13) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, (s13, Fail{(502, "flow bad phase")}, Nil{}, cw, pdc))
@@ -2986,7 +3042,8 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
 # PADDED (0x8) and PRIORITY (0x20): x_frame_of strips both fields out of
 # the payload but leaves the bits in the flags it answers, so a frame
 # re-encoded for the read seed must clear them -- otherwise the reader
-# would strip bytes that are no longer there.
+# would strip bytes that are no longer there. Every other peer flag stays
+# byte for byte (tests/io/http2_credit_paid.bend fixes that rule).
 def x_f_padded() -> U32:
   8
 
@@ -2995,6 +3052,11 @@ def x_f_priority() -> U32:
 
 def x_f_seed(+flags: U32) -> U32:
   U32.and(flags, U32.sub(255, (x_f_padded() + x_f_priority() : U32)))
+
+# The flags of a frame the pump settled itself: the peer flags with the
+# padding and priority bits cleared, plus the internal settled bit.
+def x_f_seed_settled(+flags: U32) -> U32:
+  U32.or(x_f_seed(flags), x_f_settled())
 
 # The sender keeps the rest of the recv as its own read buffer after a
 # stash: the frames behind the stashed one can hold the WINDOW_UPDATE the
@@ -3011,9 +3073,10 @@ def x_f_seed(+flags: U32) -> U32:
 # frame (DATA or HEADERS of another stream, PRIORITY, PUSH_PROMISE — what
 # the old routing dropped, TASK-042 phase 2e — plus a sibling's RST_STREAM,
 # see x_flow.keep_cls); 12 is the frames the sender answers itself
-# (WINDOW_UPDATE, SETTINGS, PING, the RST_STREAM of the stream being sent,
-# GOAWAY). The bools take their own def because a match cannot scrutinize a
-# computed value.
+# (WINDOW_UPDATE, a fresh SETTINGS that the sender answers and stores for
+# the caller, PING, the RST_STREAM of the stream being sent, GOAWAY). The
+# bools take their own def because a match cannot scrutinize a computed
+# value.
 def x_flow.route_go(is_head: Bool, same: Bool, is_keep: Bool) -> U32:
   match is_head same is_keep:
     case _ _ False{}:
@@ -3024,13 +3087,15 @@ def x_flow.route_go(is_head: Bool, same: Bool, is_keep: Bool) -> U32:
       14
 
 # The frames the sender hands to the caller instead of acting on them: the
-# class-0 bucket (DATA, HEADERS, PRIORITY, PUSH_PROMISE) and a RST_STREAM
-# of another stream. The sibling RST is the node:http2 shape -- a peer
-# resets a stream it already answered while the next request's body is
-# still going -- and the drain is the one place that decides whose frame it
-# is (client.route.stream_cls), so the sender stashes it like any other
-# foreign frame. The RST of the stream being sent is not kept: it stops the
-# send with the typed error.
+# class-0 bucket (DATA, HEADERS, PRIORITY, PUSH_PROMISE), a SETTINGS ACK
+# (class 10) and a RST_STREAM of another stream. The sibling RST is the
+# node:http2 shape -- a peer resets a stream it already answered while the
+# next request's body is still going -- and the drain is the one place that
+# decides whose frame it is (client.route.stream_cls), so the sender stashes
+# it like any other foreign frame. The RST of the stream being sent is not
+# kept: it stops the send with the typed error. A fresh SETTINGS (class 4)
+# is not kept either: the sender answers it and stores it with the settled
+# flag, so the loop does not answer it again.
 def x_flow.keep_cls(+cls: U32, same: Bool) -> Bool:
   match cls same:
     case 0 _:
@@ -3038,6 +3103,8 @@ def x_flow.keep_cls(+cls: U32, same: Bool) -> Bool:
     case 3 False{}:
       True{}
     case 4 _:
+      False{}
+    case 10 _:
       True{}
     case _ _:
       False{}
@@ -3049,9 +3116,35 @@ def x_flow.route(+typ: U32, +sid29: U32, +sid: U32, +cls: U32) -> U32:
 # frame re-encoded the way the reader expects it, followed by the rest of
 # the recv (which may hold more frames). The accumulated seed comes first;
 # it holds bytes that arrived earlier on the wire.
-def x_flow.seed_add(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
-  +frag : List<&2, U32> = x_frame_write(typ, x_f_seed(flags), sid, payload)
+def x_flow.seed_write(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
+  +frag : List<&2, U32> = x_frame_write(typ, flags, sid, payload)
   x_flow_join(seed, HTTP.x_cat.go(List.reverse(&2, U32, frag), buf))
+
+def x_flow.seed_add(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
+  x_flow.seed_write(seed, typ, x_f_seed(flags), sid, payload, buf)
+
+# The seed of a SETTINGS the pump answered: the same bytes plus the
+# internal settled flag, so the loop applies the base and sends no second
+# ACK.
+def x_flow.seed_settled(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
+  x_flow.seed_write(seed, typ, x_f_seed_settled(flags), sid, payload, buf)
+
+# The pump phase of a fresh SETTINGS: 20 when the pump answers it itself
+# (a valid SETTINGS on stream 0) and 21 when it goes to the caller
+# unanswered (the caller answers the protocol error).
+def x_flow_settle_ok(+act: U32) -> U32:
+  match act:
+    case 1:
+      20
+    case _:
+      21
+
+def x_flow_settle_phase(+sid2: U32, +pay: List<&2, U32>) -> U32:
+  match sid2:
+    case 0:
+      x_flow_settle_ok(x_settings.act(pay))
+    case _:
+      21
 
 def x_flow.cls_typ(+typ: U32) -> U32:
   match typ:
@@ -3070,15 +3163,17 @@ def x_flow.cls_typ(+typ: U32) -> U32:
     case _:
       0
 
-# RFC 9113 section 6.5/6.7: a peer never answers an ACK. A SETTINGS or PING
-# ACK read while the flow pump waits for credit is therefore a foreign
-# frame (class 0): the pump hands it to the caller, which ignores it. The
-# old table answered it, and a second SETTINGS ACK on the wire made a
-# node:http2 peer fail the session with PROTOCOL_ERROR.
+# RFC 9113 section 6.5/6.7: a peer never answers an ACK. A PING ACK read
+# while the flow pump waits for credit is therefore a foreign frame (class
+# 0): the pump hands it to the caller, which ignores it. A SETTINGS ACK
+# takes class 10 and a fresh SETTINGS keeps class 4, so the pump answers
+# the fresh one itself (do_act case 4) and stores the ACK for the caller.
+# The old table answered both, and a second SETTINGS ACK on the wire made
+# a node:http2 peer fail the session with PROTOCOL_ERROR.
 def x_flow.cls_ack(+cls: U32, fresh: Bool) -> U32:
   match cls fresh:
     case 4 False{}:
-      0
+      10
     case 6 False{}:
       0
     case _ _:
@@ -3141,6 +3236,8 @@ def x_flow.do_act(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, 
   match cl:
     case 2:
       x_flow.wu(got, sid, chunks, cw, sw, piw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2), seed, pdc)
+    case 4:
+      x_send_data_flow(x_flow_settle_phase(sid2p, pay2), got, sid, chunks, cw, sw, piw, buf, cl, 0, pay2, True{}, sid2p, seed, pdc)
     case 6:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)
@@ -5077,6 +5174,9 @@ def client.loop(~S: HTTP.StreamEv -> HTTP.StreamOut, ~C: HTTP.CStreamEv -> HTTP.
           do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             got2 : Socket & HTTP.Got <- httpx.ack(got)
             client.loop(~S, ~C, mode, 0, got2, buf, tab, exp, slots, cpend, spend, cw, x_settings.iw_of(payload, piw), pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2}, pdc)
+        case 20 Act{+a2, +r2, +c2}:
+          # The pump answered this SETTINGS: apply the base, no ACK.
+          client.loop(~S, ~C, mode, 0, got, buf, tab, exp, slots, cpend, spend, cw, x_settings.iw_of(payload, piw), pending, high, head, ok, total, fins, 0, 0, 0, Nil{}, 0, 0, 0, Act{4, r2, c2}, pdc)
         case 4 Act{+a2, +r2, +c2}:
           do IO<Socket & Result<&1, &1, U32 & String, LoopRes> & HTTP.Tab & Sink>:
             gotp : Socket & HTTP.Got <- httpx.ack_ping(got, payload)
@@ -6483,6 +6583,9 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             got2 : Socket & HTTP.Got <- httpx.ack(got)
             +iw1 : U32 = x_settings.iw_of(payload, iw)
             server.loop(~H, ~B, form, mode, last, 0, got2, slots, cpend, spend, cw, iw1, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+        case 20:
+          # The pump answered this SETTINGS: apply the base, no ACK.
+          server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, cw, x_settings.iw_of(payload, iw), fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 4:
           do IO<Unit>:
             gotp : Socket & HTTP.Got <- httpx.ack_ping(got, payload)

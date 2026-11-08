@@ -1,11 +1,28 @@
 # h2spec: a conformidade externa do H2
 
-Data: 2026-11-07. Ferramenta: `h2spec` 2.6.0 (commit 70ac2294). Cliente:
-`curl` 8.5.0 com nghttp2 1.59.0. Compilador: `bend` 2.0.27. Servidor:
+Data: 2026-11-07. Ferramenta: o binário oficial do `h2spec` 2.6.0 (commit
+70ac2294). Cliente: `curl` 8.5.0 com nghttp2 1.59.0. Compilador: `bend`
+2.0.27 nas duas passagens. Servidor:
 `examples/httpx/stress_h2.bend` no modo `ok`, um binário nativo na porta
 18960, com o certificado de teste `tests/io/tls_test_cert.pem`.
 
 ## Como repetir
+
+```sh
+bash tests/conformance/h2spec.sh
+```
+
+O script constrói o servidor, o sobe, roda o `h2spec` e compara a lista de
+falhas com `tests/conformance/h2spec.expected`. Ele sai 0 quando nenhuma
+falha nova aparece. Ele sai 1 quando uma falha não está na lista. Ele sai
+2 quando o `h2spec` falta, a porta está ocupada, o servidor não sobe ou
+o servidor para no meio das três tentativas. A variável `H2SPEC` aponta o
+binário do `h2spec`. Use o binário oficial do release 2.6.0: um binário
+construído de fonte mostra falhas falsas (ver "A ferramenta certa"). A
+construção leva cerca de 8 minutos. Use uma máquina sem outra carga: o
+servidor é Bend puro sobre TLS.
+
+Os passos manuais:
 
 ```sh
 bend examples/httpx/stress_h2.bend -o /tmp/stress_h2
@@ -13,26 +30,96 @@ bend examples/httpx/stress_h2.bend -o /tmp/stress_h2
 h2spec -h 127.0.0.1 -p 18960 -t -k --timeout 3
 ```
 
-O modo `ok` responde 200 com um corpo de dois octetos. O corpo importa: um
+O modo `ok` responde 200 com um corpo de 8 octetos. O corpo importa: um
 corpo vazio fecha o stream no `HEADERS` e esconde o caminho de `DATA` que
-quatro provas do `h2spec` medem.
+quatro provas do `h2spec` medem. O corpo tem 5 octetos ou mais, porque o
+`h2spec` pula a prova 6.9.2.2 abaixo desse tamanho.
 
 ## Resultado
 
-146 provas: 143 aprovadas, 1 pulada, 2 falhas. A prova pulada é a 6.9.2.2
-(`Sends a SETTINGS frame for window size to be negative`): o `h2spec` a
-pula quando o corpo da resposta tem menos de 5 octetos, e o modo `ok`
-responde 2.
+A passagem de referência, com o servidor de task-070 (corpo de 2 octetos),
+deu 143 provas aprovadas, 1 pulada e 2 falhas. O binário oficial do
+`h2spec` 2.6.0 reproduz este número nesta máquina. A prova pulada é a
+6.9.2.2 (`Sends a SETTINGS frame for window size to be negative`). O
+`h2spec` a pula quando o corpo da resposta tem menos de 5 octetos.
 
-A pulada esconde um defeito. Com o modo `big 1` (corpo de 1 MiB) a prova
-roda e falha: `Expected SETTINGS ACK, Actual Timeout`. O lane não responde
-o SETTINGS enquanto um envio espera crédito; ele guarda o frame na
-semente e só responde o ACK quando o envio termina. O node responde o ACK
-no caminho de leitura da sessão e passa esta prova. A correção e o teste
-estão no Registro de Descobertas de task-070.
+A passagem de task-071 (corpo de 8 octetos) roda a prova 6.9.2.2 e a
+aprova. A passagem completa deu 144 provas aprovadas, 0 puladas e 2
+falhas. As duas falhas são os desvios aceitos abaixo.
+
+| Servidor | Corpo | Resultado | Falhas |
+|---|---|---|---|
+| antes da correção | 2 octetos | 143 aprovadas, 1 pulada, 2 falhas | 4.2.3, 5.1.2.1 |
+| antes da correção | 8 octetos | 143 aprovadas, 0 puladas, 3 falhas | 4.2.3, 5.1.2.1, 6.9.2.2 |
+| com a correção | 8 octetos | 144 aprovadas, 0 puladas, 2 falhas | 4.2.3, 5.1.2.1 |
+
+As duas falhas da primeira linha e da terceira linha são as mesmas: os
+dois desvios aceitos abaixo. A linha do meio tem uma falha a mais, a
+6.9.2.2. Com o corpo de 8 octetos o `h2spec` não pula a prova, e o código
+sem a correção falha nela. O corpo de 2 octetos escondia a prova.
+
+Para comparação, o node v22.23.2 com o mesmo corpo de 8 octetos deu 135
+aprovadas, 1 pulada e 10 falhas. As listas não se sobrepõem. O node passa
+a 4.2.3 e pula a 5.1.2.1; nós falhamos essas duas e passamos as 10 do
+node.
+
+### A prova 6.9.2.2 antes e depois
+
+```text
+antes  (corpo de 2 octetos): 3 provas, 2 aprovadas, 1 pulada
+depois (corpo de 8 octetos): 3 provas, 3 aprovadas, 0 puladas
+```
+
+A pulada escondia um defeito. Com o modo `big 1` (corpo de 1 MiB) a prova
+rodava e falhava: `Expected SETTINGS ACK, Actual Timeout`. O lane não
+respondia o SETTINGS enquanto um envio esperava crédito. Ele guardava o
+frame na semente e só respondia o ACK quando o envio terminava. O node
+responde o ACK no caminho de leitura da sessão. O lane agora segue o node.
+O teste `tests/io/http2_settings_ack.bend` fixa o fio.
 
 As duas falhas restantes são desvios aceitos. Cada uma tem a razão
 escrita e um teste que fixa o limite real do módulo.
+
+## A ferramenta certa
+
+Use o binário oficial do release 2.6.0. Um binário construído do mesmo
+commit (70ac2294) com Go 1.22 mostra 7 falhas a mais: 6.9.1.1, 6.9.1.2,
+6.9.1.3, 6.9.2.1, 6.9.2.2, 6.10.1 e 7.2. O servidor é o mesmo nas duas
+medidas. Medido em 2026-11-07 com o servidor de task-070:
+
+| Cliente | Resultado |
+|---|---|
+| release 2.6.0 | 143 aprovadas, 1 pulada, 2 falhas |
+| fonte, Go 1.22 | 137 aprovadas, 0 puladas, 9 falhas |
+
+O portão usa o `h2spec` do `PATH` ou o caminho de `H2SPEC`. A cópia em
+`.scratch/h2spec-bin` é o release oficial nesta máquina. task-073 registra
+a medida e o motivo.
+
+## O servidor para depois de uma passagem (task-073)
+
+Um servidor novo serve uma passagem completa. O mesmo servidor não serve
+uma segunda passagem: as conexões novas recebem o fechamento. A prova
+3.5.1 (`Sends client connection preface`) falha com `Connection closed`.
+
+A prova 6.9.1.1 sozinha já deixa o servidor neste estado, com o código de
+task-070 e com o código de task-071. A prova 6.9.2.2 faz o mesmo. As duas
+deixam um envio parado quando o par fecha a conexão.
+
+```text
+servidor novo + 6.9.2    -> 3 de 3
+servidor novo + passagem -> 144 aprovadas, 2 falhas
+mesmo servidor + 6.9.2   -> 0 de 3, Error: EOF
+```
+
+O defeito é anterior a task-071. Ele está aberto em task-073.
+
+O defeito aparece no meio de algumas passagens: o servidor para antes do
+fim e as provas seguintes falham com `Connection closed`. O portão do
+`h2spec` prova cada passagem com uma conexão nova (`http2/3.5`) e repete
+a passagem com outro servidor quando a prova falha. Ele tenta três vezes
+e sai 2 quando todas falham. Nesta máquina a primeira tentativa falhou em
+duas de três medidas, e a repetição salvou uma.
 
 ### 4.2.3 Tamanho de HEADERS acima de SETTINGS_MAX_FRAME_SIZE
 
@@ -43,6 +130,10 @@ frame de 20 KiB é legal e ele responde. O limite real é fixado por
 `GOAWAY` 6. Mudar o anúncio para 16384 fecharia esta prova e perderia a
 cobertura do frame grande (`tests/io/http2_frame_big.bend`).
 
+O node v22.23.2 passa esta prova porque anuncia `MAX_FRAME_SIZE` 16384.
+Ele recusa o frame de 20 KiB. Nós anunciamos 65535 e aceitamos o frame.
+A mudança do anúncio para 16384 está planejada em task-062, fase 8.
+
 ### 5.1.2.1 Limite de streams simultâneos
 
 O `h2spec` abre 102 streams com `END_STREAM` e com `INITIAL_WINDOW_SIZE`
@@ -52,6 +143,11 @@ abertos ao mesmo tempo. O limite é real e tem prova:
 `tests/io/http2_stream_cap.bend` abre 100 streams sem `END_STREAM` e o
 101º recebe `RST_STREAM` 7. Fechar esta prova exige uma fila de envio por
 stream, que o servidor em buffer não tem.
+
+O node v22.23.2 pula esta prova porque não anuncia
+`MAX_CONCURRENT_STREAMS`. Nós anunciamos 100 e o limite é real. O `h2spec`
+não vê o limite porque o servidor em buffer fecha cada stream antes do
+próximo `HEADERS`.
 
 ## Falhas corrigidas nesta fase
 
@@ -70,12 +166,13 @@ stream, que o servidor em buffer não tem.
 | 6.5 (PUSH_PROMISE) | 1 | frame de push era ignorado | ato 9 | `http2_dispatch` |
 | 4.3 (HPACK) | 1 | atualização de tabela no fim do bloco era aceita | `x_req.late` | `http2_dispatch` |
 | 6.9.1 | 1 | `WINDOW_UPDATE` de stream acima de 2^31-1 era ignorado | `x_win_fits` + ato 15 | `http2_dispatch` |
+| 6.9.2.2 (task-071) | 1 | SETTINGS sem ACK durante a espera de crédito | ACK no pump, bit `x_f_settled`, ato 20 | `http2_settings_ack` |
 
 A primeira passagem, antes de qualquer correção, deu 38 falhas em 100
 provas; a suíte parava no meio porque um par que fecha depois do
 handshake travava o accept (`tests/io/http2_pre_eof.bend`).
 
-## Saída completa
+## Saída completa (passagem de referência, bend 2.0.27)
 
 ```text
 Generic tests for HTTP/2 server

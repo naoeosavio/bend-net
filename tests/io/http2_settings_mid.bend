@@ -5,8 +5,9 @@
 # The peer announces a stream window of WIN1 bytes and grants only the
 # connection window, so the 4096-byte answer of stream 1 stops after WIN1.
 # The peer then announces WIN2 = 4096 while the send is parked. The pump
-# shifts its own window and stores the frame in the read seed; the loop
-# reads the stored frame, acks it and takes the new value for its ledger.
+# answers the ACK, shifts its own window and stores the frame in the read
+# seed with the settled flag. The loop reads the stored frame and takes
+# the new value for its ledger, with no second ACK (task-071).
 # The peer then asks for stream 3: with the fix the whole 4096-byte body
 # rides one DATA frame, because the loop seeds the send with 4096. Without
 # the fix the loop keeps WIN1 and the body rides WIN1-byte frames.
