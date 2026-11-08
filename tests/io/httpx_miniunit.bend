@@ -63,14 +63,16 @@ def resp_t() -> U32:
 # initial SETTINGS frame the dial builds (client.on.preface_bytes). A
 # lost byte here breaks the handshake on every lane, so the seam has a
 # pure test. The magic is the take of 24; the tail is one SETTINGS frame
-# with an empty flag set, sid 0 and the 12-byte payload of two settings.
+# with an empty flag set, sid 0 and the 24-byte payload of four settings
+# (ENABLE_PUSH, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE,
+# MAX_FRAME_SIZE).
 def settings_score(frame: HTTP.Frame, rest: List<&2, U32>) -> U32:
   match frame:
     case HTTP.Frame{typ, flags, sid, payload}:
       b2u(Bool.and(U32.is_eq(typ, 4),
         Bool.and(U32.is_eq(flags, 0),
           Bool.and(U32.is_eq(sid, 0),
-            Bool.and(U32.is_eq(HTTP.x_len32(payload), 12),
+            Bool.and(U32.is_eq(HTTP.x_len32(payload), 24),
               U32.is_eq(HTTP.x_len32(rest), 0))))))
 
 def settings_out(out: HTTP.UnitOut) -> U32:

@@ -80,6 +80,17 @@ require break from any other directory. Bend 2.0.21+.
 - Naming: `_insecure` means "no chain verify" (loopback/self-signed), never
   "no TLS". `_plain` means cleartext (`ws://`, `http://`) and takes no cert.
   No `is_tls` flags anywhere.
+- H2 limits are announced and enforced, not advisory. `lib/http2.bend`
+  announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 100 and the two
+  65535 sizes in its initial SETTINGS; a header block past 64 KiB
+  answers `GOAWAY 11` on the server and `431` on the client; the 101st
+  open stream answers `RST_STREAM 7` (REFUSED_STREAM). A header block
+  travels in 16384-byte slices (HEADERS plus CONTINUATION). A request
+  copy drops `connection`, `keep-alive`, `proxy-connection`,
+  `transfer-encoding`, `upgrade` and `te` before it reaches the wire.
+- A request head needs `:method` and `:path` (RFC 9113 8.3.1), so a
+  CONNECT block and a request trailer block fail the decode; no lane
+  serves tunnels or request trailers.
 - Fail-closed codes: malformed input answers `Fail` with the code above, never
   a partial body. H1 head cap 16 KB (`431` past it); H1 server refuses
   `Transfer-Encoding` + `Content-Length` pairs, non-`chunked` TE, double

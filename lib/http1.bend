@@ -1,2509 +1,2398 @@
-# HTTP lib over the existing TCP kit (no TLS), with package-local DNS
-# (./dns.bend) for name hosts.
+# HTTP1: the HTTP/1.1 module. It owns the wire: the request render, the
+# head and body parsers, the reason-phrase table, the chunked codec, the
+# keep-alive connection machine, the streaming upload and download lanes,
+# the 101 upgrade machine and the per-connection runners the accept loops
+# spawn.
 #
-# Reuses Base (String/List/U32/Nat/TCP/Socket/IO) and the two demos:
-# - io_http_fetch's blank-line cut (window word 218762506 = "\r\n\r\n")
-# - io_http_server's per-connection spawn + response shape.
+# It does not dial, does not accept and does not name a transport. The
+# runners take the three templates (~recv/~send/~close, plus ~K on the
+# upgrade lane) and the facade (./httpx.bend) instantiates them with TLS or
+# TCP. The core (./http.bend) owns the types and the shared leaves.
 #
-# Import as: import ../lib/http.bend as HTTP
-# Then HTTP.read_url, HTTP.get_header, HTTP.fetch, ...
+# Callee above caller; match scrutinees are params or pattern-bound vars;
+# self-recursion only, and @unsafe keeps the fuel-bounded loops.
 #
-# Discipline (user-land Bend has no Base carve-out):
-# - every callee is defined ABOVE its caller; only self-recursion.
-# - match scrutinees are params or pattern-bound vars, never computed.
-# - helpers above drivers are leaves: they never call back down.
-#
-# Security policy (fail-closed):
-# - show_* rejects CRLF in every field (injection) with Fail 400.
-# - read_* caps the head at 16KB; oversize is Fail 413.
-# - ports must be 1..65535; hosts reject whitespace and controls.
-# - https:// parses but fetch refuses with 501 (no TLS yet).
-# - fetch reads at most 8x8192 bytes (64KB cap), then truncates.
-# - name hosts resolve via ./dns.bend (A over UDP; Fail 601-605):
-#   fetch/send_request connect by the resolved IPv4 but send the
-#   ORIGINAL host in the Host header, so virtual hosting never
-#   changes; dotted quads and localhost take the pure fast path.
+# Import as: import ./http1.bend as HTTP1 (from lib).
 import Base
-import ./dns.bend as DNS
-import ./tcp.bend as TCP
+import ./http.bend as HTTP
 
-# Bytes
-# -----
-# A Bytes value is List<&2, U32> of UTF-8 bytes (reuses Base List/U32).
+# H1 lane, ported patterns (Phase 11): the old lib/http.bend was the base
+# that worked, so its shapes came over verbatim (window scan, recurse-in-args
+# with match-result-as-param, fuel loops) — but speaking Request/Response/Hdr
+# natively, so no pairs converters and no encode/decode layer are needed.
+# Subset, fail-closed: client and server decode Transfer-Encoding: chunked
+# since TASK-033 (x_h1.chunk_step below); a malformed chunked body is 400 on
+# both ends, and everything the decoder refuses stays refused. The client
+# still requires Content-Length when the head is not chunked (missing →502,
+# never hangs on keep-alive); the server treats a missing CL as an empty
+# body. Keep-alive on both ends since TASK-027: the server answers
+# and loops back to read (x_h1.srv.head phase 3), the client reuses the
+# socket for N requests in order (x_h1.cli.exch / client_seq.h1.keep).
+# Closing is by "connection: close", EOF, or a terminal 413/502/400; no
+# Connection header is ever emitted, so the one-shot bytes are unchanged.
+# ---------------------------------------------------------------------
 
-def encode.go2(+code: U32) -> List<&2, U32>:
-  b1 = (192 + U32.shrn(code, 6n) : U32)
-  b2 = (128 + U32.and(code, 63) : U32)
-  [b1, b2]
+def x_h1.eq_ci(a: String, b: String) -> Bool:
+  String.eq(String.to_lower(a), String.to_lower(b))
 
-def encode.go3(+code: U32) -> List<&2, U32>:
-  b1 = (224 + U32.shrn(code, 12n) : U32)
-  b2 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
-  b3 = (128 + U32.and(code, 63) : U32)
-  [b1, b2, b3]
+def x_h1.bad_char(+s: String) -> Bool:
+  Bool.or(HTTP.has_crlf(s), HTTP.has_nul(s))
 
-def encode.go4(+code: U32) -> List<&2, U32>:
-  b1 = (240 + U32.shrn(code, 18n) : U32)
-  b2 = (128 + U32.and(U32.shrn(code, 12n), 63) : U32)
-  b3 = (128 + U32.and(U32.shrn(code, 6n), 63) : U32)
-  b4 = (128 + U32.and(code, 63) : U32)
-  [b1, b2, b3, b4]
+# Render safety of a header FIELD (TASK-030): render_hs.go writes
+# "name: value\r\n" verbatim, so a CR/LF/NUL inside either half ends the
+# field early and the rest is read as headers the caller never asked for —
+# request splitting on the client render, response splitting on the server
+# render, one predicate for both. bad_char is the same check the request
+# line already applied to method/path/host. Note the parser cannot be the
+# source: it cuts the head on CRLF, so a parsed value never carries one —
+# the source is text the app built itself (a decoded query/path echoed
+# into a response header is the classic case).
+def x_h1.bad_hdr(+h: HTTP.Hdr) -> Bool:
+  match h:
+    case HTTP.Hdr{+n, +v}:
+      Bool.or(x_h1.bad_char(n), x_h1.bad_char(v))
 
-def encode.big(code: U32, is2: Bool, is3: Bool) -> List<&2, U32>:
-  match is2 is3:
-    case True{} _:
-      encode.go2(code)
-    case False{} True{}:
-      encode.go3(code)
-    case False{} False{}:
-      encode.go4(code)
-
-def encode.small(code: U32, is1: Bool, is2: Bool, is3: Bool) -> List<&2, U32>:
-  match is1:
-    case True{}:
-      [code]
-    case False{}:
-      encode.big(code, is2, is3)
-
-def encode_char(+code: U32) -> List<&2, U32>:
-  encode.small(code, U32.is_lt(code, 128), U32.is_lt(code, 2048), U32.is_lt(code, 65536))
-
-def encode.one(c: Char) -> List<&2, U32>:
-  match c:
-    case Chr{code}:
-      encode_char(code)
-
-def encode(s: String) -> List<&2, U32>:
-  match s:
-    case SNil{}:
-      Nil{}
-    case SCon{h, t}:
-      List.append(&2, U32, encode.one(h), encode(t))
-
-# Total UTF-8 decode: every match is structural (U32 literals nest
-# under the byte-list cons), every arm holds at most one recursive
-# call, so it runs in linear time. A bad sequence emits U+FFFD and
-# resumes at the next byte, never Fail.
-
-def decode.is_cont(+b: U32) -> Bool:
-  Bool.and(U32.is_ge(b, 128), U32.is_le(b, 191))
-
-def decode.bad(+code: U32) -> Bool:
-  Bool.and(U32.is_ge(code, 55296), U32.is_le(code, 57343))
-
-def decode.code2(+b1: U32, +b2: U32) -> U32:
-  ((U32.and(b1, 31) * 64 + U32.and(b2, 63) : U32))
-
-def decode.ok2(+b1: U32, +b2: U32) -> Bool:
-  Bool.and(decode.is_cont(b2),
-    Bool.and(U32.is_ge(decode.code2(b1, b2), 128), U32.is_lt(decode.code2(b1, b2), 2048)))
-
-def decode.code3(+b1: U32, +b2: U32, +b3: U32) -> U32:
-  ((U32.and(b1, 15) * 4096 + U32.and(b2, 63) * 64 + U32.and(b3, 63) : U32))
-
-def decode.ok3(+b1: U32, +b2: U32, +b3: U32) -> Bool:
-  Bool.and(decode.is_cont(b2),
-    Bool.and(decode.is_cont(b3),
-      Bool.and(Bool.and(U32.is_ge(decode.code3(b1, b2, b3), 2048),
-        U32.is_lt(decode.code3(b1, b2, b3), 65536)),
-        Bool.not(decode.bad(decode.code3(b1, b2, b3))))))
-
-def decode.code4(+b1: U32, +b2: U32, +b3: U32, +b4: U32) -> U32:
-  ((U32.and(b1, 7) * 262144 + U32.and(b2, 63) * 4096 + U32.and(b3, 63) * 64 + U32.and(b4, 63) : U32))
-
-def decode.ok4(+b1: U32, +b2: U32, +b3: U32, +b4: U32) -> Bool:
-  Bool.and(decode.is_cont(b2),
-    Bool.and(decode.is_cont(b3),
-      Bool.and(decode.is_cont(b4),
-        Bool.and(U32.is_ge(decode.code4(b1, b2, b3, b4), 65536),
-          U32.is_le(decode.code4(b1, b2, b3, b4), 1114111)))))
-
-def decode.put(ok: Bool, code: U32, rec: String) -> String:
-  match ok:
-    case True{}:
-      SCon{Chr{code}, rec}
-    case False{}:
-      SCon{Chr{65533}, rec}
-
-def decode(bs: List<&2, U32>) -> String:
-  match bs:
-    case Nil{}:
-      SNil{}
-    case b1 <> rest:
-      match b1:
-        case 194:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(194, b2), decode.code2(194, b2), decode(rest2))
-        case 195:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(195, b2), decode.code2(195, b2), decode(rest2))
-        case 196:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(196, b2), decode.code2(196, b2), decode(rest2))
-        case 197:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(197, b2), decode.code2(197, b2), decode(rest2))
-        case 198:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(198, b2), decode.code2(198, b2), decode(rest2))
-        case 199:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(199, b2), decode.code2(199, b2), decode(rest2))
-        case 200:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(200, b2), decode.code2(200, b2), decode(rest2))
-        case 201:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(201, b2), decode.code2(201, b2), decode(rest2))
-        case 202:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(202, b2), decode.code2(202, b2), decode(rest2))
-        case 203:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(203, b2), decode.code2(203, b2), decode(rest2))
-        case 204:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(204, b2), decode.code2(204, b2), decode(rest2))
-        case 205:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(205, b2), decode.code2(205, b2), decode(rest2))
-        case 206:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(206, b2), decode.code2(206, b2), decode(rest2))
-        case 207:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(207, b2), decode.code2(207, b2), decode(rest2))
-        case 208:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(208, b2), decode.code2(208, b2), decode(rest2))
-        case 209:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(209, b2), decode.code2(209, b2), decode(rest2))
-        case 210:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(210, b2), decode.code2(210, b2), decode(rest2))
-        case 211:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(211, b2), decode.code2(211, b2), decode(rest2))
-        case 212:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(212, b2), decode.code2(212, b2), decode(rest2))
-        case 213:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(213, b2), decode.code2(213, b2), decode(rest2))
-        case 214:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(214, b2), decode.code2(214, b2), decode(rest2))
-        case 215:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(215, b2), decode.code2(215, b2), decode(rest2))
-        case 216:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(216, b2), decode.code2(216, b2), decode(rest2))
-        case 217:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(217, b2), decode.code2(217, b2), decode(rest2))
-        case 218:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(218, b2), decode.code2(218, b2), decode(rest2))
-        case 219:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(219, b2), decode.code2(219, b2), decode(rest2))
-        case 220:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(220, b2), decode.code2(220, b2), decode(rest2))
-        case 221:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(221, b2), decode.code2(221, b2), decode(rest2))
-        case 222:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(222, b2), decode.code2(222, b2), decode(rest2))
-        case 223:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              decode.put(decode.ok2(223, b2), decode.code2(223, b2), decode(rest2))
-        case 224:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(224, b2, b3), decode.code3(224, b2, b3), decode(rest3))
-        case 225:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(225, b2, b3), decode.code3(225, b2, b3), decode(rest3))
-        case 226:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(226, b2, b3), decode.code3(226, b2, b3), decode(rest3))
-        case 227:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(227, b2, b3), decode.code3(227, b2, b3), decode(rest3))
-        case 228:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(228, b2, b3), decode.code3(228, b2, b3), decode(rest3))
-        case 229:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(229, b2, b3), decode.code3(229, b2, b3), decode(rest3))
-        case 230:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(230, b2, b3), decode.code3(230, b2, b3), decode(rest3))
-        case 231:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(231, b2, b3), decode.code3(231, b2, b3), decode(rest3))
-        case 232:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(232, b2, b3), decode.code3(232, b2, b3), decode(rest3))
-        case 233:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(233, b2, b3), decode.code3(233, b2, b3), decode(rest3))
-        case 234:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(234, b2, b3), decode.code3(234, b2, b3), decode(rest3))
-        case 235:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(235, b2, b3), decode.code3(235, b2, b3), decode(rest3))
-        case 236:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(236, b2, b3), decode.code3(236, b2, b3), decode(rest3))
-        case 237:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(237, b2, b3), decode.code3(237, b2, b3), decode(rest3))
-        case 238:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(238, b2, b3), decode.code3(238, b2, b3), decode(rest3))
-        case 239:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  decode.put(decode.ok3(239, b2, b3), decode.code3(239, b2, b3), decode(rest3))
-        case 240:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  match rest3:
-                    case Nil{}:
-                      SCon{Chr{65533}, SNil{}}
-                    case +b4 <> rest4:
-                      decode.put(decode.ok4(240, b2, b3, b4), decode.code4(240, b2, b3, b4), decode(rest4))
-        case 241:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  match rest3:
-                    case Nil{}:
-                      SCon{Chr{65533}, SNil{}}
-                    case +b4 <> rest4:
-                      decode.put(decode.ok4(241, b2, b3, b4), decode.code4(241, b2, b3, b4), decode(rest4))
-        case 242:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  match rest3:
-                    case Nil{}:
-                      SCon{Chr{65533}, SNil{}}
-                    case +b4 <> rest4:
-                      decode.put(decode.ok4(242, b2, b3, b4), decode.code4(242, b2, b3, b4), decode(rest4))
-        case 243:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  match rest3:
-                    case Nil{}:
-                      SCon{Chr{65533}, SNil{}}
-                    case +b4 <> rest4:
-                      decode.put(decode.ok4(243, b2, b3, b4), decode.code4(243, b2, b3, b4), decode(rest4))
-        case 244:
-          match rest:
-            case Nil{}:
-              SCon{Chr{65533}, SNil{}}
-            case +b2 <> rest2:
-              match rest2:
-                case Nil{}:
-                  SCon{Chr{65533}, SNil{}}
-                case +b3 <> rest3:
-                  match rest3:
-                    case Nil{}:
-                      SCon{Chr{65533}, SNil{}}
-                    case +b4 <> rest4:
-                      decode.put(decode.ok4(244, b2, b3, b4), decode.code4(244, b2, b3, b4), decode(rest4))
-        case _:
-          SCon{Chr{b1}, decode(rest)}
-
-def body_length.go(bs: List<&2, U32>, acc: U32) -> U32:
-  match bs:
+def x_h1.bad_hdrs.go(+hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
+  match hs:
     case Nil{}:
       acc
     case h <> t:
-      body_length.go(t, (acc + 1 : U32))
+      x_h1.bad_hdrs.go(t, Bool.or(acc, x_h1.bad_hdr(h)))
 
-def body_length(bs: List<&2, U32>) -> U32:
-  body_length.go(bs, 0)
+def x_h1.bad_hdrs(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.bad_hdrs.go(hs, False{})
 
-def from_string(s: String) -> U32 & List<&2, U32>:
-  +bs = encode(s)
-  (body_length(bs), bs)
+# Everything the request line and the header block render, in one place:
+# the same expression was copied inline in x_h1.render_req and
+# x_h1.cli.exch.open.fit, and neither copy looked at hs.
+def x_h1.bad_req(+method: String, +path: String, +host: String, hs: List<&2, HTTP.Hdr>) ->
+  Bool:
+  Bool.or(x_h1.bad_char(method),
+    Bool.or(x_h1.bad_char(path),
+      Bool.or(x_h1.bad_char(host), x_h1.bad_hdrs(hs))))
 
+def x_h1.forbidden(+name: String) -> Bool:
+  Bool.or(String.starts_with(name, ":"),
+    Bool.or(x_h1.eq_ci(name, "host"),
+      Bool.or(x_h1.eq_ci(name, "connection"),
+        Bool.or(x_h1.eq_ci(name, "content-length"),
+          Bool.or(x_h1.eq_ci(name, "transfer-encoding"),
+            Bool.or(x_h1.eq_ci(name, "upgrade"), x_h1.eq_ci(name, "keep-alive")))))))
 
-# U32-counted String ops (Phase 10.1): String.length/take/drop return and take
-# Nat in Base, so every cap check and every body cut paid a to_nat/from_nat at
-# the call site. These walk with U32 instead. Structural form: the String is
-# the first pattern-bound part and the U32 counter is only a guard inside the
-# arm, which is the shape the termination checker accepts (Phase 10.2).
-
-def str_len32.go(+s: String, +acc: U32) -> U32:
-  match s:
-    case SNil{}:
-      acc
-    case SCon{h, t}:
-      str_len32.go(t, (acc + 1 : U32))
-
-def str_len32(s: String) -> U32:
-  str_len32.go(s, 0)
-
-def str_drop32.go(+s: String, +n: U32) -> String:
-  match s:
-    case SNil{}:
-      SNil{}
-    case SCon{h, t}:
-      match n:
-        case 0:
-          SCon{h, t}
-        case _:
-          str_drop32.go(t, (n - 1 : U32))
-
-def str_drop32(s: String, n: U32) -> String:
-  str_drop32.go(s, n)
-
-def str_take32.go(+s: String, +n: U32) -> String:
-  match s:
-    case SNil{}:
-      SNil{}
-    case SCon{h, t}:
-      match n:
-        case 0:
-          SNil{}
-        case _:
-          SCon{h, str_take32.go(t, (n - 1 : U32))}
-
-def str_take32(s: String, n: U32) -> String:
-  str_take32.go(s, n)
-
-# Stack-safe bytes->String (Phase 11.1).
-# `decode` above is the total UTF-8 decoder and it is linear-recursive: every
-# byte costs one interpreter frame, so a body over ~24 KB dies with "machine
-# stack overflow" (measured on this box -- 16 KB passes, 24 KB does not; the
-# same shape in lib/httpx.bend is chunked for exactly this reason and survives
-# 4 MB). The fix is the HTTPX one -- cut the byte list into pieces, decode each
-# with bounded depth, then String.concat -- except that the cut has to land on
-# a UTF-8 SEQUENCE BOUNDARY, not every N bytes: a cut in the middle of a
-# multi-byte character would turn one Char into two U+FFFD, so `decode_all`
-# would stop agreeing with `decode` on non-ASCII bodies.
-#
-# A byte in 128..191 is a continuation, so a cut may never land right before
-# one: `decode.is_cont` decides that and the piece simply grows past the
-# nominal size until the boundary. Same bytes out, same Chars out, and each
-# `decode` call is now bounded by the piece instead of by the whole body.
-#
-# The `cut` flag rides as a plain Bool ARGUMENT (not a scrutinee): the checker
-# reads the self-call arguments left to right and needs the byte list to be the
-# one that shrinks, so it has to stay in first position.
-
-def decode_chunk() -> U32:
-  8192
-
-# True when the head byte of `bs` may be cut in front of: the list is over, or
-# the head starts a new character. `decode.is_cont` above (the same predicate
-# the decoder itself uses to recognise a continuation byte) is reused here
-# rather than re-implemented.
-def decode.starts_seq.at(+b: U32) -> Bool:
-  Bool.not(decode.is_cont(b))
-
-def decode.starts_seq(+bs: List<&2, U32>) -> Bool:
-  match bs:
+# Keep-alive policy: the H1 server closes only when the request says so.
+# "connection: close" is the one signal — HTTP/1.1 keeps the connection
+# alive by default, and the client codec never renders the header
+# (x_h1.forbidden skips it), so a peer that sends it means it.
+def x_h1.conn_close.go(hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
+  match hs:
     case Nil{}:
+      acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.conn_close.go(t, Bool.or(acc, Bool.and(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(v, "close"))))
+
+def x_h1.conn_close(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.conn_close.go(hs, False{})
+
+def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) -> List<&2, U32>:
+  match skip:
+    case True{}:
+      acc
+    case False{}:
+      List.append(&2, U32, acc, HTTP.x_str_bytes(n ++ ": " ++ v ++ "\r\n"))
+
+# Upgrade renders keep `connection`/`upgrade` (the handshake's own headers):
+# forbidden() still drops the rest. Case-insensitive like the parse side.
+def x_h1.render_hs.keep(upgrade: Bool, +n: String) -> Bool:
+  match upgrade:
+    case True{}:
+      Bool.or(x_h1.eq_ci(n, "connection"), x_h1.eq_ci(n, "upgrade"))
+    case False{}:
       False{}
-    case b <> t:
-      decode.starts_seq.at(b)
 
-def decode.pieces.put(acc: List<&2, List<&2, U32>>, ch: List<&2, U32>) -> List<&2, List<&2, U32>>:
-  match ch:
+def x_h1.render_hs.go(hs: List<&2, HTTP.Hdr>, acc: List<&2, U32>, +upgrade: Bool) -> List<&2, U32>:
+  match hs:
     case Nil{}:
       acc
-    case _:
-      List.reverse(&2, U32, ch) <> acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, acc, Bool.and(x_h1.forbidden(n), Bool.not(x_h1.render_hs.keep(upgrade, n)))), upgrade)
 
-def decode.pieces.go(+bs: List<&2, U32>, cut: Bool, +n: U32, acc: List<&2, List<&2, U32>>, +ch: List<&2, U32>) ->
-  List<&2, List<&2, U32>>:
+# An upgrade handshake carries no body framing: with upgrade=True an empty
+# body renders no Content-Length at all (a 101 must not claim one); any
+# non-empty body still counts exactly as before.
+def x_h1.render_cl.empty(upgrade: Bool) -> String:
+  match upgrade:
+    case True{}:
+      ""
+    case False{}:
+      "Content-Length: 0\r\n"
+
+def x_h1.render_cl(+body: List<&2, U32>, upgrade: Bool) -> String:
+  match body:
+    case Nil{}:
+      x_h1.render_cl.empty(upgrade)
+    case _ <> _:
+      "Content-Length: " ++ U32.show(HTTP.x_len32(body)) ++ "\r\n"
+
+def x_h1.render_req.go(+upgrade: Bool, bad: Bool, +method: String, +path: String, +host: String, +port: U32, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, List<&2, U32>>:
+  match bad:
+    case True{}:
+      Fail{(400, "bad request")}
+    case False{}:
+      Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\n" ++ x_h1.render_cl(body, upgrade)), upgrade), HTTP.x_str_bytes("\r\n")), body)}
+
+# hs is + here (and only here): the header block is read twice, once by
+# bad_req and once by the render below.
+def x_h1.render_req(+method: String, +path: String, +host: String, +port: U32, +hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  Result<&1, &1, U32 & String, List<&2, U32>>:
+  x_h1.render_req.go(False{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body)
+
+def x_h1.reason(st: U32) -> String:
+  match st:
+    case 101:
+      "Switching Protocols"
+    case 200:
+      "OK"
+    case 204:
+      "No Content"
+    case 304:
+      "Not Modified"
+    case 400:
+      "Bad Request"
+    case 404:
+      "Not Found"
+    case 411:
+      "Length Required"
+    case 413:
+      "Content Too Large"
+    case 431:
+      "Request Header Fields Too Large"
+    case 500:
+      "Internal Error"
+    case 502:
+      "Bad Gateway"
+    case _:
+      SNil{}
+
+# Responses render with upgrade=False today: no handler emits Upgrade yet.
+# Phase 3 (answer_open/show_resp_head) revisits this for the 101 path.
+def x_h1.show_resp(+status: U32, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> List<&2, U32>:
+  List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(HTTP.x_len32(body)) ++ "\r\n"), False{}), HTTP.x_str_bytes("\r\n")), body)
+
+# The 101 head: status line + the handler's headers (Upgrade/Connection
+# kept via upgrade=True) + blank line. No Content-Length, no body — a 101
+# carries neither by definition, and show_resp would inject Length: 0.
+def x_h1.show_resp_head(+status: U32, hs: List<&2, HTTP.Hdr>) -> List<&2, U32>:
+  List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\n"), True{}), HTTP.x_str_bytes("\r\n"))
+
+# Blank-line cut over bytes (window 218762506 = \r\n\r\n, the window the
+# retired H1 module's bs_head used; the discriminant rides a param, never
+# a match on computed). Triple (head, rest, found) with thin projections.
+# ---------------------------------------------------------------------
+
+def x_h1.split.go(+bs: List<&2, U32>, found: Bool, +w: U32, acc: List<&2, U32>) -> List<&2, U32> & List<&2, U32> & Bool:
   match bs:
     case Nil{}:
-      decode.pieces.put(acc, ch)
-    case b <> rest:
-      match cut:
+      # found is carried out of the Nil arm: the boundary can land exactly
+      # at the end of the buffer (a GET with no body, a bodyless response),
+      # and dropping the flag here made the H1 head loop read forever
+      # (TASK-026 Phase 7b, found by tests/io/httpx_plain_h1).
+      (List.reverse(&2, U32, acc), Nil{}, found)
+    case +b <> t:
+      match found:
         case True{}:
-          match n:
-            case 0:
-              decode.pieces.go(rest, decode.starts_seq(rest), (decode_chunk() - 1 : U32), decode.pieces.put(acc, ch), [b])
-            case _:
-              decode.pieces.go(rest, decode.starts_seq(rest), (n - 1 : U32), acc, b <> ch)
+          (List.reverse(&2, U32, acc), b <> t, True{})
         case False{}:
-          decode.pieces.go(rest, decode.starts_seq(rest), (decode_chunk() - 1 : U32), acc, b <> ch)
+          +w2 = (w * 256 + b : U32)
+          x_h1.split.go(t, U32.is_eq(w2, 218762506), w2, b <> acc)
 
-def decode.pieces.at(bs: List<&2, U32>, cut: Bool) -> List<&2, List<&2, U32>>:
-  decode.pieces.go(bs, cut, decode_chunk(), Nil{}, Nil{})
+def x_h1.split(+bs: List<&2, U32>) -> List<&2, U32> & List<&2, U32> & Bool:
+  x_h1.split.go(bs, False{}, 0, Nil{})
 
-def decode.pieces(+bs: List<&2, U32>) -> List<&2, List<&2, U32>>:
-  decode.pieces.at(bs, decode.starts_seq(bs))
+def x_h1.split_head(p: List<&2, U32> & List<&2, U32> & Bool) -> List<&2, U32>:
+  match p:
+    case (h, r, f):
+      h
 
-def decode.strings.go(+ps: List<&2, List<&2, U32>>, acc: List<&2, String>) -> List<&2, String>:
-  match ps:
+def x_h1.split_rest(p: List<&2, U32> & List<&2, U32> & Bool) -> List<&2, U32>:
+  match p:
+    case (h, r, f):
+      r
+
+def x_h1.split_found(p: List<&2, U32> & List<&2, U32> & Bool) -> Bool:
+  match p:
+    case (h, r, f):
+      f
+
+# Boundary probe without the rebuild (TASK-040, from test.bend's finding
+# that the pair costs nothing and the rebuild costs everything): the head
+# loops only ask whether the blank line arrived, and x_h1.split answers
+# that at the price of building the reversed head on the way. Same walk
+# and same window as split.go, so x_h1.split.test(bs) equals
+# x_h1.split_found(x_h1.split(bs)) on every input.
+def x_h1.split.test.go(+bs: List<&2, U32>, found: Bool, +w: U32) -> Bool:
+  match bs:
     case Nil{}:
-      acc
+      found
+    case +b <> t:
+      match found:
+        case True{}:
+          True{}
+        case False{}:
+          +w2 = (w * 256 + b : U32)
+          x_h1.split.test.go(t, U32.is_eq(w2, 218762506), w2)
+
+def x_h1.split.test(bs: List<&2, U32>) -> Bool:
+  x_h1.split.test.go(bs, False{}, 0)
+
+def x_h1.head_lines(+head: List<&2, U32>) -> List<&2, String>:
+  String.lines(HTTP.x_bytes_str(head))
+
+def x_h1.first_line(lines: List<&2, String>) -> String:
+  match lines:
+    case Nil{}:
+      SNil{}
     case h <> t:
-      decode.strings.go(t, decode(h) <> acc)
+      h
 
-def decode.strings(+ps: List<&2, List<&2, U32>>) -> List<&2, String>:
-  decode.strings.go(ps, Nil{})
+def x_h1.rest_lines(lines: List<&2, String>) -> List<&2, String>:
+  match lines:
+    case Nil{}:
+      Nil{}
+    case h <> t:
+      t
 
-# String.concat walks its argument list with String.append, which walks its
-# LEFT argument, so the frame count is O(total chars) no matter how the
-# list is built -- a fold with a String accumulator is the same depth. The
-# residual limit is therefore the interpreter stack against the finished
-# body, not the decoder: measured on this box, decode_all handles ~46 KB
-# where plain decode died at ~16 KB (Discovery 20).
-def decode_all(bs: List<&2, U32>) -> String:
-  String.concat(List.reverse(&2, String, decode.strings(decode.pieces(bs))))
-
-
-def to_string(bs: List<&2, U32>) -> String:
-  decode_all(bs)
-
-# Small string helpers (reuse Base String.* everywhere else)
-
-def has_crlf(+s: String) -> Bool:
-  Bool.or(String.contains(s, "\r"), String.contains(s, "\n"))
-
-def has_crlf3(a: String, b: String, c: String) -> Bool:
-  Bool.or(has_crlf(a), Bool.or(has_crlf(b), has_crlf(c)))
-
-def nul1() -> String:
-  String.from_list([Chr{0}])
-
-def has_nul(s: String) -> Bool:
-  String.contains(s, nul1())
-
-def strip_cr.go(h: Char, t: String, is_cr: Bool) -> String:
+def x_h1.strip_cr.go(h: Char, t: String, is_cr: Bool) -> String:
   match is_cr:
     case True{}:
       t
     case False{}:
       SCon{h, t}
 
-def strip_cr(s: String) -> String:
+def x_h1.strip_cr(s: String) -> String:
   match s:
     case SNil{}:
       SNil{}
     case SCon{+h, t}:
-      strip_cr.go(h, t, Char.is_eq(h, Chr{13}))
+      x_h1.strip_cr.go(h, t, Char.is_eq(h, Chr{13}))
 
-def eq_ci(a: String, b: String) -> Bool:
-  String.eq(String.to_lower(a), String.to_lower(b))
+# Request line: exactly 3 tokens; validity folds version + target +
+# bad chars into one Bool carried as param (head_act discipline).
+# ---------------------------------------------------------------------
 
-# Blank-line cut, reused from demos/io_http_fetch (window = "\r\n\r\n").
+def x_h1.req_valid(+m: String, +p: String, +v: String) -> Bool:
+  Bool.and(String.starts_with(v, "HTTP/1."),
+    Bool.and(String.starts_with(p, "/"),
+      Bool.and(Bool.not(x_h1.bad_char(m)), Bool.not(x_h1.bad_char(p)))))
 
-def body_of.go(s: String, e: Bool, w: U32) -> String:
-  match s:
-    case SNil{}:
-      SNil{}
-    case SCon{Chr{a}, t}:
-      match e:
-        case True{}:
-          SCon{Chr{a}, t}
-        case False{}:
-          +w2 = (w * 256 + a : U32)
-          body_of.go(t, U32.is_eq(w2, 218762506), w2)
-
-def body_of(s: String) -> String:
-  body_of.go(s, False{}, 0)
-
-def head_of.go(s: String, acc: String, e: Bool, w: U32) -> String:
-  match s:
-    case SNil{}:
-      acc
-    case SCon{Chr{+a}, t}:
-      match e:
-        case True{}:
-          acc
-        case False{}:
-          +w2 = (w * 256 + a : U32)
-          head_of.go(t, acc ++ Char.show(Chr{a}), U32.is_eq(w2, 218762506), w2)
-
-def head_of(s: String) -> String:
-  head_of.go(s, SNil{}, False{}, 0)
-
-def blank_win.end(found: Bool) -> U32:
-  match found:
-    case True{}:
-      1
-    case False{}:
-      0
-
-def blank_win(s: String, e: Bool, w: U32) -> U32:
-  match s:
-    case SNil{}:
-      blank_win.end(e)
-    case SCon{Chr{a}, t}:
-      match e:
-        case True{}:
-          1
-        case False{}:
-          +w2 = (w * 256 + a : U32)
-          blank_win(t, U32.is_eq(w2, 218762506), w2)
-
-def has_blank(s: String) -> Bool:
-  U32.is_ne(blank_win(s, False{}, 0), 0)
-
-# URL
-# ---
-# Result is secure & host & port & path.
-
-def default_port(secure: Bool) -> U32:
-  match secure:
-    case True{}:
-      443
-    case False{}:
-      80
-
-def valid_port(+p: U32) -> Bool:
-  Bool.and(U32.is_ge(p, 1), U32.is_le(p, 65535))
-
-def has_host_bad(+h: String) -> Bool:
-  Bool.or(String.contains(h, "/"),
-    Bool.or(String.contains(h, "?"),
-      Bool.or(String.contains(h, "#"), String.contains(h, "@"))))
-
-def valid_host.put4(sp: Bool) -> Bool:
-  match sp:
-    case True{}:
-      False{}
-    case False{}:
-      True{}
-
-def valid_host.put3(bad: Bool, sp: Bool) -> Bool:
-  match bad:
-    case True{}:
-      False{}
-    case False{}:
-      valid_host.put4(sp)
-
-def valid_host.put2(crlf: Bool, bad: Bool, sp: Bool) -> Bool:
-  match crlf:
-    case True{}:
-      False{}
-    case False{}:
-      valid_host.put3(bad, sp)
-
-def valid_host.put(empty: Bool, crlf: Bool, bad: Bool, sp: Bool) -> Bool:
-  match empty:
-    case True{}:
-      False{}
-    case False{}:
-      valid_host.put2(crlf, bad, sp)
-
-def valid_host(+h: String) -> Bool:
-  valid_host.put(String.is_empty(h), Bool.or(has_crlf(h), has_nul(h)), has_host_bad(h), String.contains(h, " "))
-
-def valid_path.put3(sp: Bool) -> Bool:
-  match sp:
-    case True{}:
-      False{}
-    case False{}:
-      True{}
-
-def valid_path.put2(crlf: Bool, sp: Bool) -> Bool:
-  match crlf:
-    case True{}:
-      False{}
-    case False{}:
-      valid_path.put3(sp)
-
-def valid_path.put(slash: Bool, crlf: Bool, sp: Bool) -> Bool:
-  match slash:
-    case True{}:
-      valid_path.put2(crlf, sp)
-    case False{}:
-      False{}
-
-def valid_path(+p: String) -> Bool:
-  valid_path.put(String.starts_with(p, "/"), Bool.or(has_crlf(p), has_nul(p)), String.contains(p, " "))
-
-def strip_host(h: String) -> String:
-  String.trim(h)
-
-def split_host_port.put(h: Char, t: String, host: String, port: String, rec: String & String, is_colon: Bool) -> String & String:
-  match is_colon:
-    case True{}:
-      (host, t)
-    case False{}:
-      rec
-
-def split_host_port.go(s: String, +host: String, +port: String) -> String & String:
-  match s:
-    case SNil{}:
-      (host, port)
-    case SCon{+h, +t}:
-      split_host_port.put(h, t, host, port, split_host_port.go(t, host ++ Char.show(h), port), Char.is_eq(h, ':'))
-
-def split_host_port(s: String) -> String & String:
-  split_host_port.go(s, SNil{}, SNil{})
-
-def split_host_path.put(h: Char, t: String, acc: String, rec: String & String, is_slash: Bool) -> String & String:
-  match is_slash:
-    case True{}:
-      (acc, SCon{h, t})
-    case False{}:
-      rec
-
-def split_host_path.go(s: String, +acc: String) -> String & String:
-  match s:
-    case SNil{}:
-      (acc, SNil{})
-    case SCon{+h, +t}:
-      split_host_path.put(h, t, acc, split_host_path.go(t, acc ++ Char.show(h)), Char.is_eq(h, '/'))
-
-def split_host_path(s: String) -> String & String:
-  split_host_path.go(s, SNil{})
-
-def norm_path(p: String) -> String:
-  match p:
-    case SNil{}:
-      "/"
-    case SCon{h, t}:
-      p
-
-def read_url.done(secure: Bool, host: String, port: U32, path: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match ok:
-    case True{}:
-      Done{(secure, host, port, path)}
-    case False{}:
-      Fail{(400, "bad url")}
-
-def read_url.explicit.put(secure: Bool, host: String, +path: String, port: Maybe<&2, U32>) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match port:
-    case None{}:
-      Fail{(400, "bad port")}
-    case Some{p}:
-      +c = p
-      read_url.done(secure, host, c, path, Bool.and(valid_port(c), valid_path(path)))
-
-def read_url.explicit(secure: Bool, host: String, portstr: String, path: String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  read_url.explicit.put(secure, host, path, U32.read(portstr))
-
-def read_url.port.go(+secure: Bool, host: String, portstr: String, +path: String, no_port: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match no_port:
-    case True{}:
-      read_url.done(secure, host, default_port(secure), path, valid_path(path))
-    case False{}:
-      read_url.explicit(secure, host, portstr, path)
-
-def read_url.port(secure: Bool, host: String, +portstr: String, path: String, host_ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match host_ok:
-    case False{}:
-      Fail{(400, "bad host")}
-    case True{}:
-      read_url.port.go(secure, host, portstr, path, String.is_empty(portstr))
-
-def read_url.host.go(secure: Bool, path: String, hp: String & String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  (host, portstr) = hp
-  +h1 = strip_host(host)
-  read_url.port(secure, h1, portstr, path, valid_host(h1))
-
-def read_url.host(secure: Bool, +hostport: String, path: String) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  read_url.host.go(secure, path, split_host_port(hostport))
-
-def read_url.split(hp: String & String, secure: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  (hostport, path0) = hp
-  read_url.host(secure, hostport, norm_path(path0))
-
-def read_url.rest(+rest: String, secure: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  read_url.split(split_host_path(rest), secure)
-
-def read_url.http(url: String, is_http: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match is_http:
-    case True{}:
-      read_url.rest(str_drop32(url, 7), False{})
-    case False{}:
-      Fail{(400, "bad scheme")}
-
-def read_url.scheme(url: String, is_https: Bool, is_http: Bool) ->
-  Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  match is_https:
-    case True{}:
-      read_url.rest(str_drop32(url, 8), True{})
-    case False{}:
-      read_url.http(url, is_http)
-
-def read_url(+url: String) -> Result<&1, &1, U32 & String, Bool & String & U32 & String>:
-  read_url.scheme(url, String.starts_with(url, "https://"), String.starts_with(url, "http://"))
-
-# Headers
-# -------
-# Headers are List<&1, String & String> of name & value (values trimmed).
-
-def get_header.put(dflt: String, v: String, rec: String, hit: Bool) -> String:
-  match hit:
-    case True{}:
-      v
-    case False{}:
-      rec
-
-def get_header(+dflt: String, +name: String, hs: List<&1, String & String>) -> String:
-  match hs:
+def x_h1.req_tok(parts: List<&2, String>) -> Result<&1, &1, U32 & String, String & String & String & Bool>:
+  match parts:
+    case +m <> r1:
+      match r1:
+        case +p <> r2:
+          match r2:
+            case +v <> Nil{}:
+              Done{(m, p, v, x_h1.req_valid(m, p, v))}
+            case Nil{}:
+              Fail{(400, "bad request line")}
+            case +v <> r3:
+              Fail{(400, "bad request line")}
+        case Nil{}:
+          Fail{(400, "bad request line")}
     case Nil{}:
-      dflt
-    case (n, v) <> t:
-      get_header.put(dflt, String.trim(v), get_header(dflt, name, t), eq_ci(n, name))
+      Fail{(400, "bad request line")}
 
-def drop_conn.put(n: String, v: String, rec: List<&1, String & String>, is_conn: Bool) ->
-  List<&1, String & String>:
-  match is_conn:
-    case True{}:
-      rec
-    case False{}:
-      (n, v) <> rec
+# The request line as the server needs it: the ReqHead the handler sees
+# plus the HTTP/1.1 flag the Host rule keys on (RFC 9112 section 3.2 asks
+# for 400 on a missing Host for HTTP/1.1 requests only). Same tokenizer,
+# same validation; only the version, which the parse used to drop, rides
+# out beside the head. The version token still carries the CR of its line
+# (String.lines cuts on \n only; x_h1.parse_hs trims it off every header
+# line for the same reason), so String.trim runs before the compare:
+# without it the flag is False for every peer and the Host rule never
+# fires.
+def x_h1.req_head(r: Result<&1, &1, U32 & String, String & String & String & Bool>) -> Result<&1, &1, U32 & String, HTTP.H1Head>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{q}:
+      match q:
+        case (m, p, v, ok):
+          match ok:
+            case True{}:
+              Done{HTTP.H1Head{HTTP.ReqHead{m, p, Nil{}}, String.eq(String.trim(v), "HTTP/1.1")}}
+            case False{}:
+              Fail{(400, "bad request")}
 
-def drop_conn(hs: List<&1, String & String>) -> List<&1, String & String>:
-  match hs:
-    case Nil{}:
-      Nil{}
-    case (n, v) <> t:
-      +nn = n
-      +vv = v
-      drop_conn.put(nn, vv, drop_conn(t), eq_ci(nn, "Connection"))
-
-def drop_host.put(n: String, v: String, rec: List<&1, String & String>, is_host: Bool) ->
-  List<&1, String & String>:
-  match is_host:
-    case True{}:
-      rec
-    case False{}:
-      (n, v) <> rec
-
-def drop_host(hs: List<&1, String & String>) -> List<&1, String & String>:
-  match hs:
-    case Nil{}:
-      Nil{}
-    case (n, v) <> t:
-      +nn = n
-      +vv = v
-      drop_host.put(nn, vv, drop_host(t), eq_ci(nn, "Host"))
-
-def show_headers.ok(n: String, v: String, hs: Result<&1, &1, U32 & String, String>) ->
-  Result<&1, &1, U32 & String, String>:
+def x_h1.req_join.hs(+m: String, +p: String, +is_11: Bool, hs: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) ->
+  Result<&1, &1, U32 & String, HTTP.H1Head>:
   match hs:
     case Fail{e}:
       Fail{e}
-    case Done{t}:
-      Done{n ++ ": " ++ String.trim(v) ++ "\r\n" ++ t}
+    case Done{+headers}:
+      Done{HTTP.H1Head{HTTP.ReqHead{m, p, headers}, is_11}}
 
-def show_headers.put(n: String, v: String, hs: Result<&1, &1, U32 & String, String>, bad: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match bad:
-    case True{}:
-      Fail{(400, "bad header")}
-    case False{}:
-      show_headers.ok(n, v, hs)
-
-def show_headers(hs: List<&1, String & String>) -> Result<&1, &1, U32 & String, String>:
-  match hs:
-    case Nil{}:
-      Done{SNil{}}
-    case (n, v) <> t:
-      +nn = n
-      +vv = v
-      show_headers.put(nn, vv, show_headers(t), Bool.or(has_crlf3(nn, vv, SNil{}), Bool.or(has_nul(nn), has_nul(vv))))
-
-def parse_headers.tail(n: String, v: String, rec: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, List<&1, String & String>>:
-  match rec:
+def x_h1.req_join(tok: Result<&1, &1, U32 & String, HTTP.H1Head>, hs: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) ->
+  Result<&1, &1, U32 & String, HTTP.H1Head>:
+  match tok:
     case Fail{e}:
       Fail{e}
-    case Done{t}:
-      Done{(n, v) <> t}
+    case Done{+rh}:
+      match rh:
+        case HTTP.H1Head{head, is_11}:
+          match head:
+            case HTTP.ReqHead{+m, +p, +hs0}:
+              x_h1.req_join.hs(m, p, is_11, hs)
 
-def parse_headers.named(n: String, v: String, rec: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, List<&1, String & String>>:
-  match n:
-    case SNil{}:
-      Fail{(400, "bad header")}
-    case SCon{h3, t3}:
-      parse_headers.tail(n, v, rec)
+# Status line: version + numeric code (Maybe.default; no partial line
+# escapes).
+# ---------------------------------------------------------------------
 
-def parse_headers.put(l1: String, n: String, v: String, rec: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, List<&1, String & String>>:
-  match l1:
-    case SNil{}:
-      rec
-    case SCon{h2, t2}:
-      parse_headers.named(n, v, rec)
+def x_h1.res_valid(+v: String, +c: String) -> Bool:
+  Bool.and(String.starts_with(v, "HTTP/1."),
+    Bool.not(U32.is_eq(Maybe.default(&2, U32, U32.read(c), 0), 0)))
 
-def split_header.join(parts: List<&2, String>, acc: String) -> String:
+def x_h1.res_tok(parts: List<&2, String>) -> Result<&1, &1, U32 & String, U32 & Bool>:
   match parts:
+    case v <> r1:
+      match r1:
+        case +c <> r2:
+          Done{(Maybe.default(&2, U32, U32.read(c), 0), x_h1.res_valid(v, c))}
+        case Nil{}:
+          Fail{(400, "bad status")}
     case Nil{}:
-      acc
-    case h <> t:
-      split_header.join(t, acc ++ ":" ++ h)
+      Fail{(400, "bad status")}
 
-def split_header.rest(x: String, rest: List<&2, String>, l1: String, t: List<&2, String>, rec: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, List<&1, String & String>>:
-  match rest:
-    case Nil{}:
-      parse_headers.put(l1, String.trim(x), SNil{}, rec)
-    case y <> ys:
-      parse_headers.put(l1, String.trim(x), String.trim(split_header.join(ys, y)), rec)
+def x_h1.res_head(q: U32 & Bool) -> Result<&1, &1, U32 & String, U32>:
+  match q:
+    case (code, ok):
+      match ok:
+        case True{}:
+          Done{code}
+        case False{}:
+          Fail{(400, "bad status")}
 
-def split_header.put(parts: List<&2, String>, +l1: String, t: List<&2, String>, rec: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, List<&1, String & String>>:
-  match parts:
-    case Nil{}:
-      parse_headers.put(l1, l1, SNil{}, rec)
-    case x <> rest:
-      split_header.rest(x, rest, l1, t, rec)
+def x_h1.res_lift(r: Result<&1, &1, U32 & String, U32 & Bool>) -> Result<&1, &1, U32 & String, U32>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{q}:
+      x_h1.res_head(q)
 
-def parse_headers(lines: List<&2, String>) -> Result<&1, &1, U32 & String, List<&1, String & String>>:
+# Header lines: blank (\r, post-lines-split) ends; colon-less fails.
+# Recursion rides args with match-result-as-param (parse_headers shape).
+# ---------------------------------------------------------------------
+
+def x_h1.is_blank(+l: String) -> Bool:
+  Bool.or(String.is_empty(l), String.eq(l, "\r"))
+
+def x_h1.hdr_val(+line: String, +nlen: Nat) -> String:
+  String.trim(String.drop(line, (nlen + 1n : Nat)))
+
+def x_h1.parse_hdr(done: Bool, parts: List<&2, String>, +line: String, rec: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) ->
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
+  match done:
+    case True{}:
+      Done{Nil{}}
+    case False{}:
+      match parts:
+        case Nil{}:
+          Fail{(400, "bad header")}
+        case +n <> vs:
+          match vs:
+            case Nil{}:
+              Fail{(400, "bad header")}
+            case +v <> vvs:
+              match rec:
+                case Fail{e}:
+                  Fail{e}
+                case Done{+tl}:
+                  Done{HTTP.Hdr{n, x_h1.hdr_val(line, String.length(n))} <> tl}
+
+def x_h1.parse_hs(lines: List<&2, String>) ->
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
   match lines:
     case Nil{}:
       Done{Nil{}}
-    case +h <> +t:
-      +l1 = String.trim(strip_cr(h))
-      split_header.put(String.split(l1, ':'), l1, t, parse_headers(t))
+    case +h <> t:
+      +l1 = String.trim(x_h1.strip_cr(h))
+      x_h1.parse_hdr(x_h1.is_blank(h), String.split(l1, ':'), l1, x_h1.parse_hs(t))
 
-def content_length(hs: List<&1, String & String>) -> U32:
-  Maybe.default(&2, U32, U32.read(get_header("0", "Content-Length", hs)), 0)
+# Framing queries (folds with combiner, fdel_go shape) + no_body.
+# ---------------------------------------------------------------------
 
-def body_len.show(body: String) -> String:
-  U32.show(str_len32(body))
-
-# Requests and responses
-# ----------------------
-# Request = method & path & headers & body. Response = status & headers & body.
-
-def no_body() -> String:
-  SNil{}
-
-def valid_req_line.spp(spp: Bool) -> Bool:
-  match spp:
+def x_h1.cl_at(is_cl: Bool, +v: String, +acc: U32) -> U32:
+  match is_cl:
     case True{}:
+      Maybe.default(&2, U32, U32.read(v), 0)
+    case False{}:
+      acc
+
+def x_h1.cl_of.go(hs: List<&2, HTTP.Hdr>, +acc: U32) -> U32:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{n, v} <> t:
+      x_h1.cl_of.go(t, x_h1.cl_at(x_h1.eq_ci(n, "content-length"), v, acc))
+
+def x_h1.cl_of(hs: List<&2, HTTP.Hdr>) -> U32:
+  x_h1.cl_of.go(hs, 0)
+
+def x_h1.te_at(is_te: Bool, +v: String, acc: Bool) -> Bool:
+  match is_te:
+    case True{}:
+      Bool.or(acc, String.contains(String.to_lower(v), "chunked"))
+    case False{}:
+      acc
+
+def x_h1.te_go(hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{n, v} <> t:
+      x_h1.te_go(t, x_h1.te_at(x_h1.eq_ci(n, "transfer-encoding"), v, acc))
+
+def x_h1.is_chunked(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.te_go(hs, False{})
+
+# Request-head validation (RFC 9112 sections 3.2 and 6.3, TASK-042 phase 6)
+# ------------------------------------------------------------------------
+# What the H1 server refuses with a 400 before it reads a single body byte.
+# The framing pair is the request-smuggling shape: a Transfer-Encoding next
+# to a Content-Length (a proxy in front may pick the other framing and the
+# two peers disagree on where the body ends), two Content-Length fields,
+# and a Content-Length that is not a plain decimal ("-1", "5x", "" all read
+# as 0 through U32.read, which is a body of a different length than the
+# sender meant). The Host rules are the RFC 9112 section 3.2 ones: more than
+# one Host field or an empty one is 400 for any version, and a missing Host
+# is 400 for an HTTP/1.1 request only (a 1.0 request may omit it).
+def x_h1.count_if(is_hit: Bool, +acc: U32) -> U32:
+  match is_hit:
+    case True{}:
+      (acc + 1 : U32)
+    case False{}:
+      acc
+
+def x_h1.hdr_count.go(+hs: List<&2, HTTP.Hdr>, +needle: String, +acc: U32) -> U32:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.hdr_count.go(t, needle, x_h1.count_if(x_h1.eq_ci(n, needle), acc))
+
+def x_h1.cl_count(hs: List<&2, HTTP.Hdr>) -> U32:
+  x_h1.hdr_count.go(hs, "content-length", 0)
+
+def x_h1.cl_bad_at(is_cl: Bool, +v: String) -> Bool:
+  match is_cl:
+    case True{}:
+      Bool.or(String.is_empty(v), Bool.not(HTTP.all_digits(v)))
+    case False{}:
       False{}
-    case False{}:
-      True{}
 
-def valid_req_line.sp(spm: Bool, spp: Bool) -> Bool:
-  match spm:
+def x_h1.cl_bad.go(+hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.cl_bad.go(t, Bool.or(acc, x_h1.cl_bad_at(x_h1.eq_ci(n, "content-length"), v)))
+
+def x_h1.cl_bad(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.cl_bad.go(hs, False{})
+
+def x_h1.host_count(hs: List<&2, HTTP.Hdr>) -> U32:
+  x_h1.hdr_count.go(hs, "host", 0)
+
+def x_h1.host_empty_at(is_host: Bool, +v: String) -> Bool:
+  match is_host:
     case True{}:
+      String.is_empty(v)
+    case False{}:
       False{}
-    case False{}:
-      valid_req_line.spp(spp)
 
-def valid_req_line.slash(slash: Bool, spm: Bool, spp: Bool) -> Bool:
-  match slash:
-    case True{}:
-      valid_req_line.sp(spm, spp)
-    case False{}:
-      False{}
-
-def valid_req_line.put(empty: Bool, slash: Bool, spm: Bool, spp: Bool) -> Bool:
-  match empty:
-    case True{}:
-      False{}
-    case False{}:
-      valid_req_line.slash(slash, spm, spp)
-
-def valid_req_line(+m: String, +p: String) -> Bool:
-  valid_req_line.put(String.is_empty(m), String.starts_with(p, "/"), Bool.or(String.contains(m, " "), has_nul(m)), Bool.or(String.contains(p, " "), has_nul(p)))
-
-def show_request.hs(m: String, p: String, +body: String, hs: Result<&1, &1, U32 & String, String>) ->
-  Result<&1, &1, U32 & String, String>:
+def x_h1.host_empty.go(+hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
   match hs:
-    case Fail{e}:
-      Fail{e}
-    case Done{h}:
-      Done{m ++ " " ++ p ++ " HTTP/1.1\r\n" ++ h ++ "Content-Length: " ++ body_len.show(body) ++ "\r\nConnection: close\r\n\r\n" ++ body}
+    case Nil{}:
+      acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.host_empty.go(t, Bool.or(acc, x_h1.host_empty_at(x_h1.eq_ci(n, "host"), v)))
 
-def show_request.head(m: String, p: String, hs: List<&1, String & String>, body: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match ok:
-    case False{}:
-      Fail{(400, "bad request line")}
-    case True{}:
-      show_request.hs(m, p, body, show_headers(hs))
+def x_h1.host_empty(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.host_empty.go(hs, False{})
 
-def show_request.put(+m: String, +p: String, hs: List<&1, String & String>, body: String, bad: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match bad:
-    case True{}:
-      Fail{(400, "bad request field")}
-    case False{}:
-      show_request.head(m, p, hs, body, valid_req_line(m, p))
-
-def show_request(+m: String, +p: String, hs: List<&1, String & String>, +body: String) ->
-  Result<&1, &1, U32 & String, String>:
-  show_request.put(m, p, hs, body, Bool.or(has_crlf3(m, p, body), Bool.or(has_nul(m), has_nul(p))))
-
-def read_request.emit(m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
+# A Transfer-Encoding the server cannot frame (anything but chunked): RFC
+# 9112 section 6.3 says the body length cannot be determined reliably, so
+# the answer is 400 and the connection ends.
+def x_h1.te_any.go(+hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
   match hs:
-    case Fail{e}:
-      Fail{e}
-    case Done{h}:
-      Done{(m, p, h, body)}
+    case Nil{}:
+      acc
+    case HTTP.Hdr{+n, +v} <> t:
+      x_h1.te_any.go(t, Bool.or(acc, x_h1.eq_ci(n, "transfer-encoding")))
 
-def read_request.put(m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>, ok: Bool) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match ok:
-    case False{}:
-      Fail{(400, "bad request line")}
+def x_h1.te_any(hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_h1.te_any.go(hs, False{})
+
+def x_h1.te_bad(+hs: List<&2, HTTP.Hdr>) -> Bool:
+  Bool.and(x_h1.te_any(hs), Bool.not(x_h1.is_chunked(hs)))
+
+# The head validation code: 400 for a head the server must not serve
+# (RFC 9112 sections 3.2/6.3), 0 when it is clean. The first rule that fires
+# wins, so a request with two problems reports the framing one. The bools
+# ride in as parameters because a match cannot scrutinize a call.
+def x_h1.srv.head_err_go(cl_bad: Bool, cl_dup: Bool, te_bad: Bool, te_cl: Bool, h_dup: Bool, h_none: Bool, h_empty: Bool, is_11: Bool) -> U32:
+  match cl_bad cl_dup te_bad te_cl h_dup h_none h_empty is_11:
+    case True{} _ _ _ _ _ _ _:
+      400
+    case _ True{} _ _ _ _ _ _:
+      400
+    case _ _ True{} _ _ _ _ _:
+      400
+    case _ _ _ True{} _ _ _ _:
+      400
+    case _ _ _ _ True{} _ _ _:
+      400
+    case _ _ _ _ _ True{} _ True{}:
+      400
+    case _ _ _ _ _ _ True{} _:
+      400
+    case _ _ _ _ _ _ _ _:
+      0
+
+def x_h1.srv.head_err(+hs: List<&2, HTTP.Hdr>, is_11: Bool) -> U32:
+  x_h1.srv.head_err_go(x_h1.cl_bad(hs), U32.is_gt(x_h1.cl_count(hs), 1), x_h1.te_bad(hs), Bool.and(x_h1.te_any(hs), U32.is_gt(x_h1.cl_count(hs), 0)), U32.is_gt(x_h1.host_count(hs), 1), U32.is_eq(x_h1.host_count(hs), 0), x_h1.host_empty(hs), is_11)
+
+# A terminal code the peer must see before the connection ends: 400..599 is
+# a status this server renders, 0 ("close") and the 6xx transport codes
+# (TLS/DNS) are not. One rule for the three H1 server lanes.
+def x_h1.srv.is_status(+code: U32) -> Bool:
+  Bool.and(U32.is_ge(code, 400), U32.is_lt(code, 600))
+
+# The server's head cap: 16384 bytes, the default node uses
+# (--max-http-header-size) and the value tests/io/httpx_h1_hardening.bend
+# pins. The read fuel (64 turns) stays as the slow-drip backstop; both
+# answer 431.
+def x_h1.head_max() -> U32:
+  16384
+
+def x_h1.head_cap() -> U32:
+  431
+
+def x_h1.head_over(+n: U32) -> Bool:
+  U32.is_gt(n, x_h1.head_max())
+
+# The two values the accumulate step feeds the next turn when the head is
+# past the cap: phase 0 (whose fuel floor answers 431) with no fuel left.
+def x_h1.fuel_cap(fuel: Nat, over: Bool) -> Nat:
+  match over:
     case True{}:
-      read_request.emit(m, p, body, hs)
-
-def read_request.is11(m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>, ok: Bool, flag: Bool) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.put(m, p, body, hs, Bool.and(ok, flag))
-
-def read_request.ver(+m: String, +p: String, +v: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.is11(m, p, body, parse_headers(rest), valid_req_line(m, p), String.eq(String.trim(v), "HTTP/1.1"))
-
-def read_request.tail(m: String, p: String, v: String, tail: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match tail:
-    case Nil{}:
-      read_request.ver(m, p, v, rest, body)
-    case h <> t:
-      Fail{(400, "bad request line")}
-
-def read_request.parts3(m: String, p: String, pv: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match pv:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case v <> tail:
-      read_request.tail(m, p, v, tail, rest, body)
-
-def read_request.parts2(m: String, pm: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match pm:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case p <> pv:
-      read_request.parts3(m, p, pv, rest, body)
-
-def read_request.parts(parts: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match parts:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case m <> pm:
-      read_request.parts2(m, pm, rest, body)
-
-def split_spaces(s: String) -> List<&2, String>:
-  String.split(s, ' ')
-
-def read_request.line(rl: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.parts(split_spaces(rl), rest, body)
-
-def read_request.lines(lines: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match lines:
-    case Nil{}:
-      Fail{(400, "empty request")}
-    case rl <> rest:
-      read_request.line(strip_cr(rl), rest, body)
-
-def read_request.head(head: String, body: String) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.lines(String.lines(head), body)
-
-def read_request.blank(+s: String, has: Bool) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match has:
+      0n
     case False{}:
-      Fail{(400, "no blank line")}
-    case True{}:
-      read_request.head(head_of(s), body_of(s))
+      fuel
 
-def read_request.capped(+s: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  match ok:
+def x_h1.head_phase(over: Bool) -> U32:
+  match over:
+    case True{}:
+      0
     case False{}:
-      Fail{(413, "head too large")}
-    case True{}:
-      read_request.blank(s, has_blank(s))
+      2
 
-def read_request(+s: String) -> Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>:
-  read_request.capped(s, U32.is_le(str_len32(s), 16384))
-
-def reason(st: U32) -> String:
-  match st:
-    case 200:
-      "OK"
-    case 201:
-      "Created"
-    case 204:
-      "No Content"
-    case 301:
-      "Moved Permanently"
-    case 302:
-      "Found"
-    case 304:
-      "Not Modified"
-    case 400:
-      "Bad Request"
-    case 401:
-      "Unauthorized"
-    case 403:
-      "Forbidden"
-    case 404:
-      "Not Found"
-    case 405:
-      "Method Not Allowed"
-    case 413:
-      "Content Too Large"
-    case 418:
-      "I'm a teapot"
-    case 429:
-      "Too Many Requests"
-    case 500:
-      "Internal Server Error"
-    case 501:
-      "Not Implemented"
-    case 502:
-      "Bad Gateway"
-    case 503:
-      "Service Unavailable"
-    case 504:
-      "Gateway Timeout"
-    case _:
-      "Status"
-
-def show_response.tail(+st: U32, +body: String, hs: Result<&1, &1, U32 & String, String>) ->
-  Result<&1, &1, U32 & String, String>:
-  match hs:
-    case Fail{e}:
-      Fail{e}
-    case Done{h}:
-      Done{"HTTP/1.1 " ++ U32.show(st) ++ " " ++ reason(st) ++ "\r\n" ++ h ++ "Content-Length: " ++ body_len.show(body) ++ "\r\nConnection: close\r\n\r\n" ++ body}
-
-def show_response.hs(st: U32, body: String, hs: Result<&1, &1, U32 & String, String>, bad: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match bad:
-    case True{}:
-      Fail{(400, "bad body")}
-    case False{}:
-      show_response.tail(st, body, hs)
-
-def show_response.code(st: U32, hs: List<&1, String & String>, +body: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match ok:
-    case False{}:
-      Fail{(400, "bad status")}
-    case True{}:
-      show_response.hs(st, body, show_headers(hs), has_crlf(body))
-
-def show_response(+st: U32, hs: List<&1, String & String>, +body: String) ->
-  Result<&1, &1, U32 & String, String>:
-  show_response.code(st, hs, body, Bool.and(U32.is_ge(st, 100), U32.is_le(st, 599)))
-
-def read_response.done(st: U32, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match hs:
-    case Fail{e}:
-      Fail{e}
-    case Done{h}:
-      Done{(st, h, body)}
-
-def read_response.emit(st: U32, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>, ok: Bool) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match ok:
-    case False{}:
-      Fail{(400, "bad status")}
-    case True{}:
-      read_response.done(st, body, hs)
-
-def read_response.code.go(rest: List<&2, String>, body: String, vok: Bool, st: Maybe<&2, U32>) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match st:
-    case None{}:
-      Fail{(400, "bad status")}
-    case Some{code}:
-      +c = code
-      read_response.emit(c, body, parse_headers(rest), Bool.and(vok, Bool.and(U32.is_ge(c, 100), U32.is_le(c, 599))))
-
-def read_response.code(v: String, cs: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  read_response.code.go(rest, body, String.eq(v, "HTTP/1.1"), U32.read(cs))
-
-def read_response.parts2(v: String, pv: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match pv:
-    case Nil{}:
-      Fail{(400, "bad status line")}
-    case cs <> tail:
-      read_response.code(v, cs, rest, body)
-
-def read_response.parts(parts: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match parts:
-    case Nil{}:
-      Fail{(400, "bad status line")}
-    case v <> pv:
-      read_response.parts2(v, pv, rest, body)
-
-def read_response.line(sl: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  read_response.parts(split_spaces(sl), rest, body)
-
-def read_response.lines(lines: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match lines:
-    case Nil{}:
-      Fail{(400, "empty response")}
-    case sl <> rest:
-      read_response.line(strip_cr(sl), rest, body)
-
-def read_response.head(head: String, body: String) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  read_response.lines(String.lines(head), body)
-
-def read_response.blank(+s: String, has: Bool) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match has:
-    case False{}:
-      Fail{(400, "no blank line")}
-    case True{}:
-      read_response.head(head_of(s), body_of(s))
-
-def read_response.capped(+s: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  match ok:
-    case False{}:
-      Fail{(413, "head too large")}
-    case True{}:
-      read_response.blank(s, has_blank(s))
-
-def read_response(+s: String) -> Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>:
-  read_response.capped(s, U32.is_le(str_len32(s), 16384))
-
-def read_head.emit(is11: Bool, m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match hs:
-    case Fail{e}:
-      Fail{e}
-    case Done{h}:
-      Done{(is11, (m, p, h, body))}
-
-def read_head.put(is11: Bool, m: String, p: String, body: String, hs: Result<&1, &1, U32 & String, List<&1, String & String>>) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.emit(is11, m, p, body, hs)
-
-def read_head.chk(is11: Bool, m: String, p: String, rest: List<&2, String>, body: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match ok:
-    case False{}:
-      Fail{(400, "bad request line")}
-    case True{}:
-      read_head.put(is11, m, p, body, parse_headers(rest))
-
-def read_head.ver(+m: String, +p: String, +v: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.chk(String.eq(String.trim(v), "HTTP/1.1"), m, p, rest, body, valid_req_line(m, p))
-
-def read_head.parts4(m: String, p: String, v: String, tail: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match tail:
-    case Nil{}:
-      read_head.ver(m, p, v, rest, body)
-    case h <> t:
-      Fail{(400, "bad request line")}
-
-def read_head.parts3(m: String, p: String, pv: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match pv:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case v <> tail:
-      read_head.parts4(m, p, v, tail, rest, body)
-
-def read_head.parts2(m: String, pm: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match pm:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case p <> pv:
-      read_head.parts3(m, p, pv, rest, body)
-
-def read_head.parts(parts: List<&2, String>, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match parts:
-    case Nil{}:
-      Fail{(400, "bad request line")}
-    case m <> pm:
-      read_head.parts2(m, pm, rest, body)
-
-def read_head.line(rl: String, rest: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.parts(split_spaces(rl), rest, body)
-
-def read_head.lines(lines: List<&2, String>, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match lines:
-    case Nil{}:
-      Fail{(400, "empty request")}
-    case rl <> rest:
-      read_head.line(strip_cr(rl), rest, body)
-
-def read_head.head(head: String, body: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.lines(String.lines(head), body)
-
-def read_head.blank(+s: String, has: Bool) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match has:
-    case False{}:
-      Fail{(400, "no blank line")}
-    case True{}:
-      read_head.head(head_of(s), body_of(s))
-
-def read_head.capped(+s: String, ok: Bool) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  match ok:
-    case False{}:
-      Fail{(413, "head too large")}
-    case True{}:
-      read_head.blank(s, has_blank(s))
-
-def read_head(+s: String) ->
-  Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>:
-  read_head.capped(s, U32.is_le(str_len32(s), 16384))
-
-# Keep-alive
-# ----------
-
-def keep_alive.open.go(is11: Bool, ka: Bool) -> Bool:
-  match ka:
+def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
+  match head:
     case True{}:
       True{}
     case False{}:
-      is11
+      match status:
+        case 204:
+          True{}
+        case 304:
+          True{}
+        case _:
+          U32.is_lt(status, 200)
 
-def keep_alive.open(conn: String, is11: Bool) -> Bool:
-  keep_alive.open.go(is11, String.eq(conn, "keep-alive"))
+def x_h1.no_body(+method: String, +status: U32) -> Bool:
+  x_h1.no_body.go(String.eq(method, "HEAD"), status)
 
-def keep_alive.conn.go(conn: String, is11: Bool, closed: Bool) -> Bool:
-  match closed:
-    case True{}:
-      False{}
-    case False{}:
-      keep_alive.open(conn, is11)
+# One carrier for the three framing answers above (same shape as
+# CT.BodyFrame): length-delimited, chunked, or absent. Reuse: the folds
+# own the rules, so the lanes stop threading three params for one
+# decision; the single-pass fold is future work if ever measured.
+def x_h1.frame_of(+hs: List<&2, HTTP.Hdr>, +method: String, +status: U32) -> HTTP.BodyFrame:
+  HTTP.BodyFrame{x_h1.cl_of(hs), x_h1.is_chunked(hs), x_h1.no_body(method, status)}
 
-def keep_alive.conn(+conn: String, is11: Bool) -> Bool:
-  keep_alive.conn.go(conn, is11, String.eq(conn, "close"))
-
-def keep_alive(is11: Bool, hs: List<&1, String & String>) -> Bool:
-  keep_alive.conn(String.to_lower(String.trim(get_header("", "Connection", hs))), is11)
-
-def with_connection.go(st: U32, hs: List<&1, String & String>, body: String, keep: Bool) ->
-  U32 & List<&1, String & String> & String:
-  match keep:
-    case True{}:
-      (st, ("Connection", "keep-alive") <> hs, body)
-    case False{}:
-      (st, ("Connection", "close") <> hs, body)
-
-def with_connection(keep: Bool, resp: U32 & List<&1, String & String> & String) ->
-  U32 & List<&1, String & String> & String:
-  (st, hs, body) = resp
-  with_connection.go(st, drop_conn(hs), body, keep)
-
-
-
-# Chunked
-# -------
-# One state machine: 0 reads a hex size, 1 skips extensions, 2 reads
-# data, 3 and 4 eat the data CRLF, 5 and 6 eat the final CRLF. Every
-# arm holds one recursive call, so it is linear; validity ANDs through
-# and gates the answer at the end.
+# Chunked (RFC 9112 section 7.1.1): one grammar, one machine.
+# ----------------------------------------------------------
+# x_h1.chunk_step eats whatever the buffer holds and answers this file's
+# own UnitOut (Got / NeedMore / End / Bad) beside its ChunkSt, so a body
+# can arrive in pieces. Ported from lib/web/http/main.bend's h1_chunk_step
+# -- same states, same answers, same two load-bearing arms (a trailing CR
+# is NeedMore and never Bad, and it rides back in the outcome's rest
+# unconsumed) -- because this file's isolation build may not import that
+# module (Base + http.bend only, see the header). What the grammar
+# accepts: a hex size line (either case, with an optional chunk
+# extension), the CRLF, that many bytes and the CRLF after them, then "0"
+# and the trailer-free CRLF. A trailer section is refused with 400, the
+# answer lib/web/http/main.bend gives too (tests/http/h1_stream.bend s10
+# and f4): a trailer is not chunked data, and reading it as if it were is
+# the fail-open shape this lane exists to avoid.
 #
-# Phase 10.1: `rem` (the bytes still owed by the chunk being read) is
-# U32 now, so the two `U32.to_nat(size)` bridges are gone. The Nat
-# `fuel` stays, and it is NOT the same situation as httpx's H1-lane
-# fuel: this def dispatches on `st` before it can look at the bytes,
-# and the checker reads self-call arguments left to right, so the
-# argument that shrinks must come first -- and the byte list cannot be
-# matched until `st` has been matched, or the state dispatch stops
-# working (Discovery 19). Defueling would mean inlining states 3 and 4
-# into state 2, which is a rewrite of the whole machine for no measured
-# gain, so the fuel stays and the file is at the HTTPX level.
-#
-# `length_nat` is now a shell over `body_length`: the file used to walk
-# every byte list twice, once per numeric type. The Nat signature stays
-# because lib/https_http1.bend calls it and is out of this phase's scope.
+# The body is copied in BLOCKS, never byte by byte: the data state takes
+# min(rem, len(bs)) bytes with one slice and leaves the tail, so a whole
+# 16 KiB recv costs one arm. Measured on a synthetic 1,1 MB body (64
+# chunks of 16 KiB, whole-buffer fold, CPU time of one program): 6,3 s
+# for this step fold against 6,9 s for the retired byte-at-a-time
+# unchunk. The decisive win is not that margin but the shape: the byte
+# machine can only answer "the whole body is here" (it has no NeedMore),
+# so an IO lane would have to re-decode the growing buffer on every recv,
+# while the step resumes from its own state and lets the lanes below
+# consume a recv per arm.
 
-def length_nat(bs: List<&2, U32>) -> Nat:
-  U32.to_nat(body_length(bs))
+# A fresh decoder: at a size line, nothing owed, no size, no partial chunk.
+def x_h1.chunk_init() -> HTTP.ChunkSt:
+  HTTP.ChunkSt{0, 0n, 0, Nil{}}
 
-def unchunk.put(r: List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  (acc, ok) = r
-  match ok:
-    case True{}:
-      Done{List.reverse(&2, U32, acc)}
-    case False{}:
-      Fail{(400, "bad chunked")}
+# The chunk's bytes out of the fragment stack the data state fills (newest
+# read first, each fragment already in order). One fragment -- the whole
+# chunk in one buffer, the common case -- comes back as it is, no copy.
+def x_h1.chunk_close.go(+frags: List<&2, List<&2, U32>>, +acc: List<&2, U32>) -> List<&2, U32>:
+  match frags:
+    case Nil{}:
+      acc
+    case f <> t:
+      x_h1.chunk_close.go(t, List.append(&2, U32, f, acc))
 
-def unchunk.go(fuel: Nat, st: U32, rem: U32, size: U32, acc: List<&2, U32>, valid: Bool, bs: List<&2, U32>) ->
-  List<&2, U32> & Bool:
-  match fuel:
-    case 0n:
-      (acc, False{})
-    case 1n+f:
-      match st:
+def x_h1.chunk_close(+frags: List<&2, List<&2, U32>>) -> List<&2, U32>:
+  match frags:
+    case Nil{}:
+      Nil{}
+    case f <> Nil{}:
+      f
+    case _ <> _:
+      x_h1.chunk_close.go(frags, Nil{})
+
+# The two numbers the data state cannot decide by matching -- the state to
+# continue in (3 when the read ended exactly on the chunk, 2 when more is
+# owed) and what is left of rem -- computed here because a match cannot
+# scrutinize a computed value: the decision has to arrive as a field the
+# next iteration matches. The subtraction is guarded by the comparison
+# that picks the state, so it never underflows.
+def x_h1.chunk_st_of(+want: U32, +have: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(want, have), 3, 2)
+
+def x_h1.chunk_rem_of(+want: U32, +have: U32) -> Nat:
+  U32.to_nat((want - have : U32))
+
+# One step of the grammar. Self-recursive (@unsafe) with one call per arm
+# and a buffer that shrinks on each, so a whole body parses in linear time
+# with no fuel. A Nil in the middle of a chunk is NeedMore -- the buffer
+# ran out, the state comes back untouched and the caller reads more --
+# while a byte the grammar does not allow is Bad. acc is Nil at every
+# chunk boundary, so the two size states clear it.
+@unsafe
+def x_h1.chunk_step(st: HTTP.ChunkSt, +bs: List<&2, U32>) -> HTTP.ChunkSt & HTTP.UnitOut:
+  match st:
+    case HTTP.ChunkSt{st2, rem, size, acc}:
+      match st2:
         case 0:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case b <> rest:
               match b:
                 case 48:
-                  unchunk.go(f, 0, 0, 0, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{0, 0n, 0, Nil{}}, rest)
                 case 49:
-                  unchunk.go(f, 7, 0, 1, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 1, Nil{}}, rest)
                 case 50:
-                  unchunk.go(f, 7, 0, 2, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 2, Nil{}}, rest)
                 case 51:
-                  unchunk.go(f, 7, 0, 3, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 3, Nil{}}, rest)
                 case 52:
-                  unchunk.go(f, 7, 0, 4, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 4, Nil{}}, rest)
                 case 53:
-                  unchunk.go(f, 7, 0, 5, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 5, Nil{}}, rest)
                 case 54:
-                  unchunk.go(f, 7, 0, 6, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 6, Nil{}}, rest)
                 case 55:
-                  unchunk.go(f, 7, 0, 7, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 7, Nil{}}, rest)
                 case 56:
-                  unchunk.go(f, 7, 0, 8, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 8, Nil{}}, rest)
                 case 57:
-                  unchunk.go(f, 7, 0, 9, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 9, Nil{}}, rest)
                 case 65:
-                  unchunk.go(f, 7, 0, 10, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 10, Nil{}}, rest)
                 case 66:
-                  unchunk.go(f, 7, 0, 11, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 11, Nil{}}, rest)
                 case 67:
-                  unchunk.go(f, 7, 0, 12, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 12, Nil{}}, rest)
                 case 68:
-                  unchunk.go(f, 7, 0, 13, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 13, Nil{}}, rest)
                 case 69:
-                  unchunk.go(f, 7, 0, 14, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 14, Nil{}}, rest)
                 case 70:
-                  unchunk.go(f, 7, 0, 15, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 15, Nil{}}, rest)
                 case 97:
-                  unchunk.go(f, 7, 0, 10, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 10, Nil{}}, rest)
                 case 98:
-                  unchunk.go(f, 7, 0, 11, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 11, Nil{}}, rest)
                 case 99:
-                  unchunk.go(f, 7, 0, 12, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 12, Nil{}}, rest)
                 case 100:
-                  unchunk.go(f, 7, 0, 13, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 13, Nil{}}, rest)
                 case 101:
-                  unchunk.go(f, 7, 0, 14, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 14, Nil{}}, rest)
                 case 102:
-                  unchunk.go(f, 7, 0, 15, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, 15, Nil{}}, rest)
                 case 59:
-                  unchunk.go(f, 1, 0, 0, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{1, 0n, 0, Nil{}}, rest)
                 case 13:
                   match rest:
+                    case Nil{}:
+                      (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, [13]})
                     case 10 <> rest2:
-                      unchunk.go(f, 5, 0, 0, acc, valid, rest2)
+                      x_h1.chunk_step(HTTP.ChunkSt{5, 0n, 0, Nil{}}, rest2)
                     case _:
-                      (acc, False{})
+                      (st, HTTP.Bad{400, "bad chunked"})
                 case _:
-                  unchunk.go(f, 0, 0, 0, acc, False{}, rest)
+                  (st, HTTP.Bad{400, "bad chunked"})
         case 7:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case b <> rest:
               match b:
                 case 48:
-                  unchunk.go(f, 7, 0, (size * 16 + 0 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 0 : U32), Nil{}}, rest)
                 case 49:
-                  unchunk.go(f, 7, 0, (size * 16 + 1 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 1 : U32), Nil{}}, rest)
                 case 50:
-                  unchunk.go(f, 7, 0, (size * 16 + 2 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 2 : U32), Nil{}}, rest)
                 case 51:
-                  unchunk.go(f, 7, 0, (size * 16 + 3 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 3 : U32), Nil{}}, rest)
                 case 52:
-                  unchunk.go(f, 7, 0, (size * 16 + 4 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 4 : U32), Nil{}}, rest)
                 case 53:
-                  unchunk.go(f, 7, 0, (size * 16 + 5 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 5 : U32), Nil{}}, rest)
                 case 54:
-                  unchunk.go(f, 7, 0, (size * 16 + 6 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 6 : U32), Nil{}}, rest)
                 case 55:
-                  unchunk.go(f, 7, 0, (size * 16 + 7 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 7 : U32), Nil{}}, rest)
                 case 56:
-                  unchunk.go(f, 7, 0, (size * 16 + 8 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 8 : U32), Nil{}}, rest)
                 case 57:
-                  unchunk.go(f, 7, 0, (size * 16 + 9 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 9 : U32), Nil{}}, rest)
                 case 65:
-                  unchunk.go(f, 7, 0, (size * 16 + 10 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 10 : U32), Nil{}}, rest)
                 case 66:
-                  unchunk.go(f, 7, 0, (size * 16 + 11 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 11 : U32), Nil{}}, rest)
                 case 67:
-                  unchunk.go(f, 7, 0, (size * 16 + 12 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 12 : U32), Nil{}}, rest)
                 case 68:
-                  unchunk.go(f, 7, 0, (size * 16 + 13 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 13 : U32), Nil{}}, rest)
                 case 69:
-                  unchunk.go(f, 7, 0, (size * 16 + 14 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 14 : U32), Nil{}}, rest)
                 case 70:
-                  unchunk.go(f, 7, 0, (size * 16 + 15 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 15 : U32), Nil{}}, rest)
                 case 97:
-                  unchunk.go(f, 7, 0, (size * 16 + 10 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 10 : U32), Nil{}}, rest)
                 case 98:
-                  unchunk.go(f, 7, 0, (size * 16 + 11 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 11 : U32), Nil{}}, rest)
                 case 99:
-                  unchunk.go(f, 7, 0, (size * 16 + 12 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 12 : U32), Nil{}}, rest)
                 case 100:
-                  unchunk.go(f, 7, 0, (size * 16 + 13 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 13 : U32), Nil{}}, rest)
                 case 101:
-                  unchunk.go(f, 7, 0, (size * 16 + 14 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 14 : U32), Nil{}}, rest)
                 case 102:
-                  unchunk.go(f, 7, 0, (size * 16 + 15 : U32), acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{7, 0n, (size * 16 + 15 : U32), Nil{}}, rest)
                 case 59:
-                  unchunk.go(f, 1, 0, size, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{1, 0n, size, Nil{}}, rest)
                 case 13:
                   match rest:
+                    case Nil{}:
+                      (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, [13]})
                     case 10 <> rest2:
-                      unchunk.go(f, 2, size, 0, acc, valid, rest2)
+                      x_h1.chunk_step(HTTP.ChunkSt{2, U32.to_nat(size), 0, Nil{}}, rest2)
                     case _:
-                      (acc, False{})
+                      (st, HTTP.Bad{400, "bad chunked"})
                 case _:
-                  unchunk.go(f, 7, 0, size, acc, False{}, rest)
+                  (st, HTTP.Bad{400, "bad chunked"})
         case 1:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case b <> rest:
               match b:
                 case 13:
                   match rest:
+                    case Nil{}:
+                      (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, [13]})
                     case 10 <> rest2:
-                      unchunk.go(f, 2, size, 0, acc, valid, rest2)
+                      x_h1.chunk_step(HTTP.ChunkSt{2, U32.to_nat(size), 0, Nil{}}, rest2)
                     case _:
-                      (acc, False{})
+                      (st, HTTP.Bad{400, "bad chunked"})
                 case _:
-                  unchunk.go(f, 1, 0, size, acc, valid, rest)
+                  x_h1.chunk_step(HTTP.ChunkSt{1, 0n, size, acc}, rest)
         case 2:
           match rem:
-            case 0:
-              unchunk.go(f, 3, 0, size, acc, valid, bs)
-            case _:
+            case 0n:
+              x_h1.chunk_step(HTTP.ChunkSt{3, 0n, size, acc}, bs)
+            case 1n+c:
               match bs:
                 case Nil{}:
-                  (acc, False{})
-                case h <> t:
-                  unchunk.go(f, 2, (rem - 1 : U32), size, h <> acc, valid, t)
+                  (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
+                case _ <> _:
+                  # The data phase in one arm: have is min(rem, len(bs)),
+                  # counted only up to rem, so the take is the chunk's own
+                  # slice and the read goes onto the fragment stack with
+                  # one cons. The decision "was that the whole chunk?"
+                  # rides as the STATE NUMBER (3 whole, 2 partial): the
+                  # next iteration matches the field, which is what makes
+                  # this legal Bend and not a special case. The partial
+                  # read's buffer ends at or before the chunk, so its rest
+                  # is Nil and state 2 answers NeedMore.
+                  +want = U32.from_nat(rem)
+                  +have = HTTP.x_len_upto(want, bs)
+                  x_h1.chunk_step(HTTP.ChunkSt{x_h1.chunk_st_of(want, have), x_h1.chunk_rem_of(want, have), size,
+                    HTTP.x_take32(have, bs) <> acc}, HTTP.x_drop32(have, bs))
         case 3:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case 13 <> t:
-              unchunk.go(f, 4, 0, size, acc, valid, t)
+              x_h1.chunk_step(HTTP.ChunkSt{4, 0n, size, acc}, t)
             case _:
-              (acc, False{})
+              (st, HTTP.Bad{400, "bad chunked"})
         case 4:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case 10 <> t:
-              unchunk.go(f, 0, 0, 0, acc, valid, t)
+              x_h1.chunk_step(HTTP.ChunkSt{8, 0n, size, acc}, t)
             case _:
-              (acc, False{})
+              (st, HTTP.Bad{400, "bad chunked"})
+        case 8:
+          match bs:
+            case Nil{}:
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
+            case 48 <> t:
+              (x_h1.chunk_init(), HTTP.Got{x_h1.chunk_close(acc), True{}, bs})
+            case 13 <> t:
+              (x_h1.chunk_init(), HTTP.Got{x_h1.chunk_close(acc), True{}, bs})
+            case _ <> t:
+              (x_h1.chunk_init(), HTTP.Got{x_h1.chunk_close(acc), False{}, bs})
         case 5:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case 13 <> t:
-              unchunk.go(f, 6, 0, size, acc, valid, t)
+              x_h1.chunk_step(HTTP.ChunkSt{6, 0n, size, acc}, t)
             case _:
-              (acc, False{})
+              (st, HTTP.Bad{400, "bad chunked"})
         case 6:
           match bs:
             case Nil{}:
-              (acc, False{})
+              (HTTP.ChunkSt{st2, rem, size, acc}, HTTP.NeedMore{1, Nil{}})
             case 10 <> t:
               match t:
                 case Nil{}:
-                  (acc, valid)
-                case _:
-                  (acc, False{})
+                  (st, HTTP.End{Nil{}})
+                case _ <> t2:
+                  (st, HTTP.Bad{400, "bad chunked"})
             case _:
-              (acc, False{})
+              (st, HTTP.Bad{400, "bad chunked"})
         case _:
-          (acc, False{})
+          (st, HTTP.Bad{400, "bad chunked"})
 
-def unchunk(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
-  unchunk.put(unchunk.go(1n+length_nat(bs), 0, 0, 0, Nil{}, True{}, bs))
+# The whole-buffer fold: one body, one Result, the shape every caller above
+# already speaks. A starved step answers the failure the byte-at-a-time
+# machine gave when its buffer ran out mid-chunk (400 "bad chunked"),
+# which is also what keeps a truncated body from reading as an empty one.
+@unsafe
+def x_h1.unchunk.go(r: HTTP.ChunkSt & HTTP.UnitOut, acc: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  (st2, out) = r
+  match out:
+    case HTTP.Got{+chunk, fin, +rest}:
+      x_h1.unchunk.go(x_h1.chunk_step(st2, rest), HTTP.x_rev_push(chunk, acc))
+    case HTTP.NeedMore{missing, rest}:
+      Fail{(400, "bad chunked")}
+    case HTTP.End{rest}:
+      Done{HTTP.x_cat(acc)}
+    case HTTP.Bad{code, msg}:
+      Fail{(code, msg)}
 
-# Router
-# ------
-# A router is a handler beside its next thunk, kept as a plain tuple
-# (a law would stay an open claim and fail the check). Route runs once.
+def x_h1.unchunk(+bs: List<&2, U32>) -> Result<&1, &1, U32 & String, List<&2, U32>>:
+  x_h1.unchunk.go(x_h1.chunk_step(x_h1.chunk_init(), bs), Nil{})
 
-def route_status(resp: U32 & List<&1, String & String> & String) -> U32:
-  (st, hs, body) = resp
-  st
+# The client's chunked body reader: the same phase+fuel shape as
+# x_h1.cli.bd, except the length is not known up front -- the step decides.
+# Got adds the chunk to a reversed body and keeps stepping, NeedMore spends
+# one recv (fuel), Bad is 400 and End is the answer. The lookahead's fin is
+# NOT the finish line: only End is, so "1\r\nA\r\n\r\n" (a bare empty line
+# standing in for the last-chunk, which the lookahead reads as "last")
+# stays 400 here, exactly like both whole-buffer decoders. The bare codes
+# are the lane's own: 413 is the fuel floor x_h1.cli.bd uses, 400 on EOF is
+# its "eof" too.
+#
+# Phase 1 exists for the same reason x_h1.cli.bd has one: the recv result is
+# a computed pair and a match cannot scrutinize a computed value, so it
+# travels here as a parameter. The pending state rides in the pair parameter
+# as well -- phase 0 hands it chunk_step(st2, Nil{}), which always answers
+# NeedMore and consumes no byte -- because that state is all phase 1 needs
+# once the new bytes are appended to the buffer.
+@unsafe
+def x_h1.cli.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, r: HTTP.ChunkSt & HTTP.UnitOut, fuel: Nat, rev: List<&2, U32>, buf: List<&2, U32>, +code: U32, hs: List<&2, HTTP.Hdr>, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match phase:
+    case 0:
+      match r:
+        case (st2, out):
+          match out:
+            case HTTP.Got{+chunk, fin, +rest}:
+              (sock, _r0) = got
+              x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(st2, rest), fuel, HTTP.x_rev_push(chunk, rev), rest, code, hs, (sock, Done{Nil{}}))
+            case HTTP.NeedMore{missing, +rest}:
+              match fuel:
+                case 0n:
+                  (sock2, _r1) = got
+                  IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock2, Fail{(413, "response too long")}))
+                case 1n+f:
+                  (sock3, _r2) = got
+                  do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>>:
+                    r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock3, 16384)
+                    x_h1.cli.chunk(~recv, ~send, ~close, 1, x_h1.chunk_step(st2, Nil{}), f, rev, rest, code, hs, r1)
+            case HTTP.End{rest}:
+              (sock4, _r3) = got
+              IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock4, Done{(HTTP.Response{code, hs, HTTP.x_cat(rev)}, Nil{})}))
+            case HTTP.Bad{code2, msg}:
+              (sock5, _r4) = got
+              IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock5, Fail{(code2, msg)}))
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{(400, "eof")}))
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(st2, buf2), fuel, rev, buf2, code, hs, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s9, Fail{(502, "bad phase")}))
 
-def dispatch(route: String & String & List<&1, String & String> & String -> IO(U32 & List<&1, String & String> & String), req: String & String & List<&1, String & String> & String) ->
-  IO(U32 & List<&1, String & String> & String):
-  route(req)
+# H1 client exchange (fallback lane): render, send, head/body fuel loops,
+# close. Matches go forward in param order per branch (checker rule).
+# Transport is three templates (~recv/~send/~close), instantiated per
+# lane at the public entries: TLS (tls_recv/send_bytes + tls_close) or
+# TCP (TCP.recv/send_bytes + Socket.close). The grammar is identical —
+# that is what let the x_h1p.* mirror die in Phase 1.
+#
+# The content-length body rides REVERSED (x_rev_push), like the chunked
+# lane below: per recv the work stays O(chunk) and the un-reverse happens
+# once with x_cat at the answer. Appending each part onto a growing body
+# (List.append(rest, part) + x_has_at_least) was O(n) per recv AND
+# linear-recursive, which overflowed the interp machine stack past ~48 KB
+# (same hazard x_rev_push's header documents for the H2 lane). `need` is
+# the count still missing, so the completion test is a match on a U32
+# param instead of a re-walk of the buffer.
+# ---------------------------------------------------------------------
 
-# IO: fetch and serve
-# -------------------
-# The fetch lane is bytes (TCP.send/recv_bytes): the head/body cut is
-# the "\r\n\r\n" window (218762506) over List<&2, U32>, mirroring
-# body_of over raw bytes; the body decodes at the end.
+@unsafe
+def x_h1.cli.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, fuel: Nat, +need: U32, +code: U32, +hs: List<&2, HTTP.Hdr>, +rev: List<&2, U32>, +cl: U32) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s0, Fail{(413, "response too long")}))
+        case 1n+f:
+          match need:
+            case 0:
+              IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s0, Done{(HTTP.Response{code, hs, HTTP.x_take32(cl, HTTP.x_cat(rev))}, Nil{})}))
+            case _:
+              do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>>:
+                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+                x_h1.cli.bd(~recv, ~send, ~close, 1, r, f, need, code, hs, rev, cl)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{e}))
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
+            case h <> t:
+              +need2 = U32.sub(need, HTTP.x_len_upto(need, part))
+              x_h1.cli.bd(~recv, ~send, ~close, 0, (s1, Done{Nil{}}), fuel, need2, code, hs, HTTP.x_rev_push(part, rev), cl)
+    case _:
+      (s9, r9) = got
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s9, Fail{(502, "bad phase")}))
 
-def bs_body.go(bs: List<&2, U32>, e: Bool, w: U32) -> List<&2, U32>:
-  match bs:
-    case Nil{}:
-      Nil{}
-    case b <> t:
-      match e:
-        case True{}:
-          b <> t
-        case False{}:
-          +w2 = (w * 256 + b : U32)
-          bs_body.go(t, U32.is_eq(w2, 218762506), w2)
-
-def bs_body(bs: List<&2, U32>) -> List<&2, U32>:
-  bs_body.go(bs, False{}, 0)
-
-def bs_head.go(bs: List<&2, U32>, e: Bool, w: U32, acc: List<&2, U32>) -> List<&2, U32>:
-  match bs:
-    case Nil{}:
-      List.reverse(&2, U32, acc)
-    case +b <> t:
-      match e:
-        case True{}:
-          List.reverse(&2, U32, acc)
-        case False{}:
-          +w2 = (w * 256 + b : U32)
-          bs_head.go(t, U32.is_eq(w2, 218762506), w2, b <> acc)
-
-def bs_head(bs: List<&2, U32>) -> List<&2, U32>:
-  bs_head.go(bs, False{}, 0, Nil{})
-
-# Phase 10.1: the walk counts in U32 (a Content-Length is a U32), so the
-# `U32.to_nat` bridge at the call site is gone. The Nat entry below is a shell
-# kept only for lib/https_http1.bend, which is out of this phase's scope.
-def bs_take32.go(+bs: List<&2, U32>, +n: U32, acc: List<&2, U32>) -> List<&2, U32>:
-  match bs:
-    case Nil{}:
-      List.reverse(&2, U32, acc)
-    case b <> t:
-      match n:
-        case 0:
-          List.reverse(&2, U32, acc)
-        case _:
-          bs_take32.go(t, (n - 1 : U32), b <> acc)
-
-def bs_take32(bs: List<&2, U32>, n: U32) -> List<&2, U32>:
-  bs_take32.go(bs, n, Nil{})
-
-def bs_take(bs: List<&2, U32>, n: Nat) -> List<&2, U32>:
-  bs_take32(bs, U32.from_nat(n))
-
-
-law fetch:
-  for url: String
-  IO(Result<&1, &1, U32 & String, String>)
-
-def fetch.fail(sock: Socket, e: U32 & String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    x : Unit <- Socket.close(sock)
-    return Fail{e}
-
-# fetch.body: framing per the response head — chunked decodes via
-# unchunk, Content-Length cuts exactly CL bytes (short of CL is 413,
-# fail-closed: the 64KB cap truncates), no framing reads until EOF.
-# Responses with no content by spec (HEAD, 1xx, 204, 304 — RFC 9110
-# 9.3.2, RFC 9112 6.4) short-circuit to an empty body: the head may
-# still carry the GET's Content-Length, so the CL check must not run.
-
-# fetch.body.frame: one linear fold over the response headers (single
-# def — a per-header helper would cycle back into the fold, and user
-# files forbid forward calls). Content-Length selects arithmetically,
-# Transfer-Encoding: chunked ORs the flag; TE wins at the put.
-
-def fetch.body.frame.u(b: Bool) -> U32:
-  match b:
+# The nbody=False arm of hd2: a body to read, or the 502 of an upgrade
+# without 101. The decision needs its own def, because Bend refuses a match
+# inside two match arms.
+def x_h1.cli.body_go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, HTTP.Hdr>, upg: Bool, chunked: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match upg:
     case True{}:
-      1
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{(502, "upgrade without 101")}))
     case False{}:
+      match chunked:
+        case True{}:
+          x_h1.cli.chunk(~recv, ~send, ~close, 0, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, Nil{}, rest, code, hs, (sock, Done{Nil{}}))
+        case False{}:
+          +clc = x_h1.cl_of(hs)
+          +need0 = U32.sub(clc, HTTP.x_len_upto(clc, rest))
+          x_h1.cli.bd(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), fuel, need0, code, hs, HTTP.x_cat(rest), clc)
+
+# The chain serves the plain lane and the upgrade lane. The flag upg turns
+# the nbody=False arm into Fail 502 "upgrade without 101" (fail-closed:
+# a 101 carries no body by definition). The plain entries drop the rest of
+# the triple, the upgrade entries keep it (x_h1.cli.exch.open).
+
+def x_h1.cli.hd2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, HTTP.Hdr>, nbody: Bool, chunked: Bool, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match nbody:
+    case True{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Done{(HTTP.Response{code, hs, Nil{}}, rest)}))
+    case False{}:
+      x_h1.cli.body_go(~recv, ~send, ~close, sock, rest, fuel, code, hs, upg, chunked)
+
+# The nbody=False arm of hd2: a body to read, or the 502 of an upgrade
+# without 101. The decision needs its own def, because Bend refuses a match
+# inside two match arms.
+def x_h1.cli.hd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, hsres: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>, nbody: Bool, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match hsres:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+hs}:
+      x_h1.cli.hd2(~recv, ~send, ~close, sock, rest, fuel, code, hs, nbody, x_h1.is_chunked(hs), upg)
+
+def x_h1.cli.coded(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +method: String, +rest: List<&2, U32>, fuel: Nat, coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match coderes:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+code}:
+      x_h1.cli.hd(~recv, ~send, ~close, sock, rest, fuel, code, hsres, x_h1.no_body(method, code), upg)
+
+# got B (TASK-040): the split triple arrives as a parameter — a computed
+# triple cannot be scrutinized (E1), a parameter can (E2) — so head-lines
+# and rest come out of ONE x_h1.split traversal. Was split_head(split(acc2))
+# plus split_rest(split(acc2)): two walks and two reverses per head.
+def x_h1.cli.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), p: List<&2, U32> & List<&2, U32> & Bool, s1: Socket, fuel: Nat, +method: String, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)), upg)
+
+def x_h1.cli.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  x_h1.cli.parsed.got(~recv, ~send, ~close, x_h1.split(acc2), s1, fuel, method, upg)
+
+# Status code of the head sitting in acc (0 when the status line does not
+# parse). The 1xx check runs before the head is turned into a response, so
+# it reads the code out of the same split/parse the answer path uses
+# (TASK-042 phase 4).
+def x_h1.cli.code_of_got(r: Result<&1, &1, U32 & String, U32>) -> U32:
+  match r:
+    case Fail{e}:
       0
+    case Done{+code}:
+      code
 
-def fetch.body.unc(r: Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  Result<&1, &1, U32 & String, String>:
+def x_h1.status_of(+acc: List<&2, U32>) -> U32:
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
+  x_h1.cli.code_of_got(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))))
+
+# 1xx is an interim status (RFC 9110 section 15.2): any number of them may
+# precede the final response — 100 Continue (Expect), 103 Early Hints
+# (node's writeEarlyHints, CDNs) — so the head is discarded and the next
+# one parsed out of the bytes already read. 101 Switching Protocols is the
+# upgrade answer: a final head for the caller, never interim here.
+def x_h1.is_info(+code: U32) -> Bool:
+  Bool.and(Bool.and(U32.is_lt(99, code), U32.is_lt(code, 200)), U32.is_ne(code, 101))
+
+@unsafe
+def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, +method: String, found: Bool, info: Bool, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s0, Fail{(413, "response too long")}))
+        case 1n+f:
+          do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.cli.head(~recv, ~send, ~close, 1, r, acc, f, method, False{}, False{}, upg)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{e}))
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2), False{}, upg)
+    case 2:
+      (s2, r2) = got
+      match found:
+        case False{}:
+          x_h1.cli.head(~recv, ~send, ~close, 0, (s2, Done{Nil{}}), acc, fuel, method, False{}, False{}, upg)
+        case True{}:
+          x_h1.cli.head(~recv, ~send, ~close, 4, (s2, Done{Nil{}}), acc, fuel, method, False{}, x_h1.is_info(x_h1.status_of(acc)), upg)
+    case 4:
+      (s4, r4) = got
+      match info:
+        case True{}:
+          +rest = x_h1.split_rest(x_h1.split(acc))
+          x_h1.cli.head(~recv, ~send, ~close, 2, (s4, Done{Nil{}}), rest, fuel, method, x_h1.split.test(rest), False{}, upg)
+        case False{}:
+          x_h1.cli.parsed(~recv, ~send, ~close, s4, acc, fuel, method, upg)
+    case _:
+      (s9, r9) = got
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s9, Fail{(502, "bad phase")}))
+
+# The plain lane drops the bytes past the answer; the upgrade lane keeps
+# them, because they are the first frame bytes.
+def x_h1.cli.rest_drop(out: Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>) ->
+  Socket & Result<&1, &1, U32 & String, HTTP.Response>:
+  (sock, r) = out
   match r:
     case Fail{e}:
-      Fail{e}
-    case Done{bs}:
-      Done{decode_all(bs)}
+      (sock, Fail{e})
+    case Done{p}:
+      (res, _rest) = p
+      (sock, Done{res})
 
-def fetch.body.cl.put(cl: U32, raw: List<&2, U32>, over: Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match over:
-    case True{}:
-      Fail{(413, "body too large")}
-    case False{}:
-      Done{decode_all(bs_take32(raw, cl))}
-
-def fetch.body.cl.len(+cl: U32, raw: List<&2, U32>, len: U32) ->
-  Result<&1, &1, U32 & String, String>:
-  fetch.body.cl.put(cl, raw, Bool.and(U32.is_gt(cl, 0), Bool.not(U32.is_le(cl, len))))
-
-def fetch.body.cl(cl: U32, +raw: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
-  fetch.body.cl.len(cl, raw, body_length(raw))
-
-def fetch.body.frame.go(hs: List<&1, String & String>, +cl: U32, +ch: Bool) -> U32 & Bool:
-  match hs:
-    case Nil{}:
-      (cl, ch)
-    case (n, v) <> t:
-      +nn = n
-      +vv = v
-      +cl_u = fetch.body.frame.u(eq_ci(nn, "Content-Length"))
-      +v_cl = Maybe.default(&2, U32, U32.read(String.trim(vv)), 0)
-      +is_chunk = Bool.and(eq_ci(nn, "Transfer-Encoding"), eq_ci(String.trim(vv), "chunked"))
-      fetch.body.frame.go(t, (cl * (1 - cl_u) + v_cl * cl_u : U32), Bool.or(ch, is_chunk))
-
-def fetch.body.frame.put(raw: List<&2, U32>, fr: U32 & Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  (cl, ch) = fr
-  match ch:
-    case True{}:
-      fetch.body.unc(unchunk(raw))
-    case False{}:
-      fetch.body.cl(cl, raw)
-
-def fetch.body.no_body(+meth: String, +st: U32) -> Bool:
-  Bool.or(eq_ci(meth, "HEAD"),
-    Bool.or(U32.is_lt(st, 200),
-      Bool.or(U32.is_eq(st, 204), U32.is_eq(st, 304))))
-
-def fetch.body.frame(nb: Bool, raw: List<&2, U32>, fr: U32 & Bool) ->
-  Result<&1, &1, U32 & String, String>:
-  match nb:
-    case True{}:
-      Done{SNil{}}
-    case False{}:
-      fetch.body.frame.put(raw, fr)
-
-def fetch.body.head(meth: String, parsed: Result<&1, &1, U32 & String, U32 & List<&1, String & String> & String>, raw: List<&2, U32>) ->
-  Result<&1, &1, U32 & String, String>:
-  match parsed:
-    case Fail{e}:
-      Fail{e}
-    case Done{r}:
-      (st, hs, b0) = r
-      +nb = fetch.body.no_body(meth, st)
-      fr = fetch.body.frame.go(hs, 0, False{})
-      fetch.body.frame(nb, raw, fr)
-
-# Phase 11.3: the recv accumulator rides REVERSED, so pushing a chunk
-# costs O(chunk) instead of O(body). `List.append` is linear-recursive
-# over its first argument, so the old `List.append(acc, part)` walked the
-# whole body on every recv -- 8 recvs of up to 8 KB meant 8 traversals of
-# up to 64 KB (Discovery 21). Each chunk is therefore reversed before the
-# prepend, and `fetch.body` reverses the whole once at the end: one
-# tail-recursive pass either way.
-def fetch.push(part: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, List.reverse(&2, U32, part), acc)
-
-def fetch.acc(bs: List<&2, U32>) -> List<&2, U32>:
-  List.reverse(&2, U32, bs)
-
-def fetch.body(meth: String, +acc: List<&2, U32>) -> Result<&1, &1, U32 & String, String>:
-  fetch.body.head(meth, read_response(decode_all(bs_head(acc))), bs_body(acc))
-
-# The recv loop is unrolled 8x and the index counts DOWN: afterNfn
-# handles the result of the Nth recv and calls recv(N+1) — so the
-# chain runs recv1 → after1fn → recv2 → ... → recv8 → after8fn →
-# finish, at most 8×8192 = 64KB. The defs sit in DESCENDING order so
-# every callee is above its caller (no forward calls). The +1 is the
-# termination budget: afterNfn → recvN would re-check and loop recv1
-# forever (the checker rejects it as a name-scope cycle). Thread the
-# meth param through every hop when touching this chain.
-
-def fetch.finish(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    x : Unit <- Socket.close(sock)
-    return fetch.body(meth, fetch.acc(acc))
-
-def fetch.after8fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.finish(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv8(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after8fn(meth, acc, m))
-
-def fetch.after7fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv8(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv7(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after7fn(meth, acc, m))
-
-def fetch.after6fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv7(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv6(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after6fn(meth, acc, m))
-
-def fetch.after5fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv6(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv5(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after5fn(meth, acc, m))
-
-def fetch.after4fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv5(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv4(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after4fn(meth, acc, m))
-
-def fetch.after3fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv4(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv3(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after3fn(meth, acc, m))
-
-def fetch.after2fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv3(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv2(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after2fn(meth, acc, m))
-
-def fetch.after1fn(meth: String, acc: List<&2, U32>, m: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  (sock2, r) = m
-  match r:
-    case Fail{e}:
-      fetch.fail(sock2, e)
-    case Done{part}:
-      match part:
-        case Nil{}:
-          fetch.finish(sock2, meth, acc)
-        case h <> t:
-          fetch.recv2(sock2, meth, fetch.push(part, acc))
-
-def fetch.recv1(sock: Socket, meth: String, acc: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, String>):
-  IO.bind(Socket & Result<&1, &1, U32 & String, List<&2, U32>>, Result<&1, &1, U32 & String, String>, TCP.recv_bytes(sock, 8192), m => fetch.after1fn(meth, acc, m))
-
-def fetch.exchange.sent(meth: String, sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  IO(Result<&1, &1, U32 & String, String>):
+def x_h1.exch.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
   (sock, r) = sent
   match r:
     case Fail{e}:
-      fetch.fail(sock, e)
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Fail{e}))
     case Done{u}:
-      fetch.recv1(sock, meth, Nil{})
+      do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response>>:
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{}, False{}, False{})
+        IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, x_h1.cli.rest_drop(out))
 
-def fetch.exchange(sock: Socket, text: String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
-    fetch.exchange.sent("GET", sent)
+def x_h1.exch.send(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
+  match rendered:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Fail{e}))
+    case Done{+bytes}:
+      do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.exch.sent(~recv, ~send, ~close, sent, method)
 
-def fetch.exchange_meth(sock: Socket, meth: String, text: String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, text)
-    fetch.exchange.sent(meth, sent)
-
-# fetch.dial: resolve-then-connect. DNS.resolve answers the IPv4 the
-# connect rides; the ORIGINAL host keeps riding the caller's text
-# (fetch.sock/send_request build the Host header from it), so virtual
-# hosting never changes. A resolve failure fails with the DNS code
-# (601-605) before any socket exists, so no handle can leak.
-
-def fetch.dial.asked(port: U32, r: Result<&1, &1, U32 & String, String>) ->
-  IO(Result<&1, &1, U32 & String, Socket>):
+def x_h1.exch.done(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), out: Socket & Result<&1, &1, U32 & String, HTTP.Response>) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
+  (s, r) = out
   match r:
     case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, Socket>, Fail{e})
-    case Done{ip}:
-      TCP.connect(ip, port)
+      do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+        x : Unit <- close(s)
+        IO.pure(Result<&1, &1, U32 & String, HTTP.Response>, Fail{e})
+    case Done{+resp}:
+      do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+        x : Unit <- close(s)
+        IO.pure(Result<&1, &1, U32 & String, HTTP.Response>, Done{resp})
 
-def fetch.dial(+host: String, port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
-  do IO<Result<&1, &1, U32 & String, Socket>>:
-    r : Result<&1, &1, U32 & String, String> <- DNS.resolve(host)
-    fetch.dial.asked(port, r)
+def x_h1.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, HTTP.Response>):
+  do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- x_h1.exch.send(~recv, ~send, ~close, sock, x_h1.render_req(method, path, host, port, hs, body), method)
+    x_h1.exch.done(~recv, ~send, ~close, out)
 
-def fetch.sock(sock: Socket, host: String, path: String) -> IO(Result<&1, &1, U32 & String, String>):
-  fetch.exchange(sock, "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n")
-
-def fetch.conn(conn: Result<&1, &1, U32 & String, Socket>, host: String, path: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match conn:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{sock}:
-      fetch.sock(sock, host, path)
-
-def fetch.go(+host: String, port: U32, path: String) -> IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- fetch.dial(host, port)
-    fetch.conn(conn, host, path)
-
-def fetch.port(host: String, port: U32, path: String, ok: Bool) -> IO(Result<&1, &1, U32 & String, String>):
-  match ok:
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad port")})
-    case True{}:
-      fetch.go(host, port, path)
-
-def fetch.host(host: String, +port: U32, path: String, ok: Bool) -> IO(Result<&1, &1, U32 & String, String>):
-  match ok:
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad host")})
-    case True{}:
-      fetch.port(host, port, path, valid_port(port))
-
-def fetch.url.go(secure: Bool, +host: String, port: U32, path: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match secure:
-    case True{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(501, "tls missing")})
-    case False{}:
-      fetch.host(host, port, path, valid_host(host))
-
-def fetch.url(u: Bool & String & U32 & String) -> IO(Result<&1, &1, U32 & String, String>):
-  (secure, host, port, path) = u
-  fetch.url.go(secure, host, port, path)
-
-def fetch.r(url: String, parsed: Result<&1, &1, U32 & String, Bool & String & U32 & String>) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match parsed:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{u}:
-      fetch.url(u)
-
-def fetch(url):
-  +u = url
-  fetch.r(u, read_url(u))
-
-# send_request: any method with headers and body over the same byte
-# exchange; fetch is its GET-and-empty special case at the URL layer.
-# HTTP/1.1 requires Host, so the ORIGINAL host is injected as the Host
-# header (a caller-supplied Host is dropped first); the connection
-# itself rides the IPv4 DNS.resolve answered for that host.
-
-def send_request.conn(conn: Result<&1, &1, U32 & String, Socket>, meth: String, text: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match conn:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{sock}:
-      fetch.exchange_meth(sock, meth, text)
-
-def send_request.go(host: String, port: U32, meth: String, text: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  do IO<Result<&1, &1, U32 & String, String>>:
-    conn : Result<&1, &1, U32 & String, Socket> <- fetch.dial(host, port)
-    send_request.conn(conn, meth, text)
-
-def send_request.shown(shown: Result<&1, &1, U32 & String, String>, +host: String, +port: U32, +meth: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  match shown:
-    case Fail{e}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{e})
-    case Done{text}:
-      send_request.go(host, port, meth, text)
-
-def send_request.fit(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String, fit: Bool) ->
-  IO(Result<&1, &1, U32 & String, String>):
+# The exchange that does NOT close: one request out, one response read
+# back, socket handed over. x_h1.exch.send already behaves that way
+# (x_h1.exch is the one-shot wrapper that closes at the end); this is the
+# named entry for the sequential batch lane, and it validates like the
+# H2 keep-alive path (client.on.fit_keep) so both lanes fail with the
+# same 400/413 before any byte leaves.
+def x_h1.cli.exch.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
   match fit:
-    case False{}:
-      IO.pure(Result<&1, &1, U32 & String, String>, Fail{(400, "bad request")})
     case True{}:
-      send_request.shown(show_request(method, path, ("Host", host) <> drop_host(hs), body), host, port, method)
+      match ok:
+        case True{}:
+          x_h1.exch.send(~recv, ~send, ~close, sock, x_h1.render_req(method, path, host, port, hs, body), method)
+        case False{}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>,
+            (sock, Fail{(413, "req too large")}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>,
+        (sock, Fail{(400, "bad request")}))
 
-def send_request(+host: String, +port: U32, +path: String, +method: String, hs: List<&1, String & String>, +body: String) ->
-  IO(Result<&1, &1, U32 & String, String>):
-  send_request.fit(host, port, path, method, hs, body, Bool.and(valid_host(host), valid_port(port)))
+def x_h1.cli.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
+  x_h1.cli.exch.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, HTTP.client.on.valid.go(host, port, path), HTTP.client.on.body_ok(body))
 
-# Serve: single-shot with a caller handler, plus a hardcoded echo
-# loop (the loop reuses only top-level defs, never an affine
-# closure, so it typechecks).
-
-def serve.shipped(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
-  (s2, r) = sent
+def x_h1.exch.sent_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  (sock, r) = sent
   match r:
     case Fail{e}:
-      Socket.close(s2)
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
     case Done{u}:
-      Socket.close(s2)
+      x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{}, False{}, True{})
 
-def serve.ship(s: Socket, st: U32, hs: List<&1, String & String>, body: String) ->
-  IO(Unit):
-  do IO<Unit>:
-    shown : String <- IO.pass(String, show_response(st, hs, body))
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, shown)
-    serve.shipped(sent)
-
-def serve.split(s: Socket, resp: U32 & List<&1, String & String> & String) ->
-  IO(Unit):
-  (st, hs, body) = resp
-  serve.ship(s, st, hs, body)
-
-def serve.answer(s: Socket, req: String & String & List<&1, String & String> & String, handler: String & String & List<&1, String & String> & String -> IO(U32 & List<&1, String & String> & String)) ->
-  IO(Unit):
-  do IO<Unit>:
-    resp : U32 & List<&1, String & String> & String <- handler(req)
-    serve.split(s, resp)
-
-def serve.parsed(s: Socket, handler: String & String & List<&1, String & String> & String -> IO(U32 & List<&1, String & String> & String), parsed: Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>) ->
-  IO(Unit):
-  match parsed:
+def x_h1.exch.send_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match rendered:
     case Fail{e}:
-      Socket.close(s)
-    case Done{req}:
-      serve.answer(s, req, handler)
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
+    case Done{+bytes}:
+      do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.exch.sent_open(~recv, ~send, ~close, sent, method)
 
-def serve.reply(m: Socket & Result<&1, &1, U32 & String, String>, handler: String & String & List<&1, String & String> & String -> IO(U32 & List<&1, String & String> & String)) ->
-  IO(Unit):
-  (s, r) = m
+# The handshake exchange: like x_h1.cli.exch (same 400/413 before any byte
+# leaves) but rendered with upgrade=True and answered by the _open chain,
+# so the socket comes back live with the bytes past the head. Not closing
+# is the caller's job — that is the whole point of the triple.
+# hs is + for the same reason as x_h1.render_req: bad_req and the render
+# both read the header block.
+def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, +hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match fit:
+    case True{}:
+      match ok:
+        case True{}:
+          x_h1.exch.send_open(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body), method)
+        case False{}:
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>,
+            (sock, Fail{(413, "req too large")}))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>,
+        (sock, Fail{(400, "bad request")}))
+
+def x_h1.cli.exch.open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  x_h1.cli.exch.open.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, HTTP.client.on.valid.go(host, port, path), HTTP.client.on.body_ok(body))
+
+# H1 streaming download (Phase 6): the H1 leg of client.stream, speaking
+# StreamEv/StreamOut like the H2 sdrop lane in ./http2.bend. One request
+# per connection, then close: the H1 answer to Cancel is close + Fail
+# (8, "cancelled") — there is no RST_STREAM on this lane. Counts only,
+# never buffers: the answer is (total bytes, chunks delivered), the same
+# pair shape the H2 lane reports as (total, fins).
+# Transport is three templates (~recv/~send/~close) like x_h1.cli.exch,
+# instantiated per lane at the entries in ./httpx.bend (TLS for the ALPN
+# dispatch in client_stream, TCP for the plaintext entry). The framing cut
+# below is shared with the upload lane (x_h1.stream.next), so both lanes
+# cut one body one way.
+# ---------------------------------------------------------------------
+
+# Field projections: Bend has no field access, so a loop carrying a
+# BodyFrame reads the three framing answers back through these.
+def x_h1.stream.frame_cl(+fr: HTTP.BodyFrame) -> U32:
+  match fr:
+    case HTTP.BodyFrame{+cl, chunked, no_body}:
+      cl
+
+def x_h1.stream.frame_chunked(+fr: HTTP.BodyFrame) -> Bool:
+  match fr:
+    case HTTP.BodyFrame{cl, +chunked, no_body}:
+      chunked
+
+def x_h1.stream.frame_nbody(+fr: HTTP.BodyFrame) -> Bool:
+  match fr:
+    case HTTP.BodyFrame{cl, chunked, +no_body}:
+      no_body
+
+# Length-delimited cut answering this file's own UnitOut, the same
+# vocabulary the chunked step speaks: Got carries the next piece with
+# its last-chunk flag and what is left, NeedMore carries the buffer back
+# for one more read, End is unused here (a spent length is a caller bug),
+# Bad is the overspent length the whole-buffer lane refuses too.
+def x_h1.stream.cl_go(+pending: List<&2, U32>, +cl: U32, +seen: U32, +chunk: List<&2, U32>, fin: Bool, empty: Bool) -> HTTP.UnitOut:
+  match empty:
+    case True{}:
+      HTTP.NeedMore{(cl - seen : U32), pending}
+    case False{}:
+      HTTP.Got{chunk, fin, HTTP.x_drop32(HTTP.x_len32(chunk), pending)}
+
+def x_h1.stream.cl_next(+pending: List<&2, U32>, +cl: U32, +seen: U32, ok: Bool) -> HTTP.UnitOut:
+  match ok:
+    case True{}:
+      +chunk = HTTP.x_take32((cl - seen : U32), pending)
+      x_h1.stream.cl_go(pending, cl, seen, chunk, U32.is_eq((seen + HTTP.x_len32(chunk) : U32), cl), List.is_empty(&2, U32, chunk))
+    case False{}:
+      HTTP.Bad{400, "eof"}
+
+# The next chunk, whichever framing the head declared. One call so the
+# loops never match the framing and the answer at once: a chunked body
+# goes to the incremental step (which keeps its own state across reads)
+# and a length-delimited one to the cut above (whose state is the seen
+# count the caller already carries).
+def x_h1.stream.next(+chunked: Bool, +cst: HTTP.ChunkSt, +pending: List<&2, U32>, +cl: U32, +seen: U32) -> HTTP.ChunkSt & HTTP.UnitOut:
+  match chunked:
+    case True{}:
+      x_h1.chunk_step(cst, pending)
+    case False{}:
+      (x_h1.chunk_init(), x_h1.stream.cl_next(pending, cl, seen, Bool.not(U32.is_gt(seen, cl))))
+
+# What the head answer means to this loop: 0 go read the body, 2 report
+# what was counted and close, 3 close and report (8, "cancelled").
+# Asking for more on a message with no body is a finish, not a close:
+# the client has nothing left to read.
+def x_h1.cli.stream.head_go(nbody: Bool) -> U32:
+  match nbody:
+    case True{}:
+      2
+    case False{}:
+      0
+
+def x_h1.cli.stream.head_act(+out: HTTP.StreamOut, nbody: Bool) -> U32:
+  match out:
+    case HTTP.StreamContinue{}:
+      x_h1.cli.stream.head_go(nbody)
+    case HTTP.StreamCancel{}:
+      3
+
+# What one body chunk answer means: 0 keep going, 2 done and report,
+# 3 cancelled. Continue past the last chunk is done — there is no next
+# chunk.
+def x_h1.cli.stream.data_act(+out: HTTP.StreamOut, +fin: Bool) -> U32:
+  match out:
+    case HTTP.StreamContinue{}:
+      match fin:
+        case True{}:
+          2
+        case False{}:
+          0
+    case HTTP.StreamCancel{}:
+      3
+
+# Close and report. Every exit goes through close, so no path leaks.
+def x_h1.cli.stream.close(~close: Socket -> IO(Unit), s: Socket, r: Result<&1, &1, U32 & String, U32 & U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    x : Unit <- close(s)
+    IO.pure(Result<&1, &1, U32 & String, U32 & U32>, r)
+
+def x_h1.cli.stream.done(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +total: U32, +chunks: U32) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Done{(total, chunks)})
+
+def x_h1.cli.stream.failed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, e: U32 & String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Fail{e})
+
+def x_h1.cli.stream.cancelled(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, g) = got
+  x_h1.cli.stream.close(~close, s, Fail{(8, "cancelled")})
+
+# The response head, parsed. The bytes that arrived with the head seed
+# the pending buffer in phase 3, the same way the one-shot lane does.
+def x_h1.cli.stream.headers(hsres: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>, +code: U32) -> Result<&1, &1, U32 & String, HTTP.Head>:
+  match hsres:
+    case Fail{e}:
+      Fail{e}
+    case Done{+hs}:
+      Done{HTTP.Head{code, hs}}
+
+def x_h1.cli.stream.built(coderes: Result<&1, &1, U32 & String, U32>, hsres: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) -> Result<&1, &1, U32 & String, HTTP.Head>:
+  match coderes:
+    case Fail{e}:
+      Fail{e}
+    case Done{+code}:
+      x_h1.cli.stream.headers(hsres, code)
+
+def x_h1.cli.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, HTTP.Head>:
+  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
+  x_h1.cli.stream.built(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
+def x_h1.cli.stream.no_head() -> Result<&1, &1, U32 & String, HTTP.Head>:
+  Fail{(400, "bad status")}
+
+# The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
+# the blank-line cut); 3 parses, frames through x_h1.frame_of and hands
+# the head over; 5 acts on the head answer; 6 asks the framing for the
+# next chunk; 7 delivers it and acts; 9 reads more body and 10 takes the
+# read back (a peer that closes mid-body is 400 "eof", the code the
+# one-shot lane already answers). act rides the last answer decoded to
+# a code; the response half the upload lane carries is dead here — the
+# client has nobody to hand it to.
+@unsafe
+def x_h1.cli.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +method: String, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: HTTP.ChunkSt, act: U32, out: HTTP.ChunkSt & HTTP.UnitOut, +total: U32, +chunks: U32, hres: Result<&1, &1, U32 & String, HTTP.Head>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.cli.stream.failed(~close, got, (413, "response too long"))
+        case 1n+f:
+          do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 1, r, acc, f, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          x_h1.cli.stream.close(~close, s1, Fail{e})
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.cli.stream.close(~close, s1, Fail{(400, "eof")})
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 2:
+      match found:
+        case True{}:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 3, got, acc, fuel, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, x_h1.cli.stream.parsed(acc))
+        case False{}:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{}, method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 3:
+      match hres:
+        case Fail{e}:
+          x_h1.cli.stream.failed(~close, got, e)
+        case Done{+hd}:
+          match hd:
+            case HTTP.Head{+code, +hs}:
+              # `found` carries the interim flag into phase 4 (the slot is
+              # free after phase 2): a 1xx head is dropped without ever
+              # reaching the handler (TASK-042 phase 4b).
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 4, got, acc, fuel, x_h1.is_info(code), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+    case 4:
+      match found:
+        case True{}:
+          +rest = x_h1.split_rest(x_h1.split(acc))
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 2, got, rest, fuel, x_h1.split.test(rest), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres)
+        case False{}:
+          match hres:
+            case Fail{e}:
+              x_h1.cli.stream.failed(~close, got, e)
+            case Done{+hd}:
+              match hd:
+                case HTTP.Head{+code, +hs}:
+                  +fr = x_h1.frame_of(hs, method, code)
+                  +nb = x_h1.stream.frame_nbody(fr)
+                  x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nb, x_h1.stream.frame_chunked(fr), x_h1.stream.frame_cl(fr), x_h1.split_rest(x_h1.split(acc)), 0, x_h1.chunk_init(), x_h1.cli.stream.head_act(H(HTTP.StreamHead{hd}), nb), (x_h1.chunk_init(), HTTP.End{Nil{}}), total, chunks, x_h1.cli.stream.no_head())
+    case 5:
+      match act:
+        case 0:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 6, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, 4, x_h1.stream.next(chunked, cst, pending, cl, seen), total, chunks, hres)
+        case 3:
+          x_h1.cli.stream.cancelled(~close, got)
+        case _:
+          x_h1.cli.stream.done(~close, got, total, chunks)
+    case 6:
+      match out:
+        case (st2, o):
+          match o:
+            case HTTP.Got{+chunk, +fin, +rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, (seen + HTTP.x_len32(chunk) : U32), st2, x_h1.cli.stream.data_act(H(HTTP.StreamData{chunk, fin}), fin), (x_h1.chunk_init(), HTTP.End{Nil{}}), (total + HTTP.x_len32(chunk) : U32), (chunks + 1 : U32), hres)
+            case HTTP.NeedMore{missing, +rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 9, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, seen, st2, act, (x_h1.chunk_init(), HTTP.End{Nil{}}), total, chunks, hres)
+            case HTTP.End{+rest}:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, rest, seen, cst, x_h1.cli.stream.data_act(H(HTTP.StreamData{Nil{}, True{}}), True{}), (x_h1.chunk_init(), HTTP.End{Nil{}}), total, (chunks + 1 : U32), hres)
+            case HTTP.Bad{code, msg}:
+              x_h1.cli.stream.failed(~close, got, (400, "bad chunked"))
+    case 7:
+      match act:
+        case 0:
+          x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, 0, (x_h1.chunk_init(), HTTP.End{Nil{}}), total, chunks, hres)
+        case 3:
+          x_h1.cli.stream.cancelled(~close, got)
+        case _:
+          x_h1.cli.stream.done(~close, got, total, chunks)
+    case 9:
+      (s9, r9) = got
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s9, 16384)
+        x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 10, r, Nil{}, 0n, False{}, method, nbody, chunked, cl, pending, seen, cst, act, (x_h1.chunk_init(), HTTP.End{Nil{}}), total, chunks, hres)
+    case 10:
+      (s10, r10) = got
+      match r10:
+        case Fail{e}:
+          x_h1.cli.stream.close(~close, s10, Fail{e})
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.cli.stream.close(~close, s10, Fail{(400, "eof")})
+            case h <> t:
+              x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 5, (s10, Done{Nil{}}), Nil{}, 0n, False{}, method, nbody, chunked, cl, List.append(&2, U32, pending, part), seen, cst, 0, (x_h1.chunk_init(), HTTP.End{Nil{}}), total, chunks, hres)
+    case _:
+      x_h1.cli.stream.failed(~close, got, (502, "bad phase"))
+
+# Entry: render, send, stream, close. The socket arrives dialed — the
+# ALPN dispatch in client_stream keeps it for the H1 answer, and the
+# plaintext entry in ./httpx.bend dials it.
+def x_h1.cli.stream.sent2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (sock, r) = sent
   match r:
     case Fail{e}:
-      Socket.close(s)
-    case Done{req}:
-      serve.parsed(s, handler, read_request(req))
+      x_h1.cli.stream.close(~close, sock, Fail{e})
+    case Done{u}:
+      x_h1.cli.stream.go(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, method, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), 4, (x_h1.chunk_init(), HTTP.End{Nil{}}), 0, 0, x_h1.cli.stream.no_head())
 
-def serve_once(sock: Socket, handler: String & String & List<&1, String & String> & String -> IO(U32 & List<&1, String & String> & String)) ->
-  IO(Unit):
-  do IO<Unit>:
-    read : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(sock, 8192)
-    serve.reply(read, handler)
-
-def echo.body(req: String & String & List<&1, String & String> & String) ->
-  IO(U32 & List<&1, String & String> & String):
-  (m, p, hs, body) = req
-  IO.pure(U32 & List<&1, String & String> & String, (200, [], body))
-
-def echo.sent(s: Socket, text: String) -> IO(Unit):
-  do IO<Unit>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, text)
-    serve.shipped(sent)
-
-def echo.shown(s: Socket, shown: Result<&1, &1, U32 & String, String>) -> IO(Unit):
-  match shown:
+def x_h1.cli.stream.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match rendered:
     case Fail{e}:
-      Socket.close(s)
-    case Done{text}:
-      echo.sent(s, text)
+      x_h1.cli.stream.close(~close, sock, Fail{e})
+    case Done{+bytes}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
+        x_h1.cli.stream.sent2(~recv, ~send, ~close, ~H, sent, method)
 
-def echo.send(s: Socket, req: String & String & List<&1, String & String> & String) ->
-  IO(Unit):
-  (m, p, hs, body) = req
-  echo.shown(s, show_response(200, [], body))
+def x_h1.cli.stream.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  x_h1.cli.stream.sent(~recv, ~send, ~close, ~H, sock, x_h1.render_req(method, path, host, port, hs, body), method)
 
-def echo.go(s: Socket, parsed: Result<&1, &1, U32 & String, String & String & List<&1, String & String> & String>) ->
-  IO(Unit):
-  match parsed:
-    case Fail{e}:
-      Socket.close(s)
-    case Done{req}:
-      echo.send(s, req)
+# H1 streaming upload (Phase 6): the H1 leg of server.stream, speaking
+# SrvEv/SrvOut like the H2 httpx_stream lane in ./http2.bend. One request
+# per connection, then close: no keep-alive, no pipelining. Backpressure
+# is the read itself — at most one recv per chunk, so a handler that stops
+# saying Continue stops the reads. Slot is 1: H1 has no stream ids, and
+# 1 is also the sid the H2 client opens with. Cancel closes without a
+# response (the answer the tree's CT.Cancel gives); RespondEarly renders
+# and closes. A malformed chunked body is 400, the code the one-shot H1
+# server answers. Transport is three templates like x_h1.srv.head.
+# ---------------------------------------------------------------------
 
-def echo.reply(m: Socket & Result<&1, &1, U32 & String, String>) -> IO(Unit):
-  (s, r) = m
-  match r:
-    case Fail{e}:
-      Socket.close(s)
-    case Done{req}:
-      echo.go(s, read_request(req))
+# What the head answer means: 0 go read the body, 1 respond now,
+# 2 close without responding. Asking for more on a message with no
+# body is a close — there is no chunk coming.
+def x_h1.stream.head_body(nbody: Bool, +resp: HTTP.Response) -> U32 & HTTP.Response:
+  match nbody:
+    case True{}:
+      (2, resp)
+    case False{}:
+      (0, resp)
 
-def echo.talk(s: Socket) -> IO(Unit):
-  do IO<Unit>:
-    read : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
-    echo.reply(read)
+def x_h1.stream.head_act(+out: HTTP.SrvOut, nbody: Bool) -> U32 & HTTP.Response:
+  match out:
+    case HTTP.Continue{}:
+      x_h1.stream.head_body(nbody, HTTP.Response{0, Nil{}, Nil{}})
+    case HTTP.RespondEarly{+resp}:
+      (1, resp)
+    case HTTP.Cancel{}:
+      (2, HTTP.Response{0, Nil{}, Nil{}})
 
-def echo.conn(m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
-  (l, r) = m
+# What one body chunk answer means. Continue past the last chunk is a
+# close — there is nothing left to hand over.
+def x_h1.stream.data_act(+out: HTTP.SrvOut, +fin: Bool) -> U32 & HTTP.Response:
+  match out:
+    case HTTP.Continue{}:
+      match fin:
+        case True{}:
+          (2, HTTP.Response{0, Nil{}, Nil{}})
+        case False{}:
+          (0, HTTP.Response{0, Nil{}, Nil{}})
+    case HTTP.RespondEarly{+resp}:
+      (1, resp)
+    case HTTP.Cancel{}:
+      (2, HTTP.Response{0, Nil{}, Nil{}})
+
+# The answer path always closes: one request per connection on this
+# lane, so there is no keep-alive decision to make.
+def x_h1.stream.sent_close(~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s, r) = sent
+  close(s)
+
+def x_h1.stream.respond(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +resp: HTTP.Response) -> IO(Unit):
+  (s, r) = got
+  match resp:
+    case HTTP.Response{+status, +headers, +body}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(s, x_h1.show_resp(status, headers, body))
+        x_h1.stream.sent_close(~close, sent)
+
+def x_h1.stream.closed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = got
+  close(s)
+
+def x_h1.stream.bad(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  x_h1.stream.respond(~send, ~close, got, HTTP.Response{400, Nil{}, Nil{}})
+
+# A terminal code the peer must see before the connection ends: the same
+# rule the keep-alive machine uses (400..599 is a status this server
+# renders; 0 "close" and the 6xx transport codes are not).
+def x_h1.stream.told_go(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +code: U32, told: Bool) -> IO(Unit):
+  match told:
+    case True{}:
+      x_h1.stream.respond(~send, ~close, got, HTTP.Response{code, Nil{}, Nil{}})
+    case False{}:
+      x_h1.stream.closed(~close, got)
+
+def x_h1.stream.told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +code: U32) -> IO(Unit):
+  x_h1.stream.told_go(~send, ~close, got, code, x_h1.srv.is_status(code))
+
+# The terminal code of a failed head read: 400/413/431/502 ride out as a
+# response, 0 "close" and the transport codes do not.
+def x_h1.stream.stop_told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, e: U32 & String) -> IO(Unit):
+  (code, msg) = e
+  x_h1.stream.told(~send, ~close, got, code)
+
+# The head answer slot for a validated head: the handler's head event when
+# the head is clean, the refusal code when it is not (the handler never
+# sees a refused request). The code rides in the slot's first half and the
+# loop routes on it with x_h1.stream.err_phase, so a match never has to
+# scrutinize a computed value.
+def x_h1.stream.head_ans(~H: HTTP.SrvEv -> HTTP.SrvOut, +code: U32, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, nb: Bool) -> U32 & HTTP.Response:
+  match code:
+    case 0:
+      x_h1.stream.head_act(H(HTTP.SrvReqHead{1, HTTP.ReqHead{m, p, hs}}), nb)
+    case _:
+      (code, HTTP.Response{0, Nil{}, Nil{}})
+
+def x_h1.stream.err_phase(+code: U32) -> U32:
+  match code:
+    case 0:
+      5
+    case _:
+      4
+
+def x_h1.stream.no_ans() -> U32 & HTTP.Response:
+  (0, HTTP.Response{0, Nil{}, Nil{}})
+
+def x_h1.stream.no_head() -> Result<&1, &1, U32 & String, HTTP.H1Head> & List<&2, U32>:
+  (Fail{(400, "bad request")}, Nil{})
+
+# got B (TASK-040): one x_h1.split traversal for head-lines and rest,
+# where the pair rides in as a parameter (E1 rejects a computed variant).
+def x_h1.stream.parsed.got(p: List<&2, U32> & List<&2, U32> & Bool) -> Result<&1, &1, U32 & String, HTTP.H1Head> & List<&2, U32>:
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      (x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))), rest)
+
+# The request head, parsed. The bytes that arrived with the head seed
+# the pending buffer — a request that arrives whole in one packet must
+# not lose its body.
+def x_h1.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, HTTP.H1Head> & List<&2, U32>:
+  x_h1.stream.parsed.got(x_h1.split(acc))
+
+# The loop, phase by phase: 0/1/2 read the head (16KB a turn, 64 turns,
+# the blank-line cut, 431 past either cap); 3 parses, validates the head
+# (RFC 9112 sections 3.2/6.3, 400) and frames it (GET/HEAD carry no body,
+# like the one-shot server); 5 acts on the head answer; 6 asks the framing
+# for the next chunk through x_h1.stream.next above; 7 delivers it and
+# acts; 9 reads more body and 10 takes the read back. ans rides the last
+# answer as code plus the response it chose.
+@unsafe
+def x_h1.stream.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: HTTP.ChunkSt, ans: U32 & HTTP.Response, out: HTTP.ChunkSt & HTTP.UnitOut, head: Result<&1, &1, U32 & String, HTTP.H1Head> & List<&2, U32>) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.stream.told(~send, ~close, got, x_h1.head_cap())
+        case 1n+f:
+          do IO<Unit>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.stream.go(~recv, ~send, ~close, ~H, 1, r, acc, f, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          x_h1.stream.closed(~close, got)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.stream.closed(~close, got)
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              x_h1.stream.go(~recv, ~send, ~close, ~H, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2), nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 2:
+      match found:
+        case True{}:
+          x_h1.stream.go(~recv, ~send, ~close, ~H, 3, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, x_h1.stream.parsed(acc))
+        case False{}:
+          x_h1.stream.go(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head)
+    case 3:
+      match head:
+        case (h3, p3):
+          match h3:
+            case Fail{e}:
+              x_h1.stream.stop_told(~send, ~close, got, e)
+            case Done{+rh}:
+              match rh:
+                case HTTP.H1Head{head, is_11}:
+                  match head:
+                    case HTTP.ReqHead{+m, +p, +hs}:
+                      +code = x_h1.srv.head_err(hs, is_11)
+                      +nb = Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD"))
+                      x_h1.stream.go(~recv, ~send, ~close, ~H, x_h1.stream.err_phase(code), got, Nil{}, 0n, False{}, nb, x_h1.is_chunked(hs), x_h1.cl_of(hs), p3, 0, x_h1.chunk_init(), x_h1.stream.head_ans(~H, code, m, p, hs, nb), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head())
+    case 4:
+      match ans:
+        case (a4, resp4):
+          x_h1.stream.told(~send, ~close, got, a4)
+    case 5:
+      match ans:
+        case (a5, resp5):
+          match a5:
+            case 0:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 6, got, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head)
+            case 1:
+              x_h1.stream.respond(~send, ~close, got, resp5)
+            case _:
+              x_h1.stream.closed(~close, got)
+    case 6:
+      match out:
+        case (st2, o):
+          match o:
+            case HTTP.Got{+chunk, +fin, +rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, (seen + HTTP.x_len32(chunk) : U32), st2, x_h1.stream.data_act(H(HTTP.SrvReqData{1, chunk, fin}), fin), (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+            case HTTP.NeedMore{missing, +rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 9, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, seen, st2, ans, (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+            case HTTP.End{+rest}:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 7, got, Nil{}, 0n, False{}, nbody, chunked, cl, rest, seen, cst, x_h1.stream.data_act(H(HTTP.SrvReqData{1, Nil{}, True{}}), True{}), (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+            case HTTP.Bad{code, msg}:
+              x_h1.stream.bad(~send, ~close, got)
+    case 7:
+      match ans:
+        case (a7, resp7):
+          match a7:
+            case 0:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 5, got, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+            case 1:
+              x_h1.stream.respond(~send, ~close, got, resp7)
+            case _:
+              x_h1.stream.closed(~close, got)
+    case 9:
+      (s9, r9) = got
+      do IO<Unit>:
+        r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s9, 16384)
+        x_h1.stream.go(~recv, ~send, ~close, ~H, 10, r, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, ans, (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+    case 10:
+      (s10, r10) = got
+      match r10:
+        case Fail{e}:
+          x_h1.stream.closed(~close, got)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.stream.closed(~close, got)
+            case h <> t:
+              x_h1.stream.go(~recv, ~send, ~close, ~H, 5, (s10, Done{Nil{}}), Nil{}, 0n, False{}, nbody, chunked, cl, List.append(&2, U32, pending, part), seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head)
+    case _:
+      x_h1.stream.closed(~close, got)
+
+# Per-connection entry, the two the accept loops spawn.
+def x_h1.stream.start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, sock: Socket) -> IO(Unit):
+  x_h1.stream.go(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head())
+
+def x_h1.stream.spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, sock: Socket) -> IO(Unit):
+  x_h1.stream.start(~recv, ~send, ~close, ~H, sock)
+
+def x_h1.stream.spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, sock: Socket, l: Listener) -> IO(Listener):
   do IO<Listener>:
-    s : Socket <- IO.pass(Socket, r)
-    IO.spawn(Unit, echo.talk(s))
+    x : Unit <- IO.spawn(Unit, x_h1.stream.spawn.go(~recv, ~send, ~close, ~H, sock))
     return l
 
-@unsafe
-def echo.serve(l: Listener) -> IO(Unit):
-  do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    l2 : Listener <- echo.conn(m)
-    echo.serve(l2)
-
-# server_on: the generic keep-alive server. The handler rides a
-# template (~H) — a def name baked at the call site (server_on~h) —
-# because a function value can neither be copied nor thread a loop in
-# affine user-land (no function type is Data). Request headers ride a
-# Data record (Hdr) so the parsed list can enter a + binder: the same
-# list feeds cl_of, keep_of and the handler tuple. The per-connection
-# task is ONE state machine (srv): accumulate head, parse, complete the
-# body at Content-Length, answer, and loop while keep-alive — the
-# states share one def because a helper per state would cycle and
-# forward calls are banned; every decision rides a parameter computed
-# at the caller (arguments, never scrutinees).
-
-type Hdr is Data:
-  Hdr{name: String, value: String}
-
-def to_hdrs(hs: List<&1, String & String>) -> List<&2, Hdr>:
-  match hs:
-    case Nil{}:
-      Nil{}
-    case (n, v) <> t:
-      Hdr{n, v} <> to_hdrs(t)
-
-def get_hdr.put(dflt: String, v: String, rec: String, hit: Bool) -> String:
-  match hit:
-    case True{}:
-      v
-    case False{}:
-      rec
-
-def get_hdr(+dflt: String, +name: String, hd: List<&2, Hdr>) -> String:
-  match hd:
-    case Nil{}:
-      dflt
-    case Hdr{n, v} <> t:
-      +vv = String.trim(v)
-      get_hdr.put(dflt, vv, get_hdr(dflt, name, t), eq_ci(n, name))
-
-def cl_of(hd: List<&2, Hdr>) -> U32:
-  Maybe.default(&2, U32, U32.read(get_hdr("0", "Content-Length", hd)), 0)
-
-def keep_of(is11: Bool, +hd: List<&2, Hdr>) -> Bool:
-  keep_alive.conn(String.to_lower(String.trim(get_hdr("", "Connection", hd))), is11)
-
-def srv.answer.show(keep: Bool, st: U32, hs: List<&1, String & String>, body: String) ->
-  Result<&1, &1, U32 & String, String>:
-  match keep:
-    case True{}:
-      show_response(st, ("Connection", "keep-alive") <> drop_conn(hs), body)
-    case False{}:
-      show_response(st, ("Connection", "close") <> drop_conn(hs), body)
-
-def srv.answer.resp(keep: Bool, resp: U32 & List<&1, String & String> & String) ->
-  Result<&1, &1, U32 & String, String>:
-  (st, hs, body) = resp
-  srv.answer.show(keep, st, hs, body)
-
-def srv.sent_str(m: Socket & Result<&1, &1, U32 & String, Unit>) ->
-  Socket & Result<&1, &1, U32 & String, String>:
-  (s, r) = m
+def x_h1.stream.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
+  (l, r) = m
   match r:
     case Fail{e}:
-      (s, Fail{e})
-    case Done{u}:
-      (s, Done{SNil{}})
+      IO.pure(Listener, l)
+    case Done{sock}:
+      x_h1.stream.spawn(~recv, ~send, ~close, ~H, sock, l)
 
-def srv.parse(x: Bool & (String & String & List<&1, String & String> & String)) ->
-  String & String & List<&2, Hdr> & String & U32 & Bool:
-  (is11, req0) = x
-  (m, p, hs, body) = req0
-  +hd = to_hdrs(hs)
-  +cl = cl_of(hd)
-  kp = keep_of(is11, hd)
-  (m, p, hd, body, cl, kp)
+# H1 serve (Phase 11), keep-alive since TASK-027: the connection lane is
+# one state machine (x_h1.srv.head) whose phase 3 decides reuse vs close,
+# fed back by the answer path as a (socket, outcome) pair — Bend has no
+# forward references, so the loop cannot be a mutual recursion. Closing is
+# by "connection: close" (x_h1.conn_close), EOF, or a terminal 413/502.
+# Handlers speak Request / Response natively, so server.on_alpn takes ONE
+# handler for both lanes.
+# ---------------------------------------------------------------------
+
+def x_h1.srv.needs_body(+m: String) -> Bool:
+  Bool.not(Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD")))
+
+def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
+  (s, r) = got
+  s
+
+# Renderability gate for a handler response (TASK-030). x_h1.show_resp and
+# x_h1.show_resp_head render the handler's headers through the same
+# x_h1.render_hs.go the client uses, verbatim, so a CR/LF/NUL in a name or
+# value would end the field early and ship the rest as response headers
+# nobody asked for — response splitting, and the classic way to get one is
+# a decoded query/path echoed into Location or Set-Cookie.
+#
+# The whole response is replaced by a bare 500 rather than dropping the
+# offending field: rendering it at all IS the injection, and silently
+# shipping a narrower response than the handler asked for hides the bug
+# that produced it. A 101 with bad headers falls into the same 500, so the
+# upgrade is refused instead of half-negotiated.
+def x_h1.srv.safe_resp.go(+status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>, bad: Bool) ->
+  HTTP.Response:
+  match bad:
+    case True{}:
+      HTTP.Response{500, Nil{}, Nil{}}
+    case False{}:
+      HTTP.Response{status, headers, body}
+
+def x_h1.srv.safe_resp(resp: HTTP.Response) -> HTTP.Response:
+  match resp:
+    case HTTP.Response{+status, +headers, +body}:
+      x_h1.srv.safe_resp.go(status, headers, body, x_h1.bad_hdrs(headers))
+
+# The answer path never closes the socket: it hands it back to the head
+# machine in the very pair type the read phases use, so phase 3 is the
+# single place that decides reuse vs close.
+#   read_next(s, rest) -> Done{rest}: the answer is out, read the next
+#     request, seeded with the bytes already read past this one.
+#   stop(s, e)         -> Fail{e}: this connection ends here. e is the
+#     send/read error, or (413/502, ...) for a terminal answer, or
+#     (0, "close") for a peer that asked for close.
+# Fail already means "stop" in phases 1 and 3, so no second outcome type
+# is invented. The loop cannot be a mutual recursion (respond -> head ->
+# parsed -> ... -> respond): Bend only sees defs already defined, so the
+# head machine is the one def allowed to loop and the answer path ends by
+# returning to it.
+def x_h1.srv.read_next(s: Socket, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Done{rest}))
+
+def x_h1.srv.stop(s: Socket, e: U32 & String) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (code, msg) = e
+  IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+    (s, Fail{(code, msg)}))
+
+# A terminal code the peer must see before the connection ends: 400..599 is
+# a status this server renders (the parse errors, the 413 caps, the 431
+# head cap), 0 ("close") and the 6xx transport codes (TLS/DNS) are not, and
+# a send that already failed is not retried.
+def x_h1.srv.told_sent(~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s2, r2) = sent
+  close(s2)
+
+def x_h1.srv.told_go(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket, +code: U32, told: Bool) -> IO(Unit):
+  match told:
+    case True{}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(s, x_h1.show_resp(code, Nil{}, Nil{}))
+        x_h1.srv.told_sent(~close, sent)
+    case False{}:
+      close(s)
+
+def x_h1.srv.told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket, e: U32 & String) -> IO(Unit):
+  (+code, msg) = e
+  x_h1.srv.told_go(~send, ~close, s, code, x_h1.srv.is_status(code))
+
+def x_h1.srv.cap_told(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket) -> IO(Unit):
+  x_h1.srv.told(~send, ~close, s, (x_h1.head_cap(), "head too large"))
+
+def x_h1.srv.sent_keep(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s2, r2) = sent
+  match r2:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
+        (s2, Fail{e}))
+    case Done{u}:
+      match keep:
+        case True{}:
+          x_h1.srv.read_next(s2, rest)
+        case False{}:
+          x_h1.srv.stop(s2, (0, "close"))
+
+def x_h1.srv.respond(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +resp: HTTP.Response, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match resp:
+    case HTTP.Response{+status, +headers, +body}:
+      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, x_h1.show_resp(status, headers, body))
+        x_h1.srv.sent_keep(~recv, ~send, ~close, sent, keep, rest)
+
+def x_h1.srv.answer(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: HTTP.Request, keep: Bool, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s, r) = got
+  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+    resp : HTTP.Response <- H(req)
+    x_h1.srv.respond(~recv, ~send, ~close, s, x_h1.srv.safe_resp(resp), keep, rest)
+
+def x_h1.srv.recv(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  (s0, r0) = got
+  recv(s0, 16384)
 
 @unsafe
-def srv(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), st: U32, mr: Socket & Result<&1, &1, U32 & String, String>, mp: Result<&1, &1, U32 & String, Bool & (String & String & List<&1, String & String> & String)>, rq: String & String & List<&2, Hdr> & String & U32 & Bool, +is11: Bool, +hd: List<&2, Hdr>, +m: String, +p: String, +body: String, +cl: U32, +keep: Bool, +fit: Bool, +acc: String) ->
-  IO(Unit):
-  match st:
+def x_h1.srv.bd(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match phase:
     case 0:
-      (s, r) = mr
-      match r:
-        case Fail{e}:
-          Socket.close(s)
-        case Done{part}:
-          +acc2 = acc ++ part
-          srv(~H, 1, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body, cl, keep, has_blank(acc2), acc2)
-    case 1:
-      (s, r) = mr
-      match fit:
-        case True{}:
-          srv(~H, 3, (s, Done{SNil{}}), read_head(acc), rq, is11, hd, m, p, body, cl, keep, fit, acc)
-        case False{}:
-          do IO<Unit>:
-            mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
-            srv(~H, 0, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
-    case 3:
-      (s, r) = mr
-      match mp:
-        case Fail{e}:
-          serve.ship(s, 400, [], "")
-        case Done{x}:
-          srv(~H, 6, (s, Done{SNil{}}), Fail{(0, SNil{})}, srv.parse(x), is11, hd, m, p, body, cl, keep, fit, acc)
-    case 6:
-      (s, r) = mr
-      (mm, pp, hd2, bd0, cl2, kp2) = rq
-      +bd3 = bd0
-      +cl3 = cl2
-      srv(~H, 2, (s, Done{SNil{}}), mp, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), is11, hd2, mm, pp, bd3, cl3, kp2, U32.is_le(cl3, str_len32(bd3)), acc)
-    case 2:
-      (s, r) = mr
-      match fit:
-        case True{}:
-          do IO<Unit>:
-            resp : U32 & List<&1, String & String> & String <- H(m, p, hd, str_take32(body, cl))
-            shown : String <- IO.pass(String, srv.answer.resp(keep, resp))
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(s, shown)
-            mr2 : Socket & Result<&1, &1, U32 & String, String> = srv.sent_str(sent)
-            srv(~H, 4, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
-        case False{}:
-          do IO<Unit>:
-            mr2 : Socket & Result<&1, &1, U32 & String, String> <- TCP.recv(s, 8192)
-            srv(~H, 5, mr2, mp, rq, is11, hd, m, p, body, cl, keep, fit, acc)
-    case 5:
-      (s, r) = mr
-      match r:
-        case Fail{e}:
-          Socket.close(s)
-        case Done{part}:
-          +body2 = body ++ part
-          srv(~H, 2, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body2, cl, keep, U32.is_le(cl, str_len32(body2)), acc)
-    case 4:
-      (s, r) = mr
-      match r:
-        case Fail{e}:
-          Socket.close(s)
-        case Done{part}:
-          match keep:
+      match fuel:
+        case 0n:
+          x_h1.srv.stop(x_h1.srv.sock_of(got), (413, "request too long"))
+        case 1n+f:
+          match enough:
             case True{}:
-              +rest = str_drop32(body, cl)
-              srv(~H, 0, (s, Done{SNil{}}), mp, rq, is11, hd, m, p, body, cl, keep, fit, rest)
+              x_h1.srv.answer(~recv, ~send, ~close, ~H, got, HTTP.Request{m, p, hs, HTTP.x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), HTTP.x_drop32(cl, have))
             case False{}:
-              Socket.close(s)
+              do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(~recv, ~send, ~close, got)
+                x_h1.srv.bd(~recv, ~send, ~close, ~H, 1, r, m, p, hs, have, f, cl, False{})
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          x_h1.srv.stop(s1, e)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              x_h1.srv.stop(s1, (400, "eof"))
+            case h <> t:
+              +have2 = List.append(&2, U32, have, part)
+              x_h1.srv.bd(~recv, ~send, ~close, ~H, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, HTTP.x_has_at_least(cl, have2))
     case _:
-      IO.pure(Unit, Unit{})
+      (s9, r9) = got
+      x_h1.srv.stop(s9, (502, "bad phase"))
 
-def server.conn(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def x_h1.srv.cl(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), s: Socket, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match big:
+    case True{}:
+      x_h1.srv.respond(~recv, ~send, ~close, s, HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+    case False{}:
+      x_h1.srv.bd(~recv, ~send, ~close, ~H, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, HTTP.x_has_at_least(cl, rest))
+
+# The server's chunked request reader: the same phase+fuel shape as
+# x_h1.srv.bd, with the decoder deciding where the body ends instead of a
+# Content-Length. Two caps, both the ones the CL path already has: the
+# decoded size (the same 16384 x_h1.srv.cl refuses with a 413 response,
+# carried as the big parameter and matched on the next iteration because a
+# match cannot scrutinize a computed value) and fuel (one recv per step,
+# floor 413 "request too long", which closes without an answer exactly
+# like x_h1.srv.bd). A chunk larger than the cap is still read before the
+# answer -- the decoder only reports a chunk when it is whole -- so the
+# memory bound in that case is the fuel floor, not the cap.
+#
+# Malformed bytes are answered 400 "bad chunked" and the connection ends:
+# task-033's fail-closed rule is that the peer is told, not just dropped
+# (the old 502 was a response too). Only End hands the request to the
+# handler; the leftover bytes past the terminator ride to x_h1.srv.answer
+# as the next request's seed, exactly like the CL path's x_drop32(cl, have).
+@unsafe
+def x_h1.srv.chunk(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), phase: U32, big: Bool, r: HTTP.ChunkSt & HTTP.UnitOut, fuel: Nat, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, rev: List<&2, U32>, buf: List<&2, U32>, +have: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match phase:
+    case 0:
+      match big:
+        case True{}:
+          (sock, _r0) = got
+          x_h1.srv.respond(~recv, ~send, ~close, sock, HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+        case False{}:
+          match r:
+            case (st2, out):
+              match out:
+                case HTTP.Got{+chunk, fin, +rest}:
+                  (sock2, _r1) = got
+                  +have2 = (have + HTTP.x_len32(chunk) : U32)
+                  x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, U32.is_gt(have2, 16384), x_h1.chunk_step(st2, rest), fuel, m, p, hs, HTTP.x_rev_push(chunk, rev), rest, have2, (sock2, Done{Nil{}}))
+                case HTTP.NeedMore{missing, +rest}:
+                  match fuel:
+                    case 0n:
+                      (sock3, _r2) = got
+                      x_h1.srv.stop(sock3, (413, "request too long"))
+                    case 1n+f:
+                      (sock4, _r3) = got
+                      do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+                        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock4, 16384)
+                        x_h1.srv.chunk(~recv, ~send, ~close, ~H, 1, big, r, f, m, p, hs, rev, rest, have, r1)
+                case HTTP.End{rest}:
+                  (sock5, _r4) = got
+                  x_h1.srv.answer(~recv, ~send, ~close, ~H, (sock5, Done{Nil{}}), HTTP.Request{m, p, hs, HTTP.x_cat(rev)}, Bool.not(x_h1.conn_close(hs)), rest)
+                case HTTP.Bad{code2, msg}:
+                  (sock6, _r5) = got
+                  do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32>>>:
+                    rr : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock6, HTTP.Response{400, Nil{}, Nil{}}, False{}, Nil{})
+                    x_h1.srv.stop(x_h1.srv.sock_of(rr), (400, "bad chunked"))
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  x_h1.srv.stop(sock, e)
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      x_h1.srv.stop(sock, (400, "eof"))
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, big, x_h1.chunk_step(st2, buf2), fuel, m, p, hs, rev, buf2, have, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      x_h1.srv.stop(s9, (502, "bad phase"))
+
+def x_h1.srv.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), s: Socket, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match needs:
+    case False{}:
+      x_h1.srv.answer(~recv, ~send, ~close, ~H, (s, Done{Nil{}}), HTTP.Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
+    case True{}:
+      match chunked:
+        case True{}:
+          x_h1.srv.chunk(~recv, ~send, ~close, ~H, 0, False{}, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, m, p, hs, Nil{}, rest, 0, (s, Done{Nil{}}))
+        case False{}:
+          x_h1.srv.cl(~recv, ~send, ~close, ~H, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
+
+def x_h1.srv.checked(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, code: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match code:
+    case 0:
+      x_h1.srv.go(~recv, ~send, ~close, ~H, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+    case _:
+      x_h1.srv.stop(s1, (code, "refused"))
+
+def x_h1.srv.ruled(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, HTTP.H1Head>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match joinres:
+    case Fail{e}:
+      x_h1.srv.stop(s1, e)
+    case Done{+rh}:
+      match rh:
+        case HTTP.H1Head{head, is_11}:
+          match head:
+            case HTTP.ReqHead{+m, +p, +hs}:
+              x_h1.srv.checked(~recv, ~send, ~close, ~H, s1, rest, fuel, m, p, hs, x_h1.srv.head_err(hs, is_11))
+
+# got B (TASK-040): one x_h1.split traversal for head-lines and rest.
+def x_h1.srv.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, p: List<&2, U32> & List<&2, U32> & Bool, fuel: Nat) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.srv.ruled(~recv, ~send, ~close, ~H, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+
+def x_h1.srv.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  x_h1.srv.parsed.got(~recv, ~send, ~close, ~H, got, x_h1.split(acc), fuel)
+
+@unsafe
+def x_h1.srv.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.srv.cap_told(~send, ~close, s0)
+        case 1n+f:
+          do IO<Unit>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.srv.head(~recv, ~send, ~close, ~H, 1, r, acc, f, False{})
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          close(s1)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              close(s1)
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              x_h1.srv.head(~recv, ~send, ~close, ~H, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2))
+    case 2:
+      match found:
+        case False{}:
+          x_h1.srv.head(~recv, ~send, ~close, ~H, 0, got, acc, fuel, False{})
+        case True{}:
+          # The answer path hands the socket back: Done{rest} keeps the
+          # connection (phase 3 re-seeds from the leftover), Fail{e}
+          # stops it (phase 3 closes). acc restarts empty — the bytes
+          # just answered are not part of the next request — and the
+          # head fuel budget restarts per request, or a long-lived
+          # connection would starve after 64 of them.
+          do IO<Unit>:
+            out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.parsed(~recv, ~send, ~close, ~H, got, acc, fuel)
+            x_h1.srv.head(~recv, ~send, ~close, ~H, 3, out, Nil{}, 64n, False{})
+    case 3:
+      # Keep-alive re-entry: never reads here, only decides. An empty
+      # seed (nothing was buffered past the request) goes back to the
+      # socket; a non-empty one is the next request's first bytes, so it
+      # enters the accumulate phase exactly like a fresh recv would —
+      # pipelined requests lose nothing.
+      (s3, r3) = got
+      match r3:
+        case Fail{e}:
+          x_h1.srv.told(~send, ~close, s3, e)
+        case Done{+seed}:
+          match seed:
+            case Nil{}:
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 0, (s3, Done{Nil{}}), acc, fuel, False{})
+            case h <> t:
+              x_h1.srv.head(~recv, ~send, ~close, ~H, 1, (s3, Done{seed}), acc, fuel, False{})
+    case _:
+      (s9, r9) = got
+      close(s9)
+
+def x_h1.serve_start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), sock: Socket) -> IO(Unit):
+  x_h1.srv.head(~recv, ~send, ~close, ~H, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+
+def h1_spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), sock: Socket) -> IO(Unit):
+  x_h1.serve_start(~recv, ~send, ~close, ~H, sock)
+
+def h1_spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), sock: Socket, l: Listener) ->
+  IO(Listener):
+  do IO<Listener>:
+    x : Unit <- IO.spawn(Unit, h1_spawn.go(~recv, ~send, ~close, ~H, sock))
+    return l
+
+def h1_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
-  do IO<Listener>:
-    s : Socket <- IO.pass(Socket, r)
-    IO.spawn(Unit, srv(~H, 0, (s, Done{SNil{}}), Fail{(0, SNil{})}, (SNil{}, SNil{}, Nil{}, SNil{}, 0, False{}), False{}, Nil{}, SNil{}, SNil{}, SNil{}, 0, False{}, False{}, SNil{}))
-    return l
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      h1_spawn(~recv, ~send, ~close, ~H, sock, l)
+
+# H1 upgrade lane (101): the answer path that lends the socket out. Unlike
+# x_h1.srv.answer (which hands the socket BACK to the head machine's phase
+# 3 as read_next/stop), answer_open never returns the socket to the
+# machine: on 101 it sends the head and calls ~K(sock, rest), and the
+# socket stays with ~K until the WS loop closes it. Anything else answers
+# through the normal respond and REJOINS the machine (rejoin = phase 3
+# with the leftover seed), so a ~H that refuses the upgrade reuses or
+# closes exactly like the keep-alive lane. The keep-alive machine itself
+# is untouched — no signature churn on the hot path, no wire change.
+# A 101 body is dropped (a 101 carries none); only status and headers
+# ride show_resp_head.
+# ---------------------------------------------------------------------
+
+def x_h1.srv.sent_open(~close: Socket -> IO(Unit), ~K: Socket -> List<&2, U32> -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +rest: List<&2, U32>) -> IO(Unit):
+  (s2, r2) = sent
+  match r2:
+    case Fail{e}:
+      close(s2)
+    case Done{u}:
+      K(s2, rest)
+
+def x_h1.srv.rejoin(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), out: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = out
+  match r:
+    case Fail{e}:
+      close(s)
+    case Done{+seed}:
+      x_h1.srv.head(~recv, ~send, ~close, ~H, 3, (s, Done{seed}), Nil{}, 64n, False{})
+
+def x_h1.srv.status_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket, +status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>, keep: Bool, +rest: List<&2, U32>, is101: Bool) -> IO(Unit):
+  match is101:
+    case True{}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, x_h1.show_resp_head(status, headers))
+        x_h1.srv.sent_open(~close, ~K, sent, rest)
+    case False{}:
+      do IO<Unit>:
+        out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock, HTTP.Response{status, headers, body}, keep, rest)
+        x_h1.srv.rejoin(~recv, ~send, ~close, ~H, out)
+
+def x_h1.srv.reply_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket, +resp: HTTP.Response, keep: Bool, +rest: List<&2, U32>) -> IO(Unit):
+  match resp:
+    case HTTP.Response{+status, +headers, +body}:
+      x_h1.srv.status_open(~recv, ~send, ~close, ~H, ~K, sock, status, headers, body, keep, rest, U32.is_eq(status, 101))
+
+def x_h1.srv.answer_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +req: HTTP.Request, keep: Bool, +rest: List<&2, U32>) -> IO(Unit):
+  (s, r) = got
+  do IO<Unit>:
+    resp : HTTP.Response <- H(req)
+    x_h1.srv.reply_open(~recv, ~send, ~close, ~H, ~K, s, x_h1.srv.safe_resp(resp), keep, rest)
 
 @unsafe
-def server_on(~H: String -> String -> List<&2, Hdr> -> String -> IO(U32 & List<&1, String & String> & String), l: Listener) ->
+def x_h1.srv.bd_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +have: List<&2, U32>, fuel: Nat, +cl: U32, enough: Bool) -> IO(Unit):
+  match phase:
+    case 0:
+      match fuel:
+        case 0n:
+          close(x_h1.srv.sock_of(got))
+        case 1n+f:
+          match enough:
+            case True{}:
+              x_h1.srv.answer_open(~recv, ~send, ~close, ~H, ~K, got, HTTP.Request{m, p, hs, HTTP.x_take32(cl, have)}, Bool.not(x_h1.conn_close(hs)), HTTP.x_drop32(cl, have))
+            case False{}:
+              do IO<Unit>:
+                r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.recv(~recv, ~send, ~close, got)
+                x_h1.srv.bd_open(~recv, ~send, ~close, ~H, ~K, 1, r, m, p, hs, have, f, cl, False{})
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          close(s1)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              close(s1)
+            case h <> t:
+              +have2 = List.append(&2, U32, have, part)
+              x_h1.srv.bd_open(~recv, ~send, ~close, ~H, ~K, 0, (s1, Done{Nil{}}), m, p, hs, have2, fuel, cl, HTTP.x_has_at_least(cl, have2))
+    case _:
+      (s9, r9) = got
+      close(s9)
+
+def x_h1.srv.cl_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s: Socket, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +rest: List<&2, U32>, fuel: Nat, +cl: U32, big: Bool) -> IO(Unit):
+  match big:
+    case True{}:
+      do IO<Unit>:
+        out : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, s, HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+        x_h1.srv.rejoin(~recv, ~send, ~close, ~H, out)
+    case False{}:
+      x_h1.srv.bd_open(~recv, ~send, ~close, ~H, ~K, 0, (s, Done{Nil{}}), m, p, hs, rest, fuel, cl, HTTP.x_has_at_least(cl, rest))
+
+# The upgrade lane's copy of the chunked reader: same grammar, same caps,
+# different endings. A 413 over the cap is answered and then rejoined
+# through x_h1.srv.rejoin (the CL path's x_h1.srv.cl_open does the same
+# with its 413), a malformed body is answered 400 and the connection ends,
+# and fuel exhaustion closes without an answer, which is what
+# x_h1.srv.bd_open does. End hands the request to the handler through
+# x_h1.srv.answer_open, so a chunked request reaches ~H on this lane too
+# instead of the old 502.
+@unsafe
+def x_h1.srv.chunk_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, big: Bool, r: HTTP.ChunkSt & HTTP.UnitOut, fuel: Nat, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, rev: List<&2, U32>, buf: List<&2, U32>, +have: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) ->
   IO(Unit):
-  do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    l2 : Listener <- server.conn(~H, m)
-    z : Unit <- server_on(~H, l2)
-    return z
-def ok(+body: String) -> U32 & List<&1, String & String> & String:
-  (200, [("Content-Length", body_len.show(body))], body)
+  match phase:
+    case 0:
+      match big:
+        case True{}:
+          (sock, _r0) = got
+          do IO<Unit>:
+            rr : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock, HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+            x_h1.srv.rejoin(~recv, ~send, ~close, ~H, rr)
+        case False{}:
+          match r:
+            case (st2, out):
+              match out:
+                case HTTP.Got{+chunk, fin, +rest}:
+                  (sock2, _r1) = got
+                  +have2 = (have + HTTP.x_len32(chunk) : U32)
+                  x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, U32.is_gt(have2, 16384), x_h1.chunk_step(st2, rest), fuel, m, p, hs, HTTP.x_rev_push(chunk, rev), rest, have2, (sock2, Done{Nil{}}))
+                case HTTP.NeedMore{missing, +rest}:
+                  match fuel:
+                    case 0n:
+                      (sock3, _r2) = got
+                      close(sock3)
+                    case 1n+f:
+                      (sock4, _r3) = got
+                      do IO<Unit>:
+                        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(sock4, 16384)
+                        x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 1, big, r, f, m, p, hs, rev, rest, have, r1)
+                case HTTP.End{rest}:
+                  (sock5, _r4) = got
+                  x_h1.srv.answer_open(~recv, ~send, ~close, ~H, ~K, (sock5, Done{Nil{}}), HTTP.Request{m, p, hs, HTTP.x_cat(rev)}, Bool.not(x_h1.conn_close(hs)), rest)
+                case HTTP.Bad{code2, msg}:
+                  (sock6, _r5) = got
+                  do IO<Unit>:
+                    rr2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, sock6, HTTP.Response{400, Nil{}, Nil{}}, False{}, Nil{})
+                    x_h1.srv.rejoin(~recv, ~send, ~close, ~H, rr2)
+    case 1:
+      match r:
+        case (st2, out):
+          match got:
+            case (sock, r1):
+              match r1:
+                case Fail{e}:
+                  close(sock)
+                case Done{+part}:
+                  match part:
+                    case Nil{}:
+                      close(sock)
+                    case h <> t:
+                      +buf2 = List.append(&2, U32, buf, part)
+                      x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, big, x_h1.chunk_step(st2, buf2), fuel, m, p, hs, rev, buf2, have, (sock, Done{Nil{}}))
+    case _:
+      (s9, r9) = got
+      close(s9)
+
+def x_h1.srv.go_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s: Socket, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, +rest: List<&2, U32>, fuel: Nat, needs: Bool, +cl: U32, chunked: Bool) -> IO(Unit):
+  match needs:
+    case False{}:
+      x_h1.srv.answer_open(~recv, ~send, ~close, ~H, ~K, (s, Done{Nil{}}), HTTP.Request{m, p, hs, Nil{}}, Bool.not(x_h1.conn_close(hs)), rest)
+    case True{}:
+      match chunked:
+        case True{}:
+          x_h1.srv.chunk_open(~recv, ~send, ~close, ~H, ~K, 0, False{}, x_h1.chunk_step(x_h1.chunk_init(), rest), fuel, m, p, hs, Nil{}, rest, 0, (s, Done{Nil{}}))
+        case False{}:
+          x_h1.srv.cl_open(~recv, ~send, ~close, ~H, ~K, s, m, p, hs, rest, fuel, cl, U32.is_gt(cl, 16384))
+
+def x_h1.srv.checked_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, code: U32) -> IO(Unit):
+  match code:
+    case 0:
+      x_h1.srv.go_open(~recv, ~send, ~close, ~H, ~K, s1, m, p, hs, rest, fuel, x_h1.srv.needs_body(m), x_h1.cl_of(hs), x_h1.is_chunked(hs))
+    case _:
+      x_h1.srv.told(~send, ~close, s1, (code, "refused"))
+
+def x_h1.srv.ruled_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, joinres: Result<&1, &1, U32 & String, HTTP.H1Head>) -> IO(Unit):
+  match joinres:
+    case Fail{e}:
+      x_h1.srv.told(~send, ~close, s1, e)
+    case Done{+rh}:
+      match rh:
+        case HTTP.H1Head{head, is_11}:
+          match head:
+            case HTTP.ReqHead{+m, +p, +hs}:
+              x_h1.srv.checked_open(~recv, ~send, ~close, ~H, ~K, s1, rest, fuel, m, p, hs, x_h1.srv.head_err(hs, is_11))
+
+# got B (TASK-040), open variant: one x_h1.split traversal for head-lines
+# and rest (see x_h1.srv.parsed.got).
+def x_h1.srv.parsed_open.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, p: List<&2, U32> & List<&2, U32> & Bool, fuel: Nat) -> IO(Unit):
+  match p:
+    case (head, rest, found):
+      +hl = x_h1.head_lines(head)
+      x_h1.srv.ruled_open(~recv, ~send, ~close, ~H, ~K, x_h1.srv.sock_of(got), rest, fuel, x_h1.req_join(x_h1.req_head(x_h1.req_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl))))
+
+def x_h1.srv.parsed_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat) -> IO(Unit):
+  x_h1.srv.parsed_open.got(~recv, ~send, ~close, ~H, ~K, got, x_h1.split(acc), fuel)
+
+@unsafe
+def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.srv.cap_told(~send, ~close, s0)
+        case 1n+f:
+          do IO<Unit>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 1, r, acc, f, False{})
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          close(s1)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              close(s1)
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2))
+    case 2:
+      (s2, r2) = got
+      match found:
+        case False{}:
+          x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 0, (s2, Done{Nil{}}), acc, fuel, False{})
+        case True{}:
+          x_h1.srv.parsed_open(~recv, ~send, ~close, ~H, ~K, (s2, Done{Nil{}}), acc, fuel)
+    case _:
+      (s9, r9) = got
+      close(s9)
+
+def h1_open_spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket) -> IO(Unit):
+  x_h1.srv.head_open(~recv, ~send, ~close, ~H, ~K, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+
+def h1_open_spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket, l: Listener) ->
+  IO(Listener):
+  do IO<Listener>:
+    x : Unit <- IO.spawn(Unit, h1_open_spawn.go(~recv, ~send, ~close, ~H, ~K, sock))
+    return l
+
+def h1_open_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  (l, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Listener, l)
+    case Done{sock}:
+      h1_open_spawn(~recv, ~send, ~close, ~H, ~K, sock, l)

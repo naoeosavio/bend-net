@@ -6,8 +6,9 @@
 #
 # Pure half pins the parser contract: NeedMore on an empty buffer and on a
 # half header, an exact write->parse roundtrip (type, flags, sid, payload
-# length, trailing bytes kept), Bad 413 over the 65535 frame cap, and the
-# PADDED/PRIORITY strip. IO half is a loopback where a canned raw peer paces
+# length, trailing bytes kept), Bad 413 over the 65535 frame cap, the
+# PRIORITY strip, and the DATA padding kept for the credit plus stripped by
+# x_data_body. IO half is a loopback where a canned raw peer paces
 # the answer: the head block in 128-byte pieces and the body as four 512B
 # DATA frames, one TLS record (so one read) each, all small enough for the
 # interpreter, and the real client HTTPX.client.once_insecure must assemble the
@@ -105,8 +106,24 @@ def v_roundtrip() -> U32:
 def v_over_cap() -> U32:
   is_bad_413(HTTP2.x_parse([1, 0, 1, 0, 0, 0, 0, 0, 0]))
 
+# A DATA frame keeps its padding in the payload: the flow credit counts
+# the declared length of the frame (RFC 9113 section 6.9.1) and x_data_body
+# strips the padding where the body is read (task-062 phase 6).
+def data_body_of(frame: HTTP.Frame) -> U32:
+  match frame:
+    case HTTP.Frame{typ, flags, sid, payload}:
+      HTTP.x_len32(HTTP2.x_data_body(payload, flags))
+
+def data_body_len(out: HTTP.UnitOut) -> U32:
+  match out:
+    case HTTP.Got{unit, fin, rest}:
+      data_body_of(HTTP2.x_frame_of(unit))
+    case _:
+      0
+
 def v_padded_strip() -> U32:
-  frame_len(HTTP2.x_parse(HTTP2.x_frame_write(0, 8, 1, [1, 0, 104, 105])))
+  +out = HTTP2.x_parse(HTTP2.x_frame_write(0, 8, 1, [1, 0, 104, 105]))
+  b2u(Bool.and(U32.is_eq(frame_len(out), 4), U32.is_eq(data_body_len(out), 2)))
 
 def v_priority_strip() -> U32:
   frame_len(HTTP2.x_parse(HTTP2.x_frame_write(0, 32, 1, [0, 0, 0, 0, 0, 104])))
@@ -157,7 +174,7 @@ law main:
 def main():
   do IO<U32>:
     +score : U32 = (chk_parser() + chk_pieces() : U32)
-    +pass : U32 = b2u(U32.is_eq(score, 14))
+    +pass : U32 = b2u(U32.is_eq(score, 13))
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
     return pass
