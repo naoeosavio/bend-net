@@ -120,7 +120,7 @@ def send_ch(+chunks: List<&2, List<&2, U32>>, +sent: U32) -> U32:
 
 @unsafe
 def send_chunks_e2e(+body: List<&2, U32>, +sent: U32) -> U32:
-  send_ch(HTTP2.x_chunks(body), sent)
+  send_ch(HTTP2.x_chunks(HTTP2.x_split_all(), body), sent)
 
 # --- sender: take32/drop32 split, timed like the shipped one --------
 # Four passes per chunk: length, copy, reverse, drop. Kept for the
@@ -283,7 +283,7 @@ def report(+name: String, want: U32, res: (Nat & (Nat & Nat)) & U32) -> IO(Unit)
 
 def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
-    +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(xs)
+    +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(HTTP2.x_split_all(), xs)
     +want : U32 = want_send(n)
     r0 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 0, xs, chunks, frame, (600000n, (0n, 0n)), 0)
     r1 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 1, xs, chunks, frame, (600000n, (0n, 0n)), 0)

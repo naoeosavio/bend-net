@@ -1857,31 +1857,112 @@ def x_chunk_of(+cw: U32, +sw: U32, +blen: U32) -> U32:
 def x_chunk_pos(+chunk: U32) -> Bool:
   U32.is_gt(chunk, 0)
 
-# The sender splits the body once into x_max_send()-byte chunks, so the
-# steady path pops one chunk in each turn. The chunk list holds the bytes
-# in order: every chunk has x_max_send() bytes, except the last one.
-# One pass builds each chunk backwards and one pass reverses it. The
-# take32/drop32 builder costs four passes (length, copy, reverse, drop)
-# and measured 1.7-2.6x slower (bench_h2: send_chunks_e2e against
-# send_chunks_td).
-def x_chunks.go(+body: List<&2, U32>, +rev: List<&2, U32>, +n: U32, full: Bool, acc: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
-  match body full:
-    case Nil{} _:
-      match rev:
-        case Nil{}:
-          List.reverse(&2, List<&2, U32>, acc)
-        case _:
-          List.reverse(&2, List<&2, U32>, List.reverse(&2, U32, rev) <> acc)
-    case (h <> t) True{}:
-      x_chunks.go(t, [h], 1, U32.is_eq(1, x_max_send()), List.reverse(&2, U32, rev) <> acc)
-    case (h <> t) False{}:
-      x_chunks.go(t, h <> rev, (n + 1 : U32), U32.is_eq((n + 1 : U32), x_max_send()), acc)
+# The sender splits the body into x_max_send()-byte chunks, so the steady
+# path pops one chunk in each turn. The chunk list holds the bytes in
+# order: every chunk has x_max_send() bytes, except the last one of the
+# body and, inside a batch, the rest chunk that closes it. One pass builds
+# each chunk backwards and one pass reverses it. The take32/drop32 builder
+# costs four passes (length, copy, reverse, drop) and measured 1.7-2.6x
+# slower (bench_h2: send_chunks_e2e against send_chunks_td).
+#
+# A split is a batch of x_split_batch() chunks: it answers those chunks,
+# then the rest of the body as one chunk, and the pump splits that chunk
+# when it reaches it. The whole split costs one more copy of the body, so
+# a 100 MB buffered response held the body twice (4.8 GB at peak); the
+# batch keeps the chunk spine at one MiB for every body size (TASK-063
+# phase 12).
+def x_split_batch() -> Nat:
+  64n
 
-# The chunks of a body in wire order. The sender used to take and drop one
+# More chunks than any body the runtime can hold: the whole-body split.
+def x_split_all() -> Nat:
+  1000000n
+
+# One chunk: the first k cells of the body, reversed and put in order, and
+# the rest of the body.
+@unsafe
+def x_chunks.take(body: List<&2, U32>, k: Nat, acc: List<&2, U32>) -> List<&2, U32> & List<&2, U32>:
+  match body k:
+    case _ 0n:
+      (List.reverse(&2, U32, acc), body)
+    case Nil{} _:
+      (List.reverse(&2, U32, acc), Nil{})
+    case h <> t 1n+p:
+      x_chunks.take(t, p, h <> acc)
+
+# Adds one taken chunk to the reversed chunk list and continues the batch.
+@unsafe
+def x_chunks.step(chunked: List<&2, U32> & List<&2, U32>, left: Nat, acc: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
+  (chunk, rest) = chunked
+  x_chunks.go(rest, left, chunk <> acc)
+
+# Ends a batch: the rest of the body as one chunk, unless the body ended.
+def x_chunks.fin(+rest: List<&2, U32>, acc: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
+  match rest:
+    case Nil{}:
+      List.reverse(&2, List<&2, U32>, acc)
+    case _:
+      List.reverse(&2, List<&2, U32>, rest <> acc)
+
+@unsafe
+def x_chunks.go(+body: List<&2, U32>, left: Nat, acc: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
+  match body left:
+    case _ 0n:
+      x_chunks.fin(body, acc)
+    case Nil{} _:
+      List.reverse(&2, List<&2, U32>, acc)
+    case h <> t 1n+p:
+      x_chunks.step(x_chunks.take(body, U32.to_nat(x_max_send()), Nil{}), p, acc)
+
+# The chunks of the first `left` chunks of a body in wire order, then the
+# rest of the body as one chunk. The sender used to take and drop one
 # slice per turn: the length walk, the copy and the drop cost three passes
 # more than this split (bench_h2: send_chunks_e2e against send_take_drop).
-def x_chunks(+body: List<&2, U32>) -> List<&2, List<&2, U32>>:
-  x_chunks.go(body, Nil{}, 0, False{}, Nil{})
+def x_chunks(+left: Nat, +body: List<&2, U32>) -> List<&2, List<&2, U32>>:
+  x_chunks.go(body, left, Nil{})
+
+# The split question of the pump: a chunk that holds more than one frame.
+# Such a chunk is a batch remainder, and the pump splits it before it
+# walks the length (TASK-063 phase 12).
+def x_chunk_long(chunk: List<&2, U32>) -> Bool:
+  HTTP.x_has_at_least((x_max_send() + 1 : U32), chunk)
+
+# Puts the chunks of a batch in front of the chunks still to send. The
+# batch holds at most x_split_batch() + 1 chunks, so this recursion is
+# shallow (TASK-063 phase 12).
+def x_flow.graft(+head: List<&2, List<&2, U32>>, +t: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
+  match head:
+    case Nil{}:
+      t
+    case h <> r:
+      h <> x_flow.graft(r, t)
+
+# One pump turn for the head chunk. Only the last element of a batch can
+# hold more than one frame: every batch chunk but the rest chunk has
+# x_max_send() bytes, and a partial send puts a short rest at the head with
+# a list behind it, so the probe runs once per batch and not per turn
+# (TASK-063 phase 12).
+@unsafe
+def x_flow.head(t: List<&2, List<&2, U32>>, +h: List<&2, U32>, s4: Socket, +sid: U32, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
+  match t:
+    case Nil{}:
+      x_flow.tail(x_chunk_long(h), h, Nil{}, s4, sid, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
+    case _:
+      +blen : U32 = HTTP.x_len32(h)
+      x_send_data_flow(5, (s4, HTTP.GotErr{0, "next"}), sid, h <> t, cw, sw, buf, cl, blen, Nil{}, x_chunk_pos(x_chunk_of(cw, sw, blen)), sid2p, seed)
+
+# The last element of a batch: a rest chunk past one frame is split into a
+# new batch, and a short chunk goes to phase 5 with its length.
+@unsafe
+def x_flow.tail(long: Bool, +h: List<&2, U32>, +t: List<&2, List<&2, U32>>, s4: Socket, +sid: U32, +cw: U32, +sw: U32, +buf: List<&2, U32>, +cl: U32, +ful: U32, +pay2: List<&2, U32>, ok: Bool, +sid2p: U32, +seed: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
+  match long:
+    case True{}:
+      x_send_data_flow(4, (s4, HTTP.GotErr{0, "next"}), sid, x_flow.graft(x_chunks(x_split_batch(), h), t), cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
+    case False{}:
+      +blen : U32 = HTTP.x_len32(h)
+      x_send_data_flow(5, (s4, HTTP.GotErr{0, "next"}), sid, h <> t, cw, sw, buf, cl, blen, Nil{}, x_chunk_pos(x_chunk_of(cw, sw, blen)), sid2p, seed)
 
 # Peer SETTINGS ledger (mold h2_settings.iw_of): current INITIAL_WINDOW_SIZE
 # (id 4) or the running default when the peer never announces it.
@@ -2004,8 +2085,7 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
         case Nil{}:
           x_send_data_flow(0, (s4, HTTP.GotErr{0, "next"}), sid, Nil{}, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
         case +h <> t:
-          +blen : U32 = HTTP.x_len32(h)
-          x_send_data_flow(5, (s4, HTTP.GotErr{0, "next"}), sid, h <> t, cw, sw, buf, cl, blen, Nil{}, x_chunk_pos(x_chunk_of(cw, sw, blen)), sid2p, seed)
+          x_flow.head(t, h, s4, sid, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
     case 5:
       (s5, g5) = got
       x_flow.chunker(got, sid, chunks, cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
@@ -2241,7 +2321,7 @@ def x_send_data_start.go(sock: Socket, +sid: U32, +body: List<&2, U32>, single: 
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_data_frame(sock, sid, body)
         IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, x_flow_keep(sent, buf, (cw - HTTP.x_len32(body) : U32)))
     case False{}:
-      x_send_data_flow(0, (sock, HTTP.GotErr{0, "next"}), sid, x_chunks(body), cw, x_init_window(), buf, 0, 0, Nil{}, True{}, 0, Nil{})
+      x_send_data_flow(0, (sock, HTTP.GotErr{0, "next"}), sid, x_chunks(x_split_batch(), body), cw, x_init_window(), buf, 0, 0, Nil{}, True{}, 0, Nil{})
 
 # The single-frame lane question: the body fits one DATA frame and the
 # caller's connection window covers it. The lane writes the whole body at
