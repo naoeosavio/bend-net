@@ -13,8 +13,10 @@
 # WINDOW_UPDATE of 2^31. The increment field is 31 bits, so the client
 # must fail 502 "bad window_update" instead of crediting it.
 #
-# Scenario C (pure): a peer SETTINGS INITIAL_WINDOW_SIZE shifts an open
-# stream window by the delta of RFC 9113 section 6.9.2.
+# The delta rule of a peer SETTINGS (scenario C of task-062) moved to
+# `tests/io/http2_settings_window.bend` in task-068 phase 8, which pins it
+# at a non-default base and on the debt. This file keeps the two wire
+# scenarios.
 #
 # Golden 4.
 import Base
@@ -66,15 +68,6 @@ def b2u(b: Bool) -> U32:
       1
     case False{}:
       0
-
-# --- pure: INITIAL_WINDOW_SIZE as a delta ---
-
-def delta_ok() -> U32:
-  +grow : U32 = b2u(U32.is_eq(HTTP2.x_settings.iw_apply(HTTP.x_be32(100000), 65535), 100000))
-  +shrink : U32 = b2u(U32.is_eq(HTTP2.x_settings.iw_apply(HTTP.x_be32(0), 65535), 0))
-  +clamp : U32 = b2u(U32.is_eq(HTTP2.x_settings.iw_apply(HTTP.x_be32(1000), 100), 0))
-  +none : U32 = b2u(U32.is_eq(HTTP2.x_settings.iw_apply(Nil{}, 500), 500))
-  U32.mul(grow, U32.mul(shrink, U32.mul(clamp, none)))
 
 # --- scenario A: the padded DATA frame ---
 
@@ -343,8 +336,7 @@ def main() -> IO(U32):
     bb : Listener & U32 <- listen_any(32n, PORT_B())
     +a : U32 <- run_a(ba)
     +b : U32 <- run_b(bb)
-    +c : U32 = delta_ok()
-    +total : U32 = (a + b + c : U32)
+    +total : U32 = (a + b : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total

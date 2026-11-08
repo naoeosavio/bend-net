@@ -318,10 +318,15 @@ The limits, measured:
 
 - Download and upload saturate near 17 MB/s. More concurrency does not
   raise it: 10 connections answer 17.1 MB/s and 100 streams 17.5 MB/s. The
-  send path costs 49 to 54 ms of server CPU per MiB. About 9 ms is
-  transport, 6 to 10 ms the split, 12 ms the TLS effect, and about 30 ms
-  is loop and runtime work that is not attributed yet. A profiler is the
-  next step.
+  send path costs 48 to 54 ms of server CPU per MiB. About 9 ms is
+  transport, 14 ms the split, and the rest is loop and runtime work. The
+  receive path costs about 52 ms per MiB after task-068. It cost 95 ms
+  before that change. The loop read a fixed block, so a frame shared its
+  buffer with other frames and was copied out of it. The loop now reads
+  the bytes the frame walk still owes, and a frame that arrives alone is
+  used in place. `examples/httpx/bench_h2.bend` names the cost of each
+  step.
+
 - A buffered lane holds the whole body: 100 MB costs about 2.4 GB of RSS,
   and the reversed accumulator plus its flatten holds a 16 MiB receive
   body at 800 MB. The stream lanes stay flat: 11.9 MB for 100 MB. Use
@@ -367,6 +372,9 @@ levers, in the `test.bend` shape:
 - Keep the counters in `U32` (about twice a `Nat` while the walk
   dominates), keep the walk tail-recursive, and do not rebuild the list
   that you just walked.
+- Read the bytes the frame walk still owes, so the buffer holds one frame.
+  The receiver then uses that buffer in place and copies nothing
+  (task-068; the row is `recv_turn`).
 
 ## HTTPS
 

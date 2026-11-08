@@ -12,6 +12,8 @@
 #   strip_lazy       branch on the PADDED flag first, no length walk
 #   wu_each          receive credit before 6b: a pair of frames per DATA frame
 #   wu_batch         shipped credit: one step per frame, flush at the half
+#   recv_turn        shipped loop turn of one DATA frame: build, parse,
+#                    slice, strip and route (TASK-068 phase 10)
 #   probe_all        the single-frame question before phase 8: x_len32
 #   probe_cap        shipped: x_len_upto stops at x_max_send + 1
 import Base
@@ -215,6 +217,11 @@ def wu_want_each(+n: U32) -> U32:
 def wu_want_batch(+n: U32) -> U32:
   U32.mul(U32.sub(nchunks(n), 1), 13)
 
+# One receive turn counts the declared length, one payload cell and the
+# class of an unpadded DATA frame: flen + 1 + 0.
+def rtwant(+nc: U32, +flen: U32) -> U32:
+  U32.mul(nc, U32.add(flen, 1))
+
 # --- receive credit: one pair per DATA frame against the batch --------
 # The old shape built both frames and wrote them on every DATA frame.
 # The shipped shape adds the length to the batch and builds the frames
@@ -243,6 +250,42 @@ def wu_each(+n: U32) -> U32:
 def wu_batch(+n: U32) -> U32:
   wu_batch_go(U32.to_nat(n), 0, Nil{}, 0)
 
+# --- receive turn: one whole DATA frame off the wire ------------------
+# The shipped loop does this for every DATA frame. x_parse walks the nine
+# header bytes, and x_frame_of slices the frame out of the buffer. The
+# body strip and the class then route the frame. The turn counts the
+# declared length plus one payload cell, so the slice cannot be erased.
+# It also counts the class, so the route cannot be erased.
+def x_recv.frame(+f: HTTP.Frame) -> U32:
+  match f:
+    case HTTP.Frame{+typ, +flags, +sid, +len, +payload}:
+      (U32.add(U32.add(len, HTTP.x_len_upto(1, payload)), HTTP2.x_flow.cls(typ, flags)) : U32)
+
+def x_recv.got(+unit: List<&2, U32>) -> U32:
+  x_recv.frame(HTTP2.x_frame_of(unit))
+
+def x_recv.wire(+u: HTTP.UnitOut) -> U32:
+  match u:
+    case HTTP.Got{+unit, fin, +rest}:
+      x_recv.got(unit)
+    case _:
+      0
+
+def x_recv.one(+frame: List<&2, U32>, +flen: U32) -> U32:
+  +wire : List<&2, U32> = HTTP2.x_frame_write_len(0, 0, 0, frame, flen)
+  x_recv.wire(HTTP2.x_parse(wire))
+
+@unsafe
+def x_recv.count(n: U32, +frame: List<&2, U32>, +flen: U32) -> U32:
+  match n:
+    case 0:
+      0
+    case _:
+      (U32.add(x_recv.one(frame, flen), x_recv.count((n - 1 : U32), frame, flen)) : U32)
+
+def x_recv.turn(+n: U32, +frame: List<&2, U32>, +flen: U32) -> U32:
+  x_recv.count(n, frame, flen)
+
 # The old single-frame question: the whole body for its length.
 def probe_all(xs: List<&2, U32>) -> U32:
   HTTP.x_len32(xs)
@@ -268,9 +311,9 @@ def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +fram
     case 5:
       strip_count_lazy(32, frame)
     case 6:
-      wu_each(nchunks(HTTP.x_len32(xs)))
+      wu_each(nc)
     case 7:
-      wu_batch(nchunks(HTTP.x_len32(xs)))
+      wu_batch(nc)
     case 8:
       probe_all(xs)
     case 9:
@@ -279,8 +322,10 @@ def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +fram
       write_walk_count(nc, frame)
     case 11:
       write_len_count(nc, frame, flen)
-    case _:
+    case 12:
       write_framed_count(nc, frame, flen)
+    case _:
+      x_recv.turn(nc, frame, flen)
 
 def fold_go(+el: Nat, mn: Nat, rest: Nat & Nat) -> Nat & (Nat & Nat):
   match rest:
@@ -343,6 +388,7 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     r10 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 10, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
     r11 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 11, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
     r12 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 12, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r13 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 13, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
     a : Unit <- report("send_take_drop", want, r0)
     b : Unit <- report("send_chunks", want, r1)
     c : Unit <- report("send_chunks_e2e", want, r2)
@@ -356,7 +402,8 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     k : Unit <- report("write_walk", wwant, r10)
     l : Unit <- report("write_len", wwant, r11)
     m : Unit <- report("write_framed", wwant, r12)
-    IO.pure(Unit, m)
+    n2 : Unit <- report("recv_turn", (rtwant(nc, flen) * U32.from_nat(RUNS()) : U32), r13)
+    IO.pure(Unit, n2)
 
 def u32_go(m: Maybe<&2, U32>, +dflt: U32) -> U32:
   match m:
@@ -390,3 +437,12 @@ def main() -> IO(Unit):
 # split out of the timer, so it is the floor and not a sender number.
 # Each sender row pays one length walk per chunk and one frame write,
 # the two passes the pump makes per turn.
+#
+# Measured at 10 MiB, 5 runs, on an idle 8-core box (task-068 phase 10):
+# probe_all 73ms, write_len 71ms, write_walk 141ms, send_chunks 215ms,
+# send_chunks_e2e 359ms, wu_each 0ms, wu_batch 0ms, recv_turn 442ms.
+# One body walk is 7.3 ms per MiB, so a row divides by 73 to count its
+# walks. The two credit rows answer zero: the batch costs less than the
+# 1 ms clock, and the old rows hid a full body walk in the timer.
+# recv_turn answers six walks, which is the whole receive frame: the
+# x_take32 copy of the frame is four of them and the rest walk is one.

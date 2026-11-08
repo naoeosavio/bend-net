@@ -400,12 +400,25 @@ def x_frame.fin4(ok: Bool, got: HTTP.UnitOut) -> HTTP.UnitOut:
     case False{}:
       HTTP.Bad{1, "bad padding"}
 
-def x_frame.fin3(+orig: List<&2, U32>, +flags: U32, +len: U32) -> HTTP.UnitOut:
-  +whole = (9 + len : U32)
-  +payload : List<&2, U32> = HTTP.x_take32(whole, orig)
+def x_frame.fin3.out(+unit: List<&2, U32>, +rest: List<&2, U32>, +flags: U32, +len: U32) -> HTTP.UnitOut:
   +padded : Bool = U32.is_eq(U32.and(flags, 8), 8)
-  +got : HTTP.UnitOut = HTTP.Got{payload, x_frame.end_of(flags), HTTP.x_drop32(whole, orig)}
-  x_frame.fin4(x_frame.pad_ok(HTTP.x_drop32(9, payload), len, padded), got)
+  +got : HTTP.UnitOut = HTTP.Got{unit, x_frame.end_of(flags), rest}
+  x_frame.fin4(x_frame.pad_ok(HTTP.x_drop32(9, unit), len, padded), got)
+
+# The frame is materialized once, from the buffer the walk started with. A
+# buffer that holds this frame and nothing else hands the buffer over as
+# the unit and the empty list as the rest, so the payload shares its cells
+# and no copy is made. The walk reads the rest first, so the test costs
+# nothing (TASK-068 phase 10).
+def x_frame.fin3.pick(+rest: List<&2, U32>, +orig: List<&2, U32>, +flags: U32, +len: U32) -> HTTP.UnitOut:
+  match rest:
+    case Nil{}:
+      x_frame.fin3.out(orig, Nil{}, flags, len)
+    case _:
+      x_frame.fin3.out(HTTP.x_take32((9 + len : U32), orig), rest, flags, len)
+
+def x_frame.fin3(+orig: List<&2, U32>, +flags: U32, +len: U32) -> HTTP.UnitOut:
+  x_frame.fin3.pick(HTTP.x_drop32((9 + len : U32), orig), orig, flags, len)
 
 # Pad/prio strip (RFC 9113 6.1/6.2): PADDED rides flag 8 with a pad
 # length prefix (must be < payload, else protocol error), PRIORITY
@@ -565,7 +578,10 @@ def x_read_loop(state: Socket & HTTP.UnitOut & List<&2, U32>) -> IO(Socket & HTT
       IO.pure(Socket & HTTP.Got, (s0, HTTP.GotErr{code, msg}))
     case HTTP.NeedMore{missing, rest}:
       do IO<Socket & HTTP.Got>:
-        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, 16384)
+        # Read exactly the bytes the walk still owes, not a fixed block:
+        # the buffer then holds this frame and nothing else, so the frame
+        # shares its cells and pays no copy (TASK-068 phase 10).
+        r1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s0, missing)
         x_read_loop(x_read.grow(r1, buf))
     case HTTP.End{rest}:
       # Nothing in this lane produces End (see the walk's note). If it ever
