@@ -1733,14 +1733,15 @@ def wsm_do_split(+buf: List<&2, U32>, unmasked_ok: Bool) -> HTTP.UnitOut:
       wsm_frame_split(buf)
 
 # Flatten the reversed chunk list (newest chunk first) into one buffer.
-# Each chunk is appended to the accumulator, so List.append copies only
-# the chunk: the loop is tail-recursive and the whole flatten is O(total).
-def wsm_cat_chunks(+cs: List<&2, List<&2, U32>>, acc: List<&2, U32>) -> List<&2, U32>:
-  match cs:
-    case Nil{}:
-      acc
-    case c <> t:
-      wsm_cat_chunks(t, List.append(&2, U32, c, acc))
+# The recv pile is the 1000 by 1000 shape of test.bend: many small chunks
+# and no single big one. List.concat survives that shape and beats a
+# hand-rolled fold (1 MiB at 93 ms there; 512 by 8192 chunks, 4 MiB, at
+# 803 ms here). Its recursion depth is the chunk count, not the total: 4096
+# chunks of 8192 bytes flatten 32 MiB here, so 12800 chunks of an 8192-byte
+# recv hold for a 100 MiB message. The pile is newest first, so the reverse
+# puts it back into arrival order before the flatten (the chunk spine is
+# 12800 cells, not the body). One big chunk would not survive: a single
+# 65536-cell chunk dies past about 32768 cells (test.bend).
 
 # Read until the frame is whole. The split answer says how many bytes are
 # missing (NeedMore{missing, rest}); instead of appending every recv onto
@@ -1763,7 +1764,7 @@ def wsm_fill(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
       (s0, r0) = m
       match need:
         case 0:
-          +full = wsm_cat_chunks(chunks, Nil{})
+          +full = List.concat(&2, U32, List.reverse(&2, List<&2, U32>, chunks))
           wsm_fill(~recv, 2, (s0, Done{Nil{}}), Nil{}, 0, unmasked_ok, wsm_do_split(full, unmasked_ok))
         case n:
           do IO<Socket & Result<&1, &1, U32 & String, List<&2, U32> & List<&2, U32>>>:

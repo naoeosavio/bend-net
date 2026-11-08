@@ -180,9 +180,6 @@ def x_block_over(+old: List<&2, U32>, +new: List<&2, U32>) -> Bool:
 # Frame write
 # -----------
 
-def x_frame_write.cat(h: List<&2, U32>, t: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, h, t)
-
 def x_frame_write.hdr(+len: U32, +typ: U32, +flags: U32, +sid: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(len, 16n), 255), U32.and(U32.shrn(len, 8n), 255), U32.and(len, 255),
    U32.and(typ, 255), U32.and(flags, 255),
@@ -191,7 +188,9 @@ def x_frame_write.hdr(+len: U32, +typ: U32, +flags: U32, +sid: U32) -> List<&2, 
 
 def x_frame_write(+typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) -> List<&2, U32>:
   +len = HTTP.x_len32(pay)
-  x_frame_write.cat(x_frame_write.hdr(len, typ, flags, sid), pay)
+  # List.append recurses on the header, nine cells, whatever the payload
+  # holds: measured at 78 ms for a 1 MiB payload.
+  List.append(&2, U32, x_frame_write.hdr(len, typ, flags, sid), pay)
 
 def x_send_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
@@ -1927,16 +1926,6 @@ def x_chunks(+left: Nat, +body: List<&2, U32>) -> List<&2, List<&2, U32>>:
 def x_chunk_long(chunk: List<&2, U32>) -> Bool:
   HTTP.x_has_at_least((x_max_send() + 1 : U32), chunk)
 
-# Puts the chunks of a batch in front of the chunks still to send. The
-# batch holds at most x_split_batch() + 1 chunks, so this recursion is
-# shallow (TASK-063 phase 12).
-def x_flow.graft(+head: List<&2, List<&2, U32>>, +t: List<&2, List<&2, U32>>) -> List<&2, List<&2, U32>>:
-  match head:
-    case Nil{}:
-      t
-    case h <> r:
-      h <> x_flow.graft(r, t)
-
 # One pump turn for the head chunk. Only the last element of a batch can
 # hold more than one frame: every batch chunk but the rest chunk has
 # x_max_send() bytes, and a partial send puts a short rest at the head with
@@ -1959,7 +1948,7 @@ def x_flow.tail(long: Bool, +h: List<&2, U32>, +t: List<&2, List<&2, U32>>, s4: 
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match long:
     case True{}:
-      x_send_data_flow(4, (s4, HTTP.GotErr{0, "next"}), sid, x_flow.graft(x_chunks(x_split_batch(), h), t), cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
+      x_send_data_flow(4, (s4, HTTP.GotErr{0, "next"}), sid, List.append(&2, List<&2, U32>, x_chunks(x_split_batch(), h), t), cw, sw, buf, cl, ful, pay2, ok, sid2p, seed)
     case False{}:
       +blen : U32 = HTTP.x_len32(h)
       x_send_data_flow(5, (s4, HTTP.GotErr{0, "next"}), sid, h <> t, cw, sw, buf, cl, blen, Nil{}, x_chunk_pos(x_chunk_of(cw, sw, blen)), sid2p, seed)

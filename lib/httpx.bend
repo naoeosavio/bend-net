@@ -97,7 +97,10 @@ def x_len(bs: List<&2, U32>) -> Nat:
 # same tail discipline as length_got_th in test.bend. Full-list
 # copies cost a rebuild like any got; live call sites take small
 # slices (16 KiB flow chunks, 24 B preface, 9 B headers), bounded
-# by n, not by the buffer.
+# by n, not by the buffer... except the frame lane, which takes a payload
+# of 65535 bytes and a Content-Length body of any size. List.take is the
+# std counterpart, but it dies past about 32768 cells, so the local take
+# stays.
 def x_take32.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
   match bs:
     case Nil{}:
@@ -112,19 +115,10 @@ def x_take32.go(+bs: List<&2, U32>, +n: Nat, acc: List<&2, U32>) -> List<&2, U32
 def x_take32(n: U32, bs: List<&2, U32>) -> List<&2, U32>:
   x_take32.go(bs, U32.to_nat(n), Nil{})
 
-def x_drop32.go(+bs: List<&2, U32>, +n: Nat) -> List<&2, U32>:
-  match bs:
-    case Nil{}:
-      Nil{}
-    case h <> t:
-      match n:
-        case 0n:
-          h <> t
-        case 1n+p:
-          x_drop32.go(t, p)
-
+# List.drop is tail (999000 of 1000000 cells dropped in 101 ms), so only
+# the U32 counter needs a leaf of its own here.
 def x_drop32(n: U32, bs: List<&2, U32>) -> List<&2, U32>:
-  x_drop32.go(bs, U32.to_nat(n))
+  List.drop(&2, U32, bs, U32.to_nat(n))
 
 # Bounded walkers (TASK-026 Phase 2, from TASK-023 Phase 12 item 12.3):
 # the question every frame and header path asks is "are there n bytes
