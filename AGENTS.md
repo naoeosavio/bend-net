@@ -91,7 +91,11 @@ require break from any other directory. Bend 2.0.21+.
   A buffered server request body is capped at 16 MiB (`x_max_body()`).
   Past the cap the lane answers `RST_STREAM 8` (CANCEL) and the handler
   never runs. For a bigger body use the stream lanes, which hold one
-  chunk.
+  chunk. A concurrent batch reads the peer preface first: the peer
+  `MAX_CONCURRENT_STREAMS` (id 3) and `INITIAL_WINDOW_SIZE` (id 4) set
+  the cap of the batch and the window of its first stream. A batch past
+  the cap answers `503` (`batch past the peer cap`) before any stream
+  opens. The chunked send-and-drain is not written (task-069 phase 5).
 - A request head needs `:method` and `:path` (RFC 9113 8.3.1), so a
   CONNECT block and a request trailer block fail the decode; no lane
   serves tunnels or request trailers.

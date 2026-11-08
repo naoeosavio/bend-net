@@ -111,9 +111,9 @@ def x_max_block() -> U32:
 # SETTINGS (id 3) and enforces it at admission with RST_STREAM 7
 # (REFUSED_STREAM), so the connection lives and the peer may retry the
 # refused stream (RFC 9113 section 6.5.2 and 8.7).
-# shortcut: our client never reads the peer SETTINGS, so a batch of more
-# than 100 requests on one connection fails on the refused streams; read
-# SETTINGS in the client when a caller needs bigger batches.
+# The client reads the peer cap (id 3) before a batch and holds the batch
+# at the smaller of the two: a batch past the cap fails before any stream
+# opens, with 503 "batch past the peer cap" (TASK-069 phase 5).
 def x_max_streams() -> U32:
   100
 
@@ -2144,7 +2144,9 @@ def x_settings.iw_delta_cap(grow: Bool, +old: U32, +iw: U32, +sw: U32) -> U32:
 def x_settings.iw_delta_go(+old: U32, +iw: U32, +sw: U32) -> U32:
   x_settings.iw_delta_cap(U32.is_ge(iw, old), old, iw, sw)
 
-def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
+# The value of one SETTINGS id, or the running value when the payload
+# holds no entry of that id.
+def x_settings.u32_of(+id: U32, +pay: List<&2, U32>, +cur: U32) -> U32:
   match pay:
     case Nil{}:
       cur
@@ -2169,7 +2171,35 @@ def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
                         case Nil{}:
                           cur
                         case +b5 <> rest:
-                          x_settings.iw_of(rest, x_pick(U32.is_eq((b0 * 256 + b1 : U32), 4), (((b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32))), cur))
+                          x_settings.u32_of(id, rest, x_pick(U32.is_eq((b0 * 256 + b1 : U32), id), (b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32), cur))
+
+def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
+  x_settings.u32_of(4, pay, cur)
+
+# A peer MAX_CONCURRENT_STREAMS (id 3), or the running value when the peer
+# does not announce one.
+def x_settings.mcs_of(+pay: List<&2, U32>, +cur: U32) -> U32:
+  x_settings.u32_of(3, pay, cur)
+
+# The streams a batch holds at once: the smaller of the peer cap and
+# x_max_streams(). RFC 9113 section 5.1.2 lets the peer cap the open
+# streams of a connection, and the client must not pass the cap.
+def client_conc.hold(+peer: U32) -> U32:
+  x_flow_min(x_max_streams(), peer)
+
+# The two peer limits the connection preface carries: the open stream cap
+# (id 3) and the initial window (id 4). RFC 9113 section 6.5.2 puts no
+# default on the cap, so the read falls back to x_max_streams().
+type Cfg is Data:
+  Cfg{hold: U32, iw: U32}
+
+def x_settings.cfg(+pay: List<&2, U32>) -> Cfg:
+  Cfg{client_conc.hold(x_settings.mcs_of(pay, x_max_streams())), x_settings.iw_of(pay, x_init_window())}
+
+# True when a batch of n requests fits the streams a connection holds. The
+# batch carries its own count (`pending`), so no lane walks the list twice.
+def client_conc.fits(+n: U32, +hold: U32) -> Bool:
+  U32.is_le(n, hold)
 
 # One SETTINGS step of a send: the new peer window and the stream window
 # it shifted. The base is the value the peer announced before. Two SETTINGS
@@ -3934,44 +3964,81 @@ def httpxc.data_cont_slots(p: HTTP.Taken, +payload: List<&2, U32>) -> List<&2, H
 # DATA) or hung for a response that had already arrived. Seeds accumulate
 # in wire order: bytes read during an earlier send are always ahead of the
 # ones read during a later one.
-@unsafe
-def client_conc.seed(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32) ->
-  Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>:
-  match sent:
-    case (s, r, seed, pdc):
-      (s, r, seed)
+# The peer connection preface: RFC 9113 section 3.4 makes a SETTINGS
+# frame the first frame a server sends. A batch reads it before the first
+# HEADERS, so it knows the peer cap and the peer window. The read stops on
+# that frame, so it consumes no byte of a later one.
+# True when a frame is the peer preface: a SETTINGS that is not an ACK.
+def client_conc.is_cfg(+typ: U32, +flags: U32) -> Bool:
+  Bool.and(U32.is_eq(typ, x_t_settings()), U32.is_eq(U32.and(flags, x_f_ack()), 0))
 
-def client_conc.paid(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32) -> U32:
-  match sent:
-    case (s, r, seed, pdc):
-      pdc
+# The ACK answer keeps the run of the send: a Fail rides to the caller,
+# which closes the socket once (the preface reader never closes).
+def client_conc.cfg_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +cfg: Cfg) ->
+  IO(Socket & Result<&1, &1, U32 & String, Cfg>):
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cfg>, (s, Fail{e}))
+    case Done{u}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cfg>, (s, Done{cfg}))
+
+# The preface answer: the SETTINGS takes the ACK and reads the two limits;
+# any other frame fails closed, because the RFC makes SETTINGS first.
+def client_conc.cfg_pay(is_cfg: Bool, s: Socket, +pay: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, Cfg>):
+  match is_cfg:
+    case True{}:
+      do IO<Socket & Result<&1, &1, U32 & String, Cfg>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
+        client_conc.cfg_sent(sent, x_settings.cfg(pay))
+    case False{}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cfg>, (s, Fail{(502, "no settings")}))
+
+def client_conc.cfg_got(got: Socket & HTTP.Got) -> IO(Socket & Result<&1, &1, U32 & String, Cfg>):
+  (s, g) = got
+  match g:
+    case HTTP.GotErr{code, msg}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, Cfg>, (s, Fail{(code, msg)}))
+    case HTTP.GotOk{+frame, +buf}:
+      match frame:
+        case HTTP.Frame{+typ, +flags, +sid, +flen, +pay}:
+          client_conc.cfg_pay(client_conc.is_cfg(typ, flags), s, pay)
+
+def client_conc.cfg(sock: Socket) -> IO(Socket & Result<&1, &1, U32 & String, Cfg>):
+  do IO<Socket & Result<&1, &1, U32 & String, Cfg>>:
+    got : Socket & HTTP.Got <- x_read_frame(sock, Nil{})
+    client_conc.cfg_got(got)
 
 @unsafe
-def client_conc.send_next(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32) ->
+def client_conc.send_next(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32, +piw: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   (s, r, rest, cw2, pdc2) = sent
-  client_conc.send_after(r, s, sid, host, port, reqs, acc, rest, cw2, pdc2)
+  client_conc.send_after(r, s, sid, host, port, reqs, acc, rest, cw2, pdc2, piw)
 
+# One send of a batch: `piw` is the peer INITIAL_WINDOW_SIZE the batch read
+# from the connection preface, so the first stream of a batch seeds its
+# window from the peer value, not from the RFC default (TASK-069 phase 5).
 @unsafe
-def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32, +pdc: U32) ->
+def client_conc.send_all(sock: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +cw: U32, +piw: U32, +pdc: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match reqs:
     case Nil{}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (sock, Done{Unit{}}, acc, pdc))
     case HTTP.Request{+method, +path, +headers, +body} <> t:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- client.req.send(sock, sid, host, port, method, path, headers, body, cw, x_init_window(), acc, pdc)
-        client_conc.send_next(sent, sid, host, port, t, acc, cw)
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- client.req.send(sock, sid, host, port, method, path, headers, body, cw, piw, acc, pdc)
+        client_conc.send_next(sent, sid, host, port, t, acc, cw, piw)
 
 # The answer of the last send picks the next step: a Fail keeps it, a
 # Done hands the read seed and the window the pump left to the next send.
-def client_conc.send_after(r: Result<&1, &1, U32 & String, Unit>, s: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +rest: List<&2, U32>, +cw2: U32, +pdc2: U32) ->
+def client_conc.send_after(r: Result<&1, &1, U32 & String, Unit>, s: Socket, +sid: U32, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +acc: List<&2, U32>, +rest: List<&2, U32>, +cw2: U32, +pdc2: U32, +piw: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32):
   match r:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, (s, Fail{e}, acc, pdc2))
     case Done{u}:
-      client_conc.send_all(s, (sid + 2 : U32), host, port, reqs, rest, cw2, pdc2)
+      client_conc.send_all(s, (sid + 2 : U32), host, port, reqs, rest, cw2, piw, pdc2)
 
 # Concurrent leaf of the loop: the phase a finished stream leaves it on
 # (7 when it was the last one, else 0).
@@ -4794,18 +4861,55 @@ def client.stream.on_insecure(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String
 # count. The buffered concurrent lane follows below.
 # ---------------------------------------------------------------------
 
-def client_cstream.after_send(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +pdc: U32, +pending: U32) ->
+def client_cstream.after_send(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, +pending: U32, +piw: U32) ->
   IO(Result<&1, &1, U32 & String, U32 & U32>):
-  (sock, r, seed) = sent
-  match r:
-    case Fail{e}:
+  match sent:
+    case (sock, Fail{e}, seed, pdc):
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
         x : Unit <- TLS.tls_close(sock)
         IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
-    case Done{u}:
+    case (sock, Done{u}, seed, pdc):
       do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        drained : Socket & Result<&1, &1, U32 & String, LoopRes> <- client.loop.concurrent(~H, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), x_init_window(), pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, False{}}, pdc)
+        drained : Socket & Result<&1, &1, U32 & String, LoopRes> <- client.loop.concurrent(~H, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), piw, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, False{}}, pdc)
         client_stream.counted(drained)
+
+# The batch against the peer cap: a batch that fits sends and drains, a
+# batch past the cap fails before any stream opens, so the peer never
+# refuses a stream of the batch. The answer names the cap, so the caller
+# can split the batch (TASK-069 phase 5).
+def client_cstream.cfg_fits(~H: HTTP.CStreamEv -> HTTP.CStreamOut, fits: Bool, s: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32, +iw: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match fits:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(s, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), iw, 0)
+        client_cstream.after_send(~H, sent, pending, iw)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{(503, "batch past the peer cap")})
+
+# The batch on a connection the caller owns: read the peer preface, then
+# apply the cap.
+def client_cstream.cfg_out(~H: HTTP.CStreamEv -> HTTP.CStreamOut, cfg: Socket & Result<&1, &1, U32 & String, Cfg>, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  (s, r) = cfg
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{+c}:
+      match c:
+        case Cfg{+hold, +iw}:
+          client_cstream.cfg_fits(~H, client_conc.fits(pending, hold), s, host, port, reqs, pending, iw)
+
+@unsafe
+def client_cstream.exch(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    cfg : Socket & Result<&1, &1, U32 & String, Cfg> <- client_conc.cfg(sock)
+    client_cstream.cfg_out(~H, cfg, host, port, reqs, pending)
 
 # N in flight (phase 2): send the batch, run the collect=false loop and
 # count. The buffered concurrent lane follows below.
@@ -4819,9 +4923,7 @@ def client.stream.concurrent.conn(~H: HTTP.CStreamEv -> HTTP.CStreamOut, conn: R
       IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
     case Done{value}:
       (sock, st) = value
-      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), 0)
-        client_cstream.after_send(~H, client_conc.seed(sent), client_conc.paid(sent), HTTP.client_conc.count(reqs))
+      client_cstream.exch(~H, sock, host, port, reqs, HTTP.client_conc.count(reqs))
 
 # An empty batch answers Done{(0, 0)} with no dial, the contract the
 # legacy facade kept in client_cstream.fit_n.
@@ -5388,19 +5490,54 @@ def client.concurrent.drained(~H: HTTP.Response -> U32, drained: Socket & Result
             x : Unit <- TLS.tls_close(s)
             IO.pure(Result<&1, &1, U32 & String, U32>, Done{client.concurrent.fold(~H, ss, 0)})
 
-def client.concurrent.after_send(~H: HTTP.Response -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +pdc: U32, +pending: U32) ->
+def client.concurrent.after_send(~H: HTTP.Response -> U32, sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32, +pending: U32, +piw: U32) ->
   IO(Result<&1, &1, U32 & String, U32>):
-  (sock, r, seed) = sent
-  match r:
-    case Fail{e}:
+  match sent:
+    case (sock, Fail{e}, seed, pdc):
       do IO<Result<&1, &1, U32 & String, U32>>:
         x : Unit <- TLS.tls_close(sock)
         IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
-    case Done{u}:
+    case (sock, Done{u}, seed, pdc):
       do IO<Result<&1, &1, U32 & String, U32>>:
         drained : Socket & Result<&1, &1, U32 & String, LoopRes> <-
-          client.loop.concurrent(~client.concurrent.drop, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), x_init_window(), pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, True{}}, pdc)
+          client.loop.concurrent(~client.concurrent.drop, 0, client.loop.next_got(sock), seed, x_tab.empty(), Nil{}, 0, Nil{}, x_init_window(), piw, pending, 0, 0, 0, 0, 0, Nil{}, 0, 0, HTTP.Head{0, Nil{}}, False{}, Act{4, Nil{}, True{}}, pdc)
         client.concurrent.drained(~H, drained)
+
+# The batch against the peer cap: a batch that fits sends and drains, a
+# batch past the cap fails before any stream opens (TASK-069 phase 5).
+def client_conc.cfg_fits(~H: HTTP.Response -> U32, fits: Bool, s: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32, +iw: U32) ->
+  IO(Result<&1, &1, U32 & String, U32>):
+  match fits:
+    case True{}:
+      do IO<Result<&1, &1, U32 & String, U32>>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(s, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), iw, 0)
+        client.concurrent.after_send(~H, sent, pending, iw)
+    case False{}:
+      do IO<Result<&1, &1, U32 & String, U32>>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(Result<&1, &1, U32 & String, U32>, Fail{(503, "batch past the peer cap")})
+
+# The batch on a connection the caller owns: read the peer preface, then
+# apply the cap.
+def client_conc.cfg_out(~H: HTTP.Response -> U32, cfg: Socket & Result<&1, &1, U32 & String, Cfg>, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32>):
+  (s, r) = cfg
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, U32>>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
+    case Done{+c}:
+      match c:
+        case Cfg{+hold, +iw}:
+          client_conc.cfg_fits(~H, client_conc.fits(pending, hold), s, host, port, reqs, pending, iw)
+
+@unsafe
+def client_conc.exch(~H: HTTP.Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
+  IO(Result<&1, &1, U32 & String, U32>):
+  do IO<Result<&1, &1, U32 & String, U32>>:
+    cfg : Socket & Result<&1, &1, U32 & String, Cfg> <- client_conc.cfg(sock)
+    client_conc.cfg_out(~H, cfg, host, port, reqs, pending)
 
 @unsafe
 # N in flight on one connection: pipeline N requests, let the loop collect
@@ -5412,9 +5549,7 @@ def client.concurrent.conn(~H: HTTP.Response -> U32, conn: Result<&1, &1, U32 & 
       IO.pure(Result<&1, &1, U32 & String, U32>, Fail{e})
     case Done{value}:
       (sock, st) = value
-      do IO<Result<&1, &1, U32 & String, U32>>:
-        +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), 0)
-        client.concurrent.after_send(~H, client_conc.seed(sent), client_conc.paid(sent), HTTP.client_conc.count(reqs))
+      client_conc.exch(~H, sock, host, port, reqs, HTTP.client_conc.count(reqs))
 
 def client.concurrent(~H: HTTP.Response -> U32, +host: String, +port: U32, +reqs: List<&2, HTTP.Request>) ->
   IO(Result<&1, &1, U32 & String, U32>):
@@ -6154,22 +6289,6 @@ def client_stream.exch(~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +host:
   do IO<Result<&1, &1, U32 & String, U32 & U32>>:
     +sent4 : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- client.req.send(sock, 1, host, port, method, path, hs, body, x_init_window(), x_init_window(), Nil{}, 0)
     client_stream.sent(~H, httpx.sent3(sent4), httpx.sent_pdc(sent4))
-
-@unsafe
-def client_cstream.exch(~H: HTTP.CStreamEv -> HTTP.CStreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
-  IO(Result<&1, &1, U32 & String, U32 & U32>):
-  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), 0)
-    client_cstream.after_send(~H, client_conc.seed(sent), client_conc.paid(sent), pending)
-
-# The facade leg keeps the name and the socket: it sends the batch on a
-# connection the caller owns, runs the same loop and fold, and closes.
-@unsafe
-def client_conc.exch(~H: HTTP.Response -> U32, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>, +pending: U32) ->
-  IO(Result<&1, &1, U32 & String, U32>):
-  do IO<Result<&1, &1, U32 & String, U32>>:
-    +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 <- client_conc.send_all(sock, client_conc.first_sid(), host, port, reqs, Nil{}, x_init_window(), 0)
-    client.concurrent.after_send(~H, client_conc.seed(sent), client_conc.paid(sent), pending)
 
 # Old helper names (tests and the facade): one line each over the live
 # helper above. They die in the facade task.
