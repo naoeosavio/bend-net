@@ -1846,17 +1846,51 @@ def x_flow_min(+a: U32, +b: U32) -> U32:
 def x_flow_wu_inc(+pay: List<&2, U32>) -> U32:
   x_be32_rd(pay)
 
+# The window cap of RFC 9113 section 6.9.1, in octets. A sender must not
+# let a flow-control window pass this value.
+def x_max_window() -> U32:
+  2147483647
+
+# The window rides signed in a U32, so bit 31 is its sign.
+def x_win_neg(+w: U32) -> Bool:
+  U32.is_eq(U32.shrn(w, 31n), 1)
+
+# The room a stream window gives: a window below zero gives none (RFC 9113
+# section 6.9.2).
+def x_win_room(+sw: U32) -> U32:
+  x_pick(x_win_neg(sw), 0, sw)
+
+# A window at or below the cap answers itself, and a grant past the cap
+# answers the cap.
+def x_win_add_pos(+sum: U32) -> U32:
+  x_pick(U32.is_gt(sum, x_max_window()), x_max_window(), sum)
+
+# The sum of a window and a grant, capped at x_max_window(). A grant that
+# crosses 2^31 turns the sign of the signed window, and the send then waits
+# for a debt the peer never owed: the cap keeps the window at the maximum a
+# peer may grant (RFC 9113 section 6.9.1). A negative window is a real debt
+# from a SETTINGS change, so it takes the plain wrap.
+def x_win_add_go(neg: Bool, +w: U32, +inc: U32) -> U32:
+  match neg:
+    case True{}:
+      (w + inc : U32)
+    case False{}:
+      x_win_add_pos((w + inc : U32))
+
+def x_win_add(+w: U32, +inc: U32) -> U32:
+  x_win_add_go(x_win_neg(w), w, inc)
+
 def x_flow_credit.mine(+cw: U32, +sw: U32, +inc: U32, is_mine: Bool) -> U32 & U32:
   match is_mine:
     case True{}:
-      (cw, (sw + inc : U32))
+      (cw, x_win_add(sw, inc))
     case False{}:
       (cw, sw)
 
 def x_flow_credit.conn(+cw: U32, +sw: U32, +inc: U32, is_conn: Bool, is_mine: Bool) -> U32 & U32:
   match is_conn:
     case True{}:
-      ((cw + inc : U32), sw)
+      (x_win_add(cw, inc), sw)
     case False{}:
       x_flow_credit.mine(cw, sw, inc, is_mine)
 
@@ -1885,13 +1919,6 @@ def x_flow_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket & H
       (s, HTTP.GotErr{code, msg})
     case Done{u}:
       (s, HTTP.GotErr{0, "next"})
-
-# The room a stream window gives: a window below zero gives none (RFC 9113
-# section 6.9.2). The window rides in a U32, so bit 31 is its sign.
-# shortcut: a peer that grants past 2^31-1 flips the sign and the send
-# stalls; the lane does not check that limit.
-def x_win_room(+sw: U32) -> U32:
-  x_pick(U32.is_eq(U32.shrn(sw, 31n), 0), sw, 0)
 
 def x_chunk_of(+cw: U32, +sw: U32, +blen: U32) -> U32:
   x_flow_min(x_flow_min(x_flow_min(cw, x_win_room(sw)), x_max_send()), blen)
@@ -2004,8 +2031,15 @@ def x_flow.tail(long: Bool, +h: List<&2, U32>, +t: List<&2, List<&2, U32>>, s4: 
 # value rides as a signed U32: the subtraction wraps and x_win_room reads
 # the sign. The old shape measured the difference against the 65535
 # default, and it clamped the result at zero (TASK-067 phase 8).
+def x_settings.iw_delta_cap(grow: Bool, +old: U32, +iw: U32, +sw: U32) -> U32:
+  match grow:
+    case True{}:
+      x_win_add(sw, (iw - old : U32))
+    case False{}:
+      (sw + (iw - old : U32) : U32)
+
 def x_settings.iw_delta_go(+old: U32, +iw: U32, +sw: U32) -> U32:
-  (sw + (iw - old : U32) : U32)
+  x_settings.iw_delta_cap(U32.is_ge(iw, old), old, iw, sw)
 
 def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
   match pay:
@@ -5515,7 +5549,7 @@ def server.admit(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, mode: U32, slots: Li
 def client.loop.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
   match is_conn:
     case True{}:
-      (cw + x_be32_rd(payload) : U32)
+      x_win_add(cw, x_be32_rd(payload))
     case False{}:
       cw
 
@@ -5529,7 +5563,7 @@ def client.loop.wu_cw(cw: U32, +sid: U32, +payload: List<&2, U32>) -> U32:
 def server.wu_cw_go(is_conn: Bool, cw: U32, +payload: List<&2, U32>) -> U32:
   match is_conn:
     case True{}:
-      (cw + x_be32_rd(payload) : U32)
+      x_win_add(cw, x_be32_rd(payload))
     case False{}:
       cw
 
