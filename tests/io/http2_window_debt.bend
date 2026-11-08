@@ -117,7 +117,7 @@ def body() -> List<&2, U32>:
 
 # A PING payload. The answer echoes it, so the peer reads it back.
 def PING_PAY() -> List<&2, U32>:
-  HTTP.x_be32(20261104)
+  List.append(&2, U32, HTTP.x_be32(20261104), HTTP.x_be32(0))
 
 # --- the raw peer, shared by both scenarios ---------------------------
 
@@ -353,7 +353,7 @@ def server_side(l: Listener) -> IO(Unit):
 
 # The request block: a head needs :method and :path (RFC 9113 8.3.1).
 def req_block() -> List<&2, U32>:
-  HTTP2.x_block([HTTP.Hdr{":method", "GET"}, HTTP.Hdr{":path", "/big"}])
+  HTTP2.x_block([HTTP.Hdr{":method", "GET"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/big"}])
 
 # Writes the preface, which is not a frame.
 def send_pref(s: Socket) -> IO(Socket):

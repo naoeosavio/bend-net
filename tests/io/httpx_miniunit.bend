@@ -43,7 +43,7 @@ def req_score_head(head: HTTP.ReqHead, ok: Bool) -> U32:
 # (checker quirk: + on Result with an external single arg). decode is
 # pure, so call it twice with single-use results instead.
 def req_blk() -> List<&2, U32>:
-  HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":path", "/echo"}])
+  HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/echo"}])
 
 def req_t() -> U32:
   req_score_head(HTTP2.x_req.rh(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())), HTTP2.x_req.ok(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))

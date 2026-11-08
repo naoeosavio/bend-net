@@ -262,6 +262,13 @@ names TLS directly for the socket (`TLS.tls_recv_bytes`,
 `TLS.tls_send_bytes`, `TLS.tls_close`). The dial, the accept and the ALPN
 dispatch are the facade's.
 
+The promised entries of this module, their signatures and the version
+rule are in `docs/h2-api.md`; `tests/io/http2_api.bend` is the
+machine-checked copy. The measured cost of the hot paths, with the
+artifact that produced each number, is in `docs/perf.md`. The external
+conformance run of `h2spec` 2.6.0, its 143 of 146 passes and the two
+accepted deviations are in `docs/h2spec.md`.
+
 HPACK decodes the full RFC 7541 subset. It reads literal (all three
 modes), static-table indexed (1–61) and dynamic-table indexed references,
 and huffman strings (canonical Appendix B code). It accepts dynamic-table

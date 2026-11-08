@@ -55,6 +55,12 @@ require break from any other directory. Bend 2.0.21+.
   `lib/tls.bend` — TLS dial/accept with ALPN modes. `lib/dns.bend` — A-record
   resolve. `lib/tcp.bend` — byte send/recv/frame effects.
 - `tests/io/` — goldens: pure codec vectors plus loopback IO (each asserts via `#|N`).
+  `tests/io/http2_api.bend` is the API contract of `lib/http2.bend` (no
+  `main`, typecheck only); `tests/io/http2_perf.bend` holds the 2x budget
+  of `docs/perf.md`.
+- `tests/fuzz/` — `frames.bend` mutates one byte of five seed frames and
+  `run.sh <secs>` loops it with new seeds; `wire.bend` injects malformed
+  frames over TLS and expects GOAWAY or the close.
 - `tests/effs/` — effects lab: twin parity, TLS interop ladder, bridge probes.
   `BEND_EFFS_DIR=lib/effs` runs ladder rungs against installed files.
 - `examples/` — runnable peers by lane (`wsm/`, `wss/`, `httpx/`, `real/`);
@@ -80,6 +86,11 @@ require break from any other directory. Bend 2.0.21+.
 - Naming: `_insecure` means "no chain verify" (loopback/self-signed), never
   "no TLS". `_plain` means cleartext (`ws://`, `http://`) and takes no cert.
   No `is_tls` flags anywhere.
+- H2 conformance is measured, not assumed: `docs/h2spec.md` holds the
+  `h2spec` 2.6.0 run (143 of 146) and the two accepted deviations. The
+  request head checks the field rules of RFC 9113 8.2/8.3; a trailer
+  block that ends the request answers it, and the trailer fields are
+  dropped.
 - H2 limits are announced and enforced, not advisory. `lib/http2.bend`
   announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 100 and the two
   65535 sizes in its initial SETTINGS; a header block past 64 KiB
@@ -96,9 +107,13 @@ require break from any other directory. Bend 2.0.21+.
   the cap of the batch and the window of its first stream. A batch past
   the cap answers `503` (`batch past the peer cap`) before any stream
   opens. The chunked send-and-drain is not written (task-069 phase 5).
-- A request head needs `:method` and `:path` (RFC 9113 8.3.1), so a
-  CONNECT block and a request trailer block fail the decode; no lane
-  serves tunnels or request trailers.
+- A request head needs `:method`, `:scheme` and `:path` (RFC 9113 8.3.1),
+  and the field rules of 8.2 (lowercase names, no connection-specific
+  field, `te` only `trailers`, one of each pseudo-header). A CONNECT
+  block (no `:path`) answers `501` and keeps the connection. A second
+  HEADERS block on an open stream is a trailer block: the lane decodes
+  its HPACK and answers the request when it ends the stream; the trailer
+  fields do not reach the handler. No lane serves tunnels.
 - Fail-closed codes: malformed input answers `Fail` with the code above, never
   a partial body. H1 head cap 16 KB (`431` past it); H1 server refuses
   `Transfer-Encoding` + `Content-Length` pairs, non-`chunked` TE, double

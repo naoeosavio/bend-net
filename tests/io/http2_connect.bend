@@ -173,7 +173,7 @@ def case_go(sock: Socket) -> IO(U32):
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       send_frame(sock, HTTP2.x_t_headers(), U32.add(HTTP2.x_f_end_headers(), HTTP2.x_f_end_stream()), 1, connect_block())
     ping : Socket & Result<&1, &1, U32 & String, Unit> <-
-      send_frame(sock_of(sent), HTTP2.x_t_ping(), 0, 0, HTTP.x_be32(20261105))
+      send_frame(sock_of(sent), HTTP2.x_t_ping(), 0, 0, List.append(&2, U32, HTTP.x_be32(20261105), HTTP.x_be32(0)))
     peer_read(0, False{}, False{}, FUEL(), (sock_of(ping), HTTP.GotErr{0, "next"}), Nil{}, 0)
 
 def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>) -> IO(U32):

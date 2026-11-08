@@ -157,7 +157,7 @@ def srv(req: HTTP.Request) -> IO(HTTP.Response):
 
 # The request block: a head needs :method and :path (RFC 9113 8.3.1).
 def req_block() -> List<&2, U32>:
-  HTTP2.x_block([HTTP.Hdr{":method", "GET"}, HTTP.Hdr{":path", "/body"}])
+  HTTP2.x_block([HTTP.Hdr{":method", "GET"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/body"}])
 
 # Writes one frame and answers the socket.
 def send1(s: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) -> IO(Socket):

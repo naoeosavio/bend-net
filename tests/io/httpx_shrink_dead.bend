@@ -49,7 +49,7 @@ def t_str() -> U32:
 
 # Dead x_req.phase + x_hdr.lit.mask + x_hdr.indexed.go2: request decode ok.
 def t_req() -> U32:
-  b2u(HTTP2.x_req.ok(HTTP2.x_req.decode(HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":path", "/echo"}]), HTTP2.x_tab.empty())))
+  b2u(HTTP2.x_req.ok(HTTP2.x_req.decode(HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/echo"}]), HTTP2.x_tab.empty())))
 
 # Live twin of dead httpxc.resp_of stays: response decode ok.
 def t_resp() -> U32:

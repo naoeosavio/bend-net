@@ -77,7 +77,7 @@ def body() -> List<&2, U32>:
   body_go(U32.to_nat(BODY()), Nil{})
 
 def PING_PAY() -> List<&2, U32>:
-  HTTP.x_be32(20261105)
+  List.append(&2, U32, HTTP.x_be32(20261105), HTTP.x_be32(0))
 
 # A SETTINGS payload with INITIAL_WINDOW_SIZE only.
 def set_pay(+v: U32) -> List<&2, U32>:

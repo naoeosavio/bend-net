@@ -7,7 +7,8 @@
 # entries and returned on the short tail, and the frame was acked.
 #
 # Pure part: a six-byte and a twelve-byte payload pass, a seven-byte
-# payload fails, and a PING of seven bytes is not the SETTINGS rule.
+# payload fails, and a PING of seven bytes fails its own fixed size
+# (RFC 9113 section 6.7, task-070 phase 1).
 # Wire part: a raw peer announces a seven-byte SETTINGS and reads the
 # server GOAWAY. The code must be 6.
 #
@@ -130,7 +131,7 @@ def run(b: Listener & U32) -> IO(U32):
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, server_side(l))
     +wire : U32 <- peer(port)
-    +pure : U32 = U32.add(score_ok(HTTP2.x_frame.size_ok(4, 6)), U32.add(score_ok(Bool.not(HTTP2.x_frame.size_ok(4, 7))), U32.add(score_ok(HTTP2.x_frame.size_ok(4, 12)), score_ok(HTTP2.x_frame.size_ok(6, 7)))))
+    +pure : U32 = U32.add(score_ok(HTTP2.x_frame.size_ok(4, 6)), U32.add(score_ok(Bool.not(HTTP2.x_frame.size_ok(4, 7))), U32.add(score_ok(HTTP2.x_frame.size_ok(4, 12)), score_ok(Bool.not(HTTP2.x_frame.size_ok(6, 7))))))
     +score : U32 = U32.add(wire, pure)
     w : Unit <- IO.print(U32.show(score))
     z : Unit <- IO.die(Unit, 0, "")

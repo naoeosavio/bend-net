@@ -3,7 +3,8 @@
 #   bend examples/httpx/stress_h2.bend <mode> [mb]
 # Modes: echo (echo the body), drop (read the body, answer empty),
 #        big (answer [mb] MiB), early (answer at the first DATA chunk),
-#        drain (read the whole body as events, answer at the end).
+#        drain (read the whole body as events, answer at the end),
+#        ok (answer a 2-byte body, the h2spec mode).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http2.bend as HTTP2
@@ -55,6 +56,11 @@ def echo_h(req: HTTP.Request) -> IO(HTTP.Response):
 def drop_h(req: HTTP.Request) -> IO(HTTP.Response):
   IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, Nil{}})
 
+# The conformance answer: a 2-byte body, so every response carries a DATA
+# frame and a peer sees the stream end. h2spec needs it (task-070 phase 1).
+def ok_h(req: HTTP.Request) -> IO(HTTP.Response):
+  IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, [111, 107]})
+
 def big_body(mb: U32) -> HTTP.Response:
   HTTP.Response{200, Nil{}, body_of(mb)}
 
@@ -99,7 +105,8 @@ def mode_code(+m: String) -> U32:
     mk(m, "drop", 2,
       mk(m, "big", 3,
         mk(m, "early", 4,
-          mk(m, "drain", 5, 0)))))
+          mk(m, "drain", 5,
+            mk(m, "ok", 6, 0))))))
 
 def run(code: U32, l: Listener) -> IO(Unit):
   match code:
@@ -113,6 +120,8 @@ def run(code: U32, l: Listener) -> IO(Unit):
       HTTP2.server.stream.concurrent(~secho_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     case 5:
       HTTP2.server.stream.concurrent(~drain_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+    case 6:
+      HTTP2.server.concurrent(~ok_h, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
     case _:
       IO.die(Unit, 2, "bad mode")
 

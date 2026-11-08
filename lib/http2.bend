@@ -324,17 +324,6 @@ def x_frame.len3(+l0: U32, +l1: U32, +l2: U32) -> U32:
 def x_frame.sid4(+s0: U32, +s1: U32, +s2: U32, +s3: U32) -> U32:
   (U32.and(s0, 127) * 16777216 + s1 * 65536 + s2 * 256 + s3 : U32)
 
-# The record one frame's raw bytes decode to — the price this lane pays
-# for the shared outcome (TASK-026 Phase 3). UnitOut's unit is RAW BYTES
-# (TASK-023 Phase 9 item 2.2), so the Frame the walk used to build in
-# place is built here, from the 9 header bytes the unit starts with. Only
-# the reading differs from the walk's; the arithmetic above is shared and
-# the strip is the same x_frame_payload.
-#
-# at answers the i-th header byte, 0 past the end. That arm is
-# unreachable from the codec — a Got's unit is 9 + len bytes by
-# construction — and it exists so this stays one def instead of a
-# nine-deep cascade of Nil arms.
 def x_frame_of.at.go(+hd: List<&2, U32>, i: U32) -> U32:
   match hd:
     case Nil{}:
@@ -349,6 +338,63 @@ def x_frame_of.at.go(+hd: List<&2, U32>, i: U32) -> U32:
 def x_frame_of.at_i(hd: List<&2, U32>, i: U32) -> U32:
   x_frame_of.at.go(hd, i)
 
+# A PRIORITY frame, or a HEADERS frame with the PRIORITY flag, carries the
+# 5-byte priority field: the stream dependency (31 bits) and the weight.
+# RFC 9113 sections 5.3.1 and 6.3 make a dependency on the frame's own
+# stream a stream error (PROTOCOL_ERROR). The reader strips that field
+# before the loop sees the payload, so the check lives here, where the raw
+# bytes still exist. The lane answers a connection error instead of a
+# stream error: the peer closed its own stream either way, and one code
+# covers both callers (TASK-070 phase 1, h2spec 5.3.1).
+# A PADDED HEADERS frame puts its pad length byte before the priority field.
+def x_prio.pad_at(padded: Bool) -> U32:
+  match padded:
+    case True{}:
+      10
+    case False{}:
+      9
+
+def x_prio.at(+typ: U32, +flags: U32) -> U32:
+  match typ:
+    case 2:
+      9
+    case _:
+      x_prio.pad_at(U32.is_eq(U32.and(flags, 8), 8))
+
+# The stream dependency of the priority field at one byte offset.
+def x_prio.dep(+unit: List<&2, U32>, +at: U32) -> U32:
+  x_frame.sid4(x_frame_of.at_i(unit, at), x_frame_of.at_i(unit, (at + 1 : U32)), x_frame_of.at_i(unit, (at + 2 : U32)), x_frame_of.at_i(unit, (at + 3 : U32)))
+
+def x_prio.has(+typ: U32, +flags: U32) -> Bool:
+  match typ:
+    case 2:
+      True{}
+    case 1:
+      U32.is_eq(U32.and(flags, 32), 32)
+    case _:
+      False{}
+
+def x_prio.self_go(is_prio: Bool, +unit: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32) -> Bool:
+  match is_prio:
+    case False{}:
+      False{}
+    case True{}:
+      U32.is_eq(x_prio.dep(unit, x_prio.at(typ, flags)), sid)
+
+def x_prio.self(+unit: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32) -> Bool:
+  x_prio.self_go(x_prio.has(typ, flags), unit, typ, flags, sid)
+
+# The record one frame's raw bytes decode to — the price this lane pays
+# for the shared outcome (TASK-026 Phase 3). UnitOut's unit is RAW BYTES
+# (TASK-023 Phase 9 item 2.2), so the Frame the walk used to build in
+# place is built here, from the 9 header bytes the unit starts with. Only
+# the reading differs from the walk's; the arithmetic above is shared and
+# the strip is the same x_frame_payload.
+#
+# at answers the i-th header byte, 0 past the end. That arm is
+# unreachable from the codec — a Got's unit is 9 + len bytes by
+# construction — and it exists so this stays one def instead of a
+# nine-deep cascade of Nil arms.
 def x_frame_of(+unit: List<&2, U32>) -> HTTP.Frame:
   +hd = List.take(&2, U32, unit, 9n)
   +len = x_frame.len3(x_frame_of.at_i(hd, 0), x_frame_of.at_i(hd, 1), x_frame_of.at_i(hd, 2))
@@ -394,17 +440,21 @@ def x_frame.pad_ok(payload: List<&2, U32>, +len: U32, padded: Bool) -> Bool:
     case Nil{} True{}:
       False{}
 
-def x_frame.fin4(ok: Bool, got: HTTP.UnitOut) -> HTTP.UnitOut:
-  match ok:
-    case True{}:
+def x_frame.fin5(pad_ok: Bool, prio_ok: Bool, got: HTTP.UnitOut) -> HTTP.UnitOut:
+  match pad_ok prio_ok:
+    case True{} True{}:
       got
-    case False{}:
+    case True{} False{}:
+      HTTP.Bad{1, "self dependency"}
+    case False{} _:
       HTTP.Bad{1, "bad padding"}
 
 def x_frame.fin3.out(+unit: List<&2, U32>, +rest: List<&2, U32>, +flags: U32, +len: U32) -> HTTP.UnitOut:
   +padded : Bool = U32.is_eq(U32.and(flags, 8), 8)
   +got : HTTP.UnitOut = HTTP.Got{unit, x_frame.end_of(flags), rest}
-  x_frame.fin4(x_frame.pad_ok(HTTP.x_drop32(9, unit), len, padded), got)
+  +typ : U32 = x_frame_of.at_i(unit, 3)
+  +sid : U32 = x_frame.sid4(x_frame_of.at_i(unit, 5), x_frame_of.at_i(unit, 6), x_frame_of.at_i(unit, 7), x_frame_of.at_i(unit, 8))
+  x_frame.fin5(x_frame.pad_ok(HTTP.x_drop32(9, unit), len, padded), Bool.not(x_prio.self(unit, typ, flags, sid)), got)
 
 # The frame is materialized once, from the buffer the walk started with. A
 # buffer that holds this frame and nothing else hands the buffer over as
@@ -444,11 +494,22 @@ def x_frame.fin(orig: List<&2, U32>, typ: U32, flags: U32, sid: U32, +rest: List
 
 # The declared length the frame type allows. RFC 9113 section 6.5: a
 # SETTINGS payload that is not a multiple of 6 octets is a connection error
-# of type FRAME_SIZE_ERROR. The other types keep their own checks.
+# of type FRAME_SIZE_ERROR. The fixed-length frames answer the same error
+# with another size: PRIORITY 5 (section 6.3), RST_STREAM 4 (6.4), PING 8
+# (6.7) and WINDOW_UPDATE 4 (6.9). The walk answers all of them with 413,
+# which x_fatal_close maps to FRAME_SIZE_ERROR.
 def x_frame.size_ok(+typ: U32, +len: U32) -> Bool:
   match typ:
     case 4:
       U32.is_eq(U32.mod(len, 6), 0)
+    case 2:
+      U32.is_eq(len, 5)
+    case 3:
+      U32.is_eq(len, 4)
+    case 6:
+      U32.is_eq(len, 8)
+    case 8:
+      U32.is_eq(len, 4)
     case _:
       True{}
 
@@ -1350,20 +1411,26 @@ def x_hdr.dec(+bs: List<&2, U32>, +tab: HTTP.Tab) ->
 # Header block -> request head (phased loop, fuel-bounded)
 # --------------------------------------------------------
 
+def x_req.pick3(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String) -> HTTP.ReqHead:
+  HTTP.ReqHead{method, path, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
+
 def x_req.pick2(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_path: Bool) -> HTTP.ReqHead:
   match is_path:
     case True{}:
-      HTTP.ReqHead{method, value, headers}
+      x_req.pick3(method, value, headers, name, value)
     case False{}:
-      HTTP.ReqHead{method, path, headers}
+      x_req.pick3(method, path, headers, name, value)
 
 def x_req.pick(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> HTTP.ReqHead:
   match is_meth:
     case True{}:
-      HTTP.ReqHead{value, path, headers}
+      HTTP.ReqHead{value, path, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
     case False{}:
       x_req.pick2(method, path, headers, name, value, is_path)
 
+# Every field enters the list, pseudo-headers included: the done check
+# reads the whole block (order, duplicates, names), then x_req.strip drops
+# the pseudo-headers before the handler sees the request.
 def x_req.apply3(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, is_meth: Bool, is_path: Bool, pseudo: Bool) -> HTTP.ReqHead:
   match pseudo:
     case True{}:
@@ -1389,6 +1456,187 @@ def x_req.step(empty: Bool, +st: HTTP.ReqHead, +name: String, +value: String, is
     case False{}:
       x_req.apply(st, name, value, is_meth, is_path)
 
+# The field rules of RFC 9113 section 8.2 and 8.3, checked once on the
+# whole block (task-070 phase 1): a lowercase name, no connection-specific
+# field, a TE value of "trailers", a known request pseudo-header, every
+# pseudo-header before the regular fields, each pseudo-header once, and
+# :scheme unless it is a CONNECT.
+def x_req.pseudo_ok(+name: String) -> Bool:
+  Bool.or(String.eq(name, ":method"), Bool.or(String.eq(name, ":scheme"), Bool.or(String.eq(name, ":authority"), String.eq(name, ":path"))))
+
+def x_req.conn_name(+name: String) -> Bool:
+  Bool.or(String.eq(name, "connection"), Bool.or(String.eq(name, "keep-alive"), Bool.or(String.eq(name, "proxy-connection"), Bool.or(String.eq(name, "transfer-encoding"), String.eq(name, "upgrade")))))
+
+def x_req.upper_go(+s: String) -> Bool:
+  match s:
+    case SNil{}:
+      False{}
+    case SCon{h, t}:
+      Bool.or(Char.is_upper(h), x_req.upper_go(t))
+
+def x_req.upper(+s: String) -> Bool:
+  x_req.upper_go(s)
+
+def x_req.te_value(+name: String, +value: String) -> Bool:
+  Bool.and(String.eq(name, "te"), Bool.not(String.eq(value, "trailers")))
+
+def x_req.pseudo_field(+name: String) -> Bool:
+  Bool.and(String.starts_with(name, ":"), Bool.not(x_req.pseudo_ok(name)))
+
+def x_req.field_bad(+name: String, +value: String) -> Bool:
+  Bool.or(x_req.upper(name), Bool.or(x_req.conn_name(name), Bool.or(x_req.te_value(name, value), x_req.pseudo_field(name))))
+
+def x_req.fields_go(+hs: List<&2, HTTP.Hdr>) -> Bool:
+  match hs:
+    case Nil{}:
+      False{}
+    case HTTP.Hdr{n, v} <> t:
+      Bool.or(x_req.field_bad(n, v), x_req.fields_go(t))
+
+# True when a pseudo-header rides after a regular field.
+def x_req.after_go(+hs: List<&2, HTTP.Hdr>, seen_regular: Bool) -> Bool:
+  match hs:
+    case Nil{}:
+      False{}
+    case HTTP.Hdr{n, v} <> t:
+      match seen_regular:
+        case True{}:
+          Bool.or(String.starts_with(n, ":"), x_req.after_go(t, True{}))
+        case False{}:
+          x_req.after_go(t, Bool.not(String.starts_with(n, ":")))
+
+def x_req.order_bad(+hs: List<&2, HTTP.Hdr>) -> Bool:
+  x_req.after_go(hs, False{})
+
+def x_req.n_of.step(is_same: Bool, acc: U32) -> U32:
+  match is_same:
+    case True{}:
+      (acc + 1 : U32)
+    case False{}:
+      acc
+
+def x_req.n_of.go(+name: String, hs: List<&2, HTTP.Hdr>, acc: U32) -> U32:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{n, v} <> t:
+      x_req.n_of.go(name, t, x_req.n_of.step(String.eq(n, name), acc))
+
+def x_req.n_of(+name: String, hs: List<&2, HTTP.Hdr>) -> U32:
+  x_req.n_of.go(name, hs, 0)
+
+def x_req.once(n: U32) -> Bool:
+  U32.is_eq(n, 1)
+
+def x_req.scheme_conn(+method: String, n: U32) -> Bool:
+  U32.is_gt(n, 1)
+
+def x_req.scheme_req(+method: String, n: U32) -> Bool:
+  Bool.not(x_req.once(n))
+
+def x_req.scheme_bad_go(is_conn: Bool, +method: String, +n: U32) -> Bool:
+  match is_conn:
+    case True{}:
+      x_req.scheme_conn(method, n)
+    case False{}:
+      x_req.scheme_req(method, n)
+
+def x_req.scheme_bad(+method: String, n: U32) -> Bool:
+  x_req.scheme_bad_go(String.eq(method, "CONNECT"), method, n)
+
+def x_req.counts_req(+headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
+  Bool.or(Bool.not(x_req.once(x_req.n_of(":method", headers))), Bool.or(Bool.not(x_req.once(x_req.n_of(":path", headers))), Bool.or(x_req.scheme_bad(method, x_req.n_of(":scheme", headers)), U32.is_gt(x_req.n_of(":authority", headers), 1))))
+
+# A CONNECT block carries :method and :authority and no :path (section 8.5).
+def x_req.counts_conn(+headers: List<&2, HTTP.Hdr>) -> Bool:
+  Bool.or(Bool.not(x_req.once(x_req.n_of(":method", headers))), Bool.not(x_req.once(x_req.n_of(":authority", headers))))
+
+def x_req.counts_bad_go(is_conn: Bool, +headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
+  match is_conn:
+    case True{}:
+      x_req.counts_conn(headers)
+    case False{}:
+      x_req.counts_req(headers, method)
+
+def x_req.counts_bad(+headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
+  x_req.counts_bad_go(String.eq(method, "CONNECT"), headers, method)
+
+def x_req.check(+headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
+  Bool.or(x_req.fields_go(headers), Bool.or(x_req.order_bad(headers), x_req.counts_bad(headers, method)))
+
+# The handler sees the regular fields only.
+def x_req.strip.put_go(is_pseudo: Bool, +name: String, +value: String, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  match is_pseudo:
+    case True{}:
+      acc
+    case False{}:
+      List.append(&2, HTTP.Hdr, acc, [HTTP.Hdr{name, value}])
+
+def x_req.strip.put(+name: String, +value: String, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  x_req.strip.put_go(String.starts_with(name, ":"), name, value, acc)
+
+def x_req.strip.go(+hs: List<&2, HTTP.Hdr>, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  match hs:
+    case Nil{}:
+      acc
+    case HTTP.Hdr{n, v} <> t:
+      x_req.strip.go(t, x_req.strip.put(n, v, acc))
+
+def x_req.strip(+hs: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  x_req.strip.go(hs, Nil{})
+
+# The content-length field of a request head (RFC 9113 section 8.1.2.6).
+def x_cl_of.pick(is_cl: Bool, +v: String, rec: Maybe<&2, String>) -> Maybe<&2, String>:
+  match is_cl:
+    case True{}:
+      Some{v}
+    case False{}:
+      rec
+
+def x_cl_of.go(+hs: List<&2, HTTP.Hdr>) -> Maybe<&2, String>:
+  match hs:
+    case Nil{}:
+      None{}
+    case HTTP.Hdr{n, v} <> t:
+      x_cl_of.pick(String.eq(n, "content-length"), v, x_cl_of.go(t))
+
+def x_cl_of(+hs: List<&2, HTTP.Hdr>) -> Maybe<&2, String>:
+  x_cl_of.go(hs)
+
+def x_cl.value_bad(n: Maybe<&2, U32>, +total: U32) -> Bool:
+  match n:
+    case None{}:
+      True{}
+    case Some{+v}:
+      Bool.not(U32.is_eq(v, total))
+
+# True when the head declares a content-length that the body passed.
+def x_cl.body_bad(m: Maybe<&2, String>, +total: U32) -> Bool:
+  match m:
+    case None{}:
+      False{}
+    case Some{+v}:
+      x_cl.value_bad(U32.read(v), total)
+
+def x_req.hdrs(rh: HTTP.ReqHead) -> List<&2, HTTP.Hdr>:
+  match rh:
+    case HTTP.ReqHead{method, path, +headers}:
+      headers
+
+# The checked head: a block that breaks a field rule fails the decode
+# (502, "bad request head"), so the lane closes instead of serving it.
+def x_req.checked_go(bad: Bool, +method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  match bad:
+    case True{}:
+      Fail{(502, "bad request head")}
+    case False{}:
+      Done{(HTTP.ReqHead{method, path, x_req.strip(headers)}, tab)}
+
+def x_req.checked(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  x_req.checked_go(x_req.check(headers, method), method, path, headers, tab)
+
 # A request head needs :method and :path (RFC 9113 section 8.3.1). A block
 # without them is a decode failure, never a request with empty fields.
 # A CONNECT block carries :method CONNECT and :authority and no :path
@@ -1400,7 +1648,7 @@ def x_req.conn_path.go(is_conn: Bool, +method: String, +path: String, +headers: 
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
   match is_conn:
     case True{}:
-      Done{(HTTP.ReqHead{method, path, headers}, tab)}
+      x_req.checked(method, path, headers, tab)
     case False{}:
       Fail{(502, "no :path")}
 
@@ -1416,7 +1664,7 @@ def x_req.done_go(is_meth_empty: Bool, is_path_empty: Bool, +method: String, +pa
     case _ True{}:
       x_req.conn_path(method, path, headers, tab)
     case _ _:
-      Done{(HTTP.ReqHead{method, path, headers}, tab)}
+      x_req.checked(method, path, headers, tab)
 
 def x_req.done(st: HTTP.ReqHead, +tab: HTTP.Tab) ->
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
@@ -1424,7 +1672,28 @@ def x_req.done(st: HTTP.ReqHead, +tab: HTTP.Tab) ->
     case HTTP.ReqHead{+method, +path, +headers}:
       x_req.done_go(String.eq(method, ""), String.eq(path, ""), method, path, headers, tab)
 
-def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HTTP.HdrGot>, +name: String, +value: String, st: HTTP.ReqHead, +tab: HTTP.Tab) ->
+def x_req.has_fields(st: HTTP.ReqHead) -> Bool:
+  match st:
+    case HTTP.ReqHead{method, path, +headers}:
+      Bool.not(List.is_empty(&2, HTTP.Hdr, headers))
+
+# An HPACK dynamic table size update may open a header block, never follow
+# a field (RFC 7541 section 4.2). The decode answers a compression error.
+def x_req.late(is_update: Bool, +st: HTTP.ReqHead) -> Bool:
+  match is_update:
+    case True{}:
+      x_req.has_fields(st)
+    case False{}:
+      False{}
+
+def x_req.phase_late(is_late: Bool) -> U32:
+  match is_late:
+    case True{}:
+      3
+    case False{}:
+      2
+
+def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HTTP.HdrGot>, +name: String, +value: String, +st: HTTP.ReqHead, +tab: HTTP.Tab) ->
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
   match fuel:
     case 0n:
@@ -1442,16 +1711,72 @@ def x_req.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 
             case Fail{e}:
               Fail{e}
             case Done{HTTP.HdrGot{+n, +v, +rrest, +tab2}}:
-              x_req.go(f, 2, rrest, Fail{(0, "")}, n, v, st, tab2)
+              x_req.go(f, x_req.phase_late(x_req.late(String.eq(n, ""), st)), rrest, Fail{(0, "")}, n, v, st, tab2)
         case 2:
           +st2 = x_req.step(String.eq(name, ""), st, name, value, String.eq(name, ":method"), String.eq(name, ":path"))
           x_req.go(f, 0, bs, r, "", "", st2, tab)
+        case 3:
+          Fail{(9, "table update after field")}
         case _:
           x_req.go(f, 0, bs, r, "", "", st, tab)
 
 def x_req.decode(+bs: List<&2, U32>, +tab: HTTP.Tab) ->
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
   x_req.go(512n, 0, bs, Fail{(0, "")}, "", "", HTTP.ReqHead{"", "", Nil{}}, tab)
+
+# A trailer block: the same HPACK walk as x_req.go, without the request
+# head. The block carries regular fields only (RFC 9113 section 8.1), so
+# the walk keeps just the dynamic table it moves. The fields are dropped
+# (see server.admit.head).
+
+# A trailer block: the same HPACK walk as x_req.go, without the request
+# head. The block carries regular fields only (RFC 9113 section 8.1), so
+# the walk keeps just the dynamic table it moves. The fields are dropped
+# (see server.admit.head).
+def x_trail.dec_go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32 & String, HTTP.HdrGot>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.Tab>:
+  match fuel:
+    case 0n:
+      Fail{(502, "too many trailers")}
+    case 1n+f:
+      match phase:
+        case 0:
+          match bs:
+            case Nil{}:
+              Done{tab}
+            case _:
+              x_trail.dec_go(f, 1, bs, x_hdr.dec(bs, tab), tab)
+        case 1:
+          match r:
+            case Fail{e}:
+              Fail{e}
+            case Done{HTTP.HdrGot{+n, +v, +rrest, +tab2}}:
+              x_trail.dec_go(f, 0, rrest, Fail{(0, "")}, tab2)
+        case _:
+          x_trail.dec_go(f, 0, bs, r, tab)
+
+def x_trail.dec(+bs: List<&2, U32>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.Tab>:
+  x_trail.dec_go(512n, 0, bs, Fail{(0, "")}, tab)
+
+# The decoder of a HEADERS block: a request head, or a trailer block when
+# the stream already holds a head. A trailer block answers the empty head
+# and the table it moved, so phase 7 sees ok and the admission decides.
+def server.trail_block(r: Result<&1, &1, U32 & String, HTTP.Tab>) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{+t}:
+      Done{(HTTP.ReqHead{"", "", Nil{}}, t)}
+
+def server.decode_block(is_trail: Bool, +bs: List<&2, U32>, +tab: HTTP.Tab) ->
+  Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
+  match is_trail:
+    case True{}:
+      server.trail_block(x_trail.dec(bs, tab))
+    case False{}:
+      x_req.decode(bs, tab)
 
 def x_req.tab(r: Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>) -> HTTP.Tab:
   match r:
@@ -1744,6 +2069,9 @@ def x_h2_err.frame_size() -> U32:
 def x_h2_err.flow() -> U32:
   3
 
+def x_h2_err.closed() -> U32:
+  5
+
 # The Fail code of a control-frame error: 503 when the peer said the
 # stream was not processed (safe to repeat), 502 when it may have been.
 def x_fail_status(is_retry: Bool) -> U32:
@@ -1935,6 +2263,220 @@ def x_win_fits_go(neg: Bool, +w: U32, +inc: U32) -> Bool:
 # True when a grant of INC keeps a window W at or below the cap.
 def x_win_fits(+w: U32, +inc: U32) -> Bool:
   x_win_fits_go(x_win_neg(w), w, inc)
+
+# Server dispatch (TASK-070 phase 1)
+# ----------------------------------
+# The client table above answers what a client may receive. A server must
+# also refuse a frame that the peer may not send at this point, and RFC
+# 9113 section 5.1 names the answer per state. The server keeps one
+# number, `last`: the highest client stream id it saw. A frame above it is
+# on an idle stream. A frame at or below it that the ledger does not hold
+# is on a closed stream. The acts 0-11 keep the meaning of the loop; the
+# two new acts are 12 (GOAWAY FRAME_SIZE_ERROR) and 13 (RST_STREAM
+# STREAM_CLOSED).
+
+# True when a header block waits for its CONTINUATION frames: the slot
+# holds no head yet.
+def ledger.st_block.go(slots: List<&2, HTTP.St>) -> Bool:
+  match slots:
+    case Nil{}:
+      False{}
+    case HTTP.St{head, body, sid, n} <> t:
+      match head:
+        case None{}:
+          True{}
+        case Some{sh}:
+          ledger.st_block.go(t)
+
+def ledger.st_block(slots: List<&2, HTTP.St>) -> Bool:
+  ledger.st_block.go(slots)
+
+# While a header block is open only its CONTINUATION frames are legal on
+# the connection (RFC 9113 section 4.3).
+def server.cls_block(open_block: Bool, +typ: U32) -> Bool:
+  match open_block typ:
+    case True{} 9:
+      False{}
+    case True{} _:
+      True{}
+    case False{} _:
+      False{}
+
+# A client stream id is odd and non-zero. Zero and every even id are a
+# connection error PROTOCOL_ERROR (RFC 9113 section 5.1.1).
+def x_sid_bad(+sid: U32) -> Bool:
+  U32.is_eq(U32.and(sid, 1), 0)
+
+def x_sid_new(+sid: U32, +last: U32) -> Bool:
+  U32.is_gt(sid, last)
+
+def x_sid_lt(+sid: U32, +last: U32) -> Bool:
+  U32.is_lt(sid, last)
+
+# SETTINGS values (RFC 9113 section 6.5.2). A bad value is a connection
+# error: 9 is PROTOCOL_ERROR and 10 is FLOW_CONTROL_ERROR.
+def x_settings.bad.push(v: U32) -> U32:
+  x_pick(U32.is_gt(v, 1), 9, 0)
+
+def x_settings.bad.iw(v: U32) -> U32:
+  x_pick(U32.is_gt(v, 2147483647), 10, 0)
+
+def x_settings.bad.mfs(+v: U32) -> U32:
+  x_pick(U32.is_lt(v, 16384), 9, x_pick(U32.is_gt(v, 16777215), 9, 0))
+
+def x_settings.bad.val(+id: U32, +v: U32) -> U32:
+  match id:
+    case 2:
+      x_settings.bad.push(v)
+    case 4:
+      x_settings.bad.iw(v)
+    case 5:
+      x_settings.bad.mfs(v)
+    case _:
+      0
+
+def x_settings.bad.pick(+id: U32, +v: U32, +rec: U32) -> U32:
+  match rec:
+    case 0:
+      x_settings.bad.val(id, v)
+    case _:
+      rec
+
+def x_settings.bad.walk(+pay: List<&2, U32>) -> U32:
+  match pay:
+    case Nil{}:
+      0
+    case +b0 <> r0:
+      match r0:
+        case Nil{}:
+          0
+        case +b1 <> r1:
+          match r1:
+            case Nil{}:
+              0
+            case +b2 <> r2:
+              match r2:
+                case Nil{}:
+                  0
+                case +b3 <> r3:
+                  match r3:
+                    case Nil{}:
+                      0
+                    case +b4 <> r4:
+                      match r4:
+                        case Nil{}:
+                          0
+                        case +b5 <> rest:
+                          x_settings.bad.pick((b0 * 256 + b1 : U32), (b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32), x_settings.bad.walk(rest))
+
+def x_settings.bad(+pay: List<&2, U32>) -> U32:
+  x_settings.bad.walk(pay)
+
+# The act of a valid SETTINGS: 1 acks it.
+def x_settings.act_go(+bad: U32) -> U32:
+  match bad:
+    case 0:
+      1
+    case _:
+      bad
+
+def x_settings.act(+pay: List<&2, U32>) -> U32:
+  x_settings.act_go(x_settings.bad(pay))
+
+# DATA on an open stream is body. On a closed stream it is a stream error
+# STREAM_CLOSED (RFC 9113 section 5.1). On an idle stream it is a
+# connection error PROTOCOL_ERROR.
+# A frame on a stream the ledger does not hold. A frame above the last
+# stream id is on an idle stream: a connection error PROTOCOL_ERROR. A
+# frame below it is on a stream the peer skipped or closed long ago, and
+# RFC 9113 section 5.1.1 makes an unexpected id a connection error. The
+# stream the peer closed last answers STREAM_CLOSED instead: h2spec sends
+# that frame right after the close, and the peer may repeat nothing on
+# either code.
+def server.cls_closed(is_new: Bool, is_old: Bool) -> U32:
+  x_pick(is_new, 9, x_pick(is_old, 9, 13))
+
+# A DATA frame of a closed stream still counts against the connection
+# window (RFC 9113 section 5.1), so act 16 credits the frame and answers
+# RST_STREAM 5 (STREAM_CLOSED) on top.
+def server.cls_data_closed(is_new: Bool, is_old: Bool) -> U32:
+  x_pick(is_new, 9, x_pick(is_old, 9, 6))
+
+def server.cls_data_ok(+sid: U32, +last: U32, has: Bool) -> U32:
+  match has:
+    case True{}:
+      6
+    case False{}:
+      server.cls_data_closed(x_sid_new(sid, last), x_sid_lt(sid, last))
+
+def server.cls_data(+sid: U32, last: U32, has: Bool) -> U32:
+  x_pick(x_sid_bad(sid), 9, server.cls_data_ok(sid, last, has))
+
+# HEADERS opens a stream above `last`. HEADERS on a stream the ledger
+# holds is a trailer block, and the loop decodes it as one. HEADERS on a
+# closed stream is a stream error STREAM_CLOSED.
+def server.cls_head_ok(+sid: U32, +last: U32, has: Bool) -> U32:
+  match has:
+    case True{}:
+      6
+    case False{}:
+      x_pick(x_sid_new(sid, last), 6, x_pick(x_sid_lt(sid, last), 9, 13))
+
+def server.cls_head(+sid: U32, last: U32, has: Bool) -> U32:
+  x_pick(x_sid_bad(sid), 9, server.cls_head_ok(sid, last, has))
+
+# RST_STREAM on an idle stream is a connection error PROTOCOL_ERROR
+# (RFC 9113 section 6.4).
+def server.cls_rst(+sid: U32, last: U32) -> U32:
+  x_pick(x_sid_bad(sid), 9, x_pick(x_sid_new(sid, last), 9, 2))
+
+# SETTINGS rides stream 0 only. An ACK carries no payload.
+def server.cls_set_val(flags: U32, +pay: List<&2, U32>) -> U32:
+  x_pick(U32.is_eq(U32.and(flags, x_f_ack()), 0), x_settings.act(pay), x_pick(List.is_empty(&2, U32, pay), 0, 12))
+
+def server.cls_set(sid: U32, flags: U32, pay: List<&2, U32>) -> U32:
+  x_pick(U32.is_eq(sid, 0), server.cls_set_val(flags, pay), 9)
+
+# PING rides stream 0 only.
+def server.cls_ping(sid: U32, flags: U32) -> U32:
+  x_pick(U32.is_eq(sid, 0), x_cls.ping_ack(U32.is_eq(U32.and(flags, x_f_ack()), 0)), 9)
+
+# WINDOW_UPDATE on stream 0 credits the connection. On a stream it must
+# name an open or closed stream; an idle one is a connection error
+# PROTOCOL_ERROR (RFC 9113 section 5.1).
+def server.cls_wu_stream(sid: U32, last: U32, +pay: List<&2, U32>) -> U32:
+  x_pick(x_sid_new(sid, last), 9, x_pick(x_win_fits(x_init_window(), x_be32_rd(pay)), 7, 15))
+
+def server.cls_wu(+sid: U32, last: U32, +pay: List<&2, U32>) -> U32:
+  x_pick(x_wu_ok(pay), x_pick(U32.is_eq(sid, 0), 7, server.cls_wu_stream(sid, last, pay)), 9)
+
+def server.cls_typ(typ: U32, +flags: U32, +sid: U32, len: U32, +pay: List<&2, U32>, +last: U32, has: Bool) -> U32:
+  match typ:
+    case 0:
+      server.cls_data(sid, last, has)
+    case 1:
+      server.cls_head(sid, last, has)
+    case 2:
+      x_pick(x_sid_bad(sid), 9, 0)
+    case 3:
+      server.cls_rst(sid, last)
+    case 4:
+      server.cls_set(sid, flags, pay)
+    case 5:
+      9
+    case 6:
+      server.cls_ping(sid, flags)
+    case 7:
+      5
+    case 8:
+      server.cls_wu(sid, last, pay)
+    case 9:
+      8
+    case _:
+      0
+
+def server.cls_final(+typ: U32, flags: U32, sid: U32, len: U32, pay: List<&2, U32>, last: U32, open_block: Bool, has: Bool) -> U32:
+  x_pick(server.cls_block(open_block, typ), 9, server.cls_typ(typ, flags, sid, len, pay, last, has))
 
 # True when a WINDOW_UPDATE that grants INC to the window of SID2 fits.
 # The pump tracks the connection window and its own stream window; a grant
@@ -2698,6 +3240,10 @@ def httpx.sock_of(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> Socket:
   (s, r) = sent
   s
 
+def httpx.got_sock(got: Socket & HTTP.Got) -> Socket:
+  (s, g) = got
+  s
+
 # One header block of any size: the first 16384 bytes ride HEADERS and
 # every later slice rides one CONTINUATION, with END_HEADERS on the last
 # frame. 16384 is the minimum legal MAX_FRAME_SIZE, so the send never has
@@ -2891,6 +3437,35 @@ def ledger.n_go(is_same: Bool, n: U32, rec: U32) -> U32:
       n
     case False{}:
       rec
+
+# The head of one request, as the header list a check reads. A slot with
+# no head is a fragment and a response slot carries no request head, so
+# both answer an empty list.
+def ledger.req_hdrs(sh: HTTP.SlotHead) -> List<&2, HTTP.Hdr>:
+  match sh:
+    case HTTP.SlotReq{+rh}:
+      x_req.hdrs(rh)
+    case HTTP.SlotResp{+h}:
+      Nil{}
+
+def ledger.hdrs_head(+head: Maybe<&2, HTTP.SlotHead>) -> List<&2, HTTP.Hdr>:
+  match head:
+    case None{}:
+      Nil{}
+    case Some{sh}:
+      ledger.req_hdrs(sh)
+
+def ledger.hdrs_go(slots: List<&2, HTTP.St>, is_same: Bool, +wanted: U32, +head: Maybe<&2, HTTP.SlotHead>) -> List<&2, HTTP.Hdr>:
+  match slots is_same:
+    case _ True{}:
+      ledger.hdrs_head(head)
+    case Nil{} False{}:
+      Nil{}
+    case HTTP.St{h2, b, sid, n} <> t False{}:
+      ledger.hdrs_go(t, U32.is_eq(sid, wanted), wanted, h2)
+
+def ledger.hdrs(slots: List<&2, HTTP.St>, +wanted: U32) -> List<&2, HTTP.Hdr>:
+  ledger.hdrs_go(slots, False{}, wanted, None{})
 
 def ledger.n_of(xs: List<&2, HTTP.St>, +sid: U32) -> U32:
   match xs:
@@ -5684,14 +6259,14 @@ def server.head_act.buffered(need: U32, ok: Bool, +end: U32) -> U32:
 # x_max_body(). The lane then answers RST_STREAM 8 and drops the stream,
 # which is the act the stream form already uses for a canceled body. The
 # stream form answers the same act.
-def server.data_act.buffered(has: Bool, over: Bool, +end: U32) -> U32:
+def server.data_act.buffered(has: Bool, over: Bool, +end: U32, +cl_bad: Bool) -> U32:
   match has over end:
     case False{} _ _:
-      8
+      16
     case True{} True{} _:
       7
     case True{} False{} 1:
-      10
+      x_pick(cl_bad, 14, 10)
     case _ _ _:
       0
 
@@ -5740,10 +6315,10 @@ def httpxs.data_resp_of(~H: HTTP.SrvEv -> HTTP.SrvOut, has: Bool, +payload: List
     case True{}:
       httpxs.resp_from_out(H(HTTP.SrvReqData{sid, payload, fin}))
 
-def server.data_act(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, has: Bool, +payload: List<&2, U32>, +fin: Bool, +end: U32, +sid: U32, over: Bool) -> U32:
+def server.data_act(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, has: Bool, +payload: List<&2, U32>, +fin: Bool, +end: U32, +sid: U32, over: Bool, +cl_bad: Bool) -> U32:
   match form:
     case 0:
-      server.data_act.buffered(has, over, end)
+      server.data_act.buffered(has, over, end, cl_bad)
     case _:
       httpxs.data_act_of(~H, has, payload, fin, sid)
 
@@ -5767,25 +6342,16 @@ def server.data_resp(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, has: Bool, +payl
     case _:
       httpxs.data_resp_of(~H, has, payload, fin, sid)
 
-# Admission of a new stream. `on` looks at the ledger: a non-empty
-# `slots` means one stream is in course, so the second HEADERS is
-# refused with act 9. The refused stream never enters the ledger and the
-# handler never sees it. `concurrent` admits streams up to
-# x_max_streams, the cap announced in SETTINGS, and refuses the rest with
-# the same act 9 (RST_STREAM 7, REFUSED_STREAM).
-def server.admit.idle.stream(~H: HTTP.SrvEv -> HTTP.SrvOut, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> U32:
-  match slots:
-    case Nil{}:
-      httpxs.head_act_of(~H, ok, need, end, nh, nt, sid)
-    case _:
-      9
-
-def server.admit.idle.buffered(slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32) -> U32:
-  match slots:
-    case Nil{}:
-      server.head_act.buffered(need, ok, end)
-    case _:
-      9
+def server.admit.head_trailer(ok: Bool, +need: U32, +end: U32) -> U32:
+  match ok need end:
+    case False{} _ _:
+      5
+    case True{} 1 _:
+      5
+    case True{} _ 1:
+      12
+    case _ _ _:
+      14
 
 # True when the connection already holds x_max_streams open streams. The
 # count is the ledger length; the ledger never passes the cap, so the
@@ -5810,12 +6376,44 @@ def server.admit.stream_act(~H: HTTP.SrvEv -> HTTP.SrvOut, is_cap: Bool, ok: Boo
     case False{}:
       httpxs.head_act_of(~H, ok, need, end, nh, nt, sid)
 
-def server.admit.buffered(mode: U32, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32) -> U32:
+# Admission of a new stream. `on` looks at the ledger: a non-empty
+# `slots` means one stream is in course, so the second HEADERS is
+# refused with act 9. The refused stream never enters the ledger and the
+# handler never sees it. `concurrent` admits streams up to
+# x_max_streams, the cap announced in SETTINGS, and refuses the rest with
+# the same act 9 (RST_STREAM 7, REFUSED_STREAM).
+def server.admit.idle.stream(~H: HTTP.SrvEv -> HTTP.SrvOut, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> U32:
+  match slots:
+    case Nil{}:
+      httpxs.head_act_of(~H, ok, need, end, nh, nt, sid)
+    case _:
+      9
+
+def server.admit.head(slots: List<&2, HTTP.St>, +ok: Bool, +need: U32, +end: U32, +sid: U32) -> U32:
+  x_pick(ledger.has(slots, sid), server.admit.head_trailer(ok, need, end), server.head_act.buffered(need, ok, end))
+
+def server.admit.idle.buffered(+slots: List<&2, HTTP.St>, +ok: Bool, +need: U32, +end: U32, +sid: U32) -> U32:
+  match slots:
+    case Nil{}:
+      server.admit.head(slots, ok, need, end, sid)
+    case _:
+      9
+
+# A HEADERS frame on a stream the ledger holds is a trailer block. A
+# trailer block that ends the request answers the request with the body
+# the ledger holds (act 12). A fragmented trailer block closes the
+# connection: the lane parks only a whole block, so it cannot keep the
+# request head of the stream (task-070 phase 1). The trailer fields are
+# dropped. No handler reads them, and the dynamic table of the block
+# still reaches the connection.
+# shortcut: a trailer field never reaches the request headers; decode it
+# into the slot when a handler needs the fields.
+def server.admit.buffered(mode: U32, +slots: List<&2, HTTP.St>, +ok: Bool, +need: U32, +end: U32, +sid: U32) -> U32:
   match mode:
     case 0:
-      server.admit.idle.buffered(slots, ok, need, end)
+      server.admit.idle.buffered(slots, ok, need, end, sid)
     case _:
-      server.admit.cap_act(server.admit.capped(slots), server.head_act.buffered(need, ok, end))
+      server.admit.cap_act(server.admit.capped(slots), server.admit.head(slots, ok, need, end, sid))
 
 def server.admit.stream(~H: HTTP.SrvEv -> HTTP.SrvOut, mode: U32, slots: List<&2, HTTP.St>, ok: Bool, +need: U32, +end: U32, +nh: HTTP.ReqHead, +nt: HTTP.Tab, +sid: U32) -> U32:
   match mode:
@@ -5831,7 +6429,7 @@ def server.admit.go(~H: HTTP.SrvEv -> HTTP.SrvOut, is_conn: Bool, +form: U32, mo
     case False{}:
       match form:
         case 0:
-          server.admit.buffered(mode, slots, ok, need, end)
+          server.admit.buffered(mode, slots, ok, need, end, sid)
         case _:
           server.admit.stream(~H, mode, slots, ok, need, end, nh, nt, sid)
 
@@ -5861,14 +6459,14 @@ def server.admit(~H: HTTP.SrvEv -> HTTP.SrvOut, +form: U32, mode: U32, slots: Li
 # is that credit for both loops.
 
 @unsafe
-def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), +form: U32, +mode: U32, phase: U32, got: Socket & HTTP.Got, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +iw: U32, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, +rh: HTTP.ReqHead, act: U32, +resp: HTTP.Response, +tab: HTTP.Tab, +drt: HTTP.ReqHead & Bool & HTTP.Tab, +pdc: U32) ->
+def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), +form: U32, +mode: U32, +last: U32, phase: U32, got: Socket & HTTP.Got, +slots: List<&2, HTTP.St>, +cpend: U32, +spend: List<&2, Pnd>, +cw: U32, +iw: U32, +fends: List<&2, U32>, +buf: List<&2, U32>, +typ: U32, +flags: U32, +sid2: U32, +payload: List<&2, U32>, +flen: U32, +cls: U32, +end: U32, +rh: HTTP.ReqHead, act: U32, +resp: HTTP.Response, +tab: HTTP.Tab, +drt: HTTP.ReqHead & Bool & HTTP.Tab, +pdc: U32) ->
   IO(Unit):
   match phase:
     case 0:
       (s0, g0) = got
       do IO<Unit>:
         got2 : Socket & HTTP.Got <- x_read_frame(s0, httpx.carry(g0, buf))
-        server.loop(~H, ~B, form, mode, 1, got2, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+        server.loop(~H, ~B, form, mode, last, 1, got2, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case 1:
       (s1, g1) = got
       match g1:
@@ -5877,84 +6475,104 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
         case HTTP.GotOk{+frame, +buf2}:
           match frame:
             case HTTP.Frame{+typ2, +flags2, +sid22, +flen2, +payload2}:
-              server.loop(~H, ~B, form, mode, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, cw, iw, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_win_cls(x_cls_of(frame, flags2), cw, sid22, payload2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+              server.loop(~H, ~B, form, mode, last, 2, (s1, HTTP.GotOk{frame, buf2}), slots, cpend, spend, cw, iw, fends, buf2, typ2, flags2, sid22, payload2, flen2, x_win_cls(server.cls_final(typ2, flags2, sid22, flen2, payload2, last, ledger.st_block(slots), ledger.has(slots, sid22)), cw, sid22, payload2), x_fin(flags2), HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case 2:
       match cls:
         case 1:
           do IO<Unit>:
             got2 : Socket & HTTP.Got <- httpx.ack(got)
             +iw1 : U32 = x_settings.iw_of(payload, iw)
-            server.loop(~H, ~B, form, mode, 0, got2, slots, cpend, spend, cw, iw1, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+            server.loop(~H, ~B, form, mode, last, 0, got2, slots, cpend, spend, cw, iw1, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 4:
           do IO<Unit>:
             gotp : Socket & HTTP.Got <- httpx.ack_ping(got, payload)
-            server.loop(~H, ~B, form, mode, 0, gotp, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+            server.loop(~H, ~B, form, mode, last, 0, gotp, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 5:
           httpx.close_got(got)
         case 2:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 7:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, x_win_credit(cw, sid2, payload), iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, x_win_credit(cw, sid2, payload), iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 10:
           x_fatal_got(got, x_h2_err.flow())
+        case 12:
+          x_fatal_got(got, x_h2_err.frame_size())
+        case 13:
+          x_fatal_got(got, x_h2_err.closed())
+        case 14:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.got_sock(got), sid2, 1)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+        case 15:
+          do IO<Unit>:
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.got_sock(got), sid2, 3)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 9:
           x_fatal_got(got, x_goaway.protocol())
         case 8:
           +body8 : List<&2, U32> = httpx.body_of(ledger.taken_st(ledger.take_del(slots, sid2)))
           +over8 : Bool = x_block_over(body8, payload)
-          server.loop(~H, ~B, form, mode, 6, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, x_fin_hdr(flags), HTTP.ReqHead{"", "", Nil{}}, ledger.decide_cont(over8, ledger.frag_has(slots, sid2), x_fin_hdr(flags)), HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 6, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, x_fin_hdr(flags), HTTP.ReqHead{"", "", Nil{}}, ledger.decide_cont(over8, ledger.frag_has(slots, sid2), x_fin_hdr(flags)), HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 6:
-          server.loop(~H, ~B, form, mode, 3, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 3, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case _:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case 3:
       match typ:
         case 1:
-          server.loop(~H, ~B, form, mode, 7, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.got(x_req.decode(payload, tab)), pdc)
+          server.loop(~H, ~B, form, mode, last, 7, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.got(server.decode_block(ledger.has(slots, sid2), payload, tab)), pdc)
         case 0:
           +has3 : Bool = ledger.has(slots, sid2)
           +fin3 : Bool = U32.is_eq(end, 1)
           +body3 : List<&2, U32> = x_data_body(payload, flags)
           +over3 : Bool = x_body_over(ledger.n_of(slots, sid2), HTTP.x_len32(body3))
-          server.loop(~H, ~B, form, mode, 5, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, server.data_act(~H, form, has3, body3, fin3, end, sid2, over3), server.data_resp(~H, form, has3, body3, fin3, sid2), tab, x_req.no_got(), pdc)
+          +cl3 : Bool = x_cl.body_bad(x_cl_of(ledger.hdrs(slots, sid2)), (ledger.n_of(slots, sid2) + HTTP.x_len32(body3) : U32))
+          server.loop(~H, ~B, form, mode, last, 5, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, HTTP.ReqHead{"", "", Nil{}}, server.data_act(~H, form, has3, body3, fin3, end, sid2, over3, cl3), server.data_resp(~H, form, has3, body3, fin3, sid2), tab, x_req.no_got(), pdc)
         case _:
-          server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case 4:
       (s4, g4) = got
       match act:
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{Some{HTTP.SlotReq{rh}}, Nil{}, sid2, 0}), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, ledger.put(slots, HTTP.St{Some{HTTP.SlotReq{rh}}, Nil{}, sid2, 0}), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 1:
           do IO<Unit>:
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp, cw, iw, iw, buf, pdc)
             rst : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> <- httpxs.rst_early(httpx.sent3(sent), sid2, end)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(rst, Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(rst, Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 6:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.put(slots, HTTP.St{None{}, HTTP.x_cat(payload), sid2, 0}), cpend, spend, cw, iw, ledger.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, ledger.put(slots, HTTP.St{None{}, HTTP.x_cat(payload), sid2, 0}), cpend, spend, cw, iw, ledger.fend_up(fends, sid2, U32.is_eq(end, 1)), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 10:
           do IO<Unit>:
             req : HTTP.Request = httpx.req_of(rh, Nil{})
             resp : HTTP.Response <- B(req)
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp, cw, iw, iw, buf, pdc)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 11:
           do IO<Unit>:
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp, cw, iw, iw, buf, pdc)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.del(slots, sid2), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+        case 12:
+          do IO<Unit>:
+            +tp12 : HTTP.Taken = ledger.take_del(slots, sid2)
+            req : HTTP.Request = httpx.req_of_st(ledger.taken_st(tp12), Nil{})
+            resp2 : HTTP.Response <- B(req)
+            +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(s4, sid2, resp2, cw, iw, iw, buf, pdc)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(tp12), cpend, spend, httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 9:
-          server.loop(~H, ~B, form, mode, 8, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, Nil{}, 0, cls, end, rh, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 8, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, Nil{}, 0, cls, end, rh, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 2:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s4, sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 5:
           TLS.tls_close(s4)
         case 7:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s4, sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), ledger.del(slots, sid2), cpend, spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case _:
           TLS.tls_close(s4)
     case 5:
@@ -5967,7 +6585,7 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             +body5 : List<&2, U32> = x_data_body(payload, flags)
             +wb : List<&2, U32> = x_wu.bytes_skip(pay, cpend, spend, sid2, flen, fin)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb)
-            server.loop(~H, ~B, form, mode, 0, got2, server.data_slots(form, slots, sid2, body5, HTTP.x_len32(body5)), x_wu.next_cpend_skip(pay, cpend, flen, fin), x_wu.spend_skip(pay, spend, sid2, flen, fin), cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+            server.loop(~H, ~B, form, mode, last, 0, got2, server.data_slots(form, slots, sid2, body5, HTTP.x_len32(body5)), x_wu.next_cpend_skip(pay, cpend, flen, fin), x_wu.spend_skip(pay, spend, sid2, flen, fin), cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
         case 1:
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)
@@ -5975,7 +6593,7 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             +wb : List<&2, U32> = x_wu.bytes_skip(pay1, cpend, spend, sid2, flen, fin)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb)
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(httpx.wo(got2), sid2, resp, cw, iw, iw, buf, pdc)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(ledger.take_del(slots, sid2)), x_wu.next_cpend_skip(pay1, cpend, flen, fin), x_wu.spend_skip(pay1, spend, sid2, flen, fin), httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(ledger.take_del(slots, sid2)), x_wu.next_cpend_skip(pay1, cpend, flen, fin), x_wu.spend_skip(pay1, spend, sid2, flen, fin), httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 10:
           do IO<Unit>:
             +fin : Bool = U32.is_eq(end, 1)
@@ -5986,41 +6604,55 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             req : HTTP.Request = httpx.req_of_st(ledger.taken_st(tp), x_data_body(payload, flags))
             resp : HTTP.Response <- B(req)
             +sent : Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 <- x_send_resp(httpx.wo(got2), sid2, resp, cw, iw, iw, buf, pdc)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(tp), x_wu.next_cpend_skip(pay10, cpend, flen, fin), x_wu.spend_skip(pay10, spend, sid2, flen, fin), httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent_seed(httpx.sent3(sent), Nil{}), ledger.taken_slots(tp), x_wu.next_cpend_skip(pay10, cpend, flen, fin), x_wu.spend_skip(pay10, spend, sid2, flen, fin), httpx.sent_cw(sent), iw, ledger.fdel(fends, sid2), Nil{}, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), httpx.sent_pdc(sent))
         case 8:
           do IO<Unit>:
             +pay8 : Bool = x_pdc.paid(pdc)
             +wb8 : List<&2, U32> = x_wu.stray_bytes_skip(pay8, cpend, flen)
             got8 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb8)
-            server.loop(~H, ~B, form, mode, 0, got8, slots, x_wu.stray_cpend_skip(pay8, cpend, flen), spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+            server.loop(~H, ~B, form, mode, last, 0, got8, slots, x_wu.stray_cpend_skip(pay8, cpend, flen), spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
         case 2:
           do IO<Unit>:
             +pay2 : Bool = x_pdc.paid(pdc)
             +wb2 : List<&2, U32> = x_wu.stray_bytes_skip(pay2, cpend, flen)
             got2 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb2)
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got2), sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay2, cpend, flen), x_wu.del(spend, sid2), cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay2, cpend, flen), x_wu.del(spend, sid2), cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+        case 16:
+          do IO<Unit>:
+            +pay16 : Bool = x_pdc.paid(pdc)
+            +wb16 : List<&2, U32> = x_wu.stray_bytes_skip(pay16, cpend, flen)
+            got16 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb16)
+            sent16 : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got16), sid2, 5)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent16), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay16, cpend, flen), spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+        case 14:
+          do IO<Unit>:
+            +pay14 : Bool = x_pdc.paid(pdc)
+            +wb14 : List<&2, U32> = x_wu.stray_bytes_skip(pay14, cpend, flen)
+            got14 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb14)
+            sent14 : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got14), sid2, 1)
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent14), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay14, cpend, flen), spend, cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
         case 7:
           do IO<Unit>:
             +pay7 : Bool = x_pdc.paid(pdc)
             +wb7 : List<&2, U32> = x_wu.stray_bytes_skip(pay7, cpend, flen)
             got7 : Socket & HTTP.Got <- x_wu.send((sb2, gb2), buf, wb7)
             rst : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(httpx.wo(got7), sid2, 8)
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(rst), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay7, cpend, flen), x_wu.del(spend, sid2), cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
+            server.loop(~H, ~B, form, mode, last, 0, httpx.sent(rst), ledger.del(slots, sid2), x_wu.stray_cpend_skip(pay7, cpend, flen), x_wu.del(spend, sid2), cw, iw, ledger.fdel(fends, sid2), buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), x_pdc.dec(pdc))
         case _:
           httpx.close_got((sb2, gb2))
     case 6:
       (s6, g6) = got
       match act:
         case 0:
-          server.loop(~H, ~B, form, mode, 0, got, ledger.frag_cont_slots(ledger.take_del(slots, sid2), payload), cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+          server.loop(~H, ~B, form, mode, last, 0, got, ledger.frag_cont_slots(ledger.take_del(slots, sid2), payload), cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
         case 1:
           +tp2 : HTTP.Taken = ledger.take_del(slots, sid2)
           +full : List<&2, U32> = HTTP.x_cat(HTTP.x_rev_push(payload, httpx.body_of(ledger.taken_st(tp2))))
           +dr6 : Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab> = x_req.decode(full, tab)
           +fp : HTTP.FendTaken = ledger.fdel_flag(fends, sid2)
           +ff : U32 = ledger.ftaken_flag(fp)
-          server.loop(~H, ~B, form, mode, 7, got, ledger.taken_slots(tp2), cpend, spend, cw, iw, ledger.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, 0, cls, ff, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6), pdc)
+          server.loop(~H, ~B, form, mode, last, 7, got, ledger.taken_slots(tp2), cpend, spend, cw, iw, ledger.ftaken_fends(fp), buf, typ, flags, sid2, Nil{}, 0, cls, ff, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_req.tab(dr6), x_req.got(dr6), pdc)
         case 2:
           x_fatal(s6, x_goaway.calm())
         case _:
@@ -6032,14 +6664,14 @@ def server.loop(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respo
             case (+ok, +t):
               +nu = ledger.need_u(typ, flags)
               +a7 = server.admit(~H, form, mode, slots, ok, nu, end, h, t, sid2)
-              server.loop(~H, ~B, form, mode, 4, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, h, a7, server.head_resp(~H, form, a7, ok, nu, end, h, t, sid2), t, x_req.no_got(), pdc)
+              server.loop(~H, ~B, form, mode, U32.max(last, sid2), 4, got, slots, cpend, spend, cw, iw, fends, buf, typ, flags, sid2, payload, flen, cls, end, h, a7, server.head_resp(~H, form, a7, ok, nu, end, h, t, sid2), t, x_req.no_got(), pdc)
     case 8:
       (s8, g8) = got
       do IO<Unit>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_rst(s8, sid2, 7)
-        server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+        server.loop(~H, ~B, form, mode, last, 0, httpx.sent(sent), slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
     case _:
-      server.loop(~H, ~B, form, mode, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
+      server.loop(~H, ~B, form, mode, last, 0, got, slots, cpend, spend, cw, iw, fends, buf, 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, tab, x_req.no_got(), pdc)
 
 # Streaming accept plumbing: the accept is H2 only behind tls_accept, which
 # asks for h2 at the handshake -- a peer whose offered list has no overlap
@@ -6058,8 +6690,16 @@ def server.pre(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respon
         case Fail{e}:
           TLS.tls_close(s0)
         case Done{+chunk}:
-          +acc2 = List.append(&2, U32, acc, chunk)
-          server.pre(~H, ~B, form, mode, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(HTTP.x_has_at_least(24, acc2)))
+          match chunk:
+            case Nil{}:
+              # The TLS read answers the empty list at the end of the
+              # stream. Without this arm a peer that closes after the
+              # handshake asks for bytes forever, and the spin starves
+              # the accept loop (found by h2spec, task-070 phase 1).
+              TLS.tls_close(s0)
+            case _:
+              +acc2 = List.append(&2, U32, acc, chunk)
+              server.pre(~H, ~B, form, mode, 1, (s0, Done{chunk}), acc2, x_preface_ok(acc2), Bool.not(HTTP.x_has_at_least(24, acc2)))
     case 1:
       (s1, r1) = rs
       match short:
@@ -6075,7 +6715,7 @@ def server.pre(~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Respon
         case 1:
           do IO<Unit>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s2, x_t_settings(), 0, 0, x_settings_initial_pay())
-            server.loop(~H, ~B, form, mode, 0, httpx.sent(sent), ledger.no_slots(), 0, Nil{}, x_init_window(), x_init_window(), ledger.no_fends(), HTTP.x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got(), 0)
+            server.loop(~H, ~B, form, mode, 0, 0, httpx.sent(sent), ledger.no_slots(), 0, Nil{}, x_init_window(), x_init_window(), ledger.no_fends(), HTTP.x_drop32(24, acc), 0, 0, 0, Nil{}, 0, 0, 0, HTTP.ReqHead{"", "", Nil{}}, 4, HTTP.Response{0, Nil{}, Nil{}}, x_tab.empty(), x_req.no_got(), 0)
         case _:
           TLS.tls_close(s2)
     case _:
