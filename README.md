@@ -349,9 +349,11 @@ Limits by design, which the load does not change:
   (`tests/io/http2_duplex_credit.bend`). `lib/httpx.bend` still carries its
   own H2 copy with the old shape, and task-064 removes that copy.
 - A SETTINGS frame read in the middle of a send moves that send's window
-  by the difference of the two announced sizes. It does not reach the
-  loop ledger, so a stream that opens after it starts from the previous
-  initial size.
+  by the difference of the two announced sizes, and the pump leaves the
+  frame in the read seed. The loop reads it, acknowledges it and takes the
+  new initial size for the next stream (`tests/io/http2_settings_mid.bend`).
+  A SETTINGS payload that is not a multiple of six octets answers
+  `GOAWAY 6` (FRAME_SIZE_ERROR, RFC 9113 6.5).
 
 The micro-bench (`examples/httpx/bench_h2.bend`, 1 MiB, 5 runs) gives the
 levers, in the `test.bend` shape:

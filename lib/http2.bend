@@ -428,17 +428,29 @@ def x_frame.fin(orig: List<&2, U32>, typ: U32, flags: U32, sid: U32, +rest: List
   HTTP.UnitOut:
   x_frame.fin2(orig, typ, flags, sid, rest, len, HTTP.x_has_at_least(len, rest))
 
-def x_frame.len_ok(orig: List<&2, U32>, +len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, ok_len: Bool) ->
+# The declared length the frame type allows. RFC 9113 section 6.5: a
+# SETTINGS payload that is not a multiple of 6 octets is a connection error
+# of type FRAME_SIZE_ERROR. The other types keep their own checks.
+def x_frame.size_ok(+typ: U32, +len: U32) -> Bool:
+  match typ:
+    case 4:
+      U32.is_eq(U32.mod(len, 6), 0)
+    case _:
+      True{}
+
+def x_frame.len_ok(orig: List<&2, U32>, +len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>, ok_len: Bool, ok_size: Bool) ->
   HTTP.UnitOut:
-  match ok_len:
-    case False{}:
+  match ok_len ok_size:
+    case False{} _:
       HTTP.Bad{413, "frame too large"}
-    case True{}:
+    case True{} False{}:
+      HTTP.Bad{413, "settings size"}
+    case True{} True{}:
       x_frame.fin(orig, typ, flags, sid, rest, len24)
 
 def x_frame.hd9.go(orig: List<&2, U32>, +len24: U32, +typ: U32, +flags: U32, +sid: U32, +rest: List<&2, U32>) ->
   HTTP.UnitOut:
-  x_frame.len_ok(orig, len24, typ, flags, sid, rest, U32.is_le(len24, x_max_frame()))
+  x_frame.len_ok(orig, len24, typ, flags, sid, rest, U32.is_le(len24, x_max_frame()), x_frame.size_ok(typ, len24))
 
 def x_frame.hd9.b8(orig: List<&2, U32>, +len_hi: U32, +b1: U32, +b2: U32, +typ: U32, +flags: U32, +s0: U32, +s1: U32, +s2: U32, +rest8: List<&2, U32>) -> HTTP.UnitOut:
   match rest8:
@@ -2025,14 +2037,6 @@ def x_settings.iw_of(+pay: List<&2, U32>, +cur: U32) -> U32:
                         case +b5 <> rest:
                           x_settings.iw_of(rest, x_pick(U32.is_eq((b0 * 256 + b1 : U32), 4), (((b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32))), cur))
 
-def x_flow.acked(sent: Socket & Result<&1, &1, U32 & String, Unit>, buf: List<&2, U32>) -> Socket & HTTP.Got:
-  (s2, r2) = sent
-  match r2:
-    case Fail{(code, msg)}:
-      (s2, HTTP.GotErr{code, msg})
-    case Done{u}:
-      (s2, HTTP.GotOk{HTTP.Frame{0, 0, 0, 0, Nil{}}, buf})
-
 # One SETTINGS step of a send: the new peer window and the stream window
 # it shifted. The base is the value the peer announced before. Two SETTINGS
 # in one session then move the window by their own difference (TASK-067
@@ -2041,6 +2045,17 @@ def x_settings.iw_step(+pay: List<&2, U32>, +sw: U32, +cur: U32) -> U32 & U32:
   +iw : U32 = x_settings.iw_of(pay, cur)
   (iw, x_settings.iw_delta_go(U32.is_ge(iw, cur), cur, iw, sw))
 
+# The step of a frame the pump reads while it waits for credit: a SETTINGS
+# moves the peer base and the open stream window, and any other frame
+# leaves both alone. The loop re-reads the stashed SETTINGS later, so its
+# own base reaches the next stream (TASK-068 phase 6).
+def x_settings.typ_step(+typ: U32, +pay: List<&2, U32>, +sw: U32, +piw: U32) -> U32 & U32:
+  match typ:
+    case 4:
+      x_settings.iw_step(pay, sw, piw)
+    case _:
+      (piw, sw)
+
 def x_settings.iw_base(p: U32 & U32) -> U32:
   (b, w) = p
   b
@@ -2048,12 +2063,6 @@ def x_settings.iw_base(p: U32 & U32) -> U32:
 def x_settings.iw_win(p: U32 & U32) -> U32:
   (b, w) = p
   w
-
-def x_flow.ack(got: Socket & HTTP.Got, buf: List<&2, U32>) -> IO(Socket & HTTP.Got):
-  (s, g) = got
-  do IO<Socket & HTTP.Got>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_settings(), x_f_ack(), 0, Nil{})
-    IO.pure(Socket & HTTP.Got, x_flow.acked(sent, buf))
 
 # Flow sends hand back a read seed: the wire bytes of the frames the
 # sender read while it waited for credit but did not consume. It stopped
@@ -2244,7 +2253,8 @@ def x_send_data_flow(+phase: U32, got: Socket & HTTP.Got, +sid: U32, +chunks: Li
               do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
                 paid : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_pay(s14, x_flow_pay(typ14, pdc), U32.is_eq(x_fin(flags14), x_f_end_stream()), sid214, flen14)
                 +p14 : Socket & HTTP.Got = x_flow.paid_got(paid)
-                x_send_data_flow(4, p14, sid, chunks, cw, sw, piw, buf14, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, Nil{}), x_pdc.step(typ14, pdc))
+                +step : U32 & U32 = x_settings.typ_step(typ14, payload14, sw, piw)
+                x_send_data_flow(4, p14, sid, chunks, cw, x_settings.iw_win(step), x_settings.iw_base(step), buf14, 0, 0, Nil{}, True{}, sid214, x_flow.seed_add(seed, typ14, flags14, sid214, payload14, Nil{}), x_pdc.step(typ14, pdc))
     case _:
       (s13, g13) = got
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32, (s13, Fail{(502, "flow bad phase")}, Nil{}, cw, pdc))
@@ -2302,6 +2312,8 @@ def x_flow.keep_cls(+cls: U32, same: Bool) -> Bool:
     case 0 _:
       True{}
     case 3 False{}:
+      True{}
+    case 4 _:
       True{}
     case _ _:
       False{}
@@ -2405,11 +2417,6 @@ def x_flow.do_act(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2, 
   match cl:
     case 2:
       x_flow.wu(got, sid, chunks, cw, sw, piw, buf, sid2p, x_flow_wu_inc(pay2), x_wu_ok(pay2), seed, pdc)
-    case 4:
-      do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
-        got2 : Socket & HTTP.Got <- x_flow.ack(got, buf)
-        +step : U32 & U32 = x_settings.iw_step(pay2, sw, piw)
-        x_send_data_flow(4, got2, sid, chunks, cw, x_settings.iw_win(step), x_settings.iw_base(step), buf, 0, 0, Nil{}, True{}, sid2p, seed, pdc)
     case 6:
       do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s, x_t_ping(), x_f_ack(), 0, pay2)

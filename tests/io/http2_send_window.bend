@@ -18,8 +18,9 @@
 # Checks: the first DATA frame holds exactly CW bytes and does not end the
 # stream, every byte keeps its index mod 256 order, the last frame ends
 # the stream with the whole body in, the send answers a window of zero and
-# hands no read seed back. The peer answers one point per check it proves
-# and the sender one point per check of its own. Golden 5.
+# hands back no frame except the SETTINGS it leaves to the loop. The peer
+# answers one point per check it proves and the sender one point per check
+# of its own. Golden 5.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -119,12 +120,25 @@ def is_end(+flags: U32) -> Bool:
 # The seed the send hands back: the frames it read while it waited for
 # credit. A SETTINGS and a WINDOW_UPDATE are acted on, not stashed, so an
 # honest send hands nothing back.
+# The seed the send hands back: the frames it read while it waited for
+# credit. A SETTINGS is left to the loop (it acks it and takes its window),
+# so the seed is empty or holds exactly that frame; a WINDOW_UPDATE is
+# acted on and never stashed.
+def seed_ok(+seed: List<&2, U32>) -> Bool:
+  match seed:
+    case Nil{}:
+      True{}
+    case _:
+      +len : U32 = HTTP2.x_frame.len3(HTTP2.x_frame_of.at_i(seed, 0), HTTP2.x_frame_of.at_i(seed, 1), HTTP2.x_frame_of.at_i(seed, 2))
+      +typ : U32 = HTTP2.x_frame_of.at_i(seed, 3)
+      Bool.and(U32.is_eq(typ, HTTP2.x_t_settings()), U32.is_eq(HTTP.x_len32(seed), (9 + len : U32)))
+
 def snd_end(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32>, +cw: U32) -> IO(U32):
   (s, r, seed) = sent
   do IO<U32>:
     x : Unit <- TLS.tls_close(s)
     +cw_ok : Bool = U32.is_eq(cw, 0)
-    IO.pure(U32, U32.add(b2u(cw_ok), b2u(list_nil(seed))))
+    IO.pure(U32, U32.add(b2u(cw_ok), b2u(seed_ok(seed))))
 
 @unsafe
 def snd_go(sock: Socket) -> IO(U32):
