@@ -63,12 +63,25 @@ def sizes_go(+chunks: List<&2, List<&2, U32>>) -> Bool:
 def want_chunks(+n: U32) -> Nat:
   Nat.div(Nat.add(U32.to_nat(n), Nat.sub(U32.to_nat(HTTP2.x_max_send()), 1n)), U32.to_nat(HTTP2.x_max_send()))
 
+# The chunk bytes at their place in the body, one chunk at a time. The
+# whole-body flatten that List.concat would build dies once a chunk passes
+# about 32768 cells (a batch rest chunk is 67232 here), and List.concat is
+# not what the sender does anyway: it pops one chunk per turn. So every
+# case compares per chunk, with take32/drop32 over the body.
+def order_go(+chunks: List<&2, List<&2, U32>>, +rest: List<&2, U32>) -> Bool:
+  match chunks:
+    case Nil{}:
+      True{}
+    case +h <> t:
+      +n : U32 = HTTP.x_len32(h)
+      Bool.and(U32.is_eq(HTTP.x_eq(h, HTTP.x_take32(n, rest)), 1), order_go(t, HTTP.x_drop32(n, rest)))
+
 def case_ok(+n: U32) -> U32:
   +body : List<&2, U32> = build(n)
   +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(HTTP2.x_split_all(), body)
   +count : Bool = Nat.is_eq(List.length(&2, List<&2, U32>, chunks), want_chunks(n))
   +bytes : Bool = U32.is_eq(total(chunks), n)
-  +order : Bool = U32.is_eq(HTTP.x_eq(List.concat(&2, U32, chunks), body), 1)
+  +order : Bool = order_go(chunks, body)
   U32.add(b2u(count), U32.add(b2u(bytes), U32.add(b2u(order), b2u(sizes_go(chunks)))))
 
 # The first `left` chunks of a batch are full: a short one there would
@@ -81,18 +94,6 @@ def head_full_go(+chunks: List<&2, List<&2, U32>>, left: Nat) -> Bool:
       True{}
     case +h <> t 1n+p:
       Bool.and(U32.is_eq(HTTP.x_len32(h), HTTP2.x_max_send()), head_full_go(t, p))
-
-# The chunk bytes at their place in the body. A batch rest chunk is longer
-# than one frame, and List.concat recurses once per element of its first
-# list: a 67232-byte rest chunk died with a machine stack overflow, so the
-# compare walks the body with take32/drop32 instead.
-def order_go(+chunks: List<&2, List<&2, U32>>, +rest: List<&2, U32>) -> Bool:
-  match chunks:
-    case Nil{}:
-      True{}
-    case +h <> t:
-      +n : U32 = HTTP.x_len32(h)
-      Bool.and(U32.is_eq(HTTP.x_eq(h, HTTP.x_take32(n, rest)), 1), order_go(t, HTTP.x_drop32(n, rest)))
 
 # One batch case: the count, the bytes, the order and the full heads.
 def batch_ok(+n: U32, +left: Nat, +want: Nat) -> U32:
