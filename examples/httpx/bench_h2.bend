@@ -35,6 +35,42 @@ def FRAME_HDR() -> U32:
 def FLEN() -> U32:
   16384
 
+# --- write path: one DATA frame write, twin walk as stand-in -----------
+# write_walk pays today: the length walk inside the write plus the twin
+# walk. write_len passes the length the pump already holds, no walk.
+# write_framed conses the nine header bytes onto the payload, no append.
+
+@unsafe
+def write_walk_count(+nc: U32, +pay: List<&2, U32>) -> U32:
+  match nc:
+    case 0:
+      0
+    case _:
+      (HTTP.x_len32(HTTP2.x_frame_write(0, 0, 0, pay)) + write_walk_count((nc - 1 : U32), pay) : U32)
+
+@unsafe
+def write_len_count(+nc: U32, +pay: List<&2, U32>, +flen: U32) -> U32:
+  match nc:
+    case 0:
+      0
+    case _:
+      (HTTP.x_len32(HTTP2.x_frame_write_len(0, 0, 0, pay, flen)) + write_len_count((nc - 1 : U32), pay, flen) : U32)
+
+def write_framed_one(+flen: U32, +pay: List<&2, U32>) -> List<&2, U32>:
+  U32.and(U32.shrn(flen, 16n), 255) <> U32.and(U32.shrn(flen, 8n), 255) <> U32.and(flen, 255) <> 0 <> 0 <> 0 <> 0 <> 0 <> 0 <> pay
+
+@unsafe
+def write_framed_count(+nc: U32, +pay: List<&2, U32>, +flen: U32) -> U32:
+  match nc:
+    case 0:
+      0
+    case _:
+      (HTTP.x_len32(write_framed_one(flen, pay)) + write_framed_count((nc - 1 : U32), pay, flen) : U32)
+
+# Checksum of one write row: one header per frame plus the payload.
+def want_write(+nc: U32, +flen: U32) -> U32:
+  U32.mul((flen + FRAME_HDR() : U32), U32.mul(nc, U32.from_nat(RUNS())))
+
 def CHECK_WIDTH() -> Nat:
   22n
 
@@ -217,7 +253,7 @@ def probe_cap(xs: List<&2, U32>) -> U32:
   HTTP.x_len_upto(HTTP2.x_send_probe(HTTP2.x_init_window()), xs)
 
 @unsafe
-def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>) -> U32:
+def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>, +nc: U32, +flen: U32) -> U32:
   match tag:
     case 0:
       send_td(MAX_SEND(), xs, 0)
@@ -237,8 +273,14 @@ def sample(tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +fram
       wu_batch(nchunks(HTTP.x_len32(xs)))
     case 8:
       probe_all(xs)
-    case _:
+    case 9:
       probe_cap(xs)
+    case 10:
+      write_walk_count(nc, frame)
+    case 11:
+      write_len_count(nc, frame, flen)
+    case _:
+      write_framed_count(nc, frame, flen)
 
 def fold_go(+el: Nat, mn: Nat, rest: Nat & Nat) -> Nat & (Nat & Nat):
   match rest:
@@ -250,7 +292,7 @@ def fold_el(el: Nat, st: Nat & (Nat & Nat)) -> Nat & (Nat & Nat):
     case (mn, rest):
       fold_go(el, mn, rest)
 
-def timed(fuel: Nat, +tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>, msst: Nat & (Nat & Nat), chk: U32) ->
+def timed(fuel: Nat, +tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U32>>, +frame: List<&2, U32>, +nc: U32, +flen: U32, msst: Nat & (Nat & Nat), chk: U32) ->
   IO((Nat & (Nat & Nat)) & U32):
   match fuel:
     case 0n:
@@ -258,10 +300,10 @@ def timed(fuel: Nat, +tag: U32, +xs: List<&2, U32>, +chunks: List<&2, List<&2, U
     case 1n+f:
       do IO<((Nat & (Nat & Nat)) & U32)>:
         t0 : Nat <- IO.now()
-        total : U32 = sample(tag, xs, chunks, frame)
+        total : U32 = sample(tag, xs, chunks, frame, nc, flen)
         t1 : Nat <- IO.now()
         +el : Nat = Nat.sub(t1, t0)
-        timed(f, tag, xs, chunks, frame, fold_el(el, msst), (chk + total : U32))
+        timed(f, tag, xs, chunks, frame, nc, flen, fold_el(el, msst), (chk + total : U32))
 
 def show_stats_go(name: String, mn: Nat, rest: Nat & Nat) -> IO(Unit):
   match rest:
@@ -285,16 +327,22 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
     +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(HTTP2.x_split_all(), xs)
     +want : U32 = want_send(n)
-    r0 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 0, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r1 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 1, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r2 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 2, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r3 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 3, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r4 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 4, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r5 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 5, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r6 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 6, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r7 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 7, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r8 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 8, xs, chunks, frame, (600000n, (0n, 0n)), 0)
-    r9 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 9, xs, chunks, frame, (600000n, (0n, 0n)), 0)
+    +nc : U32 = nchunks(n)
+    +flen : U32 = min2(n, MAX_SEND())
+    +wwant : U32 = want_write(nc, flen)
+    r0 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 0, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r1 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 1, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r2 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 2, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r3 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 3, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r4 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 4, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r5 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 5, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r6 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 6, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r7 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 7, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r8 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 8, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r9 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 9, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r10 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 10, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r11 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 11, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
+    r12 : (Nat & (Nat & Nat)) & U32 <- timed(RUNS(), 12, xs, chunks, frame, nc, flen, (600000n, (0n, 0n)), 0)
     a : Unit <- report("send_take_drop", want, r0)
     b : Unit <- report("send_chunks", want, r1)
     c : Unit <- report("send_chunks_e2e", want, r2)
@@ -305,7 +353,10 @@ def bench(+n: U32, +xs: List<&2, U32>, +frame: List<&2, U32>) -> IO(Unit):
     h : Unit <- report("wu_batch", (wu_want_batch(n) * U32.from_nat(RUNS()) : U32), r7)
     i : Unit <- report("probe_all", (n * U32.from_nat(RUNS()) : U32), r8)
     j : Unit <- report("probe_cap", ((MAX_SEND() + 1 : U32) * U32.from_nat(RUNS()) : U32), r9)
-    IO.pure(Unit, j)
+    k : Unit <- report("write_walk", wwant, r10)
+    l : Unit <- report("write_len", wwant, r11)
+    m : Unit <- report("write_framed", wwant, r12)
+    IO.pure(Unit, m)
 
 def u32_go(m: Maybe<&2, U32>, +dflt: U32) -> U32:
   match m:

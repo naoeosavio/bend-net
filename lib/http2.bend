@@ -186,15 +186,23 @@ def x_frame_write.hdr(+len: U32, +typ: U32, +flags: U32, +sid: U32) -> List<&2, 
    U32.and(U32.shrn(sid, 24n), 255), U32.and(U32.shrn(sid, 16n), 255),
    U32.and(U32.shrn(sid, 8n), 255), U32.and(sid, 255)]
 
-def x_frame_write(+typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) -> List<&2, U32>:
-  +len = HTTP.x_len32(pay)
+def x_frame_write_len(+typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>, +len: U32) -> List<&2, U32>:
   # List.append recurses on the header, nine cells, whatever the payload
-  # holds: measured at 78 ms for a 1 MiB payload.
+  # holds: measured at 78 ms for a 1 MiB payload with the length walk in.
   List.append(&2, U32, x_frame_write.hdr(len, typ, flags, sid), pay)
+
+def x_frame_write(+typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) -> List<&2, U32>:
+  x_frame_write_len(typ, flags, sid, pay, HTTP.x_len32(pay))
 
 def x_send_frame(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, Unit>):
   TLS.tls_send_bytes(sock, x_frame_write(typ, flags, sid, pay))
+
+# The steady DATA turn knows the payload length from the pump, so it skips
+# the second walk and shares the header append above.
+def x_send_frame_len(sock: Socket, +typ: U32, +flags: U32, +sid: U32, +pay: List<&2, U32>, +len: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Unit>):
+  TLS.tls_send_bytes(sock, x_frame_write_len(typ, flags, sid, pay, len))
 
 def x_send_goaway.pay(+last: U32, +code: U32) -> List<&2, U32>:
   List.append(&2, U32, HTTP.x_be32(last), HTTP.x_be32(code))
@@ -2246,7 +2254,7 @@ def x_flow.chunker(got: Socket & HTTP.Got, +sid: U32, +chunks: List<&2, List<&2,
         case True{}:
           +chunk : U32 = x_chunk_of(cw, sw, ful)
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
-            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame(s5, x_t_data(), 0, sid, x_flow_part(U32.is_eq(chunk, ful), chunk, h))
+            sent : Socket & Result<&1, &1, U32 & String, Unit> <- x_send_frame_len(s5, x_t_data(), 0, sid, x_flow_part(U32.is_eq(chunk, ful), chunk, h), chunk)
             x_send_data_flow(6, x_flow_sent(sent), sid, x_flow_rest(U32.is_eq(chunk, ful), chunk, h, t), (cw - chunk : U32), (sw - chunk : U32), buf, 0, 0, Nil{}, True{}, sid2p, seed)
         case False{}:
           do IO<Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32>:
