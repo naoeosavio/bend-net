@@ -535,8 +535,11 @@ def x_t_wu() -> U32:
 def x_t_cont() -> U32:
   9
 
+# The cap of one frame payload. 16384 is the RFC 9113 section 6.5.2
+# default, the value the server announces and the value the walk
+# enforces (TASK-072 phase 4).
 def x_max_frame() -> U32:
-  65535
+  16384
 
 def x_max_send() -> U32:
   16384
@@ -564,17 +567,16 @@ def x_preface() -> List<&2, U32>:
 def x_be32(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 24n), 255), U32.and(U32.shrn(v, 16n), 255), U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
 
-# Initial SETTINGS we announce (RFC 9113 section 6.5): INITIAL_WINDOW_SIZE
-# 65535 (the RFC 9113 section 6.5.2 initial value) + MAX_FRAME_SIZE 65535
-# (a dono decision: the RFC 9113 section 6.5.2 initial value is 16384, and
-# node, Chrome and Firefox keep it; the change to 16384 is task-062 phase
-# 8). Sent at all 4 preface points; ACKs stay empty (ack-with-payload
-# would be a protocol error).
+# Initial SETTINGS we announce (RFC 9113 section 6.5):
+# INITIAL_WINDOW_SIZE 65535 (the RFC 9113 section 6.5.2 initial value) and
+# MAX_FRAME_SIZE 16384 (x_max_frame(), the RFC 9113 section 6.5.2 initial
+# value; node, Chrome and Firefox keep it). Sent at all 4 preface points;
+# ACKs stay empty (ack-with-payload would be a protocol error).
 def x_be16(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
 
 def x_settings_initial_pay() -> List<&2, U32>:
-  List.append(&2, U32, List.append(&2, U32, x_be16(4), x_be32(65535)), List.append(&2, U32, x_be16(5), x_be32(65535)))
+  List.append(&2, U32, List.append(&2, U32, x_be16(4), x_be32(x_init_window())), List.append(&2, U32, x_be16(5), x_be32(x_max_frame())))
 
 # Types
 # -----

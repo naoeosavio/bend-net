@@ -62,9 +62,9 @@ parameter or a return type changes.
 ## What a caller must know
 
 - The server announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 128,
-  `INITIAL_WINDOW_SIZE` 65535 and `MAX_FRAME_SIZE` 65535. It enforces
+  `INITIAL_WINDOW_SIZE` 65535 and `MAX_FRAME_SIZE` 16384. It enforces
   them: the 129th open stream answers `RST_STREAM` 7, a frame past
-  65535 bytes answers `GOAWAY` 6, and a header block past 64 KiB answers
+  16384 bytes answers `GOAWAY` 6, and a header block past 64 KiB answers
   `GOAWAY` 11. The buffered form counts a stream as open while its
   answer waits in the queue, so a batch of HEADERS meets the cap.
 - A fail is a number, never text: `400`/`413`/`431`/`502`/`503` from the

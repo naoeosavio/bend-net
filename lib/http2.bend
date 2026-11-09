@@ -100,8 +100,13 @@ def x_t_wu() -> U32:
 def x_t_cont() -> U32:
   9
 
+# The cap of one frame payload, in bytes. 16384 is the RFC 9113 section
+# 6.5.2 default and the value of every measured peer. The server
+# announces it in SETTINGS (id 5), and the walk refuses a longer frame
+# with GOAWAY 6 (FRAME_SIZE_ERROR). x_max_send() keeps the send slices
+# inside the cap. The old 65535 made h2spec 4.2.3 fail (TASK-072 phase 4).
 def x_max_frame() -> U32:
-  65535
+  16384
 
 def x_max_send() -> U32:
   16384
@@ -196,17 +201,17 @@ def x_preface() -> List<&2, U32>:
 # order: ENABLE_PUSH 0 (this library serves no pushed stream, and a peer
 # must not push), MAX_CONCURRENT_STREAMS 128 (the cap server.admit
 # enforces), INITIAL_WINDOW_SIZE 65535 (the RFC 9113 section 6.5.2
-# initial value) and MAX_FRAME_SIZE 65535 (a dono decision: the RFC 9113
-# section 6.5.2 initial value is 16384, and node, Chrome and Firefox keep
-# it; 65535 is legal, because the range ends at 2^24-1. The change to
-# 16384 is task-062 phase 8). Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32 at all 4 preface points; ACKs stay empty (ack-with-payload
-# would be a protocol error).
+# initial value) and MAX_FRAME_SIZE 16384 (x_max_frame(), the RFC 9113
+# section 6.5.2 initial value; node, Chrome and Firefox keep it).
+# Socket & Result<&1, &1, U32 & String, Unit> & List<&2, U32> & U32 & U32
+# at all 4 preface points; ACKs stay empty (ack-with-payload would be a
+# protocol error).
 def x_be16(+v: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(v, 8n), 255), U32.and(v, 255)]
 
 def x_settings_initial_pay() -> List<&2, U32>:
   +head : List<&2, U32> = List.append(&2, U32, List.append(&2, U32, x_be16(2), HTTP.x_be32(0)), List.append(&2, U32, x_be16(3), HTTP.x_be32(x_max_streams())))
-  +tail : List<&2, U32> = List.append(&2, U32, List.append(&2, U32, x_be16(4), HTTP.x_be32(x_init_window())), List.append(&2, U32, x_be16(5), HTTP.x_be32(x_max_str())))
+  +tail : List<&2, U32> = List.append(&2, U32, List.append(&2, U32, x_be16(4), HTTP.x_be32(x_init_window())), List.append(&2, U32, x_be16(5), HTTP.x_be32(x_max_frame())))
   List.append(&2, U32, head, tail)
 
 # True when the open header block plus one more fragment passes
@@ -635,10 +640,10 @@ def x_read.done(s: Socket, +chunk: List<&2, U32>, +buf: List<&2, U32>, is_eof: B
     case True{}:
       (s, HTTP.Bad{400, "eof"}, buf)
     case False{}:
-      # Tail append: buf grows to one whole frame (up to 65535 bytes), and
-      # List.append recurses on it, so a frame past 32768 bytes killed the
-      # machine stack. Reverse buf and push it onto the new chunk: two
-      # tail passes, same bytes (TASK-063 phase 6b).
+      # Tail append: buf grows past one frame, and List.append recurses on
+      # it, so the old 65535-byte frame killed the machine stack. Reverse
+      # buf and push it onto the new chunk: two tail passes, same bytes
+      # (TASK-063 phase 6b).
       +buf2 = HTTP.x_cat.go(List.reverse(&2, U32, buf), chunk)
       (s, x_parse(buf2), buf2)
 

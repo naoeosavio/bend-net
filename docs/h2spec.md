@@ -53,22 +53,28 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 | antes da correção | 8 octetos | 143 aprovadas, 0 puladas, 3 falhas | 4.2.3, 5.1.2.1, 6.9.2.2 |
 | com a correção de task-071 | 8 octetos | 144 aprovadas, 0 puladas, 2 falhas | 4.2.3, 5.1.2.1 |
 | com a fila de task-072 | 8 octetos | 145 aprovadas, 0 puladas, 1 falha | 4.2.3 |
+| com `MAX_FRAME_SIZE` 16384 (task-072 fase 4) | 8 octetos | 146 provas, 0 falhas, grupo a grupo | — |
 
-As duas falhas da primeira linha e da terceira linha são as mesmas: os
-dois desvios aceitos abaixo. A linha do meio tem uma falha a mais, a
-6.9.2.2. Com o corpo de 8 octetos o `h2spec` não pula a prova, e o código
-sem a correção falha nela. O corpo de 2 octetos escondia a prova.
+As duas falhas da primeira linha e da terceira linha são as mesmas: 4.2.3
+e 5.1.2.1. A linha do meio tem uma falha a mais, a 6.9.2.2. Com o corpo de
+8 octetos o `h2spec` não pula a prova, e o código sem a correção falha
+nela. O corpo de 2 octetos escondia a prova.
 
-Com a fila de task-072 a prova 5.1.2.1 passa. Ela é a única falha que
-sai da lista. A prova 4.2.3 continua aceita, e a razão está abaixo.
-O script da conformidade ainda sai 2: a sonda `http2/3.5` falha depois da
-passagem completa, pelo defeito da task-073. A comparação do script
-responde 0, porque a lista de falhas é a de `h2spec.expected`.
+Com a fila de task-072 a prova 5.1.2.1 passa. Com o `MAX_FRAME_SIZE`
+16384 da fase 4, a prova 4.2.3 passa também. A lista de desvios fica
+vazia, e `tests/conformance/h2spec.expected` não tem linha.
+
+A passagem única não fecha nesta máquina: o servidor para no meio da
+suíte, pelo defeito da task-073. Para medir a fase 4, o `h2spec` rodou
+um grupo por vez, com um servidor novo por grupo. Os 49 grupos deram 0
+falhas, e o grupo 4.2 deu 3 de 3. O script da conformidade ainda sai 2,
+porque a sonda `http2/3.5` falha depois da passagem. A comparação do
+script responde 0, porque a lista de falhas é a de `h2spec.expected`.
 
 Para comparação, o node v22.23.2 com o mesmo corpo de 8 octetos deu 135
-aprovadas, 1 pulada e 10 falhas. As listas não se sobrepõem. O node passa
-a 4.2.3 e pula a 5.1.2.1; nós falhamos 4.2.3 e passamos a 5.1.2.1 e as
-10 do node.
+aprovadas, 1 pulada e 10 falhas. O node passa a 4.2.3 e pula a 5.1.2.1.
+Nós passamos a 4.2.3 desde a fase 4, passamos a 5.1.2.1 desde a fase 2 e
+passamos as 10 falhas do node.
 
 ### A prova 6.9.2.2 antes e depois
 
@@ -84,8 +90,9 @@ frame na semente e só respondia o ACK quando o envio terminava. O node
 responde o ACK no caminho de leitura da sessão. O lane agora segue o node.
 O teste `tests/io/http2_settings_ack.bend` fixa o fio.
 
-As duas falhas restantes são desvios aceitos. Cada uma tem a razão
-escrita e um teste que fixa o limite real do módulo.
+As duas falhas restantes eram desvios aceitos. Cada uma tinha a razão
+escrita e um teste que fixa o limite real do módulo. A lista está vazia
+desde a fase 4 de task-072.
 
 ## A ferramenta certa
 
@@ -128,18 +135,27 @@ a passagem com outro servidor quando a prova falha. Ele tenta três vezes
 e sai 2 quando todas falham. Nesta máquina a primeira tentativa falhou em
 duas de três medidas, e a repetição salvou uma.
 
-### 4.2.3 Tamanho de HEADERS acima de SETTINGS_MAX_FRAME_SIZE
+Medido em 2026-11-09 com o código da fase 4: a passagem única parou no
+meio em todas as quatro medidas, e a contagem de falhas variou de 27 a
+36. A suíte passou grupo a grupo, com um servidor novo por grupo: 49
+grupos, 0 falhas.
+
+### 4.2.3 Tamanho de HEADERS acima de SETTINGS_MAX_FRAME_SIZE (fechada por task-072 fase 4)
 
 O `h2spec` envia um bloco de cerca de 20 KiB e espera `GOAWAY` 6. O teste
-supõe o tamanho padrão de 16384 octetos. O módulo anuncia 65535, então um
-frame de 20 KiB é legal e ele responde. O limite real é fixado por
-`tests/io/http2_frame_over.bend`: um frame de 65536 octetos responde
-`GOAWAY` 6. Mudar o anúncio para 16384 fecharia esta prova e perderia a
-cobertura do frame grande (`tests/io/http2_frame_big.bend`).
+supõe o tamanho padrão de 16384 octetos. O módulo anunciava 65535, então
+um frame de 20 KiB era legal e ele respondia.
+
+Desde a fase 4 o módulo anuncia `MAX_FRAME_SIZE` 16384 (`x_max_frame()`)
+e recusa o frame com `GOAWAY` 6. A prova passou: `h2spec http2/4.2` deu 3
+de 3.
 
 O node v22.23.2 passa esta prova porque anuncia `MAX_FRAME_SIZE` 16384.
-Ele recusa o frame de 20 KiB. Nós anunciamos 65535 e aceitamos o frame.
-A mudança do anúncio para 16384 está planejada em task-062, fase 8.
+Nós anunciamos o mesmo valor e recusamos o frame de 20 KiB.
+
+O teste local é `tests/io/http2_frame_over.bend`: um frame de 16385
+octetos responde `GOAWAY` 6. O frame de 16384 octetos ainda passa, e
+`tests/io/http2_frame_big.bend` cobre o maior frame aceito.
 
 ### 5.1.2.1 Limite de streams simultâneos (fechada por task-072)
 
@@ -184,12 +200,17 @@ O node v22.23.2 pula esta prova porque não anuncia
 | 6.9.1 | 1 | `WINDOW_UPDATE` de stream acima de 2^31-1 era ignorado | `x_win_fits` + ato 15 | `http2_dispatch` |
 | 6.9.2.2 (task-071) | 1 | SETTINGS sem ACK durante a espera de crédito | ACK no pump, bit `x_f_settled`, ato 20 | `http2_settings_ack` |
 | 5.1.2.1 (task-072) | 1 | resposta fechava o stream antes do próximo `HEADERS` | fila de respostas, leitura em bloco, portão de crédito | `http2_pq_batch` |
+| 4.2.3 (task-072 fase 4) | 1 | o anúncio de `MAX_FRAME_SIZE` era 65535, então um frame de 20 KiB era legal | `x_max_frame()` 16384 no anúncio id 5 e no teto de leitura | `http2_frame_over` |
 
 A primeira passagem, antes de qualquer correção, deu 38 falhas em 100
 provas; a suíte parava no meio porque um par que fecha depois do
 handshake travava o accept (`tests/io/http2_pre_eof.bend`).
 
-## Saída completa (passagem de referência, bend 2.0.27)
+## Saída completa (passagem de referência de task-070, bend 2.0.27)
+
+Esta saída é a primeira passagem de referência. Ela mostra as duas falhas
+que a lista de desvios tinha antes de task-072. O resultado da passagem de
+task-072 está na tabela acima.
 
 ```text
 Generic tests for HTTP/2 server
