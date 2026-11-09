@@ -1,11 +1,11 @@
 # io (httpx_h2_stream_cap): the server announces and enforces a cap of
-# open streams (task-062 phase 1).
+# open streams (task-062 phase 1, task-072 phase 2).
 #
 # Three claims, score 3:
-#   * the initial SETTINGS carry MAX_CONCURRENT_STREAMS (id 3) = 100, byte
+#   * the initial SETTINGS carry MAX_CONCURRENT_STREAMS (id 3) = 128, byte
 #     for byte;
-#   * the peer opens 100 streams (HEADERS, END_HEADERS, no END_STREAM) and
-#     the 101st is refused with RST_STREAM 7 (REFUSED_STREAM), so the
+#   * the peer opens 128 streams (HEADERS, END_HEADERS, no END_STREAM) and
+#     the 129th is refused with RST_STREAM 7 (REFUSED_STREAM), so the
 #     server never holds more than the cap;
 #   * the connection lives: DATA(END_STREAM) on stream 1 after the refusal
 #     gets a 200 HEADERS back.
@@ -14,7 +14,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -30,13 +29,13 @@ def CERT() -> String:
 def KEY() -> String:
   "tests/io/tls_test_key.pem"
 
-# The cap of x_max_streams: 100 streams open at once.
+# The cap of x_max_streams: 128 streams open at once.
 def CAP() -> Nat:
-  100n
+  128n
 
-# The sid of the first stream the cap refuses: 1, 3, 5 ... 201.
+# The sid of the first stream the cap refuses: 1, 3, 5 ... 257.
 def REFUSED_SID() -> U32:
-  201
+  257
 
 # REFUSED_STREAM, the RST_STREAM code of the refusal.
 def REFUSED() -> U32:
@@ -62,10 +61,10 @@ def b2u(b: Bool) -> U32:
       0
 
 # The initial SETTINGS as bytes, in ascending id order: ENABLE_PUSH 0,
-# MAX_CONCURRENT_STREAMS 100, INITIAL_WINDOW_SIZE 65535, MAX_FRAME_SIZE
+# MAX_CONCURRENT_STREAMS 128, INITIAL_WINDOW_SIZE 65535, MAX_FRAME_SIZE
 # 65535.
 def settings_bytes() -> List<&2, U32>:
-  [0, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 100, 0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 255, 255]
+  [0, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 128, 0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 255, 255]
 
 def settings_ok() -> U32:
   b2u(U32.is_eq(HTTP.x_eq(HTTP2.x_settings_initial_pay(), settings_bytes()), 1))
@@ -228,7 +227,7 @@ def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>) -> IO(U32
 
 def peer(+port: U32) -> IO(U32):
   do IO<U32>:
-    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTPX.client.connect_insecure(HOST(), port)
+    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <- HTTP2.client.connect_insecure(HOST(), port)
     peer_conn(conn)
 
 # The real buffered concurrent lane.
@@ -239,7 +238,7 @@ def echo(req: HTTP.Request) -> IO(HTTP.Response):
 
 def server(l: Listener) -> IO(String):
   do IO<String>:
-    x : Unit <- HTTPX.server.concurrent(~echo, l, CERT(), KEY())
+    x : Unit <- HTTP2.server.concurrent(~echo, l, CERT(), KEY())
     return "up"
 
 def listen_retry(port: U32, r: Result<&1, &1, (U32 & String), Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):

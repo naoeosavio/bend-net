@@ -8,13 +8,11 @@
 # commit with a newer Go shows 7 failures a more (task-073 records the
 # measure).
 #
-# Each line is an accepted deviation, with a reason in docs/h2spec.md and
-# a test that fixes the real limit.
-#
 # 4.2.3: the module announces MAX_FRAME_SIZE 65535, so a 20 KiB HEADERS
 # frame is legal. The limit is fixed by tests/io/http2_frame_over.bend.
+#
+# 5.1.2.1 left this list in task-072: the buffered form reads a chunk,
+# admits every HEADERS of the chunk before it answers one, and holds a
+# stream open while its answer waits. tests/io/http2_pq_batch.bend fixes
+# the wire.
 http2/4.2 | Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE
-# 5.1.2.1: the buffered server answers and closes each stream before it
-# reads the next HEADERS, so no two streams stay open. The cap is real and
-# is fixed by tests/io/http2_stream_cap.bend.
-http2/5.1.2 | Sends HEADERS frames that causes their advertised concurrent stream limit to be exceeded

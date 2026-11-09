@@ -51,17 +51,24 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 |---|---|---|---|
 | antes da correção | 2 octetos | 143 aprovadas, 1 pulada, 2 falhas | 4.2.3, 5.1.2.1 |
 | antes da correção | 8 octetos | 143 aprovadas, 0 puladas, 3 falhas | 4.2.3, 5.1.2.1, 6.9.2.2 |
-| com a correção | 8 octetos | 144 aprovadas, 0 puladas, 2 falhas | 4.2.3, 5.1.2.1 |
+| com a correção de task-071 | 8 octetos | 144 aprovadas, 0 puladas, 2 falhas | 4.2.3, 5.1.2.1 |
+| com a fila de task-072 | 8 octetos | 145 aprovadas, 0 puladas, 1 falha | 4.2.3 |
 
 As duas falhas da primeira linha e da terceira linha são as mesmas: os
 dois desvios aceitos abaixo. A linha do meio tem uma falha a mais, a
 6.9.2.2. Com o corpo de 8 octetos o `h2spec` não pula a prova, e o código
 sem a correção falha nela. O corpo de 2 octetos escondia a prova.
 
+Com a fila de task-072 a prova 5.1.2.1 passa. Ela é a única falha que
+sai da lista. A prova 4.2.3 continua aceita, e a razão está abaixo.
+O script da conformidade ainda sai 2: a sonda `http2/3.5` falha depois da
+passagem completa, pelo defeito da task-073. A comparação do script
+responde 0, porque a lista de falhas é a de `h2spec.expected`.
+
 Para comparação, o node v22.23.2 com o mesmo corpo de 8 octetos deu 135
 aprovadas, 1 pulada e 10 falhas. As listas não se sobrepõem. O node passa
-a 4.2.3 e pula a 5.1.2.1; nós falhamos essas duas e passamos as 10 do
-node.
+a 4.2.3 e pula a 5.1.2.1; nós falhamos 4.2.3 e passamos a 5.1.2.1 e as
+10 do node.
 
 ### A prova 6.9.2.2 antes e depois
 
@@ -134,20 +141,29 @@ O node v22.23.2 passa esta prova porque anuncia `MAX_FRAME_SIZE` 16384.
 Ele recusa o frame de 20 KiB. Nós anunciamos 65535 e aceitamos o frame.
 A mudança do anúncio para 16384 está planejada em task-062, fase 8.
 
-### 5.1.2.1 Limite de streams simultâneos
+### 5.1.2.1 Limite de streams simultâneos (fechada por task-072)
 
-O `h2spec` abre 102 streams com `END_STREAM` e com `INITIAL_WINDOW_SIZE`
-0, e espera `RST_STREAM` 7 no 101º. O servidor em buffer responde e fecha
-cada stream antes de ler o próximo `HEADERS`, então nunca há dois streams
-abertos ao mesmo tempo. O limite é real e tem prova:
-`tests/io/http2_stream_cap.bend` abre 100 streams sem `END_STREAM` e o
-101º recebe `RST_STREAM` 7. Fechar esta prova exige uma fila de envio por
-stream, que o servidor em buffer não tem.
+O `h2spec` abre `MAX_CONCURRENT_STREAMS` + 1 streams com `END_STREAM` e
+com `INITIAL_WINDOW_SIZE` 0, e espera `RST_STREAM` 7 no 129º. O servidor
+em buffer respondia e fechava cada stream antes de ler o próximo
+`HEADERS`, então nunca havia dois streams abertos ao mesmo tempo.
+
+Desde task-072 o servidor em buffer lê um bloco, admite todos os frames do
+bloco antes de responder um, e segura o stream na fila enquanto a resposta
+espera. O `INITIAL_WINDOW_SIZE` 0 impede o primeiro envio, então o lote
+inteiro chega à admissão e o 129º recebe `RST_STREAM` 7. A prova passou:
+`h2spec http2/5.1.2` deu 1 de 1.
+
+O `WINDOW_UPDATE` de stream que chega com a resposta na fila soma na
+entrada da fila. Sem isso a prova `generic/2` do `h2spec` falhava: o laço
+consumia o `WINDOW_UPDATE`, e o pump de envio não o lia mais.
+
+A prova local é `tests/io/http2_pq_batch.bend`: o lote numa escrita, a
+janela zero, o stream cancelado e a concessão de janela.
 
 O node v22.23.2 pula esta prova porque não anuncia
-`MAX_CONCURRENT_STREAMS`. Nós anunciamos 100 e o limite é real. O `h2spec`
-não vê o limite porque o servidor em buffer fecha cada stream antes do
-próximo `HEADERS`.
+`MAX_CONCURRENT_STREAMS` quando o cap é o padrão. Com
+`settings: { maxConcurrentStreams: 100 }` ele passa a prova.
 
 ## Falhas corrigidas nesta fase
 
@@ -167,6 +183,7 @@ próximo `HEADERS`.
 | 4.3 (HPACK) | 1 | atualização de tabela no fim do bloco era aceita | `x_req.late` | `http2_dispatch` |
 | 6.9.1 | 1 | `WINDOW_UPDATE` de stream acima de 2^31-1 era ignorado | `x_win_fits` + ato 15 | `http2_dispatch` |
 | 6.9.2.2 (task-071) | 1 | SETTINGS sem ACK durante a espera de crédito | ACK no pump, bit `x_f_settled`, ato 20 | `http2_settings_ack` |
+| 5.1.2.1 (task-072) | 1 | resposta fechava o stream antes do próximo `HEADERS` | fila de respostas, leitura em bloco, portão de crédito | `http2_pq_batch` |
 
 A primeira passagem, antes de qualquer correção, deu 38 falhas em 100
 provas; a suíte parava no meio porque um par que fecha depois do
