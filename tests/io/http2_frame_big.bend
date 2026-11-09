@@ -1,16 +1,16 @@
-# io (httpx_h2_frame_big): one DATA frame of the largest size the module
-# announces, larger than the 16384-byte read slice (task-063 phase 6b).
+# io (http2_frame_big): one DATA frame of the largest size the module
+# announces (task-063 phase 6b, task-072 phase 4).
 #
 # The peer is a raw H2 client and the server is HTTP2.server.concurrent.
-# The peer sends one DATA frame of 65535 bytes, the x_max_frame() cap and
-# the whole default connection window, which the read loop assembles from
-# five 16384-byte TLS reads, and the handler answers its byte count. The
-# read accumulator appends the slices, and the append recursed on the
-# buffer: a frame of 32777 bytes died with a machine stack overflow
-# before the tail append landed.
+# The peer sends one DATA frame of 16384 bytes, the x_max_frame() cap,
+# which is wider than the 16384-byte read chunk once its nine-byte header
+# is added. The read loop assembles it from more than one TLS read, and
+# the handler answers its byte count. The read accumulator appends the
+# slices, and the append recursed on the buffer: a frame of 32777 bytes
+# died with a machine stack overflow before the tail append landed.
 #
-# Checks: the 200 head, the 65535-byte body of the handler, and the
-# connection WU of 65535 at the END_STREAM. Golden 3.
+# Checks: the 200 head, the 16384-byte body of the handler, and the
+# connection WU of 16384 at the END_STREAM. Golden 3.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -30,7 +30,7 @@ def KEY() -> String:
   "tests/io/tls_test_key.pem"
 
 def BODY() -> U32:
-  65535
+  16384
 
 def ACC_WU() -> U32:
   1

@@ -136,9 +136,9 @@ e sai 2 quando todas falham. Nesta máquina a primeira tentativa falhou em
 duas de três medidas, e a repetição salvou uma.
 
 Medido em 2026-11-09 com o código da fase 4: a passagem única parou no
-meio em todas as quatro medidas, e a contagem de falhas variou de 27 a
-36. A suíte passou grupo a grupo, com um servidor novo por grupo: 49
-grupos, 0 falhas.
+meio em todas as medidas, e a contagem de falhas variou de 27 a 36. A
+suíte passou grupo a grupo, com um servidor novo por grupo, na mesma
+porta: 49 grupos, 0 falhas.
 
 ### 4.2.3 Tamanho de HEADERS acima de SETTINGS_MAX_FRAME_SIZE (fechada por task-072 fase 4)
 

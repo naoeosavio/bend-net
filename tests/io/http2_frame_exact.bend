@@ -11,9 +11,10 @@
 #   * a frame split by a short read answers the count the loop now asks
 #     for, and the empty buffer asks for a nine-byte header;
 #   * the padded frame, the bad pad, the SETTINGS read and the 16384-byte
-#     payload keep their answer on the exact path.
+#     payload keep their answer on the exact path;
+#   * a frame one byte past x_max_frame() answers 413 at the header.
 #
-# Golden 13.
+# Golden 14.
 import Base
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
@@ -159,6 +160,14 @@ def is_bad_pad(out: HTTP.UnitOut) -> U32:
     case _:
       0
 
+# True when the walk refused the frame size at the header.
+def is_bad_413(out: HTTP.UnitOut) -> U32:
+  match out:
+    case HTTP.Bad{code, msg}:
+      U32.mul(b2u(U32.is_eq(code, 413)), b2u(String.eq(msg, "frame too large")))
+    case _:
+      0
+
 # The body of a DATA frame after the pad strip.
 def body_len(+out: HTTP.UnitOut) -> U32:
   HTTP.x_len32(HTTP2.x_data_body(pay(out), flags_of(out)))
@@ -220,7 +229,7 @@ def c12() -> U32:
   b2u(U32.is_eq(settings_iw(HTTP2.x_parse(settings())), 1024))
 
 # c13: a 16384-byte payload alone answers a 16393-byte frame and the
-# whole payload, which is the cap the read loop asks for.
+# whole payload, which is x_max_frame().
 def c13() -> U32:
   +big : List<&2, U32> = HTTP2.x_frame_write(0, 0, 1, fill(16384, Nil{}))
   +out : HTTP.UnitOut = HTTP2.x_parse(big)
@@ -230,11 +239,16 @@ def c13() -> U32:
 def c14() -> U32:
   bytes_eq(rest_of(HTTP2.x_parse(one_two())), two())
 
+# c15: a declared length one byte past the cap is a 413 at the header,
+# before any payload byte arrives.
+def c15() -> U32:
+  is_bad_413(HTTP2.x_parse(HTTP2.x_frame_write.hdr(16385, 0, 0, 1)))
+
 def main() -> IO(U32):
   do IO<U32>:
-    +total : U32 = (c1() + c2() + c3() + c4() + c6() + c7() + c8() + c9() + c10() + c11() + c12() + c13() + c14() : U32)
+    +total : U32 = (c1() + c2() + c3() + c4() + c6() + c7() + c8() + c9() + c10() + c11() + c12() + c13() + c14() + c15() : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|13
+#|14

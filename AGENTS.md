@@ -97,10 +97,11 @@ require break from any other directory. Bend 2.0.21+.
   the field rules of RFC 9113 8.2/8.3; a trailer block that ends the
   request answers it, and the trailer fields are dropped.
 - H2 limits are announced and enforced, not advisory. `lib/http2.bend`
-  announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 128 and the two
-  65535 sizes in its initial SETTINGS; a header block past 64 KiB
-  answers `GOAWAY 11` on the server and `431` on the client; the 129th
-  open stream answers `RST_STREAM 7` (REFUSED_STREAM). The buffered
+  announces `ENABLE_PUSH` 0, `MAX_CONCURRENT_STREAMS` 128, the 65535
+  window and the 16384 frame cap (`MAX_FRAME_SIZE`) in its initial
+  SETTINGS; a header block past 64 KiB answers `GOAWAY 11` on the server
+  and `431` on the client; the 129th open stream answers `RST_STREAM 7`
+  (REFUSED_STREAM). The buffered
   server form reads one chunk, admits every frame of the chunk before
   it answers one, and keeps a stream open while its answer waits in the
   queue, so a batch of HEADERS meets the cap (task-072). The stream

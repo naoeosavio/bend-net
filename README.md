@@ -289,7 +289,7 @@ larger than `MAX_FRAME_SIZE` fails closed (`400`/`413`, backlog).
   server picks; a peer without ALPN gets HTTP/1.1. Both answers dispatch
   from one `client.request`.
 - Flow control: the codec announces `INITIAL_WINDOW_SIZE=65535` and
-  `MAX_FRAME_SIZE=65535` (the RFC defaults). It replenishes the connection
+  `MAX_FRAME_SIZE=16384` (the RFC defaults). It replenishes the connection
   and stream windows on every inbound DATA, and it slices uploads into
   `WINDOW_UPDATE`-paced frames. Bodies are not capped at 64 KB. A
   `WINDOW_UPDATE` that makes a window pass 2^31-1 fails closed. A stream
@@ -308,7 +308,7 @@ bend tests/io/httpx_frame_read.bend    # 1 (frame parse + write roundtrip)
 bend tests/io/httpx_hpack_huffman.bend # 1 (Appendix B code, decode)
 bend tests/io/httpx_tab_dyn.bend       # 1 (dynamic table + eviction)
 bend tests/io/httpx_flow.bend          # 1 (25 KB up+down through the pump)
-bend tests/io/httpx_miniunit.bend      # 1 (preface + SETTINGS, pure)
+bend tests/io/httpx_miniunit.bend      # 1 (preface + SETTINGS of both copies, pure)
 ```
 
 `examples/real/httpx_real.bend` is a manual smoke against live hosts.
@@ -345,8 +345,8 @@ The limits, measured:
   (`HTTP2.x_max_body()`). A body past the cap answers `RST_STREAM 8`
   (CANCEL) and the handler never runs. The cap counts the declared DATA
   length, so it bounds the memory the peer can make the server hold.
-- The stream cap is 100 and it is enforced: 105 open streams answer exactly
-  five `RST_STREAM 7`.
+- The stream cap is 128 and it is enforced: the 129th open stream answers
+  `RST_STREAM 7`.
 - 1000 PINGs answer 1000 ACKs with no extra ACK. A bad WINDOW_UPDATE
   answers `GOAWAY 1`, a frame past `MAX_FRAME_SIZE` answers `GOAWAY 6`, and
   a header block past 64 KiB answers `GOAWAY 11`. The server keeps serving
@@ -559,7 +559,7 @@ the download lane. The upload lane frames from the request head the same
 way the one-shot H1 server does.
 
 ```sh
-bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK roundtrip, ~2s)
+bend tests/io/httpx_miniunit.bend         # 1 (pure frame + HPACK + facade SETTINGS)
 bend tests/io/httpx_client.bend           # 1 (once vs mini server)
 bend tests/io/httpx_interop.bend          # 1 (4 crossed streams vs mini server)
 bend tests/io/httpx_client_once.bend      # 1
@@ -1039,7 +1039,7 @@ four arguments.
   ~16.3s / C ~2.2s for 40 exchanges — see `tasks/task-023-perf.md`).
 - HTTP/2 done (task-020, 2026-09-25): unbounded-slot interleaved mux,
   CONTINUATION, flow control with `WINDOW_UPDATE` (connection and
-  stream), `MAX_FRAME_SIZE=65535`, `RST_STREAM`/`GOAWAY`/`PING` as
+  stream), `MAX_FRAME_SIZE=16384`, `RST_STREAM`/`GOAWAY`/`PING` as
   protocol events, HPACK dynamic table on the client, ALPN HTTP/1.1
   fallback on the same port. Still out: h2c (cleartext), server push,
   HPACK Huffman *encode* (literal-only is valid), `PRIORITY`.

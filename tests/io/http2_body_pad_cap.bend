@@ -7,12 +7,13 @@
 # the credit keeps the declared length (RFC 9113 section 6.9.1).
 #
 # The peer is a raw H2 client and the server is HTTP2.server.concurrent
-# with a handler that answers the body length. One connection sends 257
-# padded DATA frames of 65535 bytes: the declared total passes the cap by
-# 65279 bytes and the body stays 256 bytes below it, so a cap that counts
+# with a handler that answers the body length. One connection sends 1025
+# padded DATA frames of 16384 bytes: the declared total passes the cap by
+# 16384 bytes and the body stays 1041 bytes below it, so a cap that counts
 # the declared length refuses the body and a cap that counts the body
-# accepts it. Three pure checks pin the strip, the edge at the cap and the
-# declared total of the frames.
+# accepts it. The widest legal frame is 16384 bytes, so 1025 frames are the
+# fewest that can pass the cap. Three pure checks pin the strip, the edge
+# at the cap and the declared total of the frames.
 #
 # Checks: pure 3 (padding is not body, padding does not pass the cap, the
 # declared total passes it), wire 2 (the 200 head, the body count).
@@ -35,15 +36,15 @@ def CERT() -> String:
 def KEY() -> String:
   "tests/io/tls_test_key.pem"
 
-# The cap, the widest DATA frame, and the padding the peer adds to it.
+# The cap, the widest legal DATA frame, and the padding the peer adds to it.
 def CAP() -> U32:
   HTTP2.x_max_body()
 
 def FRAME() -> U32:
-  65535
+  16384
 
 def PAD() -> U32:
-  254
+  16
 
 # The body of one padded frame: the length minus the pad-length byte and
 # the padding.
@@ -52,7 +53,7 @@ def BODY() -> U32:
 
 # Frames that pass the declared cap and stay below the body cap.
 def FRAMES() -> U32:
-  257
+  1025
 
 def PADDED() -> U32:
   8

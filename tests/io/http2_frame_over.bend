@@ -1,12 +1,11 @@
 # io (http2_frame_over): a frame past the announced MAX_FRAME_SIZE answers
 # GOAWAY FRAME_SIZE_ERROR.
 #
-# The lane announces MAX_FRAME_SIZE 65535 (x_max_str, task-070 phase 1).
-# This test declares a HEADERS frame of 65536 bytes and expects the lane
+# The lane announces MAX_FRAME_SIZE 16384 (x_max_frame, task-072 phase 4).
+# This test declares a HEADERS frame of 16385 bytes and expects the lane
 # to refuse it with GOAWAY 6 before it reads any payload byte. h2spec 4.2.3
-# sends a ~20 KiB frame and expects the same code, because it assumes the
-# 16384 default; the lane announces 65535, so that frame is legal and this
-# test pins the real cap instead.
+# sends a ~20 KiB frame and expects the same code; with the 16384 cap the
+# lane now refuses it, so 4.2.3 leaves the expected-failure list.
 #
 # Score 1 when the GOAWAY carries code 6, golden 1.
 import Base
@@ -31,7 +30,7 @@ def HOST() -> String:
   "127.0.0.1"
 
 def OVER() -> U32:
-  65536
+  16385
 
 def FRAME_SIZE() -> U32:
   6

@@ -1,9 +1,11 @@
 # lib (lib_httpx_miniunit): pure roundtrips of the H2 codec in
-# lib/http2.bend. No IO, no TLS: frame write->parse and HPACK
-# block->request-head must come back byte-identical. Golden 1. Runs in
-# seconds (unlike the TLS goldens) so it gates every mini-codec change.
+# lib/http2.bend, and the SETTINGS copy of lib/httpx.bend. No IO, no TLS:
+# frame write->parse and HPACK block->request-head must come back
+# byte-identical. Golden 1. Runs in under a minute (unlike the TLS
+# goldens) so it gates every mini-codec change.
 import Base
 import ../../lib/http2.bend as HTTP2
+import ../../lib/httpx.bend as HTTPX
 import ../../lib/http.bend as HTTP
 
 def b2u(b: Bool) -> U32:
@@ -92,13 +94,21 @@ def magic_t() -> U32:
 def settings_t() -> U32:
   settings_out(HTTP2.x_parse(HTTP.x_drop32(24, HTTP2.client.on.preface_bytes())))
 
+# The facade carries its own copy of the initial SETTINGS, with ids 4 and
+# 5 only. The frame cap at offset 8 must match lib/http2.bend (16384), so
+# a change to one copy cannot leave the other behind.
+def facade_t() -> U32:
+  +pay : List<&2, U32> = HTTPX.x_settings_initial_pay()
+  +cap : U32 = HTTP2.x_be32_rd(HTTP.x_drop32(8, pay))
+  b2u(Bool.and(U32.is_eq(HTTP.x_len32(pay), 12), U32.is_eq(cap, 16384)))
+
 law main:
   IO(U32)
 
 def main():
   do IO<U32>:
-    +total : U32 = (frame_t() + req_t() + resp_t() + magic_t() + settings_t() : U32)
-    +pass : U32 = b2u(U32.is_eq(total, 5))
+    +total : U32 = (frame_t() + req_t() + resp_t() + magic_t() + settings_t() + facade_t() : U32)
+    +pass : U32 = b2u(U32.is_eq(total, 6))
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
     return pass

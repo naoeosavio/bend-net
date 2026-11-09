@@ -43,9 +43,10 @@ def BIG() -> U32:
 def BIG_B() -> U32:
   97
 
-# The body of stream 3 and so its echo.
+# The body of stream 3 and so its echo: one whole frame, so the burst
+# passes the 16384-byte read chunk and leaves a partial frame behind.
 def ECHO() -> U32:
-  20000
+  16384
 
 def ECHO_B() -> U32:
   120

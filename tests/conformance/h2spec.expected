@@ -5,14 +5,9 @@
 # the gate.
 #
 # Use the official h2spec 2.6.0 release. A binary built from the same
-# commit with a newer Go shows 7 failures a more (task-073 records the
+# commit with a newer Go shows 7 false failures (task-073 records the
 # measure).
 #
-# 4.2.3: the module announces MAX_FRAME_SIZE 65535, so a 20 KiB HEADERS
-# frame is legal. The limit is fixed by tests/io/http2_frame_over.bend.
-#
-# 5.1.2.1 left this list in task-072: the buffered form reads a chunk,
-# admits every HEADERS of the chunk before it answers one, and holds a
-# stream open while its answer waits. tests/io/http2_pq_batch.bend fixes
-# the wire.
-http2/4.2 | Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE
+# The list is empty since task-072 phase 4. MAX_FRAME_SIZE 16384 closes
+# 4.2.3, and the answer queue closed 5.1.2.1 in phase 2. The local wires
+# are tests/io/http2_frame_over.bend and tests/io/http2_pq_batch.bend.

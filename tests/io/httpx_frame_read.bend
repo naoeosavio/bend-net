@@ -101,10 +101,10 @@ def v_roundtrip() -> U32:
   +out = HTTP2.x_parse(data_frame())
   (frame_len(out) + frame_sid(out) + frame_rest(out) : U32)
 
-# 65537 bytes is one past the announced MAX_FRAME_SIZE (RFC 9113 4.2): the
+# 16385 bytes is one past the announced MAX_FRAME_SIZE (RFC 9113 4.2): the
 # 24-bit length field is read first, so only the first three bytes matter.
 def v_over_cap() -> U32:
-  is_bad_413(HTTP2.x_parse([1, 0, 1, 0, 0, 0, 0, 0, 0]))
+  is_bad_413(HTTP2.x_parse([0, 64, 1, 0, 0, 0, 0, 0, 0]))
 
 # A DATA frame keeps its padding in the payload: the flow credit counts
 # the declared length of the frame (RFC 9113 section 6.9.1) and x_data_body

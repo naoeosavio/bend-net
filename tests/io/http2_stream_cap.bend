@@ -62,9 +62,9 @@ def b2u(b: Bool) -> U32:
 
 # The initial SETTINGS as bytes, in ascending id order: ENABLE_PUSH 0,
 # MAX_CONCURRENT_STREAMS 128, INITIAL_WINDOW_SIZE 65535, MAX_FRAME_SIZE
-# 65535.
+# 16384.
 def settings_bytes() -> List<&2, U32>:
-  [0, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 128, 0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 255, 255]
+  [0, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 128, 0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 64, 0]
 
 def settings_ok() -> U32:
   b2u(U32.is_eq(HTTP.x_eq(HTTP2.x_settings_initial_pay(), settings_bytes()), 1))
