@@ -768,55 +768,269 @@ def x_int.dec.go(+first: U32, +mask: U32, +rest: List<&2, U32>) ->
 # (list walks per bit, only on Huffman peers; raw peers never enter).
 # ----------------------------------------------------------------------
 
-def x_huff_counts() -> List<&2, U32>:
-  [10, 26, 32, 6, 0, 5, 3, 2, 6, 2, 3, 0, 0,
-   0, 3, 8, 13, 26, 29, 12, 4, 15, 19, 29, 0, 4]
-
-def x_huff_firsts() -> List<&2, U32>:
-  [0, 20, 92, 248,
-   0, 1016, 2042, 4090,
-   8184, 16380, 32764, 0,
-   0, 0, 524272, 1048550,
-   2097116, 4194258, 8388568, 16777194,
-   33554412, 67108832, 134217694, 268435426,
-   0, 1073741820]
-
-def x_huff_starts() -> List<&2, U32>:
-  [0, 10, 36, 68, 74, 74, 79, 82, 84, 90, 92, 95, 95,
-   95, 95, 98, 106, 119, 145, 174, 186, 190, 205, 224, 253, 253]
-
-def x_huff_order() -> List<&2, U32>:
-  [48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
-   52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
-   110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
-   77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
-   119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
-   43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
-   195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172, 176, 177,
-   179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136, 146, 154, 156, 160,
-   163, 164, 169, 170, 173, 178, 181, 185, 186, 187, 189, 190, 196, 198, 228, 232,
-   233, 1, 135, 137, 138, 139, 140, 141, 143, 147, 149, 150, 151, 152, 155, 157,
-   158, 165, 166, 168, 174, 175, 180, 182, 183, 188, 191, 197, 231, 239, 9, 142,
-   144, 145, 148, 159, 171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193,
-   200, 201, 202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
-   212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252, 253, 254,
-   2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
-   21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22,
-   256]
-
-def x_huff_nth.go(+xs: List<&2, U32>, +n: U32) -> U32:
-  match xs:
-    case Nil{}:
-      0
-    case h <> t:
-      match n:
-        case 0:
-          h
-        case _:
-          x_huff_nth.go(t, (n - 1 : U32))
-
-def x_huff_nth(+xs: List<&2, U32>, +n: U32) -> U32:
-  x_huff_nth.go(xs, n)
+# Canonical code to symbol, flat table. The 257 arms replace the
+# 257-cell order list: a per-symbol list walk cost 29 times a match
+# (TASK-075). The index is the canonical position for one length.
+def x_huff_sym(+idx: U32) -> U32:
+  match idx:
+    case 0: 48
+    case 1: 49
+    case 2: 50
+    case 3: 97
+    case 4: 99
+    case 5: 101
+    case 6: 105
+    case 7: 111
+    case 8: 115
+    case 9: 116
+    case 10: 32
+    case 11: 37
+    case 12: 45
+    case 13: 46
+    case 14: 47
+    case 15: 51
+    case 16: 52
+    case 17: 53
+    case 18: 54
+    case 19: 55
+    case 20: 56
+    case 21: 57
+    case 22: 61
+    case 23: 65
+    case 24: 95
+    case 25: 98
+    case 26: 100
+    case 27: 102
+    case 28: 103
+    case 29: 104
+    case 30: 108
+    case 31: 109
+    case 32: 110
+    case 33: 112
+    case 34: 114
+    case 35: 117
+    case 36: 58
+    case 37: 66
+    case 38: 67
+    case 39: 68
+    case 40: 69
+    case 41: 70
+    case 42: 71
+    case 43: 72
+    case 44: 73
+    case 45: 74
+    case 46: 75
+    case 47: 76
+    case 48: 77
+    case 49: 78
+    case 50: 79
+    case 51: 80
+    case 52: 81
+    case 53: 82
+    case 54: 83
+    case 55: 84
+    case 56: 85
+    case 57: 86
+    case 58: 87
+    case 59: 89
+    case 60: 106
+    case 61: 107
+    case 62: 113
+    case 63: 118
+    case 64: 119
+    case 65: 120
+    case 66: 121
+    case 67: 122
+    case 68: 38
+    case 69: 42
+    case 70: 44
+    case 71: 59
+    case 72: 88
+    case 73: 90
+    case 74: 33
+    case 75: 34
+    case 76: 40
+    case 77: 41
+    case 78: 63
+    case 79: 39
+    case 80: 43
+    case 81: 124
+    case 82: 35
+    case 83: 62
+    case 84: 0
+    case 85: 36
+    case 86: 64
+    case 87: 91
+    case 88: 93
+    case 89: 126
+    case 90: 94
+    case 91: 125
+    case 92: 60
+    case 93: 96
+    case 94: 123
+    case 95: 92
+    case 96: 195
+    case 97: 208
+    case 98: 128
+    case 99: 130
+    case 100: 131
+    case 101: 162
+    case 102: 184
+    case 103: 194
+    case 104: 224
+    case 105: 226
+    case 106: 153
+    case 107: 161
+    case 108: 167
+    case 109: 172
+    case 110: 176
+    case 111: 177
+    case 112: 179
+    case 113: 209
+    case 114: 216
+    case 115: 217
+    case 116: 227
+    case 117: 229
+    case 118: 230
+    case 119: 129
+    case 120: 132
+    case 121: 133
+    case 122: 134
+    case 123: 136
+    case 124: 146
+    case 125: 154
+    case 126: 156
+    case 127: 160
+    case 128: 163
+    case 129: 164
+    case 130: 169
+    case 131: 170
+    case 132: 173
+    case 133: 178
+    case 134: 181
+    case 135: 185
+    case 136: 186
+    case 137: 187
+    case 138: 189
+    case 139: 190
+    case 140: 196
+    case 141: 198
+    case 142: 228
+    case 143: 232
+    case 144: 233
+    case 145: 1
+    case 146: 135
+    case 147: 137
+    case 148: 138
+    case 149: 139
+    case 150: 140
+    case 151: 141
+    case 152: 143
+    case 153: 147
+    case 154: 149
+    case 155: 150
+    case 156: 151
+    case 157: 152
+    case 158: 155
+    case 159: 157
+    case 160: 158
+    case 161: 165
+    case 162: 166
+    case 163: 168
+    case 164: 174
+    case 165: 175
+    case 166: 180
+    case 167: 182
+    case 168: 183
+    case 169: 188
+    case 170: 191
+    case 171: 197
+    case 172: 231
+    case 173: 239
+    case 174: 9
+    case 175: 142
+    case 176: 144
+    case 177: 145
+    case 178: 148
+    case 179: 159
+    case 180: 171
+    case 181: 206
+    case 182: 215
+    case 183: 225
+    case 184: 236
+    case 185: 237
+    case 186: 199
+    case 187: 207
+    case 188: 234
+    case 189: 235
+    case 190: 192
+    case 191: 193
+    case 192: 200
+    case 193: 201
+    case 194: 202
+    case 195: 205
+    case 196: 210
+    case 197: 213
+    case 198: 218
+    case 199: 219
+    case 200: 238
+    case 201: 240
+    case 202: 242
+    case 203: 243
+    case 204: 255
+    case 205: 203
+    case 206: 204
+    case 207: 211
+    case 208: 212
+    case 209: 214
+    case 210: 221
+    case 211: 222
+    case 212: 223
+    case 213: 241
+    case 214: 244
+    case 215: 245
+    case 216: 246
+    case 217: 247
+    case 218: 248
+    case 219: 250
+    case 220: 251
+    case 221: 252
+    case 222: 253
+    case 223: 254
+    case 224: 2
+    case 225: 3
+    case 226: 4
+    case 227: 5
+    case 228: 6
+    case 229: 7
+    case 230: 8
+    case 231: 11
+    case 232: 12
+    case 233: 14
+    case 234: 15
+    case 235: 16
+    case 236: 17
+    case 237: 18
+    case 238: 19
+    case 239: 20
+    case 240: 21
+    case 241: 23
+    case 242: 24
+    case 243: 25
+    case 244: 26
+    case 245: 27
+    case 246: 28
+    case 247: 29
+    case 248: 30
+    case 249: 31
+    case 250: 127
+    case 251: 220
+    case 252: 249
+    case 253: 10
+    case 254: 13
+    case 255: 22
+    case 256: 256
+    case _: 0
 
 def x_huff_bits.octet(+b: U32) -> List<&2, U32>:
   [U32.and(U32.shrn(b, 7n), 1), U32.and(U32.shrn(b, 6n), 1),
@@ -837,16 +1051,96 @@ def x_huff_bits.go(+bs: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
 def x_huff_bits(bs: List<&2, U32>) -> List<&2, U32>:
   x_huff_bits.go(bs, Nil{})
 
+# True when the code of this length names a symbol (RFC 7541 B).
+# One arm per length; the two bounds are the first canonical code and
+# the count.
 def x_huff_hit(+code: U32, +len: U32) -> Bool:
-  +i = (len - 5 : U32)
-  +cnt = x_huff_nth(x_huff_counts(), i)
-  +fst = x_huff_nth(x_huff_firsts(), i)
-  Bool.and(U32.is_ge(code, fst), U32.is_lt((code - fst : U32), cnt))
+  match len:
+    case 5: Bool.and(U32.is_ge(code, 0), U32.is_lt((code - 0 : U32), 10))
+    case 6: Bool.and(U32.is_ge(code, 20), U32.is_lt((code - 20 : U32), 26))
+    case 7: Bool.and(U32.is_ge(code, 92), U32.is_lt((code - 92 : U32), 32))
+    case 8: Bool.and(U32.is_ge(code, 248), U32.is_lt((code - 248 : U32), 6))
+    case 9: False{}
+    case 10: Bool.and(U32.is_ge(code, 1016), U32.is_lt((code - 1016 : U32), 5))
+    case 11: Bool.and(U32.is_ge(code, 2042), U32.is_lt((code - 2042 : U32), 3))
+    case 12: Bool.and(U32.is_ge(code, 4090), U32.is_lt((code - 4090 : U32), 2))
+    case 13: Bool.and(U32.is_ge(code, 8184), U32.is_lt((code - 8184 : U32), 6))
+    case 14:
+      Bool.and(U32.is_ge(code, 16380),
+        U32.is_lt((code - 16380 : U32), 2))
+    case 15:
+      Bool.and(U32.is_ge(code, 32764),
+        U32.is_lt((code - 32764 : U32), 3))
+    case 16: False{}
+    case 17: False{}
+    case 18: False{}
+    case 19:
+      Bool.and(U32.is_ge(code, 524272),
+        U32.is_lt((code - 524272 : U32), 3))
+    case 20:
+      Bool.and(U32.is_ge(code, 1048550),
+        U32.is_lt((code - 1048550 : U32), 8))
+    case 21:
+      Bool.and(U32.is_ge(code, 2097116),
+        U32.is_lt((code - 2097116 : U32), 13))
+    case 22:
+      Bool.and(U32.is_ge(code, 4194258),
+        U32.is_lt((code - 4194258 : U32), 26))
+    case 23:
+      Bool.and(U32.is_ge(code, 8388568),
+        U32.is_lt((code - 8388568 : U32), 29))
+    case 24:
+      Bool.and(U32.is_ge(code, 16777194),
+        U32.is_lt((code - 16777194 : U32), 12))
+    case 25:
+      Bool.and(U32.is_ge(code, 33554412),
+        U32.is_lt((code - 33554412 : U32), 4))
+    case 26:
+      Bool.and(U32.is_ge(code, 67108832),
+        U32.is_lt((code - 67108832 : U32), 15))
+    case 27:
+      Bool.and(U32.is_ge(code, 134217694),
+        U32.is_lt((code - 134217694 : U32), 19))
+    case 28:
+      Bool.and(U32.is_ge(code, 268435426),
+        U32.is_lt((code - 268435426 : U32), 29))
+    case 29: False{}
+    case 30:
+      Bool.and(U32.is_ge(code, 1073741820),
+        U32.is_lt((code - 1073741820 : U32), 4))
+    case _: False{}
 
+# The symbol for a hit code. The flat index is the canonical start of
+# this length plus the code offset.
 def x_huff_at(+code: U32, +len: U32) -> U32:
-  +i = (len - 5 : U32)
-  +fst = x_huff_nth(x_huff_firsts(), i)
-  x_huff_nth(x_huff_order(), (x_huff_nth(x_huff_starts(), i) + (code - fst : U32) : U32))
+  match len:
+    case 5: x_huff_sym((0 + (code - 0 : U32) : U32))
+    case 6: x_huff_sym((10 + (code - 20 : U32) : U32))
+    case 7: x_huff_sym((36 + (code - 92 : U32) : U32))
+    case 8: x_huff_sym((68 + (code - 248 : U32) : U32))
+    case 9: 0
+    case 10: x_huff_sym((74 + (code - 1016 : U32) : U32))
+    case 11: x_huff_sym((79 + (code - 2042 : U32) : U32))
+    case 12: x_huff_sym((82 + (code - 4090 : U32) : U32))
+    case 13: x_huff_sym((84 + (code - 8184 : U32) : U32))
+    case 14: x_huff_sym((90 + (code - 16380 : U32) : U32))
+    case 15: x_huff_sym((92 + (code - 32764 : U32) : U32))
+    case 16: 0
+    case 17: 0
+    case 18: 0
+    case 19: x_huff_sym((95 + (code - 524272 : U32) : U32))
+    case 20: x_huff_sym((98 + (code - 1048550 : U32) : U32))
+    case 21: x_huff_sym((106 + (code - 2097116 : U32) : U32))
+    case 22: x_huff_sym((119 + (code - 4194258 : U32) : U32))
+    case 23: x_huff_sym((145 + (code - 8388568 : U32) : U32))
+    case 24: x_huff_sym((174 + (code - 16777194 : U32) : U32))
+    case 25: x_huff_sym((186 + (code - 33554412 : U32) : U32))
+    case 26: x_huff_sym((190 + (code - 67108832 : U32) : U32))
+    case 27: x_huff_sym((205 + (code - 134217694 : U32) : U32))
+    case 28: x_huff_sym((224 + (code - 268435426 : U32) : U32))
+    case 29: 0
+    case 30: x_huff_sym((253 + (code - 1073741820 : U32) : U32))
+    case _: 0
 
 # All-ones scan, tail-recursive: the conjunction rides in acc, so a
 # 512 Kbit padding scan answers flat.

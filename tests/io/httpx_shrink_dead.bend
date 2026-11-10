@@ -1,7 +1,7 @@
 # lib (lib_httpx_shrink_dead): coverage gate for TASK-055 Phase 2.
 # The 20 dead defs have no caller; this test pins the live neighbours so a
 # cut with fallout fails here. Pure, no IO/TLS, runs in seconds.
-# Each check returns 1. Golden 10.
+# Each check returns 1. Golden 11.
 import Base
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
@@ -25,23 +25,9 @@ def t_static.v(p: String & String) -> U32:
 def t_static() -> U32:
   (t_static.n(HTTP2.x_static.go(2)) * t_static.v(HTTP2.x_static.go(2)) : U32)
 
-# Dead x_huff_lens: the live tables still head the same values.
-def t_huff.firsts(h: U32, +firsts: List<&2, U32>) -> U32:
-  match firsts:
-    case Nil{}:
-      0
-    case f <> r:
-      b2u(Bool.and(U32.is_eq(h, 10), U32.is_eq(f, 0)))
-
-def t_huff.go(+counts: List<&2, U32>, +firsts: List<&2, U32>) -> U32:
-  match counts:
-    case Nil{}:
-      0
-    case h <> t:
-      t_huff.firsts(h, firsts)
-
+# Dead x_huff_lens: the live flat table answers the same head.
 def t_huff() -> U32:
-  t_huff.go(HTTP2.x_huff_counts(), HTTP2.x_huff_firsts())
+  b2u(Bool.and(U32.is_eq(HTTP2.x_huff_sym(0), 48), HTTP2.x_huff_hit(0, 5)))
 
 # Dead x_bytes_str.go: the live bytes helper still encodes.
 def t_str() -> U32:

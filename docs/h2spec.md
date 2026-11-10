@@ -46,6 +46,10 @@ A medida de 2026-11-10 usou `--timeout 3`. O `.js` deu 146 provas em
 grupo `http2/6.10` deu 6 de 6: 0,66 s no `.js` e 0,84 s no interpretado.
 A sonda `http2/3.5` passou depois das duas passagens em cada lane.
 
+A tabela plana de task-075 troca as listas canônicas por um `match` e
+não muda o fio. O `.js` deu 146 provas em 0,55 s, 0,67 s e 0,56 s. O
+grupo `http2/6.10` deu 6 de 6 em 0,084 s.
+
 Em 2026-11-10, 30 passagens completas no servidor da porta 18960 deram
 146 de 146. A prova 6.10.5 sozinha deu 1 de 1 em cerca de 0,2 s.
 
@@ -76,6 +80,7 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 | com a correção de task-073 | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 | lane JS `.js` (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 | lane JS interpretado (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
+| lane JS com a tabela plana (task-075) | 8 octetos | 146 provas, 0 falhas, três passagens | — |
 
 As duas falhas da primeira linha e da terceira linha são as mesmas: 4.2.3
 e 5.1.2.1. A linha do meio tem uma falha a mais, a 6.9.2.2. Com o corpo de
