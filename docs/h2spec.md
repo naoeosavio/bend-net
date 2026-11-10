@@ -35,11 +35,24 @@ corpo vazio fecha o stream no `HEADERS` e esconde o caminho de `DATA` que
 quatro provas do `h2spec` medem. O corpo tem 5 octetos ou mais, porque o
 `h2spec` pula a prova 6.9.2.2 abaixo desse tamanho.
 
-Use o binário nativo (`-o <arquivo>` sem `.js`). O lane JS decodifica
-o bloco Huffman de 3,5 KiB das provas 6.10.1 e 6.10.5 devagar: cerca de
-6 s no modo interpretado e 2,8 s no `.js`. Com `--timeout 3` a passagem
-perde essas 2 provas. Com `--timeout 10` o `.js` deu 146 de 146 em 7,6 s.
-task-074 mede e corrige esse custo.
+Use o binário nativo (`-o <arquivo>` sem `.js`) para a medida de
+referência. O lane JS serve as provas desde a correção de task-074. O
+`x_huff_pad` varria a cauda de bits a cada símbolo, e o custo era
+quadrático. A correção lê a cauda só com menos de 8 bits, e a resposta do
+fio não muda.
+
+A medida de 2026-11-10 usou `--timeout 3`. O `.js` deu 146 provas em
+1,39 s e 1,51 s. O interpretado deu 146 provas em 1,49 s e 3,30 s. O
+grupo `http2/6.10` deu 6 de 6: 0,66 s no `.js` e 0,84 s no interpretado.
+A sonda `http2/3.5` passou depois das duas passagens em cada lane.
+
+Em 2026-11-10, 30 passagens completas no servidor da porta 18960 deram
+146 de 146. A prova 6.10.5 sozinha deu 1 de 1 em cerca de 0,2 s.
+
+Se a prova 6.10.5 falhar com `Timeout` e a conexão seguinte falhar no
+handshake, a máquina estava carregada. O servidor de uma linha não aceita
+conexões durante a decodificação. Repita `http2/6.10/5` sozinho. Se a
+prova passar em menos de 1 s, o código está correto e a falha foi carga.
 
 ## Resultado
 
@@ -61,6 +74,8 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 | com a fila de task-072 | 8 octetos | 145 aprovadas, 0 puladas, 1 falha | 4.2.3 |
 | com `MAX_FRAME_SIZE` 16384 (task-072 fase 4) | 8 octetos | 146 provas, 0 falhas, grupo a grupo | — |
 | com a correção de task-073 | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
+| lane JS `.js` (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
+| lane JS interpretado (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 
 As duas falhas da primeira linha e da terceira linha são as mesmas: 4.2.3
 e 5.1.2.1. A linha do meio tem uma falha a mais, a 6.9.2.2. Com o corpo de
@@ -75,6 +90,7 @@ A passagem única fecha nesta máquina desde task-073. O defeito do
 servidor está fechado (abaixo). A passagem dá 146 provas, 0 falhas.
 Duas passagens no mesmo servidor dão o mesmo número, e a sonda
 `http2/3.5` passa depois de cada uma. O script da conformidade sai 0.
+O lane JS também fecha desde task-074, com `--timeout 3`.
 
 Para comparação, o node v22.23.2 com o mesmo corpo de 8 octetos deu 135
 aprovadas, 1 pulada e 10 falhas. O node passa a 4.2.3 e pula a 5.1.2.1.

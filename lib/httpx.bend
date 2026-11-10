@@ -1130,8 +1130,16 @@ def x_huff_ones.go(+bits: List<&2, U32>, ok: Bool) -> Bool:
 def x_huff_ones(+bits: List<&2, U32>) -> Bool:
   x_huff_ones.go(bits, True{})
 
+# Esta função retorna verdadeiro se a cauda tem menos de 8 bits e é toda uns.
+def x_huff_pad.go(+bits: List<&2, U32>, short: Bool) -> Bool:
+  match short:
+    case True{}:
+      x_huff_ones(bits)
+    case False{}:
+      False{}
+
 def x_huff_pad(+bits: List<&2, U32>) -> Bool:
-  Bool.and(Bool.not(x_has_at_least(8, bits)), x_huff_ones(bits))
+  x_huff_pad.go(bits, Bool.not(x_has_at_least(8, bits)))
 
 def x_huff_emit.big(big: Bool) -> U32:
   match big:
