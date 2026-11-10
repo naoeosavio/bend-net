@@ -21,6 +21,7 @@ static pthread_mutex_t tls_w_gate = PTHREAD_MUTEX_INITIALIZER;
 static int            tls_w_ready = 0;
 static int   (*w_SSL_write)(void*, const void*, int);
 static int   (*w_SSL_get_error)(void*, int);
+static void  (*w_ERR_clear_error)(void);
 static int   (*w_SSL_get_fd)(void*);
 
 static u32 tls_w_init(void) {
@@ -45,6 +46,7 @@ static u32 tls_w_init(void) {
   }
   TLS_W_SYM(SSL_write)
   TLS_W_SYM(SSL_get_error)
+  TLS_W_SYM(ERR_clear_error)
   TLS_W_SYM(SSL_get_fd)
 #undef TLS_W_SYM
   tls_w_ready = 1;
@@ -56,6 +58,9 @@ static Term tls_send_more(Env e, IoWork* w) {
   struct TlsConn* c = (struct TlsConn*)(intptr_t)w->hand;
   u64 at = (u64)w->made;
   while (at < w->size) {
+    // A stale error from another SSL object makes SSL_get_error answer
+    // SSL_ERROR_SSL for a WANT_WRITE. Clear the queue before the call.
+    w_ERR_clear_error();
     int n = w_SSL_write(c->ssl, w->data + at, (int)(w->size - at));
     if (n <= 0) {
       int err = w_SSL_get_error(c->ssl, n);

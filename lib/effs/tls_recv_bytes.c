@@ -20,6 +20,7 @@ static pthread_mutex_t tls_r_gate = PTHREAD_MUTEX_INITIALIZER;
 static int            tls_r_ready = 0;
 static int   (*r_SSL_read)(void*, void*, int);
 static int   (*r_SSL_get_error)(void*, int);
+static void  (*r_ERR_clear_error)(void);
 
 static u32 tls_r_init(void) {
   pthread_mutex_lock(&tls_r_gate);
@@ -43,6 +44,7 @@ static u32 tls_r_init(void) {
   }
   TLS_R_SYM(SSL_read)
   TLS_R_SYM(SSL_get_error)
+  TLS_R_SYM(ERR_clear_error)
 #undef TLS_R_SYM
   tls_r_ready = 1;
   pthread_mutex_unlock(&tls_r_gate);
@@ -67,6 +69,9 @@ static Term tls_recv_pack(Env e, IoWork* w) {
 
 static Term tls_recv_more(Env e, IoWork* w) {
   struct TlsConn* c = (struct TlsConn*)(intptr_t)w->hand;
+  // A stale error from another SSL object makes SSL_get_error answer
+  // SSL_ERROR_SSL for a WANT_READ. Clear the queue before the call.
+  r_ERR_clear_error();
   int n = r_SSL_read(c->ssl, w->data, (int)w->made);
   if (n < 0) {
     int err = r_SSL_get_error(c->ssl, n);

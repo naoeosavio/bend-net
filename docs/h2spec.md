@@ -35,6 +35,12 @@ corpo vazio fecha o stream no `HEADERS` e esconde o caminho de `DATA` que
 quatro provas do `h2spec` medem. O corpo tem 5 octetos ou mais, porque o
 `h2spec` pula a prova 6.9.2.2 abaixo desse tamanho.
 
+Use o binário nativo (`-o <arquivo>` sem `.js`). O lane JS decodifica
+o bloco Huffman de 3,5 KiB das provas 6.10.1 e 6.10.5 devagar: cerca de
+6 s no modo interpretado e 2,8 s no `.js`. Com `--timeout 3` a passagem
+perde essas 2 provas. Com `--timeout 10` o `.js` deu 146 de 146 em 7,6 s.
+task-074 mede e corrige esse custo.
+
 ## Resultado
 
 A passagem de referência, com o servidor de task-070 (corpo de 2 octetos),
@@ -54,6 +60,7 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 | com a correção de task-071 | 8 octetos | 144 aprovadas, 0 puladas, 2 falhas | 4.2.3, 5.1.2.1 |
 | com a fila de task-072 | 8 octetos | 145 aprovadas, 0 puladas, 1 falha | 4.2.3 |
 | com `MAX_FRAME_SIZE` 16384 (task-072 fase 4) | 8 octetos | 146 provas, 0 falhas, grupo a grupo | — |
+| com a correção de task-073 | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 
 As duas falhas da primeira linha e da terceira linha são as mesmas: 4.2.3
 e 5.1.2.1. A linha do meio tem uma falha a mais, a 6.9.2.2. Com o corpo de
@@ -64,12 +71,10 @@ Com a fila de task-072 a prova 5.1.2.1 passa. Com o `MAX_FRAME_SIZE`
 16384 da fase 4, a prova 4.2.3 passa também. A lista de desvios fica
 vazia, e `tests/conformance/h2spec.expected` não tem linha.
 
-A passagem única não fecha nesta máquina: o servidor para no meio da
-suíte, pelo defeito da task-073. Para medir a fase 4, o `h2spec` rodou
-um grupo por vez, com um servidor novo por grupo. Os 49 grupos deram 0
-falhas, e o grupo 4.2 deu 3 de 3. O script da conformidade ainda sai 2,
-porque a sonda `http2/3.5` falha depois da passagem. A comparação do
-script responde 0, porque a lista de falhas é a de `h2spec.expected`.
+A passagem única fecha nesta máquina desde task-073. O defeito do
+servidor está fechado (abaixo). A passagem dá 146 provas, 0 falhas.
+Duas passagens no mesmo servidor dão o mesmo número, e a sonda
+`http2/3.5` passa depois de cada uma. O script da conformidade sai 0.
 
 Para comparação, o node v22.23.2 com o mesmo corpo de 8 octetos deu 135
 aprovadas, 1 pulada e 10 falhas. O node passa a 4.2.3 e pula a 5.1.2.1.
@@ -110,35 +115,40 @@ O portão usa o `h2spec` do `PATH` ou o caminho de `H2SPEC`. A cópia em
 `.scratch/h2spec-bin` é o release oficial nesta máquina. task-073 registra
 a medida e o motivo.
 
-## O servidor para depois de uma passagem (task-073)
+## O servidor para depois de uma passagem (task-073, fechada)
 
-Um servidor novo serve uma passagem completa. O mesmo servidor não serve
-uma segunda passagem: as conexões novas recebem o fechamento. A prova
-3.5.1 (`Sends client connection preface`) falha com `Connection closed`.
+Um servidor novo servia uma passagem completa. O mesmo servidor não
+servia a segunda: as conexões novas recebiam o fechamento antes do
+SETTINGS inicial. A prova 3.5.1 falhava com `Connection closed`.
 
-A prova 6.9.1.1 sozinha já deixa o servidor neste estado, com o código de
-task-070 e com o código de task-071. A prova 6.9.2.2 faz o mesmo. As duas
-deixam um envio parado quando o par fecha a conexão.
+A prova 6.9.1.1 sozinha já deixava o servidor neste estado. A prova
+deixa 7 octetos do corpo parados no pump de envio quando o par fecha.
 
-```text
-servidor novo + 6.9.2    -> 3 de 3
-servidor novo + passagem -> 144 aprovadas, 2 falhas
-mesmo servidor + 6.9.2   -> 0 de 3, Error: EOF
-```
+O código C do TLS deixa um erro do OpenSSL na fila da linha de execução
+quando o envio falha e o `tls_close` chama `SSL_shutdown`. A fila fica
+suja, e o código não a limpa.
 
-O defeito é anterior a task-071. Ele está aberto em task-073.
+O `SSL_get_error` lê a fila antes do estado de espera (OpenSSL 3.0.13,
+`ssl/ssl_lib.c`). A leitura seguinte, de uma conexão nova, espera
+`WANT_READ` e recebe `SSL_ERROR_SSL` (1). O servidor fecha a conexão
+com o código 616 antes do SETTINGS. O `h2spec` mostra
+`Connection closed`.
 
-O defeito aparece no meio de algumas passagens: o servidor para antes do
-fim e as provas seguintes falham com `Connection closed`. O portão do
-`h2spec` prova cada passagem com uma conexão nova (`http2/3.5`) e repete
-a passagem com outro servidor quando a prova falha. Ele tenta três vezes
-e sai 2 quando todas falham. Nesta máquina a primeira tentativa falhou em
-duas de três medidas, e a repetição salvou uma.
+A correção limpa a fila antes de cada `SSL_read`, `SSL_write` e
+`SSL_accept`. O portão `tests/conformance/h2spec.sh` fixa o fio: a sonda
+`http2/3.5` depois da passagem falhava antes da correção e passa agora.
 
-Medido em 2026-11-09 com o código da fase 4: a passagem única parou no
-meio em todas as medidas, e a contagem de falhas variou de 27 a 36. A
-suíte passou grupo a grupo, com um servidor novo por grupo, na mesma
-porta: 49 grupos, 0 falhas.
+A prova vive no portão, não em `tests/io`. O twin C do TLS só entra no
+binário nativo (`bend file -o`), e um teste de `tests/io` roda no lane
+JS, que não tem a fila do OpenSSL.
+
+Medido em 2026-11-09 com o código corrigido: duas passagens completas
+no mesmo servidor, 146 provas e 0 falhas em cada uma, e a sonda
+`http2/3.5` passa depois das duas.
+
+Antes da correção, a passagem parava no meio em todas as medidas, e a
+contagem de falhas variava de 27 a 36. A suíte passava grupo a grupo,
+com um servidor novo por grupo: 49 grupos, 0 falhas.
 
 ### 4.2.3 Tamanho de HEADERS acima de SETTINGS_MAX_FRAME_SIZE (fechada por task-072 fase 4)
 

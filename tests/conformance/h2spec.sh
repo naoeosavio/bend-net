@@ -8,10 +8,10 @@
 # server stopped mid-run in three attempts. A test of the expected list
 # that now passes is printed and does not fail the run.
 #
-# The server of this box stops accepting after some connections
-# (task-073). The script proves each run with a fresh-connection probe and
-# repeats a run that died in the middle, so the list measures the module
-# and not the defect.
+# A fresh-connection probe proves that the server still answers after a
+# run, and a run that died in the middle repeats with a new server. The
+# probe found task-073; it stays as a guard against a future defect that
+# stops the accept loop.
 #
 # Use the official h2spec 2.6.0 release. A binary built from the same
 # commit with a newer Go shows 7 false failures (docs/h2spec.md).
@@ -63,11 +63,10 @@ fi
 
 printf 'serve 127.0.0.1:%s\n' "$port"
 
-# One server per attempt. task-073 makes the server stop accepting after
-# some connections, so a run can die in the middle and report failures
-# that the module does not have. A fresh connection that gets the server
-# SETTINGS proves that the run was whole; a failed probe repeats the run
-# with a new server.
+# One server per attempt. A run can still die in the middle, and a dead
+# run reports failures that the module does not have. A fresh connection
+# that gets the server SETTINGS proves that the run was whole; a failed
+# probe repeats the run with a new server.
 start_server() {
   "$bin" ok >> "$work/server.log" 2>&1 &
   srv_pid=$!
@@ -115,7 +114,7 @@ while : ; do
   if [ -z "$probe_ok" ]; then
     attempt=$((attempt + 1))
     if [ "$attempt" -gt 3 ]; then
-      printf 'the server stopped after 3 runs: see task-073\n' >&2
+      printf 'the server stopped after 3 runs\n' >&2
       tail -5 "$work/probe.log" >&2
       exit 2
     fi

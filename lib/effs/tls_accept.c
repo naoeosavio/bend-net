@@ -66,6 +66,7 @@ static void  (*s_SSL_get0_alpn_selected)(const void*, const unsigned char**, uns
 static int   (*s_SSL_shutdown)(void*);
 static void  (*s_SSL_free)(void*);
 static unsigned long (*s_ERR_peek_last_error)(void);
+static void  (*s_ERR_clear_error)(void);
 
 // ERR_GET_REASON(): the low 23 bits of a packed OpenSSL error code.
 #define TLS_S_ERR_REASON(e) ((int)((e) & 0x7FFFFF))
@@ -108,6 +109,7 @@ static u32 tls_s_init(void) {
   TLS_S_SYM(SSL_shutdown)
   TLS_S_SYM(SSL_free)
   TLS_S_SYM(ERR_peek_last_error)
+  TLS_S_SYM(ERR_clear_error)
 #undef TLS_S_SYM
   tls_s_ready = 1;
   pthread_mutex_unlock(&tls_s_gate);
@@ -210,6 +212,9 @@ static void tls_serve_call(IoWork* w) {
     return;
   }
   s_SSL_set_fd(ssl, s->fd);
+  // The reason peek after the handshake must read only this handshake:
+  // a stale error from another SSL object would answer 613/615 wrong.
+  s_ERR_clear_error();
   int r = s_SSL_accept(ssl);
   // Read the reason BEFORE shutdown/free: they push their own errors. Our
   // own ALPN refusal surfaces as SSL_R_NO_APPLICATION_PROTOCOL (235), and
