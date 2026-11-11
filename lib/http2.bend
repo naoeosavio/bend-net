@@ -350,16 +350,22 @@ def x_frame.len3(+l0: U32, +l1: U32, +l2: U32) -> U32:
 def x_frame.sid4(+s0: U32, +s1: U32, +s2: U32, +s3: U32) -> U32:
   (U32.and(s0, 127) * 16777216 + s1 * 65536 + s2 * 256 + s3 : U32)
 
-def x_frame_of.at.go(+hd: List<&2, U32>, i: U32) -> U32:
+# The zero flag rides as a Bool parameter. A match on i made the backend
+# convert U32 to a word and back at every step (TASK-076).
+def x_frame_of.at.go.step(+hd: List<&2, U32>, i: U32, zero: Bool) -> U32:
   match hd:
     case Nil{}:
       0
     case b <> t:
-      match i:
-        case 0:
+      match zero:
+        case True{}:
           b
-        case _:
-          x_frame_of.at.go(t, (i - 1 : U32))
+        case False{}:
+          +ni = (i - 1 : U32)
+          x_frame_of.at.go.step(t, ni, U32.is_eq(ni, 0))
+
+def x_frame_of.at.go(+hd: List<&2, U32>, +i: U32) -> U32:
+  x_frame_of.at.go.step(hd, i, U32.is_eq(i, 0))
 
 def x_frame_of.at_i(hd: List<&2, U32>, i: U32) -> U32:
   x_frame_of.at.go(hd, i)
@@ -715,10 +721,10 @@ def x_int.enc.go(+fuel: Nat, +rest: U32, acc: List<&2, U32>, big: Bool) -> List<
         case True{}:
           +b = U32.add(U32.and(rest, 127), 128)
           +next = U32.shrn(rest, 7n)
-          x_int.enc.go(f, next, List.append(&2, U32, acc, [b]), U32.is_ge(next, 128))
+          x_int.enc.go(f, next, b <> acc, U32.is_ge(next, 128))
         case False{}:
           +b = U32.and(rest, 127)
-          List.append(&2, U32, acc, [b])
+          b <> acc
 
 def x_int.enc.small(+first: U32, +rest: U32, small: Bool) -> List<&2, U32>:
   match small:
@@ -726,7 +732,7 @@ def x_int.enc.small(+first: U32, +rest: U32, small: Bool) -> List<&2, U32>:
       [U32.or(first, rest)]
     case False{}:
       acc = x_int.enc.go(6n, (rest - 127 : U32), Nil{}, U32.is_ge((rest - 127 : U32), 128))
-      List.append(&2, U32, [U32.or(first, 127)], acc)
+      U32.or(first, 127) <> HTTP.x_cat(acc)
 
 def x_int.enc(+first: U32, +rest: U32) -> List<&2, U32>:
   x_int.enc.small(first, rest, U32.is_lt(rest, 127))
@@ -1547,18 +1553,23 @@ def x_tab.do(+ents: List<&2, HTTP.Hdr>, +size: U32, +max: U32, +name: String, +v
   +ns = (size + es : U32)
   x_tab.trim(HTTP.Hdr{name, value} <> ents, ns, max)
 
-def x_tab.ins_fit(+ents: List<&2, HTTP.Hdr>, +size: U32, +max: U32, +name: String, +value: String, fits: Bool, +es: U32) -> HTTP.Tab:
+def x_tab.ins_fit(+ents: List<&2, HTTP.Hdr>, +size: U32, +max: U32, +name: String, +value: String, fits: Bool, +es: U32, room: Bool) -> HTTP.Tab:
   match fits:
     case False{}:
       HTTP.Tab{Nil{}, 0, max}
     case True{}:
-      x_tab.do(ents, size, max, name, value, es)
+      match room:
+        case True{}:
+          HTTP.Tab{HTTP.Hdr{name, value} <> ents, (size + es : U32), max}
+        case False{}:
+          x_tab.do(ents, size, max, name, value, es)
 
 def x_tab.insert(+tab: HTTP.Tab, +name: String, +value: String) -> HTTP.Tab:
   match tab:
     case HTTP.Tab{+ents, +size, +max}:
       +es = x_tab.entry_size(name, value)
-      x_tab.ins_fit(ents, size, max, name, value, U32.is_le(es, max), es)
+      +ns = (size + es : U32)
+      x_tab.ins_fit(ents, size, max, name, value, U32.is_le(es, max), es, U32.is_le(ns, max))
 
 def x_tab.resize.go(+tab: HTTP.Tab, +max: U32) -> HTTP.Tab:
   match tab:
@@ -1569,16 +1580,24 @@ def x_tab.resize(+tab: HTTP.Tab, +max: U32) -> HTTP.Tab:
   x_tab.resize.go(tab, max)
 
 # got: bounds-check + fetch in one walk (was lookup.go len-full + at-partial).
-def x_tab.lookup.got(+ents: List<&2, HTTP.Hdr>, +k: U32) -> Result<&1, &1, U32 & String, HTTP.Hdr>:
+# The zero flag rides as a Bool parameter. A match on k made the backend
+# convert U32 to a word and back at every step (TASK-076).
+def x_tab.lookup.got.step(+ents: List<&2, HTTP.Hdr>, +k: U32, zero: Bool) ->
+  Result<&1, &1, U32 & String, HTTP.Hdr>:
   match ents:
     case Nil{}:
       Fail{(502, "hpack dyn bounds")}
     case HTTP.Hdr{n, v} <> t:
-      match k:
-        case 0:
+      match zero:
+        case True{}:
           Done{HTTP.Hdr{n, v}}
-        case _:
-          x_tab.lookup.got(t, (k - 1 : U32))
+        case False{}:
+          +nk = (k - 1 : U32)
+          x_tab.lookup.got.step(t, nk, U32.is_eq(nk, 0))
+
+def x_tab.lookup.got(+ents: List<&2, HTTP.Hdr>, +k: U32) ->
+  Result<&1, &1, U32 & String, HTTP.Hdr>:
+  x_tab.lookup.got.step(ents, k, U32.is_eq(k, 0))
 
 def x_tab.lookup(+tab: HTTP.Tab, +idx: U32) -> Result<&1, &1, U32 & String, HTTP.Hdr>:
   match tab:
@@ -1763,7 +1782,7 @@ def x_hdr.dec(+bs: List<&2, U32>, +tab: HTTP.Tab) ->
 # --------------------------------------------------------
 
 def x_req.pick3(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String) -> HTTP.ReqHead:
-  HTTP.ReqHead{method, path, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
+  HTTP.ReqHead{method, path, HTTP.Hdr{name, value} <> headers}
 
 def x_req.pick2(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_path: Bool) -> HTTP.ReqHead:
   match is_path:
@@ -1775,7 +1794,7 @@ def x_req.pick2(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +n
 def x_req.pick(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> HTTP.ReqHead:
   match is_meth:
     case True{}:
-      HTTP.ReqHead{value, path, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
+      HTTP.ReqHead{value, path, HTTP.Hdr{name, value} <> headers}
     case False{}:
       x_req.pick2(method, path, headers, name, value, is_path)
 
@@ -1787,7 +1806,7 @@ def x_req.apply3(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +
     case True{}:
       x_req.pick(method, path, headers, name, value, is_meth, is_path)
     case False{}:
-      HTTP.ReqHead{method, path, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
+      HTTP.ReqHead{method, path, HTTP.Hdr{name, value} <> headers}
 
 def x_req.apply2(+method: String, +path: String, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_meth: Bool, +is_path: Bool) -> HTTP.ReqHead:
   x_req.apply3(method, path, headers, name, value, is_meth, is_path, String.starts_with(name, ":"))
@@ -1818,15 +1837,15 @@ def x_req.pseudo_ok(+name: String) -> Bool:
 def x_req.conn_name(+name: String) -> Bool:
   Bool.or(String.eq(name, "connection"), Bool.or(String.eq(name, "keep-alive"), Bool.or(String.eq(name, "proxy-connection"), Bool.or(String.eq(name, "transfer-encoding"), String.eq(name, "upgrade")))))
 
-def x_req.upper_go(+s: String) -> Bool:
+def x_req.upper_go(+s: String, ok: Bool) -> Bool:
   match s:
     case SNil{}:
-      False{}
+      ok
     case SCon{h, t}:
-      Bool.or(Char.is_upper(h), x_req.upper_go(t))
+      x_req.upper_go(t, Bool.or(ok, Char.is_upper(h)))
 
 def x_req.upper(+s: String) -> Bool:
-  x_req.upper_go(s)
+  x_req.upper_go(s, False{})
 
 def x_req.te_value(+name: String, +value: String) -> Bool:
   Bool.and(String.eq(name, "te"), Bool.not(String.eq(value, "trailers")))
@@ -1837,27 +1856,27 @@ def x_req.pseudo_field(+name: String) -> Bool:
 def x_req.field_bad(+name: String, +value: String) -> Bool:
   Bool.or(x_req.upper(name), Bool.or(x_req.conn_name(name), Bool.or(x_req.te_value(name, value), x_req.pseudo_field(name))))
 
-def x_req.fields_go(+hs: List<&2, HTTP.Hdr>) -> Bool:
+def x_req.fields_go(+hs: List<&2, HTTP.Hdr>, bad: Bool) -> Bool:
   match hs:
     case Nil{}:
-      False{}
+      bad
     case HTTP.Hdr{n, v} <> t:
-      Bool.or(x_req.field_bad(n, v), x_req.fields_go(t))
+      x_req.fields_go(t, Bool.or(bad, x_req.field_bad(n, v)))
 
 # True when a pseudo-header rides after a regular field.
-def x_req.after_go(+hs: List<&2, HTTP.Hdr>, seen_regular: Bool) -> Bool:
+def x_req.after_go(+hs: List<&2, HTTP.Hdr>, seen_regular: Bool, bad: Bool) -> Bool:
   match hs:
     case Nil{}:
-      False{}
+      bad
     case HTTP.Hdr{n, v} <> t:
       match seen_regular:
         case True{}:
-          Bool.or(String.starts_with(n, ":"), x_req.after_go(t, True{}))
+          x_req.after_go(t, True{}, Bool.or(bad, String.starts_with(n, ":")))
         case False{}:
-          x_req.after_go(t, Bool.not(String.starts_with(n, ":")))
+          x_req.after_go(t, Bool.not(String.starts_with(n, ":")), bad)
 
 def x_req.order_bad(+hs: List<&2, HTTP.Hdr>) -> Bool:
-  x_req.after_go(hs, False{})
+  x_req.after_go(hs, False{}, False{})
 
 def x_req.n_of.step(is_same: Bool, acc: U32) -> U32:
   match is_same:
@@ -1913,7 +1932,7 @@ def x_req.counts_bad(+headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
   x_req.counts_bad_go(String.eq(method, "CONNECT"), headers, method)
 
 def x_req.check(+headers: List<&2, HTTP.Hdr>, +method: String) -> Bool:
-  Bool.or(x_req.fields_go(headers), Bool.or(x_req.order_bad(headers), x_req.counts_bad(headers, method)))
+  Bool.or(x_req.fields_go(headers, False{}), Bool.or(x_req.order_bad(headers), x_req.counts_bad(headers, method)))
 
 # The handler sees the regular fields only.
 def x_req.strip.put_go(is_pseudo: Bool, +name: String, +value: String, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
@@ -1921,7 +1940,7 @@ def x_req.strip.put_go(is_pseudo: Bool, +name: String, +value: String, acc: List
     case True{}:
       acc
     case False{}:
-      List.append(&2, HTTP.Hdr, acc, [HTTP.Hdr{name, value}])
+      HTTP.Hdr{name, value} <> acc
 
 def x_req.strip.put(+name: String, +value: String, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
   x_req.strip.put_go(String.starts_with(name, ":"), name, value, acc)
@@ -1929,7 +1948,7 @@ def x_req.strip.put(+name: String, +value: String, acc: List<&2, HTTP.Hdr>) -> L
 def x_req.strip.go(+hs: List<&2, HTTP.Hdr>, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
   match hs:
     case Nil{}:
-      acc
+      List.reverse(&2, HTTP.Hdr, acc)
     case HTTP.Hdr{n, v} <> t:
       x_req.strip.go(t, x_req.strip.put(n, v, acc))
 
@@ -2021,7 +2040,7 @@ def x_req.done(st: HTTP.ReqHead, +tab: HTTP.Tab) ->
   Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>:
   match st:
     case HTTP.ReqHead{+method, +path, +headers}:
-      x_req.done_go(String.eq(method, ""), String.eq(path, ""), method, path, headers, tab)
+      x_req.done_go(String.eq(method, ""), String.eq(path, ""), method, path, List.reverse(&2, HTTP.Hdr, headers), tab)
 
 def x_req.has_fields(st: HTTP.ReqHead) -> Bool:
   match st:
@@ -2157,7 +2176,7 @@ def x_resp.field(is_pseudo: Bool, status: U32, +headers: List<&2, HTTP.Hdr>, +na
     case True{}:
       HTTP.Head{status, headers}
     case False{}:
-      HTTP.Head{status, List.append(&2, HTTP.Hdr, headers, [HTTP.Hdr{name, value}])}
+      HTTP.Head{status, HTTP.Hdr{name, value} <> headers}
 
 def x_resp.apply2(+status: U32, +headers: List<&2, HTTP.Hdr>, +name: String, +value: String, +is_status: Bool) -> HTTP.Head:
   match is_status:
@@ -2189,7 +2208,9 @@ def x_resp.go(+fuel: Nat, +phase: U32, +bs: List<&2, U32>, r: Result<&1, &1, U32
         case 0:
           match bs:
             case Nil{}:
-              Done{(st, tab)}
+              match st:
+                case HTTP.Head{+status, +headers}:
+                  Done{(HTTP.Head{status, List.reverse(&2, HTTP.Hdr, headers)}, tab)}
             case _:
               x_resp.go(f, 1, bs, x_hdr.dec(bs, tab), "", "", st, tab)
         case 1:
@@ -2238,9 +2259,9 @@ def x_lit.enc(+name: String, +value: String) -> List<&2, U32>:
 def x_block.go(hs: List<&2, HTTP.Hdr>, acc: List<&2, U32>) -> List<&2, U32>:
   match hs:
     case Nil{}:
-      acc
+      HTTP.x_cat(acc)
     case HTTP.Hdr{n, v} <> t:
-      x_block.go(t, List.append(&2, U32, acc, x_lit.enc(n, v)))
+      x_block.go(t, HTTP.x_rev_push(x_lit.enc(n, v), acc))
 
 def x_block(hs: List<&2, HTTP.Hdr>) -> List<&2, U32>:
   x_block.go(hs, Nil{})
@@ -2710,32 +2731,35 @@ def x_settings.bad.pick(+id: U32, +v: U32, +rec: U32) -> U32:
     case _:
       rec
 
-def x_settings.bad.walk(+pay: List<&2, U32>) -> U32:
+def x_settings.bad.walk.go(+pay: List<&2, U32>, bad: U32) -> U32:
   match pay:
     case Nil{}:
-      0
+      bad
     case +b0 <> r0:
       match r0:
         case Nil{}:
-          0
+          bad
         case +b1 <> r1:
           match r1:
             case Nil{}:
-              0
+              bad
             case +b2 <> r2:
               match r2:
                 case Nil{}:
-                  0
+                  bad
                 case +b3 <> r3:
                   match r3:
                     case Nil{}:
-                      0
+                      bad
                     case +b4 <> r4:
                       match r4:
                         case Nil{}:
-                          0
+                          bad
                         case +b5 <> rest:
-                          x_settings.bad.pick((b0 * 256 + b1 : U32), (b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32), x_settings.bad.walk(rest))
+                          x_settings.bad.walk.go(rest, x_settings.bad.pick((b0 * 256 + b1 : U32), (b2 * 16777216 + b3 * 65536 + b4 * 256 + b5 : U32), bad))
+
+def x_settings.bad.walk(+pay: List<&2, U32>) -> U32:
+  x_settings.bad.walk.go(pay, 0)
 
 def x_settings.bad(+pay: List<&2, U32>) -> U32:
   x_settings.bad.walk(pay)
@@ -3226,12 +3250,15 @@ def x_send_pay(sock: Socket, do_pay: Bool, is_end: Bool, +sid: U32, +flen: U32) 
 # sent the WINDOW_UPDATE of each one before it stashed the frame. The loop
 # skips the credit of such a frame, and the peer sees no marker at all
 # (TASK-068).
-def x_pdc.dec(+n: U32) -> U32:
-  match n:
-    case 0:
-      0
-    case _:
+def x_pdc.dec.go(+n: U32, paid: Bool) -> U32:
+  match paid:
+    case True{}:
       (n - 1 : U32)
+    case False{}:
+      0
+
+def x_pdc.dec(+n: U32) -> U32:
+  x_pdc.dec.go(n, U32.is_gt(n, 0))
 
 def x_pdc.paid(+n: U32) -> Bool:
   U32.is_gt(n, 0)
@@ -3256,14 +3283,17 @@ def x_pdc.one(+typ: U32) -> U32:
 # this count plus the paid prefix of the source buffer is the paid prefix
 # of the answer. The seed holds whole frames the pump wrote.
 @unsafe
-def x_pdc.count(+b: List<&2, U32>) -> U32:
+def x_pdc.count.go(+b: List<&2, U32>, acc: U32) -> U32:
   match b:
     case Nil{}:
-      0
+      acc
     case _:
       +len : U32 = x_frame.len3(x_frame_of.at_i(b, 0), x_frame_of.at_i(b, 1), x_frame_of.at_i(b, 2))
       +typ : U32 = x_frame_of.at_i(b, 3)
-      U32.add(x_pdc.one(typ), x_pdc.count(HTTP.x_drop32((9 + len : U32), b)))
+      x_pdc.count.go(HTTP.x_drop32((9 + len : U32), b), U32.add(acc, x_pdc.one(typ)))
+
+def x_pdc.count(+b: List<&2, U32>) -> U32:
+  x_pdc.count.go(b, 0)
 
 # True when the pump must credit the frame: a DATA frame outside the paid
 # prefix of the source buffer.
@@ -3452,7 +3482,7 @@ def x_flow.route(+typ: U32, +sid29: U32, +sid: U32, +cls: U32) -> U32:
 # it holds bytes that arrived earlier on the wire.
 def x_flow.seed_write(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
   +frag : List<&2, U32> = x_frame_write(typ, flags, sid, payload)
-  x_flow_join(seed, HTTP.x_cat.go(List.reverse(&2, U32, frag), buf))
+  x_flow_join(seed, x_flow_join(frag, buf))
 
 def x_flow.seed_add(+seed: List<&2, U32>, +typ: U32, +flags: U32, +sid: U32, +payload: List<&2, U32>, +buf: List<&2, U32>) -> List<&2, U32>:
   x_flow.seed_write(seed, typ, x_f_seed(flags), sid, payload, buf)
@@ -3793,7 +3823,7 @@ def httpx.sent_seed(sent: Socket & Result<&1, &1, U32 & String, Unit> & List<&2,
     case Fail{(code, msg)}:
       (s2, HTTP.GotErr{code, msg})
     case Done{u}:
-      (s2, HTTP.GotOk{HTTP.Frame{0, 0, 0, 0, Nil{}}, List.append(&2, U32, buf, seed)})
+      (s2, HTTP.GotOk{HTTP.Frame{0, 0, 0, 0, Nil{}}, x_flow_join(buf, seed)})
 
 # The buffer a loop reads from. A leaf that hands bytes back (the response
 # sender after a stash) rides them in the Got's buffer and those bytes win;
@@ -3901,18 +3931,21 @@ def ledger.hdrs_go(slots: List<&2, HTTP.St>, is_same: Bool, +wanted: U32, +head:
 def ledger.hdrs(slots: List<&2, HTTP.St>, +wanted: U32) -> List<&2, HTTP.Hdr>:
   ledger.hdrs_go(slots, False{}, wanted, None{})
 
-def ledger.n_of(xs: List<&2, HTTP.St>, +sid: U32) -> U32:
+def ledger.n_of.go(xs: List<&2, HTTP.St>, +sid: U32, acc: U32) -> U32:
   match xs:
     case Nil{}:
-      0
+      acc
     case +st <> t:
       match st:
         case HTTP.St{head, body, +sid2, +n}:
-          ledger.n_go(U32.is_eq(sid2, sid), n, ledger.n_of(t, sid))
+          ledger.n_of.go(t, sid, ledger.n_go(U32.is_eq(sid2, sid), n, acc))
+
+def ledger.n_of(xs: List<&2, HTTP.St>, +sid: U32) -> U32:
+  ledger.n_of.go(xs, sid, 0)
 
 # Single-traversal fragment probe: slot with sid exists AND head is None.
 # 2 traversals + S clones -> 1 traversal, S incs (sids unique via put).
-def ledger.has_some_go(eq: Bool, st: HTTP.St, rec: Bool) -> Bool:
+def ledger.has_some_go(eq: Bool, st: HTTP.St) -> Bool:
   match eq:
     case True{}:
       match st:
@@ -3923,49 +3956,72 @@ def ledger.has_some_go(eq: Bool, st: HTTP.St, rec: Bool) -> Bool:
             case Some{rh}:
               False{}
     case False{}:
-      rec
+      False{}
+
+def ledger.has_some.go(slots: List<&2, HTTP.St>, +sid: U32, found: Bool) -> Bool:
+  match slots found:
+    case _ True{}:
+      True{}
+    case Nil{} False{}:
+      False{}
+    case +st <> t False{}:
+      ledger.has_some.go(t, sid, ledger.has_some_go(x_same_sid(st, sid), st))
 
 def ledger.has_some(slots: List<&2, HTTP.St>, +sid: U32) -> Bool:
-  match slots:
-    case Nil{}:
-      False{}
-    case +st <> t:
-      ledger.has_some_go(x_same_sid(st, sid), st, ledger.has_some(t, sid))
+  ledger.has_some.go(slots, sid, False{})
 
-def ledger.del_go(eq: Bool, +st: HTTP.St, rest: List<&2, HTTP.St>) -> List<&2, HTTP.St>:
+def ledger.del.keep(eq: Bool, +st: HTTP.St, acc: List<&2, HTTP.St>) ->
+  List<&2, HTTP.St>:
   match eq:
     case True{}:
-      rest
+      acc
     case False{}:
-      st <> rest
+      st <> acc
 
-def ledger.del(slots: List<&2, HTTP.St>, +sid: U32) -> List<&2, HTTP.St>:
+def ledger.del.go(slots: List<&2, HTTP.St>, +sid: U32, acc: List<&2, HTTP.St>) ->
+  List<&2, HTTP.St>:
   match slots:
     case Nil{}:
-      Nil{}
+      List.reverse(&2, HTTP.St, acc)
     case +st <> t:
-      ledger.del_go(x_same_sid(st, sid), st, ledger.del(t, sid))
+      ledger.del.go(t, sid, ledger.del.keep(x_same_sid(st, sid), st, acc))
+
+def ledger.del(slots: List<&2, HTTP.St>, +sid: U32) -> List<&2, HTTP.St>:
+  ledger.del.go(slots, sid, Nil{})
 
 # Single-traversal take in a Data wrapper (a top-level A & B pair is not
 # Data and admits no + reuse). 1x O(S) always: strict args run the tail
 # even on early match; sids unique via put so the tail found nothing.
-def ledger.take_go(eq: Bool, +st: HTTP.St, p: HTTP.Taken) -> HTTP.Taken:
-  match eq:
-    case True{}:
-      match p:
-        case HTTP.Taken{+slots, st2}:
-          HTTP.Taken{slots, st}
-    case False{}:
-      match p:
-        case HTTP.Taken{+slots2, +found2}:
-          HTTP.Taken{(st <> slots2), found2}
+def ledger.take_del.cat(+rev: List<&2, HTTP.St>, +tail: List<&2, HTTP.St>) ->
+  List<&2, HTTP.St>:
+  match rev:
+    case Nil{}:
+      tail
+    case h <> t:
+      ledger.take_del.cat(t, h <> tail)
 
-def ledger.take_del(slots: List<&2, HTTP.St>, +sid: U32) -> HTTP.Taken:
+def ledger.take_del.next_eq(+xs: List<&2, HTTP.St>, +sid: U32) -> Bool:
+  match xs:
+    case Nil{}:
+      False{}
+    case +h <> _:
+      x_same_sid(h, sid)
+
+def ledger.take_del.go(slots: List<&2, HTTP.St>, +sid: U32,
+  acc: List<&2, HTTP.St>, eq: Bool) -> HTTP.Taken:
   match slots:
     case Nil{}:
-      HTTP.Taken{Nil{}, HTTP.St{None{}, Nil{}, 0, 0}}
-    case +st <> t:
-      ledger.take_go(x_same_sid(st, sid), st, ledger.take_del(t, sid))
+      HTTP.Taken{List.reverse(&2, HTTP.St, acc), HTTP.St{None{}, Nil{}, 0, 0}}
+    case +st <> +t:
+      match eq:
+        case True{}:
+          HTTP.Taken{ledger.take_del.cat(acc, t), st}
+        case False{}:
+          ledger.take_del.go(t, sid, st <> acc,
+            ledger.take_del.next_eq(t, sid))
+
+def ledger.take_del(+slots: List<&2, HTTP.St>, +sid: U32) -> HTTP.Taken:
+  ledger.take_del.go(slots, sid, Nil{}, ledger.take_del.next_eq(slots, sid))
 
 def ledger.taken_slots(p: HTTP.Taken) -> List<&2, HTTP.St>:
   match p:
@@ -4000,38 +4056,50 @@ def ledger.frag_cont_slots(p: HTTP.Taken, +payload: List<&2, U32>) -> List<&2, H
 def ledger.put(slots: List<&2, HTTP.St>, +st: HTTP.St) -> List<&2, HTTP.St>:
   st <> ledger.del(slots, httpx.sid_of(st))
 
-def ledger.fdel_go(eq: Bool, +x: U32, rest: List<&2, U32>) -> List<&2, U32>:
+def ledger.fdel.keep(eq: Bool, +x: U32, acc: List<&2, U32>) -> List<&2, U32>:
   match eq:
     case True{}:
-      rest
+      acc
     case False{}:
-      x <> rest
+      x <> acc
+
+def ledger.fdel.go(fends: List<&2, U32>, +sid: U32, acc: List<&2, U32>) ->
+  List<&2, U32>:
+  match fends:
+    case Nil{}:
+      List.reverse(&2, U32, acc)
+    case +x <> t:
+      ledger.fdel.go(t, sid, ledger.fdel.keep(U32.is_eq(x, sid), x, acc))
 
 def ledger.fdel(fends: List<&2, U32>, +sid: U32) -> List<&2, U32>:
-  match fends:
-    case Nil{}:
-      Nil{}
-    case +x <> t:
-      ledger.fdel_go(U32.is_eq(x, sid), x, ledger.fdel(t, sid))
+  ledger.fdel.go(fends, sid, Nil{})
 
 # Fused fends take: find + remove + flag in one traversal (2 -> 1).
-def ledger.fdel_flag_go(eq: Bool, +x: U32, p: HTTP.FendTaken) -> HTTP.FendTaken:
+def ledger.fdel_flag.keep(eq: Bool, +x: U32, p: List<&2, U32> & U32) ->
+  List<&2, U32> & U32:
   match eq:
     case True{}:
       match p:
-        case HTTP.FendTaken{+rest, flag}:
-          HTTP.FendTaken{rest, 1}
+        case (acc, flag):
+          (acc, 1)
     case False{}:
       match p:
-        case HTTP.FendTaken{+rest2, +flag2}:
-          HTTP.FendTaken{(x <> rest2), flag2}
+        case (acc, flag):
+          (x <> acc, flag)
 
-def ledger.fdel_flag(fends: List<&2, U32>, +sid: U32) -> HTTP.FendTaken:
+def ledger.fdel_flag.go(fends: List<&2, U32>, +sid: U32,
+  p: List<&2, U32> & U32) -> HTTP.FendTaken:
   match fends:
     case Nil{}:
-      HTTP.FendTaken{Nil{}, 0}
+      match p:
+        case (acc, flag):
+          HTTP.FendTaken{List.reverse(&2, U32, acc), flag}
     case +x <> t:
-      ledger.fdel_flag_go(U32.is_eq(x, sid), x, ledger.fdel_flag(t, sid))
+      ledger.fdel_flag.go(t, sid,
+        ledger.fdel_flag.keep(U32.is_eq(x, sid), x, p))
+
+def ledger.fdel_flag(fends: List<&2, U32>, +sid: U32) -> HTTP.FendTaken:
+  ledger.fdel_flag.go(fends, sid, (Nil{}, 0))
 
 def ledger.ftaken_fends(p: HTTP.FendTaken) -> List<&2, U32>:
   match p:
@@ -4180,29 +4248,51 @@ def x_wu.of_go(is_same: Bool, n: U32, rec: U32) -> U32:
     case False{}:
       rec
 
-# The pending of one stream, or zero when the ledger has no entry.
-def x_wu.of(xs: List<&2, Pnd>, +sid: U32) -> U32:
-  match xs:
-    case Nil{}:
-      0
-    case Pnd{s, n} <> t:
-      x_wu.of_go(U32.is_eq(s, sid), n, x_wu.of(t, sid))
-
-def x_wu.del_go(is_same: Bool, e: Pnd, rec: List<&2, Pnd>) -> List<&2, Pnd>:
+def x_wu.of.found(is_same: Bool, found: Bool) -> Bool:
   match is_same:
     case True{}:
-      rec
+      True{}
     case False{}:
-      e <> rec
+      found
 
-# The ledger without the entry of the sid. A stream that ends leaves no
-# entry, so the walk follows the live streams only.
-def x_wu.del(xs: List<&2, Pnd>, +sid: U32) -> List<&2, Pnd>:
+def x_wu.of.next(+xs: List<&2, Pnd>, +sid: U32) -> Bool:
   match xs:
     case Nil{}:
-      Nil{}
+      False{}
+    case Pnd{s, n} <> _:
+      U32.is_eq(s, sid)
+
+# The pending of one stream, or zero when the ledger has no entry. The
+# loop is tail; the first entry with the sid keeps its n.
+def x_wu.of.go(xs: List<&2, Pnd>, +sid: U32, found: Bool, acc: U32, +same: Bool) -> U32:
+  match xs:
+    case Nil{}:
+      acc
+    case Pnd{s, n} <> +t:
+      x_wu.of.go(t, sid, x_wu.of.found(same, found), x_wu.of_go(same, n, acc), x_wu.of.next(t, sid))
+
+def x_wu.of(+xs: List<&2, Pnd>, +sid: U32) -> U32:
+  x_wu.of.go(xs, sid, False{}, 0, x_wu.of.next(xs, sid))
+
+def x_wu.del.keep(is_same: Bool, +e: Pnd, acc: List<&2, Pnd>) -> List<&2, Pnd>:
+  match is_same:
+    case True{}:
+      acc
+    case False{}:
+      e <> acc
+
+# The ledger without the entry of the sid. A stream that ends leaves no
+# entry, so the walk follows the live streams only. The loop is tail and
+# reverses the kept list once at the end.
+def x_wu.del.go(xs: List<&2, Pnd>, +sid: U32, acc: List<&2, Pnd>) -> List<&2, Pnd>:
+  match xs:
+    case Nil{}:
+      List.reverse(&2, Pnd, acc)
     case Pnd{+s, +n} <> t:
-      x_wu.del_go(U32.is_eq(s, sid), Pnd{s, n}, x_wu.del(t, sid))
+      x_wu.del.go(t, sid, x_wu.del.keep(U32.is_eq(s, sid), Pnd{s, n}, acc))
+
+def x_wu.del(xs: List<&2, Pnd>, +sid: U32) -> List<&2, Pnd>:
+  x_wu.del.go(xs, sid, Nil{})
 
 def x_wu.set_go(is_zero: Bool, xs: List<&2, Pnd>, +sid: U32, +n: U32) ->
   List<&2, Pnd>:
@@ -4431,14 +4521,17 @@ def client.req.drop.go(+n: String, +v: String, rec: List<&2, HTTP.Hdr>, drop: Bo
     case False{}:
       HTTP.Hdr{n, v} <> rec
 
-def client.req.drop(hs: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+def client.req.drop.go2(hs: List<&2, HTTP.Hdr>, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
   match hs:
     case Nil{}:
-      Nil{}
+      List.reverse(&2, HTTP.Hdr, acc)
     case HTTP.Hdr{n, v} <> t:
       +nn = n
       +vv = v
-      client.req.drop.go(nn, vv, client.req.drop(t), client.req.drop_name(nn))
+      client.req.drop.go2(t, client.req.drop.go(nn, vv, acc, client.req.drop_name(nn)))
+
+def client.req.drop(hs: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  client.req.drop.go2(hs, Nil{})
 
 def client.req.with_authority(+host: String, +port: U32, hs: List<&2, HTTP.Hdr>) ->
   List<&2, HTTP.Hdr>:
