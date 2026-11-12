@@ -271,8 +271,8 @@ def peer_read(ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +tot1: U32, 
 # The burst: HEADERS(1, END_STREAM), HEADERS(3), DATA(3, END_STREAM).
 # One write, so the read of the loop ends in the middle of DATA(3).
 def burst() -> List<&2, U32>:
-  +b1 : List<&2, U32> = HTTP2.x_frame_write(HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 1, HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/big", Nil{}))
-  +b3 : List<&2, U32> = HTTP2.x_frame_write(HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 3, HTTP2.client.on.req_block(HOST(), PORT(), "POST", "/echo", [HTTP.Hdr{"content-length", U32.show(ECHO())}]))
+  +b1 : List<&2, U32> = HTTP2.x_frame_write(HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 1, HTTP2.client.req.block(HOST(), PORT(), "GET", "/big", Nil{}))
+  +b3 : List<&2, U32> = HTTP2.x_frame_write(HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 3, HTTP2.client.req.block(HOST(), PORT(), "POST", "/echo", [HTTP.Hdr{"content-length", U32.show(ECHO())}]))
   +d3 : List<&2, U32> = HTTP2.x_frame_write(HTTP2.x_t_data(), HTTP2.x_f_end_stream(), 3, fill(ECHO(), ECHO_B()))
   HTTP.x_cat.go(List.reverse(&2, U32, b1), HTTP.x_cat.go(List.reverse(&2, U32, b3), HTTP.x_cat.go(List.reverse(&2, U32, d3), Nil{})))
 

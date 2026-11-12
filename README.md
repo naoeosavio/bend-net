@@ -252,7 +252,7 @@ every frame (`x_frame*`, `x_read_frame`), the HPACK codec (`x_tab.*`,
 `x_huff*`, `x_int.*`, `x_hdr.*`), the flow pump (`x_send_data_flow`,
 `x_flow*` and the WU credit), the two H2 connection loops (`client.loop`
 with modes `on` and `concurrent`, `server.loop` with forms and modes),
-the slot ledgers (`httpxn.*`, `httpxc.*`) and the H2 lanes of client and
+the slot ledgers (`ledger.*`, `httpxc.*`) and the H2 lanes of client and
 server. The public entries stay in the
 facade (`## HTTPX` below); a file imports this module only when it names a
 wire leaf (the codec tests).

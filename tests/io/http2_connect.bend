@@ -66,9 +66,14 @@ def connect_block() -> List<&2, U32>:
 def nopath_block() -> List<&2, U32>:
   HTTP2.x_block([HTTP.Hdr{":method", "GET"}, HTTP.Hdr{":authority", "127.0.0.1:18954"}])
 
+def dec_ok(got: HTTP.ReqHead & Bool & HTTP.Tab) -> Bool:
+  match got:
+    case (h, +ok, t):
+      ok
+
 def pure_bits() -> U32:
-  +conn_ok : Bool = HTTP2.x_req.ok(HTTP2.x_req.decode(connect_block(), HTTP2.x_tab.empty()))
-  +nopath_ok : Bool = Bool.not(HTTP2.x_req.ok(HTTP2.x_req.decode(nopath_block(), HTTP2.x_tab.empty())))
+  +conn_ok : Bool = dec_ok(HTTP2.x_req.got(HTTP2.x_req.decode(connect_block(), HTTP2.x_tab.empty())))
+  +nopath_ok : Bool = Bool.not(dec_ok(HTTP2.x_req.got(HTTP2.x_req.decode(nopath_block(), HTTP2.x_tab.empty()))))
   U32.add(weigh(conn_ok, 1), weigh(nopath_ok, 1))
 
 # --- the raw peer ----------------------------------------------------

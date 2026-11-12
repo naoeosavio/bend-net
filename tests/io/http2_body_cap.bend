@@ -223,7 +223,7 @@ def peer_read(+mode: U32, ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, 
 # One case: connect, send the head, send the body, score the answer.
 def case_go(+mode: U32, sock: Socket) -> IO(U32):
   do IO<U32>:
-    +head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "POST", "/cap", Nil{})
+    +head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "POST", "/cap", Nil{})
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, head)
     +flags_last : U32 = U32.mul(U32.sub(1, mode), end_flags())

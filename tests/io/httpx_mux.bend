@@ -276,13 +276,13 @@ def client.send1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h3: List<&2
 def client.fire(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
     # The legacy H2.h2_request.head(method, path, hs) rendered :method, :path
-    # and :scheme but no :authority. HTTP2.client.on.req_block is the same
+    # and :scheme but no :authority. HTTP2.client.req.block is the same
     # renderer plus the :authority it derives from the host and port -- which
     # is why the port is threaded in here.
-    h1 : List<&2, U32> = HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
-    h3 : List<&2, U32> = HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
-    h5 : List<&2, U32> = HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
-    h7 : List<&2, U32> = HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h1 : List<&2, U32> = HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h3 : List<&2, U32> = HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h5 : List<&2, U32> = HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{})
+    h7 : List<&2, U32> = HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{})
     sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, h1)
     client.send1(sent1, h3, h5, h7, body1(), body2(), body1(), body2())
 

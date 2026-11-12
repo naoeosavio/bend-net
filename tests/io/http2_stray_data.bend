@@ -189,7 +189,7 @@ def stray_sent(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
 
 def peer_start(sock: Socket) -> IO(U32):
   do IO<U32>:
-    head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/stray", Nil{})
+    head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "GET", "/stray", Nil{})
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), REAL_SID(), head)
     stray_sent(sent)

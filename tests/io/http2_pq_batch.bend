@@ -75,7 +75,7 @@ def b2u(b: Bool) -> U32:
 # One complete request: HEADERS with END_HEADERS and END_STREAM.
 def head_frame(+sid: U32) -> List<&2, U32>:
   HTTP2.x_frame_write(HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), sid,
-    HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/pq", Nil{}))
+    HTTP2.client.req.block(HOST(), PORT(), "GET", "/pq", Nil{}))
 
 def settings_frame(+v: U32) -> List<&2, U32>:
   HTTP2.x_frame_write(HTTP2.x_t_settings(), 0, 0, List.append(&2, U32, HTTP2.x_be16(4), HTTP.x_be32(v)))

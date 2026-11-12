@@ -98,8 +98,13 @@ def phantom_ok() -> U32:
   decode_ok(HTTP2.x_req.decode(block_phantom(), HTTP2.x_tab.empty()), one_xy(), "GET", "/")
 
 # A block without :path fails the decode.
+def no_path_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (h, +ok, t):
+      b2u(Bool.not(ok))
+
 def no_path_ok(dec: Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>) -> U32:
-  b2u(Bool.not(HTTP2.x_req.ok(dec)))
+  no_path_go(HTTP2.x_req.got(dec))
 
 def no_path_t() -> U32:
   no_path_ok(HTTP2.x_req.decode(block_no_path(), HTTP2.x_tab.empty()))

@@ -186,7 +186,7 @@ def peer_go(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
 def peer_start(sock: Socket) -> IO(U32):
   do IO<U32>:
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
-      HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), 0, 1, HTTP2.client.on.req_block(HOST(), PORT_A(), "GET", "/cap", Nil{}))
+      HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), 0, 1, HTTP2.client.req.block(HOST(), PORT_A(), "GET", "/cap", Nil{}))
     rest : Socket & Result<&1, &1, U32 & String, Unit> <-
       cont_send(FRAGS(), sent, 1, filler(U32.to_nat(SLICE())))
     peer_go(rest)

@@ -307,7 +307,7 @@ def peer_body_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +port: U32) -
       peer_done((s, 0))
     case Done{u}:
       do IO<U32>:
-        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 3, HTTP2.client.on.req_block(HOST(), port, "GET", SECOND_PATH(), Nil{}))
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(s, HTTP2.x_t_headers(), (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32), 3, HTTP2.client.req.block(HOST(), port, "GET", SECOND_PATH(), Nil{}))
         peer_h3_sent(sent)
 
 # First request head is out: send the whole window of body.
@@ -323,7 +323,7 @@ def peer_head_sent(m: Socket & Result<&1, &1, U32 & String, Unit>, +port: U32) -
 
 def peer_start(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.client.on.req_block(HOST(), port, "POST", FIRST_PATH(), Nil{}))
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.client.req.block(HOST(), port, "POST", FIRST_PATH(), Nil{}))
     peer_head_sent(sent, port)
 
 def peer_conn(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):

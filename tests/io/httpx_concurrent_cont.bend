@@ -17,7 +17,7 @@ def hi_bytes() -> List<&2, U32>:
   HTTP.x_str_bytes("hi")
 
 def req_block(+port: U32) -> List<&2, U32>:
-  HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{})
+  HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{})
 
 def frag_first(+port: U32) -> List<&2, U32>:
   HTTP.x_take32(10, req_block(port))

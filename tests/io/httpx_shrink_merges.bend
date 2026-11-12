@@ -86,10 +86,10 @@ def t_seq.open(+sid_a: U32, sid2: U32) -> Bool:
   Bool.and(Bool.not(U32.is_eq(sid_a, 0)), U32.is_eq(sid2, sid_a))
 
 def t_seq.zero() -> U32:
-  b2u(U32.is_eq(HTTP2.httpxn.decide_data(t_seq.open(0, 4), 0), 4))
+  b2u(U32.is_eq(HTTP2.ledger.decide_data(t_seq.open(0, 4), 0), 4))
 
 def t_seq.open_end() -> U32:
-  b2u(U32.is_eq(HTTP2.httpxn.decide_data(t_seq.open(4, 4), 1), 1))
+  b2u(U32.is_eq(HTTP2.ledger.decide_data(t_seq.open(4, 4), 1), 1))
 
 def t_seq() -> U32:
   (t_seq.zero() * t_seq.open_end() : U32)
@@ -111,19 +111,19 @@ def t_slot.slots() -> List<&2, HTTP.St>:
 
 # Phase 4b: the client twins are gone; the httpxn walkers serve both lanes.
 def t_slot.has() -> U32:
-  (b2u(HTTP2.httpxn.has(t_slot.slots(), 3)) * b2u(Bool.not(HTTP2.httpxn.has(t_slot.slots(), 7))) : U32)
+  (b2u(HTTP2.ledger.has(t_slot.slots(), 3)) * b2u(Bool.not(HTTP2.ledger.has(t_slot.slots(), 7))) : U32)
 
 def t_slot.has_some() -> U32:
-  (b2u(HTTP2.httpxn.has_some(t_slot.slots(), 1)) * b2u(Bool.not(HTTP2.httpxn.has_some(t_slot.slots(), 3))) : U32)
+  (b2u(HTTP2.ledger.has_some(t_slot.slots(), 1)) * b2u(Bool.not(HTTP2.ledger.has_some(t_slot.slots(), 3))) : U32)
 
 def t_slot.del_put() -> U32:
-  (b2u(Bool.not(HTTP2.httpxn.has(HTTP2.httpxn.del(t_slot.slots(), 1), 1))) * b2u(HTTP2.httpxn.has(HTTP2.httpxn.put(t_slot.slots(), HTTP.St{None{}, Nil{}, 7, 0}), 7)) : U32)
+  (b2u(Bool.not(HTTP2.ledger.has(HTTP2.ledger.del(t_slot.slots(), 1), 1))) * b2u(HTTP2.ledger.has(HTTP2.ledger.put(t_slot.slots(), HTTP.St{None{}, Nil{}, 7, 0}), 7)) : U32)
 
 def t_slot.take_st(p: HTTP.Taken) -> U32:
-  b2u(U32.is_eq(HTTP2.httpx.sid_of(HTTP2.httpxn.taken_st(p)), 3))
+  b2u(U32.is_eq(HTTP2.httpx.sid_of(HTTP2.ledger.taken_st(p)), 3))
 
 def t_slot.take() -> U32:
-  (t_slot.take_st(HTTP2.httpxn.take_del(t_slot.slots(), 3)) * b2u(Bool.not(HTTP2.httpxn.has(HTTP2.httpxn.taken_slots(HTTP2.httpxn.take_del(t_slot.slots(), 3)), 3))) : U32)
+  (t_slot.take_st(HTTP2.ledger.take_del(t_slot.slots(), 3)) * b2u(Bool.not(HTTP2.ledger.has(HTTP2.ledger.taken_slots(HTTP2.ledger.take_del(t_slot.slots(), 3)), 3))) : U32)
 
 # The two lane builders read their own tag; a foreign tag answers empty.
 def t_slot.reqof(req: HTTP.Request) -> U32:

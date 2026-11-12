@@ -123,6 +123,7 @@ def frame_t() -> U32:
 # through the alias is rejected, decode is pure).
 def req_blk() -> List<&2, U32>:
   HTTP2.x_block([HTTP.Hdr{":method", "POST"},
+    HTTP.Hdr{":scheme", "https"},
     HTTP.Hdr{":path", "/echo"}])
 
 def req_go(head: HTTP.ReqHead, ok: Bool) -> U32:
@@ -131,10 +132,13 @@ def req_go(head: HTTP.ReqHead, ok: Bool) -> U32:
       b2u(Bool.and(ok, Bool.and(String.eq(method, "POST"),
         String.eq(path, "/echo"))))
 
+def req_t_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (+h, +ok, t):
+      req_go(h, ok)
+
 def req_t() -> U32:
-  req_go(HTTP2.x_req.rh(HTTP2.x_req.decode(req_blk(),
-    HTTP2.x_tab.empty())), HTTP2.x_req.ok(HTTP2.x_req.decode(req_blk(),
-    HTTP2.x_tab.empty())))
+  req_t_go(HTTP2.x_req.got(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
 
 def resp_blk() -> List<&2, U32>:
   HTTP2.x_block([HTTP.Hdr{":status", "200"},

@@ -77,5 +77,5 @@ parameter or a return type changes.
 `x_send_goaway`, `x_send_rst`, `x_block`, `x_preface`,
 `x_settings_initial_pay`, `x_req.decode`, `x_resp.decode`, `x_be32_rd`,
 `x_tab.empty` and the other `x_*` leaves are internal helpers. The wire
-tests name them. The library keeps them stable, and a change there
-changes no version number.
+tests name them. The library can change or remove one; a test that names
+it moves to the live helper. A change there changes no version number.

@@ -192,7 +192,7 @@ def taken_score(p: List<&2, HTTP.St> & HTTP.St, +want_sid: U32,
 def taken_all() -> U32:
   +slots : List<&2, HTTP.St> = [HTTP.St{None{}, Nil{}, 7, 0},
     HTTP.St{None{}, Nil{}, 9, 0}]
-  taken_score(taken_got(HTTP2.httpxn.take_del(slots, 7)), 7, 9)
+  taken_score(taken_got(HTTP2.ledger.take_del(slots, 7)), 7, 9)
 
 law main:
   IO(U32)

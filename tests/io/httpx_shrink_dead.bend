@@ -13,10 +13,10 @@ def b2u(b: Bool) -> U32:
     case False{}:
       0
 
-# Dead x_static_name / x_static.value: live x_static.go/name/value answer.
+# Dead x_static.name: the live x_static.go pair carries the name.
 def t_static.n(p: String & String) -> U32:
   (n, v) = p
-  b2u(String.eq(HTTP2.x_static.name((n, v)), ":method"))
+  b2u(String.eq(n, ":method"))
 
 def t_static.v(p: String & String) -> U32:
   (n, v) = p
@@ -34,8 +34,13 @@ def t_str() -> U32:
   b2u(U32.is_eq(HTTP.x_len32(HTTP.x_str_bytes("hi")), 2))
 
 # Dead x_req.phase + x_hdr.lit.mask + x_hdr.indexed.go2: request decode ok.
+def t_req_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (h, +ok, t):
+      b2u(ok)
+
 def t_req() -> U32:
-  b2u(HTTP2.x_req.ok(HTTP2.x_req.decode(HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/echo"}]), HTTP2.x_tab.empty())))
+  t_req_go(HTTP2.x_req.got(HTTP2.x_req.decode(HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/echo"}]), HTTP2.x_tab.empty())))
 
 # Live twin of dead httpxc.resp_of stays: response decode ok.
 def t_resp() -> U32:
@@ -99,21 +104,21 @@ def t_keep.go(kept: HTTP.Head, fresh: HTTP.Head) -> U32:
       t_keep.fresh(status, fresh)
 
 def t_keep() -> U32:
-  t_keep.go(HTTP2.httpxn.head_keep_go(HTTP.Head{200, Nil{}}, HTTP.Head{404, Nil{}}, True{}), HTTP2.httpxn.head_keep_go(HTTP.Head{200, Nil{}}, HTTP.Head{404, Nil{}}, False{}))
+  t_keep.go(HTTP2.ledger.head_keep_go(HTTP.Head{200, Nil{}}, HTTP.Head{404, Nil{}}, True{}), HTTP2.ledger.head_keep_go(HTTP.Head{200, Nil{}}, HTTP.Head{404, Nil{}}, False{}))
 
 # Dead httpxc.body_of + client.on.st_h2: sid ledger + next sid + has_head.
 def t_clst() -> U32:
   st: HTTP.St = HTTP.St{None{}, Nil{}, 7, 0}
-  b2u(Bool.and(Bool.and(U32.is_eq(HTTP2.httpx.sid_of(st), 7), U32.is_eq(HTTP2.client.on.next_sid(1), 3)), HTTP2.client.on.has_head(HTTP.Head{200, Nil{}})))
+  b2u(Bool.and(Bool.and(U32.is_eq(HTTP2.httpx.sid_of(st), 7), U32.is_eq(HTTP2.client.loop.next_sid(1), 3)), HTTP2.client.resp.has_head(HTTP.Head{200, Nil{}})))
 
-# Dead httpxc.resp_of via live twin client.on.resp_of: status rides through.
+# The live sink projection answers the status and the ordered body.
 def t_respof.go(resp: HTTP.Response) -> U32:
   match resp:
     case HTTP.Response{status, headers, body}:
       b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_len32(body), 2)))
 
 def t_respof() -> U32:
-  t_respof.go(HTTP2.client.on.resp_of(HTTP.Head{200, Nil{}}, [1, 2]))
+  t_respof.go(HTTP2.client.sink.resp(HTTP2.Sink{HTTP.Head{200, Nil{}}, [2, 1]}))
 
 # Dead x_hdr.indexed.go/num: the live indexed route (x_hdr.dec -> dyn.num)
 # still answers a static index and a dynamic index (RFC 7541 section 6.1).

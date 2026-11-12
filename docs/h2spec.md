@@ -81,6 +81,11 @@ falhas. As duas falhas são os desvios aceitos abaixo.
 | lane JS `.js` (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 | lane JS interpretado (task-074) | 8 octetos | 146 provas, 0 falhas, duas passagens | — |
 | lane JS com a tabela plana (task-075) | 8 octetos | 146 provas, 0 falhas, três passagens | — |
+| leitura única do cabeçalho (task-079) | 8 octetos | 146 provas, 0 falhas | — |
+
+A passagem de 2026-11-11 repetiu o portão depois de task-079. O script
+saiu 0 e a lista de desvios continua vazia. A leitura única do cabeçalho
+não mudou o fio: o servidor do modo `ok` respondeu as mesmas provas.
 
 As duas falhas da primeira linha e da terceira linha são as mesmas: 4.2.3
 e 5.1.2.1. A linha do meio tem uma falha a mais, a 6.9.2.2. Com o corpo de

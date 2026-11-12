@@ -231,7 +231,7 @@ def peer_read(ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +acc: U32) -
 
 def case_go(sock: Socket) -> IO(U32):
   do IO<U32>:
-    +head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "POST", "/pad", Nil{})
+    +head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "POST", "/pad", Nil{})
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, head)
     up : Socket & Result<&1, &1, U32 & String, Unit> <- send_frames(FRAMES(), chunk(), sock_of(sent))

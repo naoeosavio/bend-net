@@ -69,9 +69,13 @@ def req_head(head: HTTP.ReqHead, ok: Bool) -> U32:
     case HTTP.ReqHead{method, path, headers}:
       b2u(Bool.and(ok, Bool.and(String.eq(method, "GET"), String.eq(path, "/"))))
 
+def v7_req_block_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (+h, +ok, t):
+      req_head(h, ok)
+
 def v7_req_block() -> U32:
-  req_head(HTTP2.x_req.rh(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())),
-    HTTP2.x_req.ok(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
+  v7_req_block_go(HTTP2.x_req.got(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
 
 # Indexed ":status 302" (0x48) plus the Huffman literal from v2: the response
 # side of the same two layers.

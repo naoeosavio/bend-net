@@ -174,7 +174,7 @@ def alive_sent(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
 
 def alive_head(sock: Socket) -> IO(U32):
   do IO<U32>:
-    head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "POST", "/alive", Nil{})
+    head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "POST", "/alive", Nil{})
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), ALIVE_SID(), head)
     alive_sent(sent)
@@ -189,7 +189,7 @@ def cancel_sent(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):
 
 def peer_start(sock: Socket) -> IO(U32):
   do IO<U32>:
-    head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/cancel", Nil{})
+    head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "GET", "/cancel", Nil{})
     flags : U32 = (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32)
     sent : Socket & Result<&1, &1, U32 & String, Unit> <-
       HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), flags, CANCEL_SID(), head)

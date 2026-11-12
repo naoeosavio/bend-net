@@ -183,7 +183,7 @@ def peer_read(ph: U32, got: Socket & HTTP.Got, +buf: List<&2, U32>, +total: U32,
 
 def peer_go(sock: Socket) -> IO(U32):
   do IO<U32>:
-    head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/big", Nil{})
+    head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "GET", "/big", Nil{})
     +flags : U32 = (HTTP2.x_f_end_headers() + HTTP2.x_f_end_stream() : U32)
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), flags, 1, head)
     peer_read(0, (sock_of(sent), HTTP.GotErr{0, "next"}), Nil{}, 0, 0)

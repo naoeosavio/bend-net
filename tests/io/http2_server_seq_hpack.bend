@@ -41,7 +41,7 @@ def buf_h(req: HTTP.Request) -> IO(HTTP.Response):
       IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
 def blk(+method: String, +path: String) -> List<&2, U32>:
-  HTTP2.client.on.req_block(HOST(), 0, method, path, Nil{})
+  HTTP2.client.req.block(HOST(), 0, method, path, Nil{})
 
 # Literal header field with incremental indexing: name "x", value "v".
 def incr() -> List<&2, U32>:

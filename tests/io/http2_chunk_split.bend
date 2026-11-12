@@ -78,7 +78,7 @@ def order_go(+chunks: List<&2, List<&2, U32>>, +rest: List<&2, U32>) -> Bool:
 
 def case_ok(+n: U32) -> U32:
   +body : List<&2, U32> = build(n)
-  +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(HTTP2.x_split_all(), body)
+  +chunks : List<&2, List<&2, U32>> = HTTP2.x_chunks(1000000n, body)
   +count : Bool = Nat.is_eq(List.length(&2, List<&2, U32>, chunks), want_chunks(n))
   +bytes : Bool = U32.is_eq(total(chunks), n)
   +order : Bool = order_go(chunks, body)

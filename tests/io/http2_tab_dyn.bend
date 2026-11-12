@@ -79,7 +79,7 @@ def v5_oversize(tab: HTTP.Tab) -> U32:
   match tab:
     case HTTP.Tab{ents, size, tmax}:
       tab_size(HTTP2.x_tab.ins_fit(ents, size, tmax, "x", "y", False{},
-        HTTP2.x_tab.entry_size("x", "y")))
+        HTTP2.x_tab.entry_size("x", "y"), False{}))
 
 def v6_bounds() -> U32:
   is_fail_hdr(HTTP2.x_tab.lookup(two_tab(), 5))

@@ -44,7 +44,7 @@ def h(ev: HTTP.SrvEv) -> HTTP.SrvOut:
       HTTP.RespondEarly{HTTP.Response{200, Nil{}, chunk}}
 
 def blk(+method: String, +path: String) -> List<&2, U32>:
-  HTTP2.client.on.req_block(HOST(), 0, method, path, Nil{})
+  HTTP2.client.req.block(HOST(), 0, method, path, Nil{})
 
 # The whole exchange in one write: HEADERS 1 (open), HEADERS 3 (refused
 # while 1 is open), DATA 1 (ends 1, "hi"), HEADERS 5 (open) and DATA 5

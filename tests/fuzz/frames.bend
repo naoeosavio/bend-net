@@ -197,4 +197,4 @@ def main() -> IO(U32):
     +st : Fz = run(cfg_rounds(c), cfg_seed(c))
     report(st)
 
-#|1803377
+#|26326

@@ -181,7 +181,7 @@ def peer_tail(sock: Socket) -> IO(U32):
 
 def peer_go(sock: Socket) -> IO(U32):
   do IO<U32>:
-    head : List<&2, U32> = HTTP2.client.on.req_block(HOST(), PORT(), "POST", "/cancel", Nil{})
+    head : List<&2, U32> = HTTP2.client.req.block(HOST(), PORT(), "POST", "/cancel", Nil{})
     sent : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, head)
     peer_tail(sock_of(sent))
 

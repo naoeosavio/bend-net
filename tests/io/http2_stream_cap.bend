@@ -85,7 +85,7 @@ def head_send(fuel: Nat, m: Socket & Result<&1, &1, U32 & String, Unit>, +sid: U
           do IO<Socket & Result<&1, &1, U32 & String, Unit>>:
             sent : Socket & Result<&1, &1, U32 & String, Unit> <-
               HTTP2.x_send_frame(s, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), sid,
-                HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/cap", Nil{}))
+                HTTP2.client.req.block(HOST(), PORT(), "GET", "/cap", Nil{}))
             head_send(p, sent, (sid + 2 : U32))
 
 # Scenario step 2: the 101st HEADERS.
@@ -96,7 +96,7 @@ def head_cap(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Socket & Resu
       IO.pure(Socket & Result<&1, &1, U32 & String, Unit>, (s, Fail{e}))
     case Done{u}:
       HTTP2.x_send_frame(s, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), REFUSED_SID(),
-        HTTP2.client.on.req_block(HOST(), PORT(), "GET", "/cap", Nil{}))
+        HTTP2.client.req.block(HOST(), PORT(), "GET", "/cap", Nil{}))
 
 # Scenario step 3: the body of stream 1, so the server answers it.
 def head_alive(m: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Socket & Result<&1, &1, U32 & String, Unit>):

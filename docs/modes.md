@@ -70,8 +70,8 @@ drain.
 
 Both modes use the same pieces: the frame codec + HPACK (`x_frame*`,
 `x_read_frame`, `x_tab.*`, `x_huff*`), the flow pump `x_send_data_flow`,
-WU credit, CONTINUATION (`client.on.cont_read`), the preface/accept code
-and the slot ledgers (`httpxn.*`, `httpxc.*`) — all in `lib/http2.bend`.
+WU credit, CONTINUATION (`client.cont.*`), the preface/accept code
+and the slot ledgers (`ledger.*`, `httpxc.*`) — all in `lib/http2.bend`.
 The H1 lane is `x_h1.*` in `lib/http1.bend`; both transports use the
 `~recv`/`~send`/`~close` triple — see `docs/h1-transport.md`. A body
 accumulates in reverse (`x_rev_push`) and one `x_cat` un-reverses it, so

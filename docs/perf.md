@@ -73,3 +73,8 @@ O número que importa para o porteiro é a virada de recepção e o corte do
 envio, porque os dois rodam por frame. Um frame de 16384 bytes custa 169 /
 64 = 2,6 ms por MiB dividido em 16 KiB. Um pedido de controle de 4 KiB
 custa menos de 1 ms.
+
+Em 2026-11-11, task-079 leu o cabeçalho de 9 octetos em um `match` e o
+`recv` do `http2_perf` deu 169 ms e 179 ms por MiB. O `send` deu 265 ms
+e 266 ms. Numa terceira passagem, o `recv` deu 195 ms e o `send` deu
+244 ms. Todos ficam abaixo do teto de 338 ms e de 346 ms.

@@ -275,8 +275,8 @@ def client.send1(sent: Socket & Result<&1, &1, U32 & String, Unit>, +h3: List<&2
 
 def client.fire(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}))
-    client.send1(sent1, HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTP2.client.on.req_block("127.0.0.1", port, "POST", "/echo", Nil{}), body1(), body2(), body1(), body2())
+    sent1 : Socket & Result<&1, &1, U32 & String, Unit> <- HTTP2.x_send_frame(sock, HTTP2.x_t_headers(), HTTP2.x_f_end_headers(), 1, HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{}))
+    client.send1(sent1, HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{}), HTTP2.client.req.block("127.0.0.1", port, "POST", "/echo", Nil{}), body1(), body2(), body1(), body2())
 
 def client_conn(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32):
   match conn:

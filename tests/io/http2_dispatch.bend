@@ -96,8 +96,13 @@ def is_bad(unit: List<&2, U32>) -> U32:
   is_bad_go(HTTP2.x_parse(unit))
 
 # The request head rules (RFC 9113 sections 8.2 and 8.3), one block each.
+def dec_ok_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (h, +ok, t):
+      b2u(ok)
+
 def dec_ok(block: List<&2, U32>) -> U32:
-  b2u(HTTP2.x_req.ok(HTTP2.x_req.decode(block, HTTP2.x_tab.empty())))
+  dec_ok_go(HTTP2.x_req.got(HTTP2.x_req.decode(block, HTTP2.x_tab.empty())))
 
 def hdr(name: String, value: String) -> HTTP.Hdr:
   HTTP.Hdr{name, value}
@@ -142,6 +147,17 @@ def dec_code_go(dec: Result<&1, &1, U32 & String, HTTP.ReqHead & HTTP.Tab>) -> U
 
 def dec_code(block: List<&2, U32>) -> U32:
   dec_code_go(HTTP2.x_req.decode(block, HTTP2.x_tab.empty()))
+
+# x_frame_of reads the 9 header bytes once: length, type, flags, sid and
+# the payload that follows them. The R bit of the sid is masked.
+def hdr_frame_go(frame: HTTP.Frame) -> U32:
+  match frame:
+    case HTTP.Frame{+typ, +flags, +sid, +flen, +payload}:
+      (point(1, typ) * point(5, flags) * point(1, sid)
+        * point(2, flen) * point(2, HTTP.x_len32(payload)) : U32)
+
+def hdr_frame_score() -> U32:
+  hdr_frame_go(HTTP2.x_frame_of([0, 0, 2, 1, 5, 128, 0, 0, 1, 9, 9]))
 
 def run() -> U32:
   +s0 : U32 = point(ACT_PROTOCOL(), act(0, 0, 0, 0, nil(), LAST(), False{}, False{}))
@@ -232,7 +248,8 @@ def run() -> U32:
   +s85 : U32 = point(17, HTTP2.server.admit.trailer_cl(True{}, True{}, 0, 1))
   +s86 : U32 = point(12, HTTP2.server.admit.trailer_cl(False{}, True{}, 0, 1))
   +s87 : U32 = point(5, HTTP2.server.admit.trailer_cl(True{}, False{}, 0, 1))
-  +total : U32 = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18 + s19 + s20 + s21 + s22 + s23 + s24 + s25 + s26 + s27 + s28 + s29 + s30 + s31 + s32 + s33 + s34 + s35 + s36 + s37 + s38 + s39 + s40 + s41 + s42 + s43 + s44 + s45 + s46 + s47 + s48 + s49 + s50 + s51 + s52 + s53 + s54 + s55 + s56 + s57 + s58 + s59 + s60 + s61 + s62 + s63 + s64 + s65 + s66 + s67 + s68 + s69 + s70 + s71 + s72 + s73 + s74 + s75 + s76 + s77 + s78 + s79 + s80 + s81 + s82 + s83 + s84 + s85 + s86 + s87 : U32)
+  +s88 : U32 = hdr_frame_score()
+  +total : U32 = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18 + s19 + s20 + s21 + s22 + s23 + s24 + s25 + s26 + s27 + s28 + s29 + s30 + s31 + s32 + s33 + s34 + s35 + s36 + s37 + s38 + s39 + s40 + s41 + s42 + s43 + s44 + s45 + s46 + s47 + s48 + s49 + s50 + s51 + s52 + s53 + s54 + s55 + s56 + s57 + s58 + s59 + s60 + s61 + s62 + s63 + s64 + s65 + s66 + s67 + s68 + s69 + s70 + s71 + s72 + s73 + s74 + s75 + s76 + s77 + s78 + s79 + s80 + s81 + s82 + s83 + s84 + s85 + s86 + s87 + s88 : U32)
   total
 
 def main() -> IO(U32):
@@ -241,4 +258,4 @@ def main() -> IO(U32):
     x : Unit <- IO.print(U32.show(total))
     IO.pure(U32, total)
 
-#|88
+#|89

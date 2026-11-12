@@ -47,8 +47,13 @@ def req_score_head(head: HTTP.ReqHead, ok: Bool) -> U32:
 def req_blk() -> List<&2, U32>:
   HTTP2.x_block([HTTP.Hdr{":method", "POST"}, HTTP.Hdr{":scheme", "https"}, HTTP.Hdr{":path", "/echo"}])
 
+def req_t_go(got: HTTP.ReqHead & Bool & HTTP.Tab) -> U32:
+  match got:
+    case (+h, +ok, t):
+      req_score_head(h, ok)
+
 def req_t() -> U32:
-  req_score_head(HTTP2.x_req.rh(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())), HTTP2.x_req.ok(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
+  req_t_go(HTTP2.x_req.got(HTTP2.x_req.decode(req_blk(), HTTP2.x_tab.empty())))
 
 def resp_score_head(head: HTTP.Head, ok: Bool) -> U32:
   match head:
@@ -89,10 +94,10 @@ def settings_out(out: HTTP.UnitOut) -> U32:
       0
 
 def magic_t() -> U32:
-  HTTP.x_eq(List.take(&2, U32, HTTP2.client.on.preface_bytes(), 24n), HTTP2.x_preface())
+  HTTP.x_eq(List.take(&2, U32, HTTP2.client.preface.bytes(), 24n), HTTP2.x_preface())
 
 def settings_t() -> U32:
-  settings_out(HTTP2.x_parse(HTTP.x_drop32(24, HTTP2.client.on.preface_bytes())))
+  settings_out(HTTP2.x_parse(HTTP.x_drop32(24, HTTP2.client.preface.bytes())))
 
 # The facade carries its own copy of the initial SETTINGS, with ids 4 and
 # 5 only. The frame cap at offset 8 must match lib/http2.bend (16384), so
