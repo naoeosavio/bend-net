@@ -27,9 +27,12 @@
 # ride that one socket against a single-accept server. F) the single-request
 # entry (client.request) on an H1 CliSt: two calls on the same socket, in
 # order, threading the state — before Phase 3 it wrote H2 frames onto the
-# HTTP/1.1 socket.
-# Golden 14 = 1 (vectors) + 3 (reuse) + 1 (one-shot) + 1 (close) + 3
-# (plaintext reuse) + 3 (client-API batch) + 2 (client.request).
+# HTTP/1.1 socket. G) the module's own buffered fold (TASK-081
+# loop.server): HTTP1.server.once over the TCP templates, the same three
+# POSTs on the one connection, pinning lib/http1.bend without the facade.
+# Golden 17 = 1 (vectors) + 3 (reuse) + 1 (one-shot) + 1 (close) + 3
+# (plaintext reuse) + 3 (client-API batch) + 2 (client.request) + 3
+# (module fold).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -128,11 +131,25 @@ def vectors() -> U32:
 # Phase 2: the batch over one connection.
 # ---------------------------------------------------------------------
 
-def echo(req: HTTP.Request) -> IO(HTTP.Response):
+# The facade's handlers speak the facade's own types (its TASK-064 split
+# from the core), so this one carries HTTPX.Request/HTTPX.Response. The
+# scenario-G fold handler below speaks the module types instead: the two
+# type systems are distinct since the split, and a handler bound for one
+# lane does not typecheck against the other.
+def echo(req: HTTPX.Request) -> IO(HTTPX.Response):
+  match req:
+    case HTTPX.Request{method, path, headers, body}:
+      IO.pure(HTTPX.Response, HTTPX.Response{200, Nil{}, body})
+
+# The module's fold handler (scenario G): the same echo over the module's
+# core types.
+def echo_fold(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
     case HTTP.Request{method, path, headers, body}:
       IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
 
+# Scores a response of the module's core type (the ladders that read
+# through the module's client leaves).
 def score_echo(+want: String, r: Result<&1, &1, U32 & String, HTTP.Response>) ->
   U32:
   match r:
@@ -141,6 +158,19 @@ def score_echo(+want: String, r: Result<&1, &1, U32 & String, HTTP.Response>) ->
     case Done{+resp}:
       match resp:
         case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 200),
+            U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
+
+# Scores a response of the facade's split type (the ladders that read
+# through the facade's client entries).
+def score_echo_x(+want: String, r: Result<&1, &1, U32 & String, HTTPX.Response>) ->
+  U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+resp}:
+      match resp:
+        case HTTPX.Response{+status, +headers, +body}:
           b2u(Bool.and(U32.is_eq(status, 200),
             U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
@@ -211,10 +241,10 @@ def run_batch(b: Listener & U32) -> IO(U32):
 # closes after one request must still answer exactly 1.
 def once_client(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTP.Response> <-
+    r : Result<&1, &1, U32 & String, HTTPX.Response> <-
       HTTPX.client.once_insecure("127.0.0.1", port,
-        HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
-    IO.pure(U32, score_echo("hello", r))
+        HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello")})
+    IO.pure(U32, score_echo_x("hello", r))
 
 def once_side(l: Listener) -> IO(U32):
   do IO<U32>:
@@ -369,13 +399,13 @@ def run_plain(b: Listener & U32) -> IO(U32):
 # branch that used to close the socket with Fail 615. The server is
 # once_h1 (ONE accept), so 3 responses can only come out if all three
 # requests rode that one connection.
-def resp_body_is(+want: String, resp: HTTP.Response) -> U32:
+def resp_body_is(+want: String, resp: HTTPX.Response) -> U32:
   match resp:
-    case HTTP.Response{+status, +headers, +body}:
+    case HTTPX.Response{+status, +headers, +body}:
       b2u(Bool.and(U32.is_eq(status, 200),
         U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
 
-def batch_score_go(wants: List<String>, rs: List<&2, HTTP.Response>, +sum: U32) ->
+def batch_score_go(wants: List<String>, rs: List<&2, HTTPX.Response>, +sum: U32) ->
   U32:
   match wants:
     case Nil{}:
@@ -391,7 +421,7 @@ def batch_score_go(wants: List<String>, rs: List<&2, HTTP.Response>, +sum: U32) 
         case +r <> rt:
           batch_score_go(ws, rt, (sum + resp_body_is(w, r) : U32))
 
-def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HTTP.Response>>) ->
+def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HTTPX.Response>>) ->
   U32:
   match r:
     case Fail{e}:
@@ -399,14 +429,14 @@ def batch_score(wants: List<String>, r: Result<&1, &1, U32 & String, List<&2, HT
     case Done{+rs}:
       batch_score_go(wants, rs, 0)
 
-def batch_reqs() -> List<&2, HTTP.Request>:
-  [HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")},
-   HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")},
-   HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")}]
+def batch_reqs() -> List<&2, HTTPX.Request>:
+  [HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")},
+   HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")},
+   HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-2")}]
 
 def api_batch(+port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <-
+    r : Result<&1, &1, U32 & String, List<&2, HTTPX.Response>> <-
       HTTPX.client.on_insecure("127.0.0.1", port, batch_reqs())
     IO.pure(U32, batch_score(["hello-0", "hello-1", "hello-2"], r))
 
@@ -421,39 +451,56 @@ def run_api(b: Listener & U32) -> IO(U32):
 # must answer in request order and thread the state. The server is once_h1
 # (ONE accept), so a second dial would hang -- which is what makes 2 a proof
 # of reuse. Before Phase 3 this path wrote H2 frames onto the HTTP/1.1 socket.
-def keep_end(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +sum: U32) -> IO(U32):
+def keep_end(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +sum: U32) -> IO(U32):
   (s2, r2, st2) = got
-  +acc : U32 = (sum + score_echo("hello-1", r2) : U32)
+  +acc : U32 = (sum + score_echo_x("hello-1", r2) : U32)
   do IO<U32>:
     x : Unit <- TLS.tls_close(s2)
     IO.pure(U32, acc)
 
-def keep_step(got: Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt, +port: U32) -> IO(U32):
+def keep_step(got: Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt, +port: U32) -> IO(U32):
   (s1, r1, st1) = got
-  +a : U32 = score_echo("hello-0", r1)
+  +a : U32 = score_echo_x("hello-0", r1)
   do IO<U32>:
-    got2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(s1, st1, "127.0.0.1", port,
-      HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")})
+    got2 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(s1, st1, "127.0.0.1", port,
+      HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-1")})
     keep_end(got2, a)
 
-def keep_run(conn: Result<&1, &1, U32 & String, Socket & HTTP.CliSt>, +port: U32) -> IO(U32):
+def keep_run(conn: Result<&1, &1, U32 & String, Socket & HTTPX.CliSt>, +port: U32) -> IO(U32):
   match conn:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{value}:
       (sock, st) = value
       do IO<U32>:
-        got1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> & HTTP.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port,
-          HTTP.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")})
+        got1 : Socket & Result<&1, &1, U32 & String, HTTPX.Response> & HTTPX.CliSt <- HTTPX.client.request(sock, st, "127.0.0.1", port,
+          HTTPX.Request{"POST", "/echo", Nil{}, HTTP.x_str_bytes("hello-0")})
         keep_step(got1, port)
 
 def run_keep(b: Listener & U32) -> IO(U32):
   (l, +port) = b
   do IO<U32>:
     c : Chan(U32) <- IO.fork(U32, batch_side(l))
-    conn : Result<&1, &1, U32 & String, Socket & HTTP.CliSt> <-
+    conn : Result<&1, &1, U32 & String, Socket & HTTPX.CliSt> <-
       HTTPX.client.connect_insecure("127.0.0.1", port)
     keep_run(conn, port)
+
+# Scenario G (TASK-081): the module's own buffered fold, no facade in the
+# path. HTTP1.server.once accepts ONE connection over the TCP templates;
+# the three POSTs ride that one socket through the plain ladder, so 3 can
+# only come out if the fold answers each request and re-seeds the next
+# head on the same connection. This pins lib/http1.bend directly.
+def fold_side(l: Listener) -> IO(U32):
+  do IO<U32>:
+    x : Unit <- HTTP1.server.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~echo_fold, l)
+    IO.pure(U32, 0)
+
+def run_fold(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, fold_side(l))
+    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
+    plain_run(conn, port)
 
 law listen_retry:
   for port: U32
@@ -501,9 +548,11 @@ def main():
     +api : U32 <- run_api(b5)
     b6 : Listener & U32 <- listen_any(32n, 18517)
     +keep : U32 <- run_keep(b6)
-    +total : U32 = (pure + batch + once + close + plain + api + keep : U32)
+    b7 : Listener & U32 <- listen_any(32n, 18518)
+    +fold : U32 <- run_fold(b7)
+    +total : U32 = (pure + batch + once + close + plain + api + keep + fold : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|14
+#|17

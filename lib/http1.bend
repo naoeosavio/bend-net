@@ -1592,13 +1592,47 @@ def x_h1.stream.sent_close(~close: Socket -> IO(Unit), sent: Socket & Result<&1,
   (s, r) = sent
   close(s)
 
-def x_h1.stream.respond(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +resp: HTTP.Response) -> IO(Unit):
-  (s, r) = got
+# Renderability gate for a handler response (TASK-030). x_h1.show_resp and
+# x_h1.show_resp_head render the handler's headers through the same
+# x_h1.render_hs.go the client uses, verbatim, so a CR/LF/NUL in a name or
+# value would end the field early and ship the rest as response headers
+# nobody asked for — response splitting, and the classic way to get one is
+# a decoded query/path echoed into Location or Set-Cookie.
+#
+# The whole response is replaced by a bare 500 rather than dropping the
+# offending field: rendering it at all IS the injection, and silently
+# shipping a narrower response than the handler asked for hides the bug
+# that produced it. A 101 with bad headers falls into the same 500, so the
+# upgrade is refused instead of half-negotiated.
+#
+# TASK-081 moved the gate above the stream answer: every handler answer
+# rides it now. The stream RespondEarly path used to render verbatim, so
+# a pure handler shipped the split the buffered lane refused.
+def x_h1.srv.safe_resp.go(+status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>, bad: Bool) ->
+  HTTP.Response:
+  match bad:
+    case True{}:
+      HTTP.Response{500, Nil{}, Nil{}}
+    case False{}:
+      HTTP.Response{status, headers, body}
+
+def x_h1.srv.safe_resp(resp: HTTP.Response) -> HTTP.Response:
+  match resp:
+    case HTTP.Response{+status, +headers, +body}:
+      x_h1.srv.safe_resp.go(status, headers, body, x_h1.bad_hdrs(headers))
+
+# The rendered half of the stream answer, matched on the checked response:
+# a computed match is illegal, so the gate's answer rides a parameter.
+def x_h1.stream.respond.go(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s: Socket, +resp: HTTP.Response) -> IO(Unit):
   match resp:
     case HTTP.Response{+status, +headers, +body}:
       do IO<Unit>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(s, x_h1.show_resp(status, headers, body))
         x_h1.stream.sent_close(~close, sent)
+
+def x_h1.stream.respond(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +resp: HTTP.Response) -> IO(Unit):
+  (s, r) = got
+  x_h1.stream.respond.go(~send, ~close, s, x_h1.srv.safe_resp(resp))
 
 def x_h1.stream.closed(~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
   (s, r) = got
@@ -1807,31 +1841,6 @@ def x_h1.srv.needs_body(+m: String) -> Bool:
 def x_h1.srv.sock_of(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> Socket:
   (s, r) = got
   s
-
-# Renderability gate for a handler response (TASK-030). x_h1.show_resp and
-# x_h1.show_resp_head render the handler's headers through the same
-# x_h1.render_hs.go the client uses, verbatim, so a CR/LF/NUL in a name or
-# value would end the field early and ship the rest as response headers
-# nobody asked for — response splitting, and the classic way to get one is
-# a decoded query/path echoed into Location or Set-Cookie.
-#
-# The whole response is replaced by a bare 500 rather than dropping the
-# offending field: rendering it at all IS the injection, and silently
-# shipping a narrower response than the handler asked for hides the bug
-# that produced it. A 101 with bad headers falls into the same 500, so the
-# upgrade is refused instead of half-negotiated.
-def x_h1.srv.safe_resp.go(+status: U32, +headers: List<&2, HTTP.Hdr>, +body: List<&2, U32>, bad: Bool) ->
-  HTTP.Response:
-  match bad:
-    case True{}:
-      HTTP.Response{500, Nil{}, Nil{}}
-    case False{}:
-      HTTP.Response{status, headers, body}
-
-def x_h1.srv.safe_resp(resp: HTTP.Response) -> HTTP.Response:
-  match resp:
-    case HTTP.Response{+status, +headers, +body}:
-      x_h1.srv.safe_resp.go(status, headers, body, x_h1.bad_hdrs(headers))
 
 # The answer path never closes the socket: it hands it back to the head
 # machine in the very pair type the read phases use, so phase 3 is the
@@ -2139,14 +2148,378 @@ def h1_spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, Li
     x : Unit <- IO.spawn(Unit, h1_spawn.go(~recv, ~send, ~close, ~H, sock))
     return l
 
-def h1_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+# The four loops (TASK-081 Phase 1): the server lane rides one loop, two
+# forms. The stream form answers each event with the pure handler, one
+# request per connection. The buffered form collects the whole request,
+# calls the IO handler once and keeps the connection alive. The old
+# machines stay until Phase 5 removes what the folds replaced.
+# ---------------------------------------------------------------------
+
+# The two forms of the server loop, the names the H2 module already
+# owns. The act tables carry the form; the loop only reads it.
+def x_form.stream() -> U32:
+  1
+
+def x_form.buffered() -> U32:
+  0
+
+# The handler a form does not use. The stream form never calls the IO
+# one, and the buffered form never calls the event one.
+def server.no_event(ev: HTTP.SrvEv) -> HTTP.SrvOut:
+  HTTP.Continue{}
+
+def server.no_buffered(req: HTTP.Request) -> IO(HTTP.Response):
+  IO.pure(HTTP.Response, HTTP.Response{0, Nil{}, Nil{}})
+
+# The form branches of the deep loop arms. Bend refuses a match on a
+# parameter past the third arm, so every branch below matches `form` in
+# a def of its own and the arms only route on the answers.
+# ---------------------------------------------------------------------
+
+# The buffered fold's head routing: 0 read the body, 1 answer now (the
+# method carries no body), 2 refuse with 413 (a Content-Length past the
+# 16384 cap). A chunked body answers 0 whatever the length field says,
+# like the buffered lane it replaces.
+def server.fold.head_go(nbody: Bool, chunked: Bool, +cl: U32) -> U32:
+  match nbody:
+    case True{}:
+      1
+    case False{}:
+      match chunked:
+        case True{}:
+          0
+        case False{}:
+          Bool.pick(U32, U32.is_gt(cl, 16384), 2, 0)
+
+# The head answer of one form: the buffered fold routes on its own
+# table, the stream form asks the handler. The parse arm of the loop
+# cannot match `form` that deep, so the branch lives here.
+def server.fold.ans_of(~H: HTTP.SrvEv -> HTTP.SrvOut, +code: U32, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, nb: Bool, chunked: Bool, +cl: U32, +form: U32) -> U32 & HTTP.Response:
+  match form:
+    case 0:
+      (server.fold.head_go(nb, chunked, cl), HTTP.Response{0, Nil{}, Nil{}})
+    case _:
+      x_h1.stream.head_ans(~H, code, m, p, hs, nb)
+
+# The next phase after one body chunk: the buffered fold takes it back,
+# the stream form routes the data event.
+def server.fold.got_phase(+form: U32) -> U32:
+  match form:
+    case 0:
+      11
+    case _:
+      7
+
+# The buffered fold's chunk routing: 0 keep reading (the length field is
+# not the end of a chunked body, the terminator is), 1 the length-
+# delimited body is whole, 2 the decoded body passed the 16384 cap.
+def server.fold.got_route(over: Bool, chunked: Bool, fin: Bool) -> U32:
+  match over:
+    case True{}:
+      2
+    case False{}:
+      match chunked:
+        case True{}:
+          0
+        case False{}:
+          match fin:
+            case True{}:
+              1
+            case False{}:
+              0
+
+# The answer of one body chunk: the buffered fold routes on its own
+# table, the stream form asks the handler about the event.
+def server.fold.got_ans(~H: HTTP.SrvEv -> HTTP.SrvOut, +chunk: List<&2, U32>, +fin: Bool, chunked: Bool, over: Bool, +form: U32) -> U32 & HTTP.Response:
+  match form:
+    case 0:
+      (server.fold.got_route(over, chunked, fin), HTTP.Response{0, Nil{}, Nil{}})
+    case _:
+      x_h1.stream.data_act(H(HTTP.SrvReqData{1, chunk, fin}), fin)
+
+# The body accumulator of one form: the buffered fold pushes the chunk,
+# the stream form holds nothing.
+def server.fold.got_rev(+chunk: List<&2, U32>, rev: List<&2, U32>, +form: U32) -> List<&2, U32>:
+  match form:
+    case 0:
+      HTTP.x_rev_push(chunk, rev)
+    case _:
+      rev
+
+# The buffered fold's end-of-body: a close mid-body. The buffered form
+# answers 400 "eof" like the machine it replaces; the stream form closes
+# silently. The branch rides a helper because the loop arm sits too deep
+# for a match on `form`.
+def server.fold.eof(~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +form: U32) -> IO(Unit):
+  match form:
+    case 0:
+      x_h1.srv.told(~send, ~close, x_h1.srv.sock_of(got), (400, "eof"))
+    case _:
+      x_h1.stream.closed(~close, got)
+
+# The buffered fold's answer: the request from the threaded head pieces
+# plus the folded body, through the answer ladder the buffered lane owns
+# (the 500 guard, the keep-alive seed, the close).
+def server.fold.answer(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~B: HTTP.Request -> IO(HTTP.Response), got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>, rev: List<&2, U32>, +rest: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>):
+  x_h1.srv.answer(~recv, ~send, ~close, ~B, got, HTTP.Request{m, p, hs, HTTP.x_cat(rev)}, Bool.not(x_h1.conn_close(hs)), rest)
+
+# The server loop, phase by phase: 0/1/2 read the head (16 KB a turn,
+# 64 turns, answer 431 past either cap); 3 parses, validates and frames
+# the head (400 before any body byte) and threads the request pieces; 4
+# refuses a bad head; 5 routes the head answer; 6 takes the framing
+# answer back; 7 routes the data answer of the stream form; 8 re-seeds
+# the keep-alive; 9/10 read more body; 11 takes the buffered body answer
+# back (the chunk route rides `ans`); 12 routes the read the framing
+# asked for; 13 routes the chunked terminator. The stream form closes
+# after one request, its H1 contract. The buffered form answers and
+# reads the next head.
+#
+# The head accumulator keeps `List.append` under the 16384 cap of
+# x_h1.head_max, the margin the probes measured (the raw append dies
+# between 24577 and 32768 cells). Raise the cap and the append grows past
+# that stack limit; swap the accumulator for x_rev_push first, the way
+# the body reader already did.
+#
+# A malformed chunked body is 400 once, then the connection closes. The
+# buffered machine it replaces answered 400 twice: the respond ran, then
+# the stop carried (400, "bad chunked") into the told path, and the told
+# rendered a second status line nobody asked for.
+@unsafe
+def loop.server(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), phase: U32, +form: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool, +nbody: Bool, +chunked: Bool, +cl: U32, +pending: List<&2, U32>, +seen: U32, +cst: HTTP.ChunkSt, ans: U32 & HTTP.Response, out: HTTP.ChunkSt & HTTP.UnitOut, head: Result<&1, &1, U32 & String, HTTP.H1Head> & List<&2, U32>, rev: List<&2, U32>, +m: String, +p: String, +hs: List<&2, HTTP.Hdr>) -> IO(Unit):
+  match phase:
+    case 0:
+      (s0, r0) = got
+      match fuel:
+        case 0n:
+          x_h1.stream.told(~send, ~close, got, x_h1.head_cap())
+        case 1n+f:
+          do IO<Unit>:
+            r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s0, 16384)
+            loop.server(~recv, ~send, ~close, ~H, ~B, 1, form, r, acc, f, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head, rev, m, p, hs)
+    case 1:
+      (s1, r1) = got
+      match r1:
+        case Fail{e}:
+          close(s1)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              close(s1)
+            case h <> t:
+              +acc2 = List.append(&2, U32, acc, part)
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              loop.server(~recv, ~send, ~close, ~H, ~B, x_h1.head_phase(over), form, (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2), nbody, chunked, cl, pending, seen, cst, ans, out, head, rev, m, p, hs)
+    case 2:
+      match found:
+        case True{}:
+          loop.server(~recv, ~send, ~close, ~H, ~B, 3, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, x_h1.stream.parsed(acc), rev, m, p, hs)
+        case False{}:
+          loop.server(~recv, ~send, ~close, ~H, ~B, 0, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, ans, out, head, rev, m, p, hs)
+    case 3:
+      match head:
+        case (h3, p3):
+          match h3:
+            case Fail{e}:
+              x_h1.stream.stop_told(~send, ~close, got, e)
+            case Done{+rh}:
+              match rh:
+                case HTTP.H1Head{head2, is_11}:
+                  match head2:
+                    case HTTP.ReqHead{+m, +p, +hs}:
+                      +code = x_h1.srv.head_err(hs, is_11)
+                      +nb = Bool.or(String.eq(m, "GET"), String.eq(m, "HEAD"))
+                      +ch2 = x_h1.is_chunked(hs)
+                      +cl2 = x_h1.cl_of(hs)
+                      loop.server(~recv, ~send, ~close, ~H, ~B, x_h1.stream.err_phase(code), form, got, Nil{}, fuel, False{}, nb, ch2, cl2, p3, 0, x_h1.chunk_init(), server.fold.ans_of(~H, code, m, p, hs, nb, ch2, cl2, form), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, m, p, hs)
+    case 4:
+      match ans:
+        case (a4, resp4):
+          x_h1.stream.told(~send, ~close, got, a4)
+    case 5:
+      match form:
+        case 0:
+          match ans:
+            case (a5, resp5):
+              match a5:
+                case 0:
+                  loop.server(~recv, ~send, ~close, ~H, ~B, 6, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head, rev, m, p, hs)
+                case 1:
+                  do IO<Unit>:
+                    out5 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- server.fold.answer(~recv, ~send, ~close, ~B, got, m, p, hs, rev, pending)
+                    loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out5, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, m, p, hs)
+                case _:
+                  do IO<Unit>:
+                    out5b : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, x_h1.srv.sock_of(got), HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+                    loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out5b, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, Nil{}, m, p, hs)
+        case _:
+          match ans:
+            case (a5, resp5):
+              match a5:
+                case 0:
+                  loop.server(~recv, ~send, ~close, ~H, ~B, 6, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head, rev, m, p, hs)
+                case 1:
+                  x_h1.stream.respond(~send, ~close, got, resp5)
+                case _:
+                  x_h1.stream.closed(~close, got)
+    case 6:
+      match out:
+        case (st2, o):
+          match o:
+            case HTTP.Got{+chunk, +fin, +rest}:
+              +seen2 = (seen + HTTP.x_len32(chunk) : U32)
+              loop.server(~recv, ~send, ~close, ~H, ~B, server.fold.got_phase(form), form, got, acc, fuel, False{}, nbody, chunked, cl, rest, seen2, st2, server.fold.got_ans(~H, chunk, fin, chunked, U32.is_gt(seen2, 16384), form), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, server.fold.got_rev(chunk, rev, form), m, p, hs)
+            case HTTP.NeedMore{missing, +rest}:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 12, form, got, acc, fuel, False{}, nbody, chunked, cl, rest, seen, st2, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+            case HTTP.End{+rest}:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 13, form, got, acc, fuel, False{}, nbody, chunked, cl, rest, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+            case HTTP.Bad{code, msg}:
+              x_h1.stream.bad(~send, ~close, got)
+    case 7:
+      match ans:
+        case (a7, resp7):
+          match a7:
+            case 0:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 6, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head, rev, m, p, hs)
+            case 1:
+              x_h1.stream.respond(~send, ~close, got, resp7)
+            case _:
+              x_h1.stream.closed(~close, got)
+    case 8:
+      (s8, r8) = got
+      match r8:
+        case Fail{e}:
+          x_h1.srv.told(~send, ~close, s8, e)
+        case Done{+seed}:
+          match seed:
+            case Nil{}:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 0, form, (s8, Done{Nil{}}), Nil{}, 64n, False{}, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, "", "", Nil{})
+            case h <> t:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 1, form, (s8, Done{seed}), Nil{}, 64n, False{}, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, "", "", Nil{})
+    case 9:
+      (s9, r9) = got
+      do IO<Unit>:
+        r : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- recv(s9, 16384)
+        loop.server(~recv, ~send, ~close, ~H, ~B, 10, form, r, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+    case 10:
+      (s10, r10) = got
+      match r10:
+        case Fail{e}:
+          close(s10)
+        case Done{+part}:
+          match part:
+            case Nil{}:
+              server.fold.eof(~send, ~close, got, form)
+            case h <> t:
+              +pend2 = List.append(&2, U32, pending, part)
+              loop.server(~recv, ~send, ~close, ~H, ~B, 6, form, (s10, Done{Nil{}}), acc, fuel, False{}, nbody, chunked, cl, pend2, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pend2, cl, seen), head, rev, m, p, hs)
+    case 11:
+      match ans:
+        case (a11, resp11):
+          match a11:
+            case 2:
+              do IO<Unit>:
+                out11 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, x_h1.srv.sock_of(got), HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+                loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out11, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, Nil{}, m, p, hs)
+            case 1:
+              do IO<Unit>:
+                out11b : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- server.fold.answer(~recv, ~send, ~close, ~B, got, m, p, hs, rev, pending)
+                loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out11b, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, m, p, hs)
+            case _:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 6, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), x_h1.stream.next(chunked, cst, pending, cl, seen), head, rev, m, p, hs)
+    case 12:
+      match form:
+        case 0:
+          match fuel:
+            case 0n:
+              do IO<Unit>:
+                out12 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- x_h1.srv.respond(~recv, ~send, ~close, x_h1.srv.sock_of(got), HTTP.Response{413, Nil{}, Nil{}}, False{}, Nil{})
+                loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out12, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, Nil{}, m, p, hs)
+            case 1n+f:
+              loop.server(~recv, ~send, ~close, ~H, ~B, 9, form, got, acc, f, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+        case _:
+          loop.server(~recv, ~send, ~close, ~H, ~B, 9, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+    case 13:
+      match form:
+        case 0:
+          do IO<Unit>:
+            out13 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- server.fold.answer(~recv, ~send, ~close, ~B, got, m, p, hs, rev, pending)
+            loop.server(~recv, ~send, ~close, ~H, ~B, 8, form, out13, Nil{}, 0n, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, m, p, hs)
+        case _:
+          loop.server(~recv, ~send, ~close, ~H, ~B, 7, form, got, acc, fuel, False{}, nbody, chunked, cl, pending, seen, cst, x_h1.stream.data_act(H(HTTP.SrvReqData{1, Nil{}, True{}}), True{}), (x_h1.chunk_init(), HTTP.End{Nil{}}), head, rev, m, p, hs)
+    case _:
+      x_h1.stream.closed(~close, got)
+
+# Per-connection entries over the loop, both forms.
+def server.start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), form: U32, sock: Socket) -> IO(Unit):
+  loop.server(~recv, ~send, ~close, ~H, ~B, 0, form, (sock, Done{Nil{}}), Nil{}, 64n, False{}, False{}, False{}, 0, Nil{}, 0, x_h1.chunk_init(), x_h1.stream.no_ans(), (x_h1.chunk_init(), HTTP.End{Nil{}}), x_h1.stream.no_head(), Nil{}, "", "", Nil{})
+
+def server.spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), form: U32, sock: Socket, l: Listener) ->
+  IO(Listener):
+  do IO<Listener>:
+    x : Unit <- IO.spawn(Unit, server.start(~recv, ~send, ~close, ~H, ~B, form, sock))
+    return l
+
+def server.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, ~B: HTTP.Request -> IO(HTTP.Response), form: U32, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
     case Fail{e}:
       IO.pure(Listener, l)
     case Done{sock}:
-      h1_spawn(~recv, ~send, ~close, ~H, sock, l)
+      server.spawn(~recv, ~send, ~close, ~H, ~B, form, sock, l)
+
+# The stream form: the pure handler answers each event.
+def server.stream.on.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.SrvEv -> HTTP.SrvOut, m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  server.conn(~recv, ~send, ~close, ~H, ~server.no_buffered, x_form.stream(), m)
+
+# The buffered form: the loop collects the whole request and the IO
+# handler answers it once.
+def server.buffered.on.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~B: HTTP.Request -> IO(HTTP.Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  server.conn(~recv, ~send, ~close, ~server.no_event, ~B, x_form.buffered(), m)
+
+# The accept entries: the accept is a template like the transport triple,
+# so the module still names no transport. Plain TCP passes ~TCP.accept;
+# a TLS lane passes a wrapper for tls_accept_http1. `once` counts
+# connections, not requests.
+def server.stream.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
+    l2 : Listener <- server.stream.on.conn(~recv, ~send, ~close, ~H, m)
+    return Unit{}
+
+# The accept loop never shrinks the listener, so the checker cannot prove
+# it ends. @unsafe marks only that loop, like every accept loop the
+# facade owns today.
+@unsafe
+def server.stream.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
+    l2 : Listener <- server.stream.on.conn(~recv, ~send, ~close, ~H, m)
+    z : Unit <- server.stream.on(~recv, ~send, ~close, ~accept, ~H, l2)
+    return z
+
+def server.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
+    l2 : Listener <- server.buffered.on.conn(~recv, ~send, ~close, ~B, m)
+    return Unit{}
+
+@unsafe
+def server.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
+    l2 : Listener <- server.buffered.on.conn(~recv, ~send, ~close, ~B, m)
+    z : Unit <- server.on(~recv, ~send, ~close, ~accept, ~B, l2)
+    return z
+
+# The public buffered entry, kept on the fold (TASK-081 Phase 1): same
+# signature, same bytes, one line. lib/wsm.bend calls this name.
+def h1_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  server.buffered.on.conn(~recv, ~send, ~close, ~H, m)
 
 # H1 upgrade lane (101): the answer path that lends the socket out. Unlike
 # x_h1.srv.answer (which hands the socket BACK to the head machine's phase
