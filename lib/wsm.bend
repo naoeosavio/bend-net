@@ -2119,7 +2119,8 @@ def serve_once_plain(sock: Socket) -> IO(Unit):
 
 # Cleartext echo accept loop (TASK-036 Phase 1): one serve_once_plain per
 # accepted socket, no handler to write. Reuse: the body already exists
-# above; Fail keeps the listener alive like HTTP1.h1_conn, never dies.
+# above; Fail keeps the listener alive like the module's buffered accept
+# event, never dies.
 def ws_conn(m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Listener):
   (l, r) = m
   match r:
