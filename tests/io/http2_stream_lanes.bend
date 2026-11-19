@@ -12,7 +12,6 @@
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http2.bend as HTTP2
 import ../../lib/http.bend as HTTP
 
@@ -115,7 +114,7 @@ law server_side:
 
 def server_side(l):
   do IO<Unit>:
-    x : Unit <- HTTPX.server.concurrent(~echo, l, CERT(), KEY())
+    x : Unit <- HTTP2.server.concurrent(~echo, l, CERT(), KEY())
     IO.pure(Unit, Unit{})
 
 law listen_retry:
