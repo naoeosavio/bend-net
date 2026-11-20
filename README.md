@@ -649,12 +649,12 @@ a bug (TASK-042, phase 7):
 ## WebSocket (WSM)
 
 `lib/wsm.bend` (import as `WSM`) is **one** RFC 6455 implementation for
-both schemes. The handshake rides the H1 upgrade lane (`h1_open` on the
-client, `on_h1_open` on the server, both entries of `lib/httpx.bend`; the
-`101` detaches the socket). The frames ride `lib/tls.bend` /
-`lib/tcp.bend` directly once the socket is handed over. The module imports
-the facade for the upgrade entries, `./http1.bend` for the handshake text
-helpers and `./http.bend` for the types and the byte leaves. The codec
+both schemes. The handshake rides the H1 upgrade lane of
+`lib/http1.bend`: the module's own dials and accept loops drive the
+lane, and the `101` detaches the socket. The frames ride `lib/tls.bend`
+/ `lib/tcp.bend` directly once the socket is handed over. The module
+imports `./http1.bend` for the upgrade lane and the handshake text
+helpers, and `./http.bend` for the types and the byte leaves. The codec
 (frames, mask, close, ping/pong, fragments, UTF-8) lives in the module.
 
 **Lanes are picked by name.** TLS keeps the short name, cleartext gets

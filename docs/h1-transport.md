@@ -2,10 +2,12 @@
 
 `lib/http1.bend` speaks HTTP/1.1 over **two transports**: TLS sockets
 (`wss://`, `https://`) and plain TCP (`ws://`, `http://`). One grammar
-serves both transports. The grammar lives in `x_h1.*` inside that module;
-the facade (`lib/httpx.bend`) owns every dial and every accept and
-instantiates the triple there. The transport arrives as three template
-parameters. Every def that touches the wire receives these parameters:
+serves both transports. The grammar lives in `x_h1.*` inside that module.
+The named entries of that module own their transports (TASK-081 Phase 3):
+the client dials and the server accepts. The facade (`lib/httpx.bend`)
+keeps its own legacy copies and instantiates its own triple. The
+transport arrives as three template parameters. Every def that touches
+the wire receives these parameters:
 
 | Template | Type | TLS instance | TCP instance |
 |---|---|---|---|
@@ -13,21 +15,22 @@ parameters. Every def that touches the wire receives these parameters:
 | `~send` | `Socket -> List<&2,U32> -> IO(Socket & Result<&1,&1,U32 & String, Unit>)` | `TLS.tls_send_bytes` | `TCP.send_bytes` |
 | `~close` | `Socket -> IO(Unit)` | `TLS.tls_close` | `Socket.close` |
 
-A caller instantiates the triple one time, at the edge, in the facade. All
-defs below the edge only forward the triple:
+A caller instantiates the triple one time, at the edge. In the module the
+edge is the named entry (TASK-081); in the facade it is the facade's own
+copy. All defs below the edge only forward the triple:
 
 | Facade call site | Triple | Grammar |
 |---|---|---|
 | `h1_once.conn` (`h1_once`, `h1_once_insecure`) | TLS | `x_h1.exch` |
 | `h1_once.conn` (`fetch.plain`, `fetch_bytes.plain`, `request_plain`, after `TCP.connect`) | TCP | `x_h1.exch` |
 | `h1_open.conn` (`h1_open`, `h1_open_insecure`) | TLS | `x_h1.cli.exch.open` |
-| `HTTP1.x_h1.cli.exch` (`client.on.h1_keep`, the H1 leg of `client.request`) | TLS | `x_h1.cli.exch` |
-| `HTTP1.x_h1.cli.stream.exch` (through `x_h1.cli.stream.tls`, stream download) | TLS | `x_h1.cli.stream.*` |
-| `HTTP1.x_h1.cli.stream.exch` (`client.stream_plain`, after `plain.dial`) | TCP | `x_h1.cli.stream.*` |
-| `HTTP1.h1_spawn` / `HTTP1.x_h1.stream.spawn` (H1 keep-alive and stream upload behind TLS) | TLS | `x_h1.srv.*` / `x_h1.stream.*` |
-| `HTTP1.h1_conn` / `HTTP1.h1_open_conn` (`server.on_h1`, `server.once_h1`, `server.on_h1_open*`) | TLS | `x_h1.srv.*` |
-| `HTTP1.h1_conn` / `HTTP1.h1_open_conn` (`server.on_h1_plain`, `server.on_h1_open_plain`) | TCP | `x_h1.srv.*` |
-| `HTTP1.x_h1.stream.conn` (`server.stream_plain`, after `TCP.accept`) | TCP | `x_h1.stream.*` |
+| `x_h1.cli.exch` (`client.on.h1_keep`, the H1 leg of `client.request`) | TLS | `x_h1.cli.exch` |
+| `x_h1.cli.stream.exch` (through `x_h1.cli.stream.tls`, stream download) | TLS | `x_h1.cli.stream.*` |
+| `x_h1.cli.stream.exch` (`client.stream_plain`, after `plain.dial`) | TCP | `x_h1.cli.stream.*` |
+| `h1_spawn` / `x_h1.stream.spawn` (H1 keep-alive and stream upload behind TLS) | TLS | `x_h1.srv.*` / `x_h1.stream.*` |
+| `h1_conn` / `h1_open_conn` (`server.on_h1`, `server.once_h1`, `server.on_h1_open*`) | TLS | `x_h1.srv.*` |
+| `h1_conn` / `h1_open_conn` (`server.on_h1_plain`, `server.on_h1_open_plain`) | TCP | `x_h1.srv.*` |
+| `x_h1.stream.conn` (`server.stream_plain`, after `TCP.accept`) | TCP | `x_h1.stream.*` |
 
 ## Why not two copies (one per transport)?
 
@@ -120,11 +123,12 @@ migration record: what was deleted, what was threaded, and the golden gate
 ## Who consumes the upgrade lane
 
 `lib/wsm.bend` (the one WebSocket implementation, `ws://` + `wss://`) is
-the only caller of the upgrade lane. The client side goes through
-`h1_open[_insecure]` (TLS) and `x_h1.cli.exch.open` + `TCP.connect`
-(cleartext). The server side goes through `on_h1_open` /
-`on_h1_open_plain`; their `~K` runs the frame loop on the socket that the
-lane handed over. The documentation of the WSM surface is in `README.md`
-(`## WebSocket (WSM)`) and in the task file (Phase 6). This surface holds
-the `_plain` / TLS name map, the compat instances and the `HTTP.Hdr` /
+the only caller of the upgrade lane, and it rides `lib/http1.bend`
+directly (TASK-081 Phase 2). The client side dials itself and calls
+`x_h1.cli.exch.open`. The server side runs its own accept loops over
+`x_h1.srv.head_open` and `h1_open_conn`; their `~K` runs the frame loop
+on the socket that the lane handed over. The documentation of the WSM
+surface is in `README.md` (`## WebSocket (WSM)`) and in
+`tasks/task-081-h1-quatro-loops.md` (Phase 2). This surface holds the
+`_plain` / TLS name map, the compat instances and the `HTTP.Hdr` /
 `HTTP.Request` shapes it takes from the core.

@@ -1,8 +1,10 @@
 # HTTP1: the HTTP/1.1 module. It owns the wire: the request render, the
-# head and body parsers, the reason-phrase table, the chunked codec, the
-# keep-alive connection machine, the streaming upload and download lanes,
-# the 101 upgrade machine and the per-connection runners the accept loops
-# spawn.
+# head and body parsers, the reason-phrase table and the chunked codec.
+# Four loops carry the lanes (TASK-081). loop.server serves the two
+# server forms: stream events and buffered keep-alive. loop.client reads
+# the two client forms: the collect flag picks the fold or the events.
+# The 101 lanes ride the loops. On the server side, loop.pre.open feeds
+# server.open. On the client side, the client.open.exch ladder answers.
 #
 # It owns its transports on the named entries (TASK-081 Phase 3, user
 # decision). The client dials: client.connect is the TCP dial,
