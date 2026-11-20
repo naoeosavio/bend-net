@@ -28,7 +28,7 @@
 # field is a valid header and the peer answers the request normally, so
 # only the Fail itself separates the two worlds.
 #
-# Phase 3 — the server direction. x_h1.srv.safe_resp replaces a whole
+# Phase 3 — the server direction. server.safe_resp replaces a whole
 # response whose handler headers cannot be rendered with a bare 500 (two
 # pure vectors: the bad one collapses, the clean one is untouched), and the
 # wire vector asks a handler for exactly that bad response: the client must
@@ -126,12 +126,12 @@ def resp_kept(resp: HTTP.Response) -> U32:
         U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes("keep")), 1)))
 
 def v_resp_bad() -> U32:
-  resp_is_500(HTTP1.x_h1.srv.safe_resp(
+  resp_is_500(HTTP1.server.safe_resp(
     HTTP.Response{200, [hdr("x-echo", "a\r\nInjected: 1")],
       HTTP.x_str_bytes("leak")}))
 
 def v_resp_ok() -> U32:
-  resp_kept(HTTP1.x_h1.srv.safe_resp(
+  resp_kept(HTTP1.server.safe_resp(
     HTTP.Response{200, [hdr("x-ok", "1")], HTTP.x_str_bytes("keep")}))
 
 def vectors() -> U32:

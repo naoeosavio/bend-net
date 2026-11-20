@@ -8,9 +8,11 @@
 # import ../../lib/wsm.bend as WSM (from tests/io and examples/).
 #
 # One module, one surface, two lanes, built on the HTTP library. The
-# handshake rides the H1 upgrade lane: h1_open for TLS, TCP.connect +
-# x_h1.cli.exch.open for cleartext, on_h1_open(+_plain) for the server;
-# frames ride tls.bend / tcp.bend directly once ~K owns the socket.
+# handshake rides the H1 upgrade lane of the module: the wsm dials
+# itself (TLS.tls_connect_noalpn[_insecure] or TCPB.connect) and calls
+# client.open.exch; the accept loops drive server.open.conn and
+# server.open.start; frames ride tls.bend / tcp.bend directly once ~K
+# owns the socket.
 # The codec (frames, mask, close, ping/pong, fragments) and the handshake
 # live in this file, ported def by def and adapted to HTTP.Hdr; the H1
 # text leaves (x_h1.split, x_h1.parse_hs, x_h1.render_req.go) come from
@@ -2113,10 +2115,10 @@ def wsm_serve_once_k_plain(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   wsm_echo_one(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, rest)
 
 def serve_once(sock: Socket) -> IO(Unit):
-  HTTP1.x_h1.srv.head_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, ~wsm_serve_once_k, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+  HTTP1.server.open.start(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, ~wsm_serve_once_k, sock)
 
 def serve_once_plain(sock: Socket) -> IO(Unit):
-  HTTP1.x_h1.srv.head_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, ~wsm_serve_once_k_plain, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+  HTTP1.server.open.start(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, ~wsm_serve_once_k_plain, sock)
 
 # Cleartext echo accept loop (TASK-036 Phase 1): one serve_once_plain per
 # accepted socket, no handler to write. Reuse: the body already exists
@@ -2140,7 +2142,7 @@ def ws_serve(l: Listener) -> IO(Unit):
     ws_serve(l2)
 
 # Session servers: the accept loop belongs to the wsm now, over the
-# module's open lane (HTTP1.h1_open_conn, the four-loop 101 lane of
+# module's open lane (HTTP1.server.open.conn, the 101 lane of
 # TASK-081) with the transport as templates — the facade and its type
 # boundary stay out of this file. The ~K lambdas close over the
 # caller's ~H (curried single binders — the dialect's lambda shape) and
@@ -2167,28 +2169,28 @@ def wsm_rewrap(~close: Socket -> IO(Unit), out: Socket & Result<&1, &1, U32 & St
 def server_on(~H: WSEv -> IO(WSOut), l: Listener, +cert: String, +key: String) -> IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept_http1(l, cert, key)
-    l2 : Listener <- HTTP1.h1_open_conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), accepted)
+    l2 : Listener <- HTTP1.server.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~wsm_srv_h, sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), accepted)
     server_on(~H, l2, cert, key)
 
 @unsafe
 def server_on_sub(~H: WSEv -> IO(WSOut), ~wanted: List<&2, String>, l: Listener, +cert: String, +key: String) -> IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <- TLS.tls_accept_http1(l, cert, key)
-    l2 : Listener <- HTTP1.h1_open_conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), accepted)
+    l2 : Listener <- HTTP1.server.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, False{}, sock, rest), accepted)
     server_on_sub(~H, ~wanted, l2, cert, key)
 
 @unsafe
 def server_on_plain(~H: WSEv -> IO(WSOut), l: Listener) -> IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    l2 : Listener <- HTTP1.h1_open_conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), accepted)
+    l2 : Listener <- HTTP1.server.open.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~wsm_srv_h, sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), accepted)
     server_on_plain(~H, l2)
 
 @unsafe
 def server_on_sub_plain(~H: WSEv -> IO(WSOut), ~wanted: List<&2, String>, l: Listener) -> IO(Unit):
   do IO<Unit>:
     accepted : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    l2 : Listener <- HTTP1.h1_open_conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), accepted)
+    l2 : Listener <- HTTP1.server.open.conn(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~req => wsm_srv_h_sub(req, wanted), sock => rest => wsm_session_open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, False{}, sock, rest), accepted)
     server_on_sub_plain(~H, ~wanted, l2)
 
 # Session clients: dial, upgrade over the H1 lane, validate 101 + Accept,
@@ -2250,7 +2252,7 @@ def wsm_client_tls_sock(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, port
   match rr:
     case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~TLS.tls_close, out)
         wsm_client_validated(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, rw, key)
 
@@ -2279,7 +2281,7 @@ def wsm_client_tls_sock_sub(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, 
   match rr:
     case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~TLS.tls_close, out)
         wsm_client_validated_sub(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, rw, key, offered)
 
@@ -2308,7 +2310,7 @@ def wsm_client_plain_sock(~H: WSEv -> IO(WSOut), sock: Socket, +host: String, po
   match req:
     case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~Socket.close, out)
         wsm_client_validated(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, rw, key)
 
@@ -2331,7 +2333,7 @@ def wsm_client_plain_sock_sub(~H: WSEv -> IO(WSOut), sock: Socket, +host: String
   match req:
     case HTTP.Request{method, path, headers, body}:
       do IO<Unit>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~Socket.close, out)
         wsm_client_validated_sub(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, ~H, rw, key, offered)
 
@@ -2510,7 +2512,7 @@ def wsm_client_echo_tls_sock(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, 
   match rr:
     case HTTP.Request{method, path, headers, body}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~recv, ~send, ~close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~recv, ~send, ~close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~close, out)
         wsm_client_echo_opened(~recv, ~send, ~close, rw, key, framed, want)
 
@@ -2551,7 +2553,7 @@ def wsm_client_echo_plain_sock(sock: Socket, +host: String, port: U32, rr: HTTP.
   match rr:
     case HTTP.Request{method, path, headers, body}:
       do IO<Result<&1, &1, U32 & String, String>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, sock, host, port, method, path, headers, body)
         rw : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- wsm_rewrap(~Socket.close, out)
         wsm_client_echo_opened(~TCPB.recv_bytes, ~TCPB.send_bytes, ~Socket.close, rw, key, framed, want)
 

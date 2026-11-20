@@ -13,7 +13,7 @@
 # write/parse + short NeedMore + oversize Bad 413 (RFC 9113 section
 # 4.1), HPACK req/resp round trips (RFC 7541 section 5.1), the H1 cut,
 # request parse + version gate + the request-head rules of RFC 9112
-# sections 3.2/6.3 (x_h1.srv.head_err: TE+CL, TE not chunked, duplicated
+# sections 3.2/6.3 (server.head_err: TE+CL, TE not chunked, duplicated
 # and invalid Content-Length, Host required on 1.1 / duplicated / empty),
 # render CRLF refusal (RFC 9112 section 3.2), framing pieces, the RFC
 # 9112 section 7.1 chunked body, the 200 first line and the URL gates.
@@ -227,7 +227,7 @@ def head_11.go(r: Result<&1, &1, U32 & String, HTTP.H1Head>,
           bool_is(is_11, want)
 
 def head_err.go(heads: List<&2, HTTP.Hdr>, is_11: Bool, want: U32) -> U32:
-  u32_is(HTTP1.x_h1.srv.head_err(heads, is_11), want)
+  u32_is(HTTP1.server.head_err(heads, is_11), want)
 
 def host_headers() -> List<&2, HTTP.Hdr>:
   [HTTP.Hdr{"Host", "a"}]

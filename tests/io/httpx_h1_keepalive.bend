@@ -297,7 +297,7 @@ def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
         (s, Fail{e}))
     case Done{u}:
       do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response>>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{}, False{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{}, False{})
         IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, HTTP1.x_h1.cli.rest_drop(out))
 
 def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans: U32) ->
