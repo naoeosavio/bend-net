@@ -41,7 +41,6 @@
 # Golden 12.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/tls.bend as TLS
 import ../../lib/http1.bend as HTTP1
 import ../../lib/http.bend as HTTP
 
@@ -220,16 +219,13 @@ def raw_side(~after: Socket -> IO(Unit), l: Listener, +bytes: String) -> IO(Unit
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
     raw_side.m(~after, m, bytes)
 
-# Server sides. The plain ones ride the TCP accept; the TLS one rides
-# the module's own lane over the test cert.
+# Server sides. The plain one rides the TCP accept; the TLS one rides
+# the module's own _secure entry over the test cert.
 def side_fold(l: Listener) -> IO(Unit):
-  HTTP1.server.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~echo, l)
-
-def tls_acc(l: Listener) -> IO(Listener & Result<&1, &1, U32 & String, Socket>):
-  TLS.tls_accept_http1(l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+  HTTP1.server.once(~echo, l)
 
 def side_fold_tls(l: Listener) -> IO(Unit):
-  HTTP1.server.once(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~tls_acc, ~echo, l)
+  HTTP1.server.once_secure(~echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
 def side_chunked(l: Listener) -> IO(Unit):
   raw_side(~after_drain, l, resp_chunked())

@@ -4,15 +4,17 @@
 # the 101 upgrade machine and the per-connection runners the accept loops
 # spawn.
 #
-# It does not accept and names no transport on the server lanes: the
-# accept rides the ~accept template and the runner takes the byte
-# triple. The client lanes dial (TASK-081 Phase 3, user decision).
-# client.connect is the TCP dial, client.connect_secure the verified-TLS
-# dial and client.connect_insecure the no-verify-TLS dial. Every client
-# entry owns a _secure and an _insecure twin. The .conn
-# arms keep the three templates plus the dialed socket, so a caller
-# that dials itself drives the same core. The core (./http.bend) owns
-# the types and the shared leaves.
+# It owns its transports on the named entries (TASK-081 Phase 3, user
+# decision). The client dials: client.connect is the TCP dial,
+# client.connect_secure the verified-TLS dial and
+# client.connect_insecure the no-verify-TLS dial. The server accepts:
+# server.accept is the TCP accept and server.accept_secure the TLS
+# accept with the certificate and key it serves. Every entry owns a
+# _secure twin, and the client owns the _insecure twins; the server
+# has none, because it serves a certificate and verifies no chain.
+# The .conn arms keep the three templates plus the dialed or accepted
+# socket, so a caller that owns its transport drives the same core.
+# The core (./http.bend) owns the types and the shared leaves.
 #
 # Callee above caller; match scrutinees are params or pattern-bound vars;
 # self-recursion only, and @unsafe keeps the fuel-bounded loops.
@@ -2487,39 +2489,77 @@ def server.buffered.on.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U
   IO(Listener):
   server.conn(~recv, ~send, ~close, ~server.no_event, ~B, x_form.buffered(), m)
 
-# The accept entries: the accept is a template like the transport triple,
-# so the module still names no transport. Plain TCP passes ~TCP.accept;
-# a TLS lane passes a wrapper for tls_accept_http1. `once` counts
-# connections, not requests.
-def server.stream.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
+# The named accepts: the server side of the client dials. server.accept
+# is the plain TCP accept; server.accept_secure is the TLS one with the
+# certificate and key it serves. The server has no _insecure: it serves
+# a certificate and verifies no chain, so there is no verify step to
+# skip -- the _insecure word names the client's act.
+def server.accept(l: Listener) -> IO(Listener & Result<&1, &1, U32 & String, Socket>):
+  TCP.accept(l)
+
+def server.accept_secure(l: Listener, +cert: String, +key: String) -> IO(Listener & Result<&1, &1, U32 & String, Socket>):
+  TLS.tls_accept_http1(l, cert, key)
+
+# The accept entries over the two forms, one twin per transport. A
+# caller that owns its transport accepts itself and drives the .conn
+# arms above. `once` counts connections, not requests.
+def server.stream.once(~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
   do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
-    l2 : Listener <- server.stream.on.conn(~recv, ~send, ~close, ~H, m)
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.stream.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, m)
+    return Unit{}
+
+def server.stream.once_secure(~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.stream.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, m)
     return Unit{}
 
 # The accept loop never shrinks the listener, so the checker cannot prove
 # it ends. @unsafe marks only that loop, like every accept loop the
 # facade owns today.
 @unsafe
-def server.stream.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
+def server.stream.on(~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener) -> IO(Unit):
   do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
-    l2 : Listener <- server.stream.on.conn(~recv, ~send, ~close, ~H, m)
-    z : Unit <- server.stream.on(~recv, ~send, ~close, ~accept, ~H, l2)
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.stream.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, m)
+    z : Unit <- server.stream.on(~H, l2)
     return z
 
-def server.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
+@unsafe
+def server.stream.on_secure(~H: HTTP.SrvEv -> HTTP.SrvOut, l: Listener, +cert: String, +key: String) -> IO(Unit):
   do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
-    l2 : Listener <- server.buffered.on.conn(~recv, ~send, ~close, ~B, m)
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.stream.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, m)
+    z : Unit <- server.stream.on_secure(~H, l2, cert, key)
+    return z
+
+def server.once(~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.buffered.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~B, m)
+    return Unit{}
+
+def server.once_secure(~B: HTTP.Request -> IO(HTTP.Response), l: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.buffered.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~B, m)
     return Unit{}
 
 @unsafe
-def server.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~accept: Listener -> IO(Listener & Result<&1, &1, U32 & String, Socket>), ~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
+def server.on(~B: HTTP.Request -> IO(HTTP.Response), l: Listener) -> IO(Unit):
   do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- accept(l)
-    l2 : Listener <- server.buffered.on.conn(~recv, ~send, ~close, ~B, m)
-    z : Unit <- server.on(~recv, ~send, ~close, ~accept, ~B, l2)
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.buffered.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~B, m)
+    z : Unit <- server.on(~B, l2)
+    return z
+
+@unsafe
+def server.on_secure(~B: HTTP.Request -> IO(HTTP.Response), l: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.buffered.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~B, m)
+    z : Unit <- server.on_secure(~B, l2, cert, key)
     return z
 
 # H1 upgrade lane (101): the answer path that lends the socket out. Unlike
@@ -2774,20 +2814,63 @@ def loop.pre.open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
 def x_h1.srv.head_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), phase: U32, got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: List<&2, U32>, fuel: Nat, found: Bool) -> IO(Unit):
   loop.pre.open(~recv, ~send, ~close, ~H, ~K, phase, got, acc, fuel, found)
 
-def h1_open_spawn.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket) -> IO(Unit):
+# The open family's runners: the per-socket start, the fork wrapper and
+# the conn arm, the same three the other server families own.
+def server.open.start(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket) -> IO(Unit):
   loop.pre.open(~recv, ~send, ~close, ~H, ~K, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
 
-def h1_open_spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket, l: Listener) ->
+def server.open.spawn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), sock: Socket, l: Listener) ->
   IO(Listener):
   do IO<Listener>:
-    x : Unit <- IO.spawn(Unit, h1_open_spawn.go(~recv, ~send, ~close, ~H, ~K, sock))
+    x : Unit <- IO.spawn(Unit, server.open.start(~recv, ~send, ~close, ~H, ~K, sock))
     return l
 
-def h1_open_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+def server.open.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
   IO(Listener):
   (l, r) = m
   match r:
     case Fail{e}:
       IO.pure(Listener, l)
     case Done{sock}:
-      h1_open_spawn(~recv, ~send, ~close, ~H, ~K, sock, l)
+      server.open.spawn(~recv, ~send, ~close, ~H, ~K, sock, l)
+
+# The public alias of the open family's conn arm: the wsm calls this
+# name from its own accept loops (its leaf contract with this module),
+# so the rename keeps it. One line into the conn arm above.
+def h1_open_conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) ->
+  IO(Listener):
+  server.open.conn(~recv, ~send, ~close, ~H, ~K, m)
+
+# The open lane's named accepts, one twin per transport: the 101 family
+# over the same server.accept/server.accept_secure the other lanes use.
+# server.open.conn is the conn arm with the templates; the alias
+# h1_open_conn keeps the wsm's contract name for it.
+def server.open.once(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.open.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, m)
+    return Unit{}
+
+def server.open.once_secure(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, ~K, m)
+    return Unit{}
+
+# The accept loop never shrinks the listener, so the checker cannot
+# prove it ends. @unsafe marks only that loop.
+@unsafe
+def server.open.on(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept(l)
+    l2 : Listener <- server.open.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, m)
+    z : Unit <- server.open.on(~H, ~K, l2)
+    return z
+
+@unsafe
+def server.open.on_secure(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener, +cert: String, +key: String) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- server.accept_secure(l, cert, key)
+    l2 : Listener <- server.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, ~K, m)
+    z : Unit <- server.open.on_secure(~H, ~K, l2, cert, key)
+    return z

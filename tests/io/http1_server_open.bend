@@ -1,7 +1,8 @@
 # io (http1_server_open): the TASK-081 open server lane (loop.pre.open
 # feeding server.open) of lib/http1.bend, driven directly, no facade in
-# the path. Six cases,
-# one connection each, all over plaintext TCP templates:
+# the path. Seven cases,
+# one connection each: cases 1-6 over plaintext TCP, case 7 over the
+# module's own secure twin with the test cert:
 #   1. upgrade_101 ....... a GET with upgrade headers plus extra bytes:
 #                          the loop answers 101 (the head keeps
 #                          Connection and Upgrade), ~K receives the
@@ -10,7 +11,8 @@
 #   2. refuse_rejoin ...... the handler answers 200, never 101: the
 #                          answer rides the normal respond and the
 #                          connection rejoins loop.server; two GETs on
-#                          one socket, two 200s.
+#                          one socket, two 200s. The side rides
+#                          server.open.once, the named TCP accept.
 #   3. head_431 ........... a head past the 16384-byte cap: the open
 #                          loop's own head reader answers 431 and
 #                          closes.
@@ -24,12 +26,17 @@
 #   6. chunked_trail_400 .. one byte past the chunked terminator in the
 #                          same buffer: the shared chunk_step grammar
 #                          answers one single 400, then EOF.
+#   7. secure_101 ......... the same upgrade of case 1 through
+#                          server.open.once_secure and the TLS triple:
+#                          the 101 head, the rest to ~K and the echo
+#                          back, all over the secure accept.
 # Cases 1, 3, 4, 5 and 6 ride the public alias (the exact call shape the
-# wsm lane makes); case 2 rides h1_open_conn, the accept entry over the
-# loop.
-# Golden 6.
+# wsm lane makes); case 2 rides server.open.once and case 7 rides its
+# secure twin.
+# Golden 7.
 import Base
 import ../../lib/tcp.bend as TCP
+import ../../lib/tls.bend as TLS
 import ../../lib/http1.bend as HTTP1
 import ../../lib/http.bend as HTTP
 
@@ -171,12 +178,24 @@ def alias_side(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32
     x : Unit <- alias_conn(~H, ~K, m)
     return Unit{}
 
-# Case 2's side: the accept entry over the loop, the H2 shape.
-def conn_side(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener) -> IO(Unit):
+# Case 2's side: the named accept entry of the open family.
+def side_rejoin(l: Listener) -> IO(Unit):
+  HTTP1.server.open.once(~refuse_h, ~k_echo, l)
+
+# Case 7's ~K: the echo through the lent socket over the TLS triple,
+# closed with tls_close (the handle is opaque).
+def tls_k_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s2, _r) = sent
+  TLS.tls_close(s2)
+
+def tls_k_echo(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
   do IO<Unit>:
-    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    l2 : Listener <- HTTP1.h1_open_conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, m)
-    return Unit{}
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, rest)
+    tls_k_sent(sent)
+
+# Case 7's side: the secure twin of the open family, over the test cert.
+def side_secure(l: Listener) -> IO(Unit):
+  HTTP1.server.open.once_secure(~up_h, ~tls_k_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
 def side_up(l: Listener) -> IO(Unit):
   alias_side(~up_h, ~k_echo, l)
@@ -186,9 +205,6 @@ def side_bad(l: Listener) -> IO(Unit):
 
 def side_chunk(l: Listener) -> IO(Unit):
   alias_side(~up_chunk_h, ~k_ok, l)
-
-def side_rejoin(l: Listener) -> IO(Unit):
-  conn_side(~refuse_h, ~k_echo, l)
 
 def side_trail(l: Listener) -> IO(Unit):
   alias_side(~up_h, ~k_echo, l)
@@ -231,6 +247,46 @@ def drive_case1(sock: Socket) -> IO(U32):
 
 def drive_case5(sock: Socket) -> IO(U32):
   drive_101(sock, req_chunk_up(), "k-ok")
+
+# Client drive of case 7: the same raw upgrade over the TLS triple. One
+# def converts the byte answer to text so the TCP scorers stay shared.
+def bs_str(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> Result<&1, &1, U32 & String, String>:
+  match r:
+    case Fail{e}:
+      Fail{e}
+    case Done{+bs}:
+      Done{HTTP.x_bytes_str(bs)}
+
+def tls_up_read2(got2: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, scores: U32 & U32, +want: String) -> IO(U32):
+  (s2, r2) = got2
+  (one, in1) = scores
+  +score : U32 = (one * U32.max(in1, hit(bs_str(r2), want)) : U32)
+  do IO<U32>:
+    x : Unit <- TLS.tls_close(s2)
+    IO.pure(U32, score)
+
+def tls_up_read1(got1: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +want: String) -> IO(U32):
+  (s1, r1) = got1
+  do IO<U32>:
+    got2 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s1, 16384)
+    tls_up_read2(got2, hit_101_rest(bs_str(r1), want), want)
+
+def tls_up_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +want: String) -> IO(U32):
+  (s1, r1) = sent
+  match r1:
+    case Fail{e}:
+      do IO<U32>:
+        x : Unit <- TLS.tls_close(s1)
+        IO.pure(U32, 0)
+    case Done{u}:
+      do IO<U32>:
+        got1 : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s1, 16384)
+        tls_up_read1(got1, want)
+
+def drive_case7(sock: Socket) -> IO(U32):
+  do IO<U32>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, HTTP.x_str_bytes(req_up()))
+    tls_up_sent(sent, "rest-bytes")
 
 # Client drive of case 6: one 400, then EOF (a second status line would
 # be the double-400 the old buffered machine shipped).
@@ -408,10 +464,24 @@ def run_case(~side: Listener -> IO(Unit), ~drive: Socket -> IO(U32), b: Listener
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", p)
     run_conn(~drive, conn)
 
+# The TLS runner: the client dials with no chain verify (the test cert
+# is self-signed), the drive reads the TLS triple.
+def run_case_tls(~side: Listener -> IO(Unit), ~drive: Socket -> IO(U32), b: Listener & U32) -> IO(U32):
+  (l, p) = b
+  do IO<U32>:
+    chan : Chan(Unit) <- IO.fork(Unit, side(l))
+    conn : Result<&1, &1, U32 & String, Socket> <- TLS.tls_connect_noalpn_insecure("127.0.0.1", p)
+    run_conn(~drive, conn)
+
 def case_open(~side: Listener -> IO(Unit), ~drive: Socket -> IO(U32), +port: U32) -> IO(U32):
   do IO<U32>:
     b : Listener & U32 <- listen_any(8n, port)
     run_case(~side, ~drive, b)
+
+def case_open_tls(~side: Listener -> IO(Unit), ~drive: Socket -> IO(U32), +port: U32) -> IO(U32):
+  do IO<U32>:
+    b : Listener & U32 <- listen_any(8n, port)
+    run_case_tls(~side, ~drive, b)
 
 def main() -> IO(U32):
   do IO<U32>:
@@ -421,9 +491,10 @@ def main() -> IO(U32):
     d : U32 <- case_open(~side_bad, ~drive_bad, 20623)
     e : U32 <- case_open(~side_chunk, ~drive_case5, 20624)
     f : U32 <- case_open(~side_trail, ~drive_trail, 20625)
-    +total : U32 = (a + b + c + d + e + f : U32)
+    g : U32 <- case_open_tls(~side_secure, ~drive_case7, 20626)
+    +total : U32 = (a + b + c + d + e + f + g : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|6
+#|7

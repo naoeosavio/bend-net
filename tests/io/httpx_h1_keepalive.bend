@@ -28,7 +28,7 @@
 # entry (client.request) on an H1 CliSt: two calls on the same socket, in
 # order, threading the state — before Phase 3 it wrote H2 frames onto the
 # HTTP/1.1 socket. G) the module's own buffered fold (TASK-081
-# loop.server): HTTP1.server.once over the TCP templates, the same three
+# loop.server): HTTP1.server.once, the same three
 # POSTs on the one connection, pinning lib/http1.bend without the facade.
 # Golden 17 = 1 (vectors) + 3 (reuse) + 1 (one-shot) + 1 (close) + 3
 # (plaintext reuse) + 3 (client-API batch) + 2 (client.request) + 3
@@ -486,13 +486,13 @@ def run_keep(b: Listener & U32) -> IO(U32):
     keep_run(conn, port)
 
 # Scenario G (TASK-081): the module's own buffered fold, no facade in the
-# path. HTTP1.server.once accepts ONE connection over the TCP templates;
-# the three POSTs ride that one socket through the plain ladder, so 3 can
-# only come out if the fold answers each request and re-seeds the next
-# head on the same connection. This pins lib/http1.bend directly.
+# path. HTTP1.server.once accepts ONE connection; the three POSTs ride
+# that one socket through the plain ladder, so 3 can only come out if
+# the fold answers each request and re-seeds the next head on the same
+# connection. This pins lib/http1.bend directly.
 def fold_side(l: Listener) -> IO(U32):
   do IO<U32>:
-    x : Unit <- HTTP1.server.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~echo_fold, l)
+    x : Unit <- HTTP1.server.once(~echo_fold, l)
     IO.pure(U32, 0)
 
 def run_fold(b: Listener & U32) -> IO(U32):

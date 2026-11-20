@@ -278,18 +278,18 @@ def conn_bad(conn: Result<&1, &1, U32 & String, Socket>, +req: String) -> IO(U32
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send(sock, req)
         sent_bad(sent)
 
-# Server sides: the module entries accept themselves (~TCP.accept).
+# Server sides: the module entries accept themselves.
 def fold_side(l: Listener) -> IO(Unit):
-  HTTP1.server.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~echo, l)
+  HTTP1.server.once(~echo, l)
 
 def stream_echo_side(l: Listener) -> IO(Unit):
-  HTTP1.server.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~sh_echo, l)
+  HTTP1.server.stream.once(~sh_echo, l)
 
 def stream_cancel_side(l: Listener) -> IO(Unit):
-  HTTP1.server.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~sh_cancel, l)
+  HTTP1.server.stream.once(~sh_cancel, l)
 
 def stream_bad_side(l: Listener) -> IO(Unit):
-  HTTP1.server.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~sh_bad, l)
+  HTTP1.server.stream.once(~sh_bad, l)
 
 def listen_retry(port: U32, r: Result<&1, &1, U32 & String, Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:

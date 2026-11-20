@@ -16,8 +16,11 @@ Published bundle is `lib/package.bend` (http + http1 + http2 + httpx + wsm
 - The H1 wire is `lib/http1.bend` as `HTTP1`: the request render, the head
   and body parsers, the reason table, the chunked codec, the keep-alive
   machine, the H1 stream lanes, the `101` upgrade machine and the
-  per-connection runners. It does not dial, does not accept and does not
-  name a transport (the facade passes `~recv`/`~send`/`~close`). A caller
+  per-connection runners. Its named entries own their transports
+  (TASK-081 Phase 3): the client dials (`client.connect` TCP,
+  `client.connect[_in]secure` TLS) and the server accepts
+  (`server.accept` TCP, `server.accept_secure` TLS); the `.conn` arms keep
+  `~recv`/`~send`/`~close` for a caller that owns its transport. A caller
   that names an H1 leaf imports this file too.
 - The core is `lib/http.bend` as `HTTP`: the 25 Data types, the byte and text
   leaves, the string checks and the request validation. A caller that names a
