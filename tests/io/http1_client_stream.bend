@@ -1,19 +1,21 @@
-# io (http1_client_stream): the TASK-081 Phase 3 client loop of
-# lib/http1.bend, driven directly (no facade in the path). Ten cases,
-# one connection each, all over plaintext TCP templates:
-#   1. once_echo ......... client.once against the module's buffered
-#                         fold server: the whole answer in one Response.
-#   2. on_fold ............ client.on, two POSTs on the one connection
-#                         the single-accept server owns: both answers,
-#                         in request order.
-#   3. stream_counts ...... client.stream.once, counts only: 5 bytes,
-#                         1 chunk.
+# io (http1_client_stream): the TASK-081 Phase 3 client lanes of
+# lib/http1.bend, driven directly (no facade in the path). Twelve
+# cases, one connection each. The client entries dial themselves, so
+# every case forks a side and hands the entry the port:
+#   1. once_echo ......... client.once (TCP): the whole answer in one
+#                         Response against the module's buffered fold
+#                         server.
+#   2. on_fold ............ client.on (TCP), two POSTs on the one
+#                         connection the single-accept server owns:
+#                         both answers, in request order.
+#   3. stream_counts ...... client.stream.once (TCP), counts only:
+#                         5 bytes, 1 chunk.
 #   4. stream_chunked ..... client.stream.once against a canned chunked
 #                         answer of two chunks: 9 bytes, 2 chunks (the
 #                         last chunk carries the fin flag, so the count
 #                         stops at the data events).
-#   5. stream_on .......... client.stream.on, two requests on the one
-#                         connection: the counts add up.
+#   5. stream_on .......... client.stream.on (TCP), two requests on
+#                         the one connection: the counts add up.
 #   6. stream_cancel ...... the handler cancels at the head event: the
 #                         entry closes and answers Fail 8.
 #   7. fold_eof ........... the peer closes mid-body: Fail 400.
@@ -28,9 +30,18 @@
 #                         parse error (400, "bad header"). The read
 #                         chain the fold replaces waited for a next
 #                         head that never comes.
-# Golden 10.
+#  11. secure_refuse ..... client.once_secure against a self-signed
+#                         cert: the verified dial refuses it, Fail 614
+#                         ("verify failed"), before any byte leaves.
+#  12. tls_insecure ....... client.once_insecure over the no-verify
+#                         dial: the same loop through the TLS triple,
+#                         the echo scored. The insecure mode is the one
+#                         every loopback test needs, so it owns a named
+#                         entry, the H2 twin's name.
+# Golden 12.
 import Base
 import ../../lib/tcp.bend as TCP
+import ../../lib/tls.bend as TLS
 import ../../lib/http1.bend as HTTP1
 import ../../lib/http.bend as HTTP
 
@@ -209,9 +220,16 @@ def raw_side(~after: Socket -> IO(Unit), l: Listener, +bytes: String) -> IO(Unit
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
     raw_side.m(~after, m, bytes)
 
-# Server sides.
+# Server sides. The plain ones ride the TCP accept; the TLS one rides
+# the module's own lane over the test cert.
 def side_fold(l: Listener) -> IO(Unit):
   HTTP1.server.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~TCP.accept, ~echo, l)
+
+def tls_acc(l: Listener) -> IO(Listener & Result<&1, &1, U32 & String, Socket>):
+  TLS.tls_accept_http1(l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+
+def side_fold_tls(l: Listener) -> IO(Unit):
+  HTTP1.server.once(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~tls_acc, ~echo, l)
 
 def side_chunked(l: Listener) -> IO(Unit):
   raw_side(~after_drain, l, resp_chunked())
@@ -228,59 +246,71 @@ def side_pipe(l: Listener) -> IO(Unit):
 def side_info(l: Listener) -> IO(Unit):
   raw_side(~after_drain, l, resp_info_bad())
 
-# The one client exchange each case drives. The port and the socket are
-# plain parameters, so every def here fits the runner's template.
-def cli_once_echo(port: U32, sock: Socket) -> IO(U32):
+# One client exchange each case drives. The entry dials, so the port
+# is the only argument.
+def cli_once_echo(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_fold(r, "hello"))
 
-def cli_on_fold(port: U32, sock: Socket) -> IO(U32):
+def cli_on_fold(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTP1.client.on(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, reqs2("hi-0", "hi-1"))
+    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTP1.client.on("127.0.0.1", port, reqs2("hi-0", "hi-1"))
     IO.pure(U32, score_on2(r, "hi-0", "hi-1"))
 
-def cli_stream_counts(port: U32, sock: Socket) -> IO(U32):
+def cli_stream_counts(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~h_all, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~h_all, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
     IO.pure(U32, score_counts(r, 5, 1))
 
-def cli_stream_chunked(port: U32, sock: Socket) -> IO(U32):
+def cli_stream_chunked(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~h_all, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, Nil{})
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~h_all, "127.0.0.1", port, "POST", "/echo", Nil{}, Nil{})
     IO.pure(U32, score_counts(r, 9, 2))
 
-def cli_stream_on(port: U32, sock: Socket) -> IO(U32):
+def cli_stream_on(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.on(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~h_all, sock, "127.0.0.1", port, reqs2("a", "b"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.on(~h_all, "127.0.0.1", port, reqs2("a", "b"))
     IO.pure(U32, score_counts(r, 2, 2))
 
-def cli_stream_cancel(port: U32, sock: Socket) -> IO(U32):
+def cli_stream_cancel(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~h_cancel, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, U32 & U32> <- HTTP1.client.stream.once(~h_cancel, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
     IO.pure(U32, score_cancel(r))
 
-def cli_fold_eof(port: U32, sock: Socket) -> IO(U32):
+def cli_fold_eof(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_err_resp(r, 400))
 
-def cli_fold_bad(port: U32, sock: Socket) -> IO(U32):
+def cli_fold_bad(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_err_resp(r, 400))
 
-def cli_on_seed(port: U32, sock: Socket) -> IO(U32):
+def cli_on_seed(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTP1.client.on(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, reqs2("hi-0", "hi-1"))
+    r : Result<&1, &1, U32 & String, List<&2, HTTP.Response>> <- HTTP1.client.on("127.0.0.1", port, reqs2("hi-0", "hi-1"))
     IO.pure(U32, score_on2(r, "hi-0", "hi-1"))
 
-def cli_info_bad(port: U32, sock: Socket) -> IO(U32):
+def cli_info_bad(port: U32) -> IO(U32):
   do IO<U32>:
-    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("hello"))
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_err_msg(r, 400, "bad header"))
 
-# The harness: fork the side, dial, drive the client def.
+# The verified dial refuses the self-signed test cert.
+def cli_secure_refuse(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once_secure("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_err_resp(r, 614))
+
+# The no-verify TLS entry: one call, the loopback lane.
+def cli_once_insecure(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once_insecure("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_fold(r, "hello"))
+
+# The harness: fork the side, hand the client def the port.
 def listen_retry(port: U32, r: Result<&1, &1, U32 & String, Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:
     case Done{l}:
@@ -298,21 +328,13 @@ def listen_any(tries: Nat, +port: U32) -> IO(Listener & U32):
         r : Result<&1, &1, U32 & String, Listener> <- TCP.listen(port)
         listen_retry(port, r, rest)
 
-def run_client.go(~cli: U32 -> Socket -> IO(U32), port: U32, conn: Result<&1, &1, U32 & String, Socket>) -> IO(U32):
-  match conn:
-    case Fail{e}:
-      IO.pure(U32, 0)
-    case Done{sock}:
-      cli(port, sock)
-
-def run_client(~side: Listener -> IO(Unit), ~cli: U32 -> Socket -> IO(U32), b: Listener & U32) -> IO(U32):
+def run_client(~side: Listener -> IO(Unit), ~cli: U32 -> IO(U32), b: Listener & U32) -> IO(U32):
   (l, +port) = b
   do IO<U32>:
     chan : Chan(Unit) <- IO.fork(Unit, side(l))
-    conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
-    run_client.go(~cli, port, conn)
+    cli(port)
 
-def case_client(~side: Listener -> IO(Unit), ~cli: U32 -> Socket -> IO(U32), +port: U32) -> IO(U32):
+def case_client(~side: Listener -> IO(Unit), ~cli: U32 -> IO(U32), +port: U32) -> IO(U32):
   do IO<U32>:
     b : Listener & U32 <- listen_any(8n, port)
     run_client(~side, ~cli, b)
@@ -329,9 +351,11 @@ def main() -> IO(U32):
     h : U32 <- case_client(~side_bad, ~cli_fold_bad, 20647)
     i : U32 <- case_client(~side_pipe, ~cli_on_seed, 20648)
     j : U32 <- case_client(~side_info, ~cli_info_bad, 20649)
-    +total : U32 = (a + b + c + d + e + f + g + h + i + j : U32)
+    k : U32 <- case_client(~side_fold_tls, ~cli_secure_refuse, 20650)
+    l : U32 <- case_client(~side_fold_tls, ~cli_once_insecure, 20651)
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|10
+#|12

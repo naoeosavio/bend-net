@@ -4,10 +4,15 @@
 # the 101 upgrade machine and the per-connection runners the accept loops
 # spawn.
 #
-# It does not dial, does not accept and does not name a transport. The
-# runners take the three templates (~recv/~send/~close, plus ~K on the
-# upgrade lane) and the facade (./httpx.bend) instantiates them with TLS or
-# TCP. The core (./http.bend) owns the types and the shared leaves.
+# It does not accept and names no transport on the server lanes: the
+# accept rides the ~accept template and the runner takes the byte
+# triple. The client lanes dial (TASK-081 Phase 3, user decision).
+# client.connect is the TCP dial, client.connect_secure the verified-TLS
+# dial and client.connect_insecure the no-verify-TLS dial. Every client
+# entry owns a _secure and an _insecure twin. The .conn
+# arms keep the three templates plus the dialed socket, so a caller
+# that dials itself drives the same core. The core (./http.bend) owns
+# the types and the shared leaves.
 #
 # Callee above caller; match scrutinees are params or pattern-bound vars;
 # self-recursion only, and @unsafe keeps the fuel-bounded loops.
@@ -15,6 +20,8 @@
 # Import as: import ./http1.bend as HTTP1 (from lib).
 import Base
 import ./http.bend as HTTP
+import ./tcp.bend as TCP
+import ./tls.bend as TLS
 
 # H1 lane, ported patterns (Phase 11): the old lib/http.bend was the base
 # that worked, so its shapes came over verbatim (window scan, recurse-in-args
@@ -1679,20 +1686,86 @@ def client.once.fin(~close: Socket -> IO(Unit), out: Socket & Result<&1, &1, U32
         case ((t, c), resp, rest):
           client.once.close(~close, s, Done{resp})
 
-# One streamed request over a dialed socket: the loop counts the body
-# events, the entry closes. The render gate answers 400 before any byte
-# leaves, the code the deleted one-shot wrapper answered.
-def client.stream.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
-  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-    out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~H, False{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
-    client.stream.fin(~close, out)
+# The client dials (TASK-081 Phase 3, user decision): the module names
+# its own transports on the client side. The plain dial speaks TCP by
+# address; resolve the name first when the host is not an address. The
+# secure dial verifies the chain and the insecure dial does not
+# (_insecure is the house word for a loopback or self-signed cert);
+# both offer no ALPN, so the H1 lane owns the protocol. Every entry
+# has a _secure and an _insecure twin over these dials.
+def client.connect(+host: String, +port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
+  TCP.connect(host, port)
 
-# One buffered request over a dialed socket: the loop folds the whole
-# answer into one Response, the entry closes.
-def client.once(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
+def client.connect_secure(+host: String, +port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
+  TLS.tls_connect_noalpn(host, port)
+
+def client.connect_insecure(+host: String, +port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
+  TLS.tls_connect_noalpn_insecure(host, port)
+
+# The conn arm of one streamed request: a dialed socket, the body
+# events to the handler, close. The templates stay open, so a caller
+# that dials itself drives the same core.
+def client.stream.once.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+        out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~H, False{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
+        client.stream.fin(~close, out)
+
+# One streamed request over TCP: dial, count the body events, close.
+# The render gate answers 400 before any byte leaves, the code the
+# deleted one-shot wrapper answered.
+def client.stream.once(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect(host, port)
+    client.stream.once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, conn, host, port, method, path, hs, body)
+
+# One streamed request over verified TLS.
+def client.stream.once_secure(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_secure(host, port)
+    client.stream.once.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, conn, host, port, method, path, hs, body)
+
+# One streamed request over TLS without chain verify.
+def client.stream.once_insecure(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_insecure(host, port)
+    client.stream.once.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, conn, host, port, method, path, hs, body)
+
+# The conn arm of one buffered request: a dialed socket, one folded
+# exchange, close. The request rides one HTTP.Request, the signature of
+# the H2 client.once twin.
+def client.once.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, req: HTTP.Request) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, HTTP.Response>, Fail{e})
+    case Done{sock}:
+      match req:
+        case HTTP.Request{+method, +path, +hs, +body}:
+          do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+            out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~client.no_event, True{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
+            client.once.fin(~close, out)
+
+# One buffered request over TCP: dial, fold the whole answer into one
+# Response, close.
+def client.once(+host: String, +port: U32, req: HTTP.Request) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
   do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
-    out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~client.no_event, True{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
-    client.once.fin(~close, out)
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect(host, port)
+    client.once.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, req)
+
+# One buffered request over verified TLS.
+def client.once_secure(+host: String, +port: U32, req: HTTP.Request) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
+  do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_secure(host, port)
+    client.once.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, req)
+
+# One buffered request over TLS without chain verify.
+def client.once_insecure(+host: String, +port: U32, req: HTTP.Request) -> IO(Result<&1, &1, U32 & String, HTTP.Response>):
+  do IO<Result<&1, &1, U32 & String, HTTP.Response>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_insecure(host, port)
+    client.once.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, req)
 
 # The keep-alive batch of streamed requests: each answer's leftover
 # seeds the next read on the same socket, the counts add up, the close
@@ -1720,16 +1793,39 @@ def client.stream.on.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
                 out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~H, False{}, s2, x_h1.render_req(method, path, host, port, hs, body), method, left)
                 client.stream.on.go(~recv, ~send, ~close, ~H, t, host, port, (tot + t2 : U32), (chks + c2 : U32), out)
 
-# N streamed requests in order over one dialed socket: the sequential
-# reuse the server loop owns, counted.
-def client.stream.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
-  match reqs:
-    case Nil{}:
-      x_h1.cli.stream.close(~close, sock, Done{(0, 0)})
-    case HTTP.Request{+method, +path, +hs, +body} <> t:
-      do IO<Result<&1, &1, U32 & String, U32 & U32>>:
-        out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~H, False{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
-        client.stream.on.go(~recv, ~send, ~close, ~H, t, host, port, 0, 0, out)
+# The conn arm of the streamed batch: N requests in order on one dialed
+# socket, the counts add up, close once.
+def client.stream.on.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), ~H: HTTP.StreamEv -> HTTP.StreamOut, conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, U32 & U32>, Fail{e})
+    case Done{sock}:
+      match reqs:
+        case Nil{}:
+          x_h1.cli.stream.close(~close, sock, Done{(0, 0)})
+        case HTTP.Request{+method, +path, +hs, +body} <> t:
+          do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+            out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~H, False{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
+            client.stream.on.go(~recv, ~send, ~close, ~H, t, host, port, 0, 0, out)
+
+# N streamed requests in order over TCP: the sequential reuse the
+# server loop owns, counted.
+def client.stream.on(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect(host, port)
+    client.stream.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, conn, host, port, reqs)
+
+# N streamed requests in order over verified TLS.
+def client.stream.on_secure(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_secure(host, port)
+    client.stream.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, conn, host, port, reqs)
+
+# N streamed requests in order over TLS without chain verify.
+def client.stream.on_insecure(~H: HTTP.StreamEv -> HTTP.StreamOut, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, U32 & U32>):
+  do IO<Result<&1, &1, U32 & String, U32 & U32>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_insecure(host, port)
+    client.stream.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, ~H, conn, host, port, reqs)
 
 # The keep-alive batch of buffered requests: the responses collect in
 # request order, each leftover seeds the next read, the close runs once
@@ -1757,16 +1853,38 @@ def client.on.go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String
                 out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~client.no_event, True{}, s2, x_h1.render_req(method, path, host, port, hs, body), method, left)
                 client.on.go(~recv, ~send, ~close, t, host, port, resp <> acc, out)
 
-# N buffered requests in order over one dialed socket: the whole
-# responses in request order.
-def client.on(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>):
-  match reqs:
-    case Nil{}:
-      client.on.close(~close, sock, Done{Nil{}})
-    case HTTP.Request{+method, +path, +hs, +body} <> t:
-      do IO<Result<&1, &1, U32 & String, List<&2, HTTP.Response>>>:
-        out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~client.no_event, True{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
-        client.on.go(~recv, ~send, ~close, t, host, port, Nil{}, out)
+# The conn arm of the buffered batch: N requests in order on one dialed
+# socket, the whole responses in request order, close once.
+def client.on.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>, Fail{e})
+    case Done{sock}:
+      match reqs:
+        case Nil{}:
+          client.on.close(~close, sock, Done{Nil{}})
+        case HTTP.Request{+method, +path, +hs, +body} <> t:
+          do IO<Result<&1, &1, U32 & String, List<&2, HTTP.Response>>>:
+            out : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- client.exch(~recv, ~send, ~client.no_event, True{}, sock, x_h1.render_req(method, path, host, port, hs, body), method, Nil{})
+            client.on.go(~recv, ~send, ~close, t, host, port, Nil{}, out)
+
+# N buffered requests in order over TCP.
+def client.on(+host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, HTTP.Response>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect(host, port)
+    client.on.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, reqs)
+
+# N buffered requests in order over verified TLS.
+def client.on_secure(+host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, HTTP.Response>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_secure(host, port)
+    client.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, reqs)
+
+# N buffered requests in order over TLS without chain verify.
+def client.on_insecure(+host: String, +port: U32, reqs: List<&2, HTTP.Request>) -> IO(Result<&1, &1, U32 & String, List<&2, HTTP.Response>>):
+  do IO<Result<&1, &1, U32 & String, List<&2, HTTP.Response>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_insecure(host, port)
+    client.on.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, reqs)
 
 # H1 streaming upload (Phase 6): the H1 leg of server.stream, speaking
 # SrvEv/SrvOut like the H2 httpx_stream lane in ./http2.bend. One request
