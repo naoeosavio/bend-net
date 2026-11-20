@@ -128,6 +128,7 @@ require break from any other directory. Bend 2.0.21+.
   its HPACK and answers the request when it ends the stream; the trailer
   fields do not reach the handler. No lane serves tunnels.
 - Fail-closed codes: malformed input answers `Fail` with the code above, never
-  a partial body. H1 head cap 16 KB (`431` past it); H1 server refuses
+  a partial body. H1 head cap 16 KB on both ends (`431` past it on the
+  server, `413` — the fuel floor's code — on the client); H1 server refuses
   `Transfer-Encoding` + `Content-Length` pairs, non-`chunked` TE, double
   `Content-Length`, missing/duplicate `Host` with `400` before reading a body byte.

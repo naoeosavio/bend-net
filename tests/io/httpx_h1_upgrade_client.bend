@@ -9,10 +9,25 @@
 # socket that still works (one byte down, the same byte back).
 # A second peer answers 200: the open chain must refuse it fail-closed
 # with 502 "upgrade without 101" without reading a body.
-# Golden 10 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502) + 3 (the
-# same three checks behind a 100 that must be discarded).
+# A third peer answers the handshake with more than 60 KB and no blank
+# line anywhere: the head read must answer Fail 413, the code of its
+# fuel floor, and keep the process alive. Before the Phase 4 cap the
+# append past the 32k cell ceiling killed it (probe
+# /tmp/opencode/client_head_fault.bend).
+# The named vectors of TASK-081 Phase 4 close the family: client.open
+# dials TCP and answers the socket, the response and the rest in one
+# triple; the cap case rides it (the rewrap closes on the 413 path),
+# the plain round scores 101 + rest + echo through it,
+# client.open_insecure runs the same round over the module's own
+# secure open server (the echo through the lent TLS handle proves the
+# triple carries the TLS transport), and client.open_secure refuses
+# the self-signed test cert with 614 before any byte.
+# Golden 18 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502) + 3 (the
+# same three checks behind a 100 that must be discarded) + 1 (head cap)
+# + 3 (plain vector) + 3 (insecure vector) + 1 (verified refuse).
 import Base
 import ../../lib/tcp.bend as TCP
+import ../../lib/tls.bend as TLS
 import ../../lib/http1.bend as HTTP1
 import ../../lib/http.bend as HTTP
 
@@ -65,6 +80,19 @@ def canned_info101() -> List<&2, U32>:
 
 def canned200() -> List<&2, U32>:
   HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+
+# The over-long head: a status line plus 60000 bytes, no blank line
+# anywhere. Tail builder, because List.replicate is not tail-recursive
+# (the measured lesson of the bench file).
+def pad(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      pad(p, 65 <> acc)
+
+def big_head() -> List<&2, U32>:
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nX-Pad: "), pad(60000n, Nil{}))
 
 def cli_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: U32) -> IO(U32):
   (s, r) = got
@@ -284,6 +312,167 @@ def run_reject(b: Listener & U32) -> IO(U32):
     conn : Result<&1, &1, U32 & String, Socket> <- TCP.connect("127.0.0.1", port)
     cli_round_reject(conn, port)
 
+# The cap case rides the bare vector: the over-long head answers the
+# 413 of the fuel floor (TASK-081 Phase 4), not the memory fault the
+# deep append answered before the cap. The vector's rewrap closes the
+# socket on the Fail path, so the score only reads the code.
+def peer_open_big(conn: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(U32):
+  (l, r) = conn
+  match r:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{sock}:
+      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, big_head())
+
+def peer_side_big(l: Listener) -> IO(U32):
+  do IO<U32>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    peer_open_big(m)
+
+def cli_cap(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
+  match r:
+    case Fail{e}:
+      (code, msg) = e
+      IO.pure(U32, b2u(U32.is_eq(code, 413)))
+    case Done{pr}:
+      (s2, _resp, _rest) = pr
+      do IO<U32>:
+        x : Unit <- Socket.close(s2)
+        IO.pure(U32, 0)
+
+def run_cap(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side_big(l))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    cli_cap(r)
+
+# The bare vector's Done path: the canned 101 peer, the triple scored
+# (101, rest, echo) through the dialed entry.
+def vec_score(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
+  match r:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{pr}:
+      (s, resp, rest) = pr
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          +acc : U32 = (b2u(U32.is_eq(status, 101)) + HTTP.x_eq(rest, frame_want()) : U32)
+          cli_echofy(s, acc)
+
+def run_vec_plain(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side(l))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_score(r)
+
+# The TLS open server for the vector twins: the handler answers the
+# upgrade 101, the ~K echoes the rest through the lent TLS handle.
+def up_h(req: HTTP.Request) -> IO(HTTP.Response):
+  match req:
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{101, [HTTP.Hdr{"Upgrade", "websocket"}, HTTP.Hdr{"Connection", "Upgrade"}, HTTP.Hdr{"Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}], Nil{}})
+
+def tls_k_fin(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s3, _sr) = sent
+  TLS.tls_close(s3)
+
+def tls_k_after(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(Unit):
+  (s, r) = got
+  match r:
+    case Fail{e}:
+      TLS.tls_close(s)
+    case Done{+part}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(s, part)
+        tls_k_fin(sent)
+
+def tls_k_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
+  (s2, _r) = sent
+  do IO<Unit>:
+    got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s2, 16)
+    tls_k_after(got)
+
+def tls_k_echo(sock: Socket, rest: List<&2, U32>) -> IO(Unit):
+  do IO<Unit>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, frame_want())
+    tls_k_sent(sent)
+
+def side_vec_tls(l: Listener) -> IO(Unit):
+  HTTP1.server.open.once_secure(~up_h, ~tls_k_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
+
+# The echo through the lent handle: the triple's socket must be the TLS
+# handle, so the byte goes out and comes back through the TLS triple.
+def tls_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: U32) -> IO(U32):
+  (s, r) = got
+  match r:
+    case Fail{e}:
+      do IO<U32>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(U32, acc)
+    case Done{+part}:
+      do IO<U32>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(U32, (acc + HTTP.x_eq(part, [7]) : U32))
+
+def tls_echo_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>, +acc: U32) -> IO(U32):
+  (s, r) = sent
+  match r:
+    case Fail{e}:
+      do IO<U32>:
+        x : Unit <- TLS.tls_close(s)
+        IO.pure(U32, acc)
+    case Done{u}:
+      do IO<U32>:
+        got : Socket & Result<&1, &1, U32 & String, List<&2, U32>> <- TLS.tls_recv_bytes(s, 16)
+        tls_echo_got(got, acc)
+
+def tls_echofy(sock: Socket, +acc: U32) -> IO(U32):
+  do IO<U32>:
+    sent : Socket & Result<&1, &1, U32 & String, Unit> <- TLS.tls_send_bytes(sock, [7])
+    tls_echo_sent(sent, acc)
+
+# The insecure vector: the same 101 + rest + echo through the TLS dial
+# without chain verify, against the module's own secure open server.
+def vec_tls_score(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
+  match r:
+    case Fail{e}:
+      IO.pure(U32, 0)
+    case Done{pr}:
+      (s, resp, rest) = pr
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          +acc : U32 = (b2u(U32.is_eq(status, 101)) + HTTP.x_eq(rest, frame_want()) : U32)
+          tls_echofy(s, acc)
+
+def run_vec_insecure(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(Unit) <- IO.fork(Unit, side_vec_tls(l))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open_insecure("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_tls_score(r)
+
+# The verified twin refuses the self-signed test cert with 614, before
+# any byte leaves the dial.
+def vec_refuse(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
+  match r:
+    case Fail{e}:
+      (code, msg) = e
+      IO.pure(U32, b2u(U32.is_eq(code, 614)))
+    case Done{pr}:
+      (s2, _resp, _rest) = pr
+      do IO<U32>:
+        x : Unit <- TLS.tls_close(s2)
+        IO.pure(U32, 0)
+
+def run_vec_refuse(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(Unit) <- IO.fork(Unit, side_vec_tls(l))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open_secure("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_refuse(r)
+
 law listen_retry:
   for port: U32
   for r: Result<&1, &1, (U32 & String), Listener>
@@ -324,9 +513,17 @@ def main():
     +rej : U32 <- run_reject(b2)
     b3 : Listener & U32 <- listen_any(32n, 18522)
     +inf : U32 <- run_info(b3)
-    +total : U32 = (pure + up + rej + inf : U32)
+    b4 : Listener & U32 <- listen_any(32n, 18523)
+    +cap : U32 <- run_cap(b4)
+    b5 : Listener & U32 <- listen_any(32n, 18524)
+    +vec : U32 <- run_vec_plain(b5)
+    b6 : Listener & U32 <- listen_any(32n, 18525)
+    +vtls : U32 <- run_vec_insecure(b6)
+    b7 : Listener & U32 <- listen_any(32n, 18526)
+    +vref : U32 <- run_vec_refuse(b7)
+    +total : U32 = (pure + up + rej + inf + cap + vec + vtls + vref : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|10
+#|18

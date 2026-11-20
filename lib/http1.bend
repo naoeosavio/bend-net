@@ -73,7 +73,7 @@ def x_h1.bad_hdrs(hs: List<&2, HTTP.Hdr>) -> Bool:
 
 # Everything the request line and the header block render, in one place:
 # the same expression was copied inline in x_h1.render_req and
-# x_h1.cli.exch.open.fit, and neither copy looked at hs.
+# client.open.fit, and neither copy looked at hs.
 def x_h1.bad_req(+method: String, +path: String, +host: String, hs: List<&2, HTTP.Hdr>) ->
   Bool:
   Bool.or(x_h1.bad_char(method),
@@ -1066,7 +1066,8 @@ def x_h1.cli.body_go(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & St
 # The chain serves the plain lane and the upgrade lane. The flag upg turns
 # the nbody=False arm into Fail 502 "upgrade without 101" (fail-closed:
 # a 101 carries no body by definition). The plain entries drop the rest of
-# the triple, the upgrade entries keep it (x_h1.cli.exch.open).
+# the triple, the upgrade entries keep it (client.open; the alias
+# x_h1.cli.exch.open keeps the wsm's contract name).
 
 def x_h1.cli.hd2(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +rest: List<&2, U32>, fuel: Nat, +code: U32, +hs: List<&2, HTTP.Hdr>, nbody: Bool, chunked: Bool, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   match nbody:
@@ -1151,7 +1152,13 @@ def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
               IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              x_h1.cli.head(~recv, ~send, ~close, 2, (s1, Done{Nil{}}), acc2, fuel, method, x_h1.split.test(acc2), False{}, upg)
+              # The head cap keeps the append shallow: the raw List.append
+              # faults near 32k cells (measured), two full turns, long
+              # before the 64-turn floor fires. Past 16384 the read routes
+              # to the empty-fuel arm, whose 413 is the client's ceiling
+              # code; the client never answers 431.
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              x_h1.cli.head(~recv, ~send, ~close, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), method, x_h1.split.test(acc2), False{}, upg)
     case 2:
       (s2, r2) = got
       match found:
@@ -1226,7 +1233,7 @@ def x_h1.cli.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
   IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
   x_h1.cli.exch.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, HTTP.client.on.valid.go(host, port, path), HTTP.client.on.body_ok(body))
 
-def x_h1.exch.sent_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+def client.open.sent(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sent: Socket & Result<&1, &1, U32 & String, Unit>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   (sock, r) = sent
   match r:
     case Fail{e}:
@@ -1234,28 +1241,28 @@ def x_h1.exch.sent_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 &
     case Done{u}:
       x_h1.cli.head(~recv, ~send, ~close, 0, (sock, Done{Nil{}}), Nil{}, 64n, method, False{}, False{}, True{})
 
-def x_h1.exch.send_open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+def client.open.send(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, rendered: Result<&1, &1, U32 & String, List<&2, U32>>, +method: String) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   match rendered:
     case Fail{e}:
       IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (sock, Fail{e}))
     case Done{+bytes}:
       do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>>:
         sent : Socket & Result<&1, &1, U32 & String, Unit> <- send(sock, bytes)
-        x_h1.exch.sent_open(~recv, ~send, ~close, sent, method)
+        client.open.sent(~recv, ~send, ~close, sent, method)
 
 # The handshake exchange: like x_h1.cli.exch (same 400/413 before any byte
-# leaves) but rendered with upgrade=True and answered by the _open chain,
-# so the socket comes back live with the bytes past the head. Not closing
-# is the caller's job — that is the whole point of the triple.
+# leaves) but rendered with upgrade=True and answered by the client.open
+# ladder, so the socket comes back live with the bytes past the head. Not
+# closing is the caller's job — that is the whole point of the triple.
 # hs is + for the same reason as x_h1.render_req: bad_req and the render
 # both read the header block.
-def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, +hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
+def client.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, +hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>, fit: Bool, ok: Bool) ->
   IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   match fit:
     case True{}:
       match ok:
         case True{}:
-          x_h1.exch.send_open(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body), method)
+          client.open.send(~recv, ~send, ~close, sock, x_h1.render_req.go(True{}, x_h1.bad_req(method, path, host, hs), method, path, host, port, hs, body), method)
         case False{}:
           IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>,
             (sock, Fail{(413, "req too large")}))
@@ -1263,9 +1270,18 @@ def x_h1.cli.exch.open.fit(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U3
       IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>,
         (sock, Fail{(400, "bad request")}))
 
+# The exchange of the open family: the handshake on a socket the caller
+# owns. The wsm dials itself and reaches this core through the alias
+# below; the named vectors dial and wrap it.
+def client.open.exch(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  client.open.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, HTTP.client.on.valid.go(host, port, path), HTTP.client.on.body_ok(body))
+
+# The public alias of the open lane: the wsm calls this name (six sites
+# there), so the rename keeps it. One line into client.open.exch above.
 def x_h1.cli.exch.open(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), sock: Socket, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
   IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
-  x_h1.cli.exch.open.fit(~recv, ~send, ~close, sock, host, port, method, path, hs, body, HTTP.client.on.valid.go(host, port, path), HTTP.client.on.body_ok(body))
+  client.open.exch(~recv, ~send, ~close, sock, host, port, method, path, hs, body)
 
 # H1 client body framing (Phase 6; TASK-081 Phase 3 rides it): the
 # StreamEv/StreamOut lane of the client, the H1 sibling of the H2 sdrop
@@ -1474,8 +1490,10 @@ def client.counts_out(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
   (s, Done{((total, chunks), HTTP.Response{0, Nil{}, Nil{}}, rest)})
 
 # The client loop, phase by phase: 0/1/2 read the head (16KB a turn, 64
-# turns, the blank-line cut; no byte cap -- the client never answered
-# 431 and keeps not answering it); 3 parses, frames through
+# turns, the blank-line cut, and the 16384 byte cap of Phase 4: past it
+# the read routes to the empty-fuel arm, which answers the 413 of the
+# floor -- the client never answered 431 and keeps not answering it);
+# 3 parses, frames through
 # x_h1.frame_of and hands the head over; 4 drops an interim 1xx and
 # re-seeds, or routes the head answer; 5 routes that answer (the
 # buffered form answers a bodiless or finished body at once); 6 asks
@@ -1525,7 +1543,11 @@ def loop.client(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
               IO.pure(Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
             case h <> t:
               +acc2 = List.append(&2, U32, acc, part)
-              loop.client(~recv, ~H, 2, collect, (s1, Done{Nil{}}), acc2, fuel, x_h1.split.test(acc2), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres, rev)
+              # The head cap of x_h1.cli.head, the same wiring: the
+              # shallow append and the 413 of the floor instead of the
+              # memory fault of the deep one.
+              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              loop.client(~recv, ~H, x_h1.head_phase(over), collect, (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres, rev)
     case 2:
       match found:
         case True{}:
@@ -1703,6 +1725,57 @@ def client.connect_secure(+host: String, +port: U32) -> IO(Result<&1, &1, U32 & 
 
 def client.connect_insecure(+host: String, +port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
   TLS.tls_connect_noalpn_insecure(host, port)
+
+# The close-and-report leaf of the dialed vectors: a failed handshake
+# closes the socket and answers Fail; a done one answers the socket,
+# the response and the rest in one triple, so the caller owns the
+# transport after the 101.
+def client.open.rewrap(~close: Socket -> IO(Unit), out: Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>) ->
+  IO(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>):
+  (s, r) = out
+  match r:
+    case Fail{e}:
+      do IO<Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>>:
+        x : Unit <- close(s)
+        IO.pure(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, Fail{e})
+    case Done{pr}:
+      (resp, rest) = pr
+      IO.pure(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, Done{(s, resp, rest)})
+
+# The conn arm of the open family: a failed dial owns no socket, so its
+# Fail goes out with no close; a done dial runs the exchange and the
+# rewrap closes on a failed handshake.
+def client.open.conn(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), conn: Result<&1, &1, U32 & String, Socket>, +host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>):
+  match conn:
+    case Fail{e}:
+      IO.pure(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, Fail{e})
+    case Done{sock}:
+      do IO<Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>>:
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- client.open.exch(~recv, ~send, ~close, sock, host, port, method, path, hs, body)
+        client.open.rewrap(~close, out)
+
+# The open handshake over TCP: dial, run the exchange, answer the
+# socket, the response and the rest.
+def client.open(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect(host, port)
+    client.open.conn(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, conn, host, port, method, path, hs, body)
+
+# The open handshake over verified TLS.
+def client.open_secure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_secure(host, port)
+    client.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, method, path, hs, body)
+
+# The open handshake over TLS without chain verify.
+def client.open_insecure(+host: String, +port: U32, +method: String, +path: String, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) ->
+  IO(Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>):
+  do IO<Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>>:
+    conn : Result<&1, &1, U32 & String, Socket> <- client.connect_insecure(host, port)
+    client.open.conn(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, conn, host, port, method, path, hs, body)
 
 # The conn arm of one streamed request: a dialed socket, the body
 # events to the handler, close. The templates stay open, so a caller
@@ -2162,6 +2235,13 @@ def x_h1.srv.recv(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
 # (x_h1.cli.stream.go and its entries) are gone; the plain read chain
 # (x_h1.cli.head through bd/chunk) stays, because the open lane
 # (Phase 4) and the direct tests drive it.
+# Phase 4 closed the open lane: client.open is the 101 machine of the
+# client namespace, the ladder client.open.sent/send/fit feeds it, and
+# the alias x_h1.cli.exch.open keeps the wsm's contract name. Both
+# client head reads (this loop and x_h1.cli.head) now carry the 16384
+# byte cap: past it the empty-fuel arm answers 413, because the raw
+# List.append faults near 32k cells and the 64-turn floor could never
+# fire first.
 # ---------------------------------------------------------------------
 
 # The two forms of the server loop, the names the H2 module already

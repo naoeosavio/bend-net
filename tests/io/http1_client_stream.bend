@@ -38,7 +38,12 @@
 #                         the echo scored. The insecure mode is the one
 #                         every loopback test needs, so it owns a named
 #                         entry, the H2 twin's name.
-# Golden 12.
+#  13. fold_cap .......... a canned answer head of more than 60 KB with
+#                         no blank line anywhere: the fold's head read
+#                         answers Fail 413, the code of its fuel floor,
+#                         and the process stays alive. Before the
+#                         Phase 4 cap the deep append killed it.
+# Golden 13.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http1.bend as HTTP1
@@ -100,6 +105,19 @@ def resp_pipe() -> String:
 # An interim 1xx head whose header block is malformed.
 def resp_info_bad() -> String:
   "HTTP/1.1 100 Continue\r\nX-Interim\r\n\r\n"
+
+# The over-long answer head: more than 60 KB, no blank line anywhere.
+# Tail builder, because List.replicate is not tail-recursive (the
+# measured lesson of the bench file).
+def pad(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      pad(p, 65 <> acc)
+
+def resp_cap() -> List<&2, U32>:
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nX-Pad: "), pad(60000n, Nil{}))
 
 # Scoring helpers: each matches its own parameter, one marker set each.
 def score_fold(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: String) -> U32:
@@ -242,6 +260,26 @@ def side_pipe(l: Listener) -> IO(Unit):
 def side_info(l: Listener) -> IO(Unit):
   raw_side(~after_drain, l, resp_info_bad())
 
+# The bytes twin of raw_side: the over-long head is a byte list, not a
+# string literal, so the send rides TCP.send_bytes.
+def raw_side_b.m(~after: Socket -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>, +bytes: List<&2, U32>) -> IO(Unit):
+  (l2, r) = m
+  match r:
+    case Fail{e}:
+      IO.pure(Unit, Unit{})
+    case Done{sock}:
+      do IO<Unit>:
+        sent : Socket & Result<&1, &1, U32 & String, Unit> <- TCP.send_bytes(sock, bytes)
+        raw_side.sent(~after, sent)
+
+def raw_side_b(~after: Socket -> IO(Unit), l: Listener, +bytes: List<&2, U32>) -> IO(Unit):
+  do IO<Unit>:
+    m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
+    raw_side_b.m(~after, m, bytes)
+
+def side_cap(l: Listener) -> IO(Unit):
+  raw_side_b(~after_drain, l, resp_cap())
+
 # One client exchange each case drives. The entry dials, so the port
 # is the only argument.
 def cli_once_echo(port: U32) -> IO(U32):
@@ -306,6 +344,13 @@ def cli_once_insecure(port: U32) -> IO(U32):
     r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once_insecure("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_fold(r, "hello"))
 
+# The over-long head answers the 413 of the fold's fuel floor, not the
+# memory fault of the deep append (TASK-081 Phase 4).
+def cli_fold_cap(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_err_resp(r, 413))
+
 # The harness: fork the side, hand the client def the port.
 def listen_retry(port: U32, r: Result<&1, &1, U32 & String, Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:
@@ -349,9 +394,10 @@ def main() -> IO(U32):
     j : U32 <- case_client(~side_info, ~cli_info_bad, 20649)
     k : U32 <- case_client(~side_fold_tls, ~cli_secure_refuse, 20650)
     l : U32 <- case_client(~side_fold_tls, ~cli_once_insecure, 20651)
-    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l : U32)
+    m : U32 <- case_client(~side_cap, ~cli_fold_cap, 20652)
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|12
+#|13
