@@ -9,11 +9,18 @@
 # socket that still works (one byte down, the same byte back).
 # A second peer answers 200: the open chain must refuse it fail-closed
 # with 502 "upgrade without 101" without reading a body.
-# A third peer answers the handshake with more than 60 KB and no blank
-# line anywhere: the head read must answer Fail 413, the code of its
-# fuel floor, and keep the process alive. Before the Phase 4 cap the
-# append past the 32k cell ceiling killed it (probe
-# /tmp/opencode/client_head_fault.bend).
+# A third peer answers the handshake with more than 70 KB and no blank
+# line anywhere: past the 64 KiB client budget the read answers Fail
+# 413, the code of its fuel floor, and keeps the process alive.
+# TASK-081 Phase 4.5 raised the client budget from 16 KiB to 64 KiB
+# (the H2 twin's block budget; the RFC sets no limit, node caps at
+# 16 KiB, Chrome at 256 KiB) and made every walk of the head
+# tail-safe. The three last cases pin the new contract: a valid 101
+# head of ~24 KiB parses (the window the old budget refused), a valid
+# head of 8000 short lines (~56 KiB) parses through the tail fold, and
+# one line of 20 KB fails closed with 400 "line too long" (the
+# per-line gate keeps every Base walk on one line under the stack
+# ceiling; nginx and Apache cap a line at 8 KiB).
 # The named vectors of TASK-081 Phase 4 close the family: client.open
 # dials TCP and answers the socket, the response and the rest in one
 # triple; the cap case rides it (the rewrap closes on the 413 path),
@@ -22,9 +29,10 @@
 # secure open server (the echo through the lent TLS handle proves the
 # triple carries the TLS transport), and client.open_secure refuses
 # the self-signed test cert with 614 before any byte.
-# Golden 18 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502) + 3 (the
+# Golden 25 = 3 (renderer) + 3 (101 + rest + echo) + 1 (502) + 3 (the
 # same three checks behind a 100 that must be discarded) + 1 (head cap)
-# + 3 (plain vector) + 3 (insecure vector) + 1 (verified refuse).
+# + 3 (plain vector) + 3 (insecure vector) + 1 (verified refuse)
+# + 3 (reopened window) + 3 (many lines) + 1 (line gate).
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/tls.bend as TLS
@@ -92,7 +100,31 @@ def pad(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
       pad(p, 65 <> acc)
 
 def big_head() -> List<&2, U32>:
-  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nX-Pad: "), pad(60000n, Nil{}))
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\nX-Pad: "), pad(70000n, Nil{}))
+
+# The line builder of the valid big heads: n copies of one short line,
+# pushed in final order (x_cat un-reverses the whole at the end).
+def many_pad(n: Nat, +line: String, acc: List<&2, U32>) -> List<&2, U32>:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      many_pad(p, line, HTTP.x_rev_push(HTTP.x_str_bytes(line), acc))
+
+# The reopened window: a valid 101 of ~24 KiB, past the old 16 KiB
+# budget and far under the 64 KiB one, every line short.
+def reopen_head() -> List<&2, U32>:
+  HTTP.x_cat(HTTP.x_rev_push([129, 2, 104, 105], HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), many_pad(2000n, "x-pad: aaaa\r\n", HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\n"), Nil{})))))
+
+# The many-lines head: 8000 short lines, ~56 KiB, valid, under the
+# budget. The parse-depth pin: the fold answers without a fault.
+def many_head() -> List<&2, U32>:
+  HTTP.x_cat(HTTP.x_rev_push([129, 2, 104, 105], HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), many_pad(8000n, "a: bb\r\n", HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\n"), Nil{})))))
+
+# One line of 20 KB: the per-line gate answers 400 before any Base
+# walk on the line.
+def line_head() -> List<&2, U32>:
+  HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("\r\n\r\n"), pad(20000n, HTTP.x_rev_push(HTTP.x_str_bytes("x-long: "), HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 101 Switching Protocols\r\n"), Nil{})))))
 
 def cli_echo_got(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +acc: U32) -> IO(U32):
   (s, r) = got
@@ -316,18 +348,21 @@ def run_reject(b: Listener & U32) -> IO(U32):
 # 413 of the fuel floor (TASK-081 Phase 4), not the memory fault the
 # deep append answered before the cap. The vector's rewrap closes the
 # socket on the Fail path, so the score only reads the code.
-def peer_open_big(conn: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(U32):
+def peer_open_blob(conn: Listener & Result<&1, &1, U32 & String, Socket>, +blob: List<&2, U32>) -> IO(U32):
   (l, r) = conn
   match r:
     case Fail{e}:
       IO.pure(U32, 0)
     case Done{sock}:
-      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, big_head())
+      peer_drain(0, (sock, Done{Nil{}}), Nil{}, 64n, False{}, blob)
 
-def peer_side_big(l: Listener) -> IO(U32):
+def peer_side_blob(l: Listener, +blob: List<&2, U32>) -> IO(U32):
   do IO<U32>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    peer_open_big(m)
+    peer_open_blob(m, blob)
+
+def peer_side_big(l: Listener) -> IO(U32):
+  peer_side_blob(l, big_head())
 
 def cli_cap(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>) -> IO(U32):
   match r:
@@ -473,6 +508,40 @@ def run_vec_refuse(b: Listener & U32) -> IO(U32):
     r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open_secure("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
     vec_refuse(r)
 
+# The three budget cases (TASK-081 Phase 4.5), all through the bare
+# vector: the reopened window, the many-lines fold, the line gate.
+def vec_fail(r: Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>>, +want: U32) -> IO(U32):
+  match r:
+    case Fail{e}:
+      (code, msg) = e
+      IO.pure(U32, b2u(U32.is_eq(code, want)))
+    case Done{pr}:
+      (s2, _resp, _rest) = pr
+      do IO<U32>:
+        x : Unit <- Socket.close(s2)
+        IO.pure(U32, 0)
+
+def run_vec_reopen(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side_blob(l, reopen_head()))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_score(r)
+
+def run_vec_many(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side_blob(l, many_head()))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_score(r)
+
+def run_vec_line(b: Listener & U32) -> IO(U32):
+  (l, +port) = b
+  do IO<U32>:
+    c : Chan(U32) <- IO.fork(U32, peer_side_blob(l, line_head()))
+    r : Result<&1, &1, U32 & String, Socket & HTTP.Response & List<&2, U32>> <- HTTP1.client.open("127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+    vec_fail(r, 400)
+
 law listen_retry:
   for port: U32
   for r: Result<&1, &1, (U32 & String), Listener>
@@ -521,9 +590,15 @@ def main():
     +vtls : U32 <- run_vec_insecure(b6)
     b7 : Listener & U32 <- listen_any(32n, 18526)
     +vref : U32 <- run_vec_refuse(b7)
-    +total : U32 = (pure + up + rej + inf + cap + vec + vtls + vref : U32)
+    b8 : Listener & U32 <- listen_any(32n, 18527)
+    +vreo : U32 <- run_vec_reopen(b8)
+    b9 : Listener & U32 <- listen_any(32n, 18528)
+    +vmany : U32 <- run_vec_many(b9)
+    b10 : Listener & U32 <- listen_any(32n, 18529)
+    +vline : U32 <- run_vec_line(b10)
+    +total : U32 = (pure + up + rej + inf + cap + vec + vtls + vref + vreo + vmany + vline : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|18
+#|25

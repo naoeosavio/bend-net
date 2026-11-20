@@ -38,12 +38,35 @@
 #                         the echo scored. The insecure mode is the one
 #                         every loopback test needs, so it owns a named
 #                         entry, the H2 twin's name.
-#  13. fold_cap .......... a canned answer head of more than 60 KB with
-#                         no blank line anywhere: the fold's head read
-#                         answers Fail 413, the code of its fuel floor,
-#                         and the process stays alive. Before the
-#                         Phase 4 cap the deep append killed it.
-# Golden 13.
+#  13. fold_cap .......... a canned answer head of more than 70 KB with
+#                         no blank line anywhere: past the 64 KiB
+#                         client budget the fold's head read answers
+#                         Fail 413, the code of its fuel floor, and
+#                         the process stays alive.
+#  14. fold_reopen ....... a valid 200 answer head of ~24 KiB, past
+#                         the old 16 KiB budget: the fold parses it
+#                         (TASK-081 Phase 4.5 reopened the window).
+#  15. fold_many ......... a valid answer head of 8000 short lines
+#                         (~56 KiB): the tail parse fold answers
+#                         without a fault.
+#  16. fold_line ......... one answer line of 20 KB: the per-line gate
+#                         answers Fail 400 "line too long".
+#  17. big_resp .......... the handler answers 3000 headers (~39 KB):
+#                         the render must survive its own answer (the
+#                         old render's List.append was quadratic and
+#                         faulted near 32k cells).
+#  18. req_big ........... the request itself carries 3000 headers: the
+#                         client renders it without a fault; the module
+#                         server would refuse the head, so the side is
+#                         a lenient canned peer.
+#  19. fold_big_chunk .... one single chunk of 64 KB through the fold:
+#                         the machine consumes every turn and the
+#                         fragment assembly rides chunk_close with the
+#                         fragment (<=16k) on the first side, so the
+#                         answer is the whole body (the "buffer wall"
+#                         the log once registered was a misread,
+#                         measured dead).
+# Golden 19.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http1.bend as HTTP1
@@ -61,6 +84,24 @@ def echo(req: HTTP.Request) -> IO(HTTP.Response):
   match req:
     case HTTP.Request{+method, +path, +headers, +body}:
       IO.pure(HTTP.Response, HTTP.Response{200, Nil{}, body})
+
+# 3000 headers of "x-pad: aaaa": a ~39 KB block, past the old render
+# wall (Base's List.append faults near 32k cells on its first side).
+def pad_hdrs(n: Nat, acc: List<&2, HTTP.Hdr>) -> List<&2, HTTP.Hdr>:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      pad_hdrs(p, HTTP.Hdr{"x-pad", "aaaa"} <> acc)
+
+def big_hs() -> List<&2, HTTP.Hdr>:
+  pad_hdrs(3000n, Nil{})
+
+# The big-header answer handler.
+def big_h(req: HTTP.Request) -> IO(HTTP.Response):
+  match req:
+    case HTTP.Request{+method, +path, +headers, +body}:
+      IO.pure(HTTP.Response, HTTP.Response{200, big_hs(), body})
 
 # The stream handler that never stops the read.
 def h_all(ev: HTTP.StreamEv) -> HTTP.StreamOut:
@@ -117,7 +158,32 @@ def pad(n: Nat, acc: List<&2, U32>) -> List<&2, U32>:
       pad(p, 65 <> acc)
 
 def resp_cap() -> List<&2, U32>:
-  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nX-Pad: "), pad(60000n, Nil{}))
+  List.append(&2, U32, HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nX-Pad: "), pad(70000n, Nil{}))
+
+# The line builder of the valid big heads: n copies of one short
+# line, pushed in final order (x_cat un-reverses the whole at the
+# end).
+def pad_lines(n: Nat, +line: String, acc: List<&2, U32>) -> List<&2, U32>:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      pad_lines(p, line, HTTP.x_rev_push(HTTP.x_str_bytes(line), acc))
+
+# The reopened window on the fold: a valid 204 answer head of ~24 KiB,
+# every line short. A 204 owns no body, so the fold answers at once.
+def resp_reopen() -> String:
+  HTTP.x_bytes_str(HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), pad_lines(2000n, "x-pad: aaaa\r\n", HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 204 No Content\r\n"), Nil{})))))
+
+# The many-lines head: 8000 short lines, ~56 KiB, valid, under the
+# budget. The parse-depth pin on the fold.
+def resp_many() -> String:
+  HTTP.x_bytes_str(HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), pad_lines(8000n, "a: bb\r\n", HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 204 No Content\r\n"), Nil{})))))
+
+# One line of 20 KB: the per-line gate answers 400 before any Base
+# walk on the line.
+def resp_line() -> String:
+  HTTP.x_bytes_str(HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("\r\n\r\n"), pad(20000n, HTTP.x_rev_push(HTTP.x_str_bytes("x-long: "), HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 200 OK\r\n"), Nil{}))))))
 
 # Scoring helpers: each matches its own parameter, one marker set each.
 def score_fold(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: String) -> U32:
@@ -242,6 +308,25 @@ def raw_side(~after: Socket -> IO(Unit), l: Listener, +bytes: String) -> IO(Unit
 def side_fold(l: Listener) -> IO(Unit):
   HTTP1.server.once(~echo, l)
 
+def side_big_resp(l: Listener) -> IO(Unit):
+  HTTP1.server.once(~big_h, l)
+
+def resp_ok5() -> String:
+  "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+
+def side_lenient(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_ok5())
+
+# The 64 KB single chunk (TASK-081 Phase 4.7): the pad nests INSIDE
+# the third push -- the pushes evaluate innermost first and ride the
+# final order, so the A's must sit between the size line and its
+# closing CRLF.
+def resp_big_chunk() -> String:
+  HTTP.x_bytes_str(HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("0\r\n\r\n"), HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), pad(65536n, HTTP.x_rev_push(HTTP.x_str_bytes("10000\r\n"), HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), Nil{})))))))
+
+def side_big_chunk(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_big_chunk())
+
 def side_fold_tls(l: Listener) -> IO(Unit):
   HTTP1.server.once_secure(~echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
@@ -279,6 +364,15 @@ def raw_side_b(~after: Socket -> IO(Unit), l: Listener, +bytes: List<&2, U32>) -
 
 def side_cap(l: Listener) -> IO(Unit):
   raw_side_b(~after_drain, l, resp_cap())
+
+def side_reopen(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_reopen())
+
+def side_many(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_many())
+
+def side_line(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_line())
 
 # One client exchange each case drives. The entry dials, so the port
 # is the only argument.
@@ -351,6 +445,68 @@ def cli_fold_cap(port: U32) -> IO(U32):
     r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_err_resp(r, 413))
 
+# One mark when the answer is the bodiless 204.
+def score_204(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+resp}:
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(U32.is_eq(status, 204))
+
+# The reopened window on the fold (TASK-081 Phase 4.5): a valid ~24 KiB
+# answer head parses; a 204 owns no body, so the fold answers at once.
+def cli_fold_reopen(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_204(r))
+
+# The many-lines head: the tail parse fold answers 8000 lines.
+def cli_fold_many(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_204(r))
+
+# The per-line gate: one 20 KB line fails closed.
+def cli_fold_line(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_err_msg(r, 400, "line too long"))
+
+# The big-header answer (TASK-081 Phase 4.6): the render must survive
+# the ~39 KB head the handler answers.
+def cli_once_big_resp(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_fold(r, "hello"))
+
+# The big-header request: the client's own render must survive the
+# ~39 KB head it sends.
+def req_big() -> HTTP.Request:
+  HTTP.Request{"POST", "/echo", big_hs(), HTTP.x_str_bytes("hello")}
+
+def cli_req_big(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req_big())
+    IO.pure(U32, score_fold(r, "hello"))
+
+# One mark when the answer is 200 with the exact body length.
+def score_200_len(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: U32) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+resp}:
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 200), U32.is_eq(HTTP.x_len32(body), want)))
+
+# The 64 KB single chunk through the fold.
+def cli_fold_big_chunk(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_200_len(r, 65536))
+
 # The harness: fork the side, hand the client def the port.
 def listen_retry(port: U32, r: Result<&1, &1, U32 & String, Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:
@@ -395,9 +551,15 @@ def main() -> IO(U32):
     k : U32 <- case_client(~side_fold_tls, ~cli_secure_refuse, 20650)
     l : U32 <- case_client(~side_fold_tls, ~cli_once_insecure, 20651)
     m : U32 <- case_client(~side_cap, ~cli_fold_cap, 20652)
-    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m : U32)
+    n : U32 <- case_client(~side_reopen, ~cli_fold_reopen, 20653)
+    o : U32 <- case_client(~side_many, ~cli_fold_many, 20654)
+    p : U32 <- case_client(~side_line, ~cli_fold_line, 20655)
+    q : U32 <- case_client(~side_big_resp, ~cli_once_big_resp, 20656)
+    r : U32 <- case_client(~side_lenient, ~cli_req_big, 20657)
+    s : U32 <- case_client(~side_big_chunk, ~cli_fold_big_chunk, 20658)
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|13
+#|19

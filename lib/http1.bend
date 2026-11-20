@@ -102,12 +102,18 @@ def x_h1.conn_close.go(hs: List<&2, HTTP.Hdr>, acc: Bool) -> Bool:
 def x_h1.conn_close(hs: List<&2, HTTP.Hdr>) -> Bool:
   x_h1.conn_close.go(hs, False{})
 
-def x_h1.render_hs.skip(+n: String, +v: String, acc: List<&2, U32>, skip: Bool) -> List<&2, U32>:
+# The render walk is the concat_th shape of the bench: each header's
+# bytes drain onto the reversed accumulator in one pass, and the
+# caller finishes with a single x_cat. Base's List.append here was
+# quadratic (it re-walked the accumulated head per header) and not
+# tail-recursive -- it faulted near 32k cells, so a handler answering
+# ~40 KB of headers killed the server on its own answer.
+def x_h1.render_hs.skip(+n: String, +v: String, rev: List<&2, U32>, skip: Bool) -> List<&2, U32>:
   match skip:
     case True{}:
-      acc
+      rev
     case False{}:
-      List.append(&2, U32, acc, HTTP.x_str_bytes(n ++ ": " ++ v ++ "\r\n"))
+      HTTP.x_rev_push(HTTP.x_str_bytes(n ++ ": " ++ v ++ "\r\n"), rev)
 
 # Upgrade renders keep `connection`/`upgrade` (the handshake's own headers):
 # forbidden() still drops the rest. Case-insensitive like the parse side.
@@ -118,12 +124,14 @@ def x_h1.render_hs.keep(upgrade: Bool, +n: String) -> Bool:
     case False{}:
       False{}
 
-def x_h1.render_hs.go(hs: List<&2, HTTP.Hdr>, acc: List<&2, U32>, +upgrade: Bool) -> List<&2, U32>:
+# The rev answer: the seed first, then each header, so one x_cat gives
+# the seed followed by the headers in order.
+def x_h1.render_hs.go(hs: List<&2, HTTP.Hdr>, rev: List<&2, U32>, +upgrade: Bool) -> List<&2, U32>:
   match hs:
     case Nil{}:
-      acc
+      rev
     case HTTP.Hdr{+n, +v} <> t:
-      x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, acc, Bool.and(x_h1.forbidden(n), Bool.not(x_h1.render_hs.keep(upgrade, n)))), upgrade)
+      x_h1.render_hs.go(t, x_h1.render_hs.skip(n, v, rev, Bool.and(x_h1.forbidden(n), Bool.not(x_h1.render_hs.keep(upgrade, n)))), upgrade)
 
 # An upgrade handshake carries no body framing: with upgrade=True an empty
 # body renders no Content-Length at all (a 101 must not claim one); any
@@ -148,7 +156,7 @@ def x_h1.render_req.go(+upgrade: Bool, bad: Bool, +method: String, +path: String
     case True{}:
       Fail{(400, "bad request")}
     case False{}:
-      Done{List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\n" ++ x_h1.render_cl(body, upgrade)), upgrade), HTTP.x_str_bytes("\r\n")), body)}
+      Done{HTTP.x_cat(HTTP.x_rev_push(body, HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), x_h1.render_hs.go(hs, HTTP.x_rev_push(HTTP.x_str_bytes(method ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ U32.show(port) ++ "\r\n" ++ x_h1.render_cl(body, upgrade)), Nil{}), upgrade))))}
 
 # hs is + here (and only here): the header block is read twice, once by
 # bad_req and once by the render below.
@@ -187,13 +195,13 @@ def x_h1.reason(st: U32) -> String:
 # connection/upgrade fields the codec forbids. The 101 head keeps them
 # (show_resp_head below).
 def x_h1.show_resp(+status: U32, hs: List<&2, HTTP.Hdr>, +body: List<&2, U32>) -> List<&2, U32>:
-  List.append(&2, U32, List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(HTTP.x_len32(body)) ++ "\r\n"), False{}), HTTP.x_str_bytes("\r\n")), body)
+  HTTP.x_cat(HTTP.x_rev_push(body, HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), x_h1.render_hs.go(hs, HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\nContent-Length: " ++ U32.show(HTTP.x_len32(body)) ++ "\r\n"), Nil{}), False{}))))
 
 # The 101 head: status line + the handler's headers (Upgrade/Connection
 # kept via upgrade=True) + blank line. No Content-Length, no body — a 101
 # carries neither by definition, and show_resp would inject Length: 0.
 def x_h1.show_resp_head(+status: U32, hs: List<&2, HTTP.Hdr>) -> List<&2, U32>:
-  List.append(&2, U32, x_h1.render_hs.go(hs, HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\n"), True{}), HTTP.x_str_bytes("\r\n"))
+  HTTP.x_cat(HTTP.x_rev_push(HTTP.x_str_bytes("\r\n"), x_h1.render_hs.go(hs, HTTP.x_rev_push(HTTP.x_str_bytes("HTTP/1.1 " ++ U32.show(status) ++ " " ++ x_h1.reason(status) ++ "\r\n"), Nil{}), True{})))
 
 # Blank-line cut over bytes (window 218762506 = \r\n\r\n, the window the
 # retired H1 module's bs_head used; the discriminant rides a param, never
@@ -255,8 +263,34 @@ def x_h1.split.test.go(+bs: List<&2, U32>, found: Bool, +w: U32) -> Bool:
 def x_h1.split.test(bs: List<&2, U32>) -> Bool:
   x_h1.split.test.go(bs, False{}, 0)
 
+# The line split of a head as one tail walk over the bytes (TASK-081
+# Phase 4.5): Base's String.split is not tail-recursive and its depth
+# is the length of the string, so a 64 KiB head would fault inside
+# String.lines. Same list on every input: the bytes are one char each,
+# and a line ends at byte 10.
+def x_h1.head_lines.cut(line_rev: String, rev: List<&2, String>) -> List<&2, String>:
+  String.reverse(line_rev) <> rev
+
+def x_h1.head_lines.turn(cut: Bool, +b: U32, line_rev: String, rev: List<&2, String>) -> String & List<&2, String>:
+  match cut:
+    case True{}:
+      (SNil{}, x_h1.head_lines.cut(line_rev, rev))
+    case False{}:
+      (SCon{Chr{b}, line_rev}, rev)
+
+def x_h1.head_lines.go(+bs: List<&2, U32>, carry: String & List<&2, String>) -> List<&2, String>:
+  match bs:
+    case Nil{}:
+      match carry:
+        case (line_rev, rev):
+          List.reverse(&2, String, x_h1.head_lines.cut(line_rev, rev))
+    case +b <> t:
+      match carry:
+        case (line_rev, rev):
+          x_h1.head_lines.go(t, x_h1.head_lines.turn(U32.is_eq(b, 10), b, line_rev, rev))
+
 def x_h1.head_lines(+head: List<&2, U32>) -> List<&2, String>:
-  String.lines(HTTP.x_bytes_str(head))
+  x_h1.head_lines.go(head, (SNil{}, Nil{}))
 
 def x_h1.first_line(lines: List<&2, String>) -> String:
   match lines:
@@ -390,7 +424,7 @@ def x_h1.res_lift(r: Result<&1, &1, U32 & String, U32 & Bool>) -> Result<&1, &1,
       x_h1.res_head(q)
 
 # Header lines: blank (\r, post-lines-split) ends; colon-less fails.
-# Recursion rides args with match-result-as-param (parse_headers shape).
+# The fold is the fdel_go shape: the combiner never recurses.
 # ---------------------------------------------------------------------
 
 def x_h1.is_blank(+l: String) -> Bool:
@@ -399,34 +433,68 @@ def x_h1.is_blank(+l: String) -> Bool:
 def x_h1.hdr_val(+line: String, +nlen: Nat) -> String:
   String.trim(String.drop(line, (nlen + 1n : Nat)))
 
-def x_h1.parse_hdr(done: Bool, parts: List<&2, String>, +line: String, rec: Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>) ->
-  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
-  match done:
+# parse_hs as a tail fold with a combiner (TASK-081 Phase 4.5, the
+# fdel_go shape): the recursion used to ride the parse_hdr argument,
+# depth = the number of lines, and a 64 KiB head may carry twenty
+# thousand of them. The combiner is a leaf that never recurses; it
+# folds one line into the phase pair -- 0 still folding, 1 blank
+# stopped, 2 failed -- and the final leaf turns the pair into the same
+# answers as the parse_hdr chain: a blank line ends the fold and the
+# headers before it survive (the old Done{Nil} was the base of the
+# wrapping arms, not a discard), a line without a colon fails with
+# the same (400, "bad header"), the good lines keep their order.
+def x_h1.parse_hs.line(blank: Bool, parts: List<&2, String>, +l1: String, rev: List<&2, HTTP.Hdr>) -> U32 & List<&2, HTTP.Hdr>:
+  match blank:
     case True{}:
-      Done{Nil{}}
+      (1, rev)
     case False{}:
       match parts:
         case Nil{}:
-          Fail{(400, "bad header")}
+          (2, rev)
         case +n <> vs:
           match vs:
             case Nil{}:
-              Fail{(400, "bad header")}
+              (2, rev)
             case +v <> vvs:
-              match rec:
-                case Fail{e}:
-                  Fail{e}
-                case Done{+tl}:
-                  Done{HTTP.Hdr{n, x_h1.hdr_val(line, String.length(n))} <> tl}
+              (0, HTTP.Hdr{n, x_h1.hdr_val(l1, String.length(n))} <> rev)
 
-def x_h1.parse_hs(lines: List<&2, String>) ->
+def x_h1.parse_hs.comb(ph: U32, +h: String, rev: List<&2, HTTP.Hdr>) -> U32 & List<&2, HTTP.Hdr>:
+  match ph:
+    case 0:
+      +l1 = String.trim(x_h1.strip_cr(h))
+      x_h1.parse_hs.line(x_h1.is_blank(h), String.split(l1, ':'), l1, rev)
+    case _:
+      (ph, rev)
+
+def x_h1.parse_hs.fin.pick(ph: U32, rev: List<&2, HTTP.Hdr>) ->
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
+  match ph:
+    case 0:
+      Done{List.reverse(&2, HTTP.Hdr, rev)}
+    case 1:
+      Done{List.reverse(&2, HTTP.Hdr, rev)}
+    case _:
+      Fail{(400, "bad header")}
+
+def x_h1.parse_hs.fin(acc: U32 & List<&2, HTTP.Hdr>) ->
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
+  match acc:
+    case (ph, rev):
+      x_h1.parse_hs.fin.pick(ph, rev)
+
+def x_h1.parse_hs.go(lines: List<&2, String>, acc: U32 & List<&2, HTTP.Hdr>) ->
   Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
   match lines:
     case Nil{}:
-      Done{Nil{}}
+      x_h1.parse_hs.fin(acc)
     case +h <> t:
-      +l1 = String.trim(x_h1.strip_cr(h))
-      x_h1.parse_hdr(x_h1.is_blank(h), String.split(l1, ':'), l1, x_h1.parse_hs(t))
+      match acc:
+        case (ph, rev):
+          x_h1.parse_hs.go(t, x_h1.parse_hs.comb(ph, h, rev))
+
+def x_h1.parse_hs(lines: List<&2, String>) ->
+  Result<&1, &1, U32 & String, List<&2, HTTP.Hdr>>:
+  x_h1.parse_hs.go(lines, (0, Nil{}))
 
 # Framing queries (folds with combiner, fdel_go shape) + no_body.
 # ---------------------------------------------------------------------
@@ -606,6 +674,52 @@ def x_h1.head_phase(over: Bool) -> U32:
       0
     case False{}:
       2
+
+# The client's head budget (TASK-081 Phase 4.5): 64 KiB, the block
+# budget the H2 module already enforces on its own client. The RFC sets
+# no predefined limit (RFC 9110 section 5.4); the defaults around the
+# field: node 16 KiB on both ends, Chrome 256 KiB on responses, the
+# CDN fronts 8 KiB. The read accumulates tail-safe, so the budget is a
+# policy choice, not a stack margin; the per-line gate below keeps
+# every Base walk on one line under the machine-stack ceiling.
+def x_h1.cli_head_max() -> U32:
+  65536
+
+def x_h1.cli_head_over(+n: U32) -> Bool:
+  U32.is_gt(n, x_h1.cli_head_max())
+
+# The per-line gate (TASK-081 Phase 4.5): Base's String.length is not
+# tail-recursive either, and one long line would fault every Base walk
+# on it (String.split on ':' or ' ', the length of the name). Each
+# line keeps the 16 KiB house budget -- nginx and Apache cap a line at
+# 8 KiB, so no mainstream server sends one near it -- while the whole
+# head may be 64 KiB. A line past the budget fails closed with 400.
+def x_h1.line_len.go(+s: String, +n: U32) -> U32:
+  match s:
+    case SNil{}:
+      n
+    case SCon{h, t}:
+      x_h1.line_len.go(t, (n + 1 : U32))
+
+def x_h1.line_len(+s: String) -> U32:
+  x_h1.line_len.go(s, 0)
+
+def x_h1.line_gate.go(hl: List<&2, String>, ok: Bool) -> Bool:
+  match hl:
+    case Nil{}:
+      ok
+    case +h <> t:
+      x_h1.line_gate.go(t, Bool.and(ok, U32.is_le(x_h1.line_len(h), x_h1.head_max())))
+
+def x_h1.line_gate.fin(ok: Bool, hl: List<&2, String>) -> Result<&1, &1, U32 & String, List<&2, String>>:
+  match ok:
+    case True{}:
+      Done{hl}
+    case False{}:
+      Fail{(400, "line too long")}
+
+def x_h1.line_gate(+hl: List<&2, String>) -> Result<&1, &1, U32 & String, List<&2, String>>:
+  x_h1.line_gate.fin(x_h1.line_gate.go(hl, True{}), hl)
 
 def x_h1.no_body.go(head: Bool, +status: U32) -> Bool:
   match head:
@@ -1097,11 +1211,19 @@ def x_h1.cli.coded(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Stri
 # triple cannot be scrutinized (E1), a parameter can (E2) — so head-lines
 # and rest come out of ONE x_h1.split traversal. Was split_head(split(acc2))
 # plus split_rest(split(acc2)): two walks and two reverses per head.
+# The line gate answers before any Base walk on a line: a too-long
+# line fails closed here, the same 400 on both client lanes.
+def x_h1.cli.parsed.lines(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +rest: List<&2, U32>, fuel: Nat, +method: String, upg: Bool, g: Result<&1, &1, U32 & String, List<&2, String>>) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
+  match g:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{e}))
+    case Done{+hl}:
+      x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)), upg)
+
 def x_h1.cli.parsed.got(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), p: List<&2, U32> & List<&2, U32> & Bool, s1: Socket, fuel: Nat, +method: String, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   match p:
     case (head, rest, found):
-      +hl = x_h1.head_lines(head)
-      x_h1.cli.coded(~recv, ~send, ~close, s1, method, rest, fuel, x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)), upg)
+      x_h1.cli.parsed.lines(~recv, ~send, ~close, s1, rest, fuel, method, upg, x_h1.line_gate(x_h1.head_lines(head)))
 
 def x_h1.cli.parsed(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String, List<&2, U32>>), ~send: Socket -> List<&2, U32> -> IO(Socket & Result<&1, &1, U32 & String, Unit>), ~close: Socket -> IO(Unit), s1: Socket, +acc2: List<&2, U32>, fuel: Nat, +method: String, upg: Bool) -> IO(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>):
   x_h1.cli.parsed.got(~recv, ~send, ~close, x_h1.split(acc2), s1, fuel, method, upg)
@@ -1117,9 +1239,18 @@ def x_h1.cli.code_of_got(r: Result<&1, &1, U32 & String, U32>) -> U32:
     case Done{+code}:
       code
 
+# The interim check reads only the status line. A head the line gate
+# refuses answers 0 (not interim); the parse of the same head then
+# answers the 400 of the gate.
+def x_h1.status_of.got(g: Result<&1, &1, U32 & String, List<&2, String>>) -> U32:
+  match g:
+    case Fail{e}:
+      0
+    case Done{+hl}:
+      x_h1.cli.code_of_got(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))))
+
 def x_h1.status_of(+acc: List<&2, U32>) -> U32:
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  x_h1.cli.code_of_got(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))))
+  x_h1.status_of.got(x_h1.line_gate(x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))))
 
 # 1xx is an interim status (RFC 9110 section 15.2): any number of them may
 # precede the final response — 100 Continue (Expect), 103 Early Hints
@@ -1151,13 +1282,15 @@ def x_h1.cli.head(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & Strin
             case Nil{}:
               IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
             case h <> t:
-              +acc2 = List.append(&2, U32, acc, part)
-              # The head cap keeps the append shallow: the raw List.append
-              # faults near 32k cells (measured), two full turns, long
-              # before the 64-turn floor fires. Past 16384 the read routes
-              # to the empty-fuel arm, whose 413 is the client's ceiling
-              # code; the client never answers 431.
-              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              # TASK-081 Phase 4.5: the turn builds the in-order buffer
+              # with the three tail passes of the core (x_cat, x_rev_push,
+              # x_cat). Base's List.append is not tail-recursive and
+              # faults near 32k cells, and the client head may be 64 KiB
+              # now. Past the budget the read routes to the empty-fuel
+              # arm, whose 413 is the client's ceiling code; the client
+              # never answers 431.
+              +acc2 = HTTP.x_cat(HTTP.x_rev_push(part, HTTP.x_cat(acc)))
+              +over = x_h1.cli_head_over(HTTP.x_len32(acc2))
               x_h1.cli.head(~recv, ~send, ~close, x_h1.head_phase(over), (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), method, x_h1.split.test(acc2), False{}, upg)
     case 2:
       (s2, r2) = got
@@ -1396,9 +1529,17 @@ def x_h1.cli.stream.built(coderes: Result<&1, &1, U32 & String, U32>, hsres: Res
     case Done{+code}:
       x_h1.cli.stream.headers(hsres, code)
 
+# The line gate answers before any Base walk on a line (the stream
+# lane's parse): a too-long line fails closed with the same 400.
+def x_h1.cli.stream.parsed.got(g: Result<&1, &1, U32 & String, List<&2, String>>) -> Result<&1, &1, U32 & String, HTTP.Head>:
+  match g:
+    case Fail{e}:
+      Fail{e}
+    case Done{+hl}:
+      x_h1.cli.stream.built(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+
 def x_h1.cli.stream.parsed(+acc: List<&2, U32>) -> Result<&1, &1, U32 & String, HTTP.Head>:
-  +hl = x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))
-  x_h1.cli.stream.built(x_h1.res_lift(x_h1.res_tok(String.split(x_h1.first_line(hl), ' '))), x_h1.parse_hs(x_h1.rest_lines(hl)))
+  x_h1.cli.stream.parsed.got(x_h1.line_gate(x_h1.head_lines(x_h1.split_head(x_h1.split(acc)))))
 
 def x_h1.cli.stream.no_head() -> Result<&1, &1, U32 & String, HTTP.Head>:
   Fail{(400, "bad status")}
@@ -1490,10 +1631,10 @@ def client.counts_out(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>,
   (s, Done{((total, chunks), HTTP.Response{0, Nil{}, Nil{}}, rest)})
 
 # The client loop, phase by phase: 0/1/2 read the head (16KB a turn, 64
-# turns, the blank-line cut, and the 16384 byte cap of Phase 4: past it
-# the read routes to the empty-fuel arm, which answers the 413 of the
-# floor -- the client never answered 431 and keeps not answering it);
-# 3 parses, frames through
+# turns, the blank-line cut, and the 64 KiB budget of Phase 4.5: the
+# accumulation is tail-safe, and past the budget the read routes to the
+# empty-fuel arm, which answers the 413 of the floor -- the client
+# never answered 431 and keeps not answering it); 3 parses, frames through
 # x_h1.frame_of and hands the head over; 4 drops an interim 1xx and
 # re-seeds, or routes the head answer; 5 routes that answer (the
 # buffered form answers a bodiless or finished body at once); 6 asks
@@ -1542,11 +1683,10 @@ def loop.client(~recv: Socket -> U32 -> IO(Socket & Result<&1, &1, U32 & String,
             case Nil{}:
               IO.pure(Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>>, (s1, Fail{(400, "eof")}))
             case h <> t:
-              +acc2 = List.append(&2, U32, acc, part)
-              # The head cap of x_h1.cli.head, the same wiring: the
-              # shallow append and the 413 of the floor instead of the
-              # memory fault of the deep one.
-              +over = x_h1.head_over(HTTP.x_len32(acc2))
+              # The accumulation and the budget of x_h1.cli.head, the
+              # same wiring (TASK-081 Phase 4.5).
+              +acc2 = HTTP.x_cat(HTTP.x_rev_push(part, HTTP.x_cat(acc)))
+              +over = x_h1.cli_head_over(HTTP.x_len32(acc2))
               loop.client(~recv, ~H, x_h1.head_phase(over), collect, (s1, Done{Nil{}}), acc2, x_h1.fuel_cap(fuel, over), x_h1.split.test(acc2), method, nbody, chunked, cl, pending, seen, cst, act, out, total, chunks, hres, rev)
     case 2:
       match found:
