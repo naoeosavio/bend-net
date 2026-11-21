@@ -3,7 +3,7 @@
 # Pure renderer vectors: the upgrade flag keeps the handshake's own
 # headers (Upgrade/Connection, case-insensitively) and drops the
 # Content-Length of an empty body; upgrade=False keeps the old bytes.
-# Canned-peer round trip over plain TCP through x_h1.cli.exch.open:
+# Canned-peer round trip over plain TCP through client.open.exch:
 # the peer answers 101 + headers + one frame in a single write, and the
 # client must come back with status 101, the frame bytes as rest, and a
 # socket that still works (one byte down, the same byte back).
@@ -175,7 +175,7 @@ def cli_round(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32)
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
         cli_score(out)
 
 # The peer echoes the one post-handshake byte, proving the socket the
@@ -313,7 +313,7 @@ def cli_round_reject(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> 
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.x_h1.cli.exch.open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.open.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "GET", "/chat", up_hs(), Nil{})
         cli_reject(out)
 
 def peer_denied(sent: Socket & Result<&1, &1, U32 & String, Unit>) -> IO(U32):

@@ -55,8 +55,9 @@ the 101.
   ~close` order. `~H` comes next, then the rest. All recursive defs that
   take the triple are already `@unsafe`, so parameter order is free.
   Uniformity helps the reader, not the checker.
-- **A pure def takes no triple**: `needs_body`, `sock_of`, `read_next` and
-  `stop` never touch the socket. One copy serves both lanes.
+- **A pure def takes no triple**: `server.needs_body`,
+  `server.sock_of`, `server.read_next` and `server.stop` never touch
+  the socket. One copy serves both lanes.
 - The design rejects a `Bool is_tls` flag. The flag puts a `match` at each
   of the ~10 `recv`/`send`/`close` sites, not one instantiation for each
   edge. The `~H` handler precedent shows that the dialect prefers a
@@ -125,8 +126,8 @@ migration record: what was deleted, what was threaded, and the golden gate
 `lib/wsm.bend` (the one WebSocket implementation, `ws://` + `wss://`) is
 the only caller of the upgrade lane, and it rides `lib/http1.bend`
 directly (TASK-081 Phase 2). The client side dials itself and calls
-`x_h1.cli.exch.open`. The server side runs its own accept loops over
-`x_h1.srv.head_open` and `h1_open_conn`; their `~K` runs the frame loop
+`client.open.exch`. The server side runs its own accept loops over
+`server.open.start` and `server.open.conn`; their `~K` runs the frame loop
 on the socket that the lane handed over. The documentation of the WSM
 surface is in `README.md` (`## WebSocket (WSM)`) and in
 `tasks/task-081-h1-quatro-loops.md` (Phase 2). This surface holds the

@@ -66,7 +66,12 @@
 #                         answer is the whole body (the "buffer wall"
 #                         the log once registered was a misread,
 #                         measured dead).
-# Golden 19.
+#  20. fold_500 .......... a canned 500 answer with Content-Length: 0:
+#                         the fold answers the empty body, it never
+#                         asks for more on a satisfied need (the
+#                         TASK-082 fix of the cl cut; the old NeedMore
+#                         starved a keep-alive recv forever).
+# Golden 20.
 import Base
 import ../../lib/tcp.bend as TCP
 import ../../lib/http1.bend as HTTP1
@@ -195,6 +200,17 @@ def score_fold(r: Result<&1, &1, U32 & String, HTTP.Response>, +want: String) ->
         case HTTP.Response{+status, +headers, +body}:
           b2u(Bool.and(U32.is_eq(status, 200),
             U32.is_eq(HTTP.x_eq(body, HTTP.x_str_bytes(want)), 1)))
+
+# Case 20: a 500 whose body is empty folds to the answer.
+def score_500(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
+  match r:
+    case Fail{e}:
+      0
+    case Done{+resp}:
+      match resp:
+        case HTTP.Response{+status, +headers, +body}:
+          b2u(Bool.and(U32.is_eq(status, 500),
+            List.is_empty(&2, U32, body)))
 
 def score_counts(r: Result<&1, &1, U32 & String, U32 & U32>, +want_t: U32, +want_c: U32) -> U32:
   match r:
@@ -326,6 +342,14 @@ def resp_big_chunk() -> String:
 
 def side_big_chunk(l: Listener) -> IO(Unit):
   raw_side(~after_drain, l, resp_big_chunk())
+
+# Case 20: the fixed 500 with an empty body, the answer shape the cl
+# cut once starved.
+def resp_500_cl0() -> String:
+  "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+
+def side_500(l: Listener) -> IO(Unit):
+  raw_side(~after_drain, l, resp_500_cl0())
 
 def side_fold_tls(l: Listener) -> IO(Unit):
   HTTP1.server.once_secure(~echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
@@ -507,6 +531,12 @@ def cli_fold_big_chunk(port: U32) -> IO(U32):
     r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
     IO.pure(U32, score_200_len(r, 65536))
 
+# Case 20: the 500 with the empty body must fold, not starve.
+def cli_fold_500(port: U32) -> IO(U32):
+  do IO<U32>:
+    r : Result<&1, &1, U32 & String, HTTP.Response> <- HTTP1.client.once("127.0.0.1", port, req("hello"))
+    IO.pure(U32, score_500(r))
+
 # The harness: fork the side, hand the client def the port.
 def listen_retry(port: U32, r: Result<&1, &1, U32 & String, Listener>, rest: IO(Listener & U32)) -> IO(Listener & U32):
   match r:
@@ -557,9 +587,10 @@ def main() -> IO(U32):
     q : U32 <- case_client(~side_big_resp, ~cli_once_big_resp, 20656)
     r : U32 <- case_client(~side_lenient, ~cli_req_big, 20657)
     s : U32 <- case_client(~side_big_chunk, ~cli_fold_big_chunk, 20658)
-    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s : U32)
+    t : U32 <- case_client(~side_500, ~cli_fold_500, 20659)
+    +total : U32 = (a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t : U32)
     w : Unit <- IO.print(U32.show(total))
     z : Unit <- IO.die(Unit, 0, "")
     return total
 
-#|19
+#|20

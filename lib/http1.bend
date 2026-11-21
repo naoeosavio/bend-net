@@ -1370,12 +1370,20 @@ def frame.nbody(+fr: HTTP.BodyFrame) -> Bool:
 # its last-chunk flag and what is left, NeedMore carries the buffer back
 # for one more read, End is unused here (a spent length is a caller bug),
 # Bad is the overspent length the whole-buffer lane refuses too.
+# The fin cut is the answer, empty chunk or not: a satisfied need must
+# not ask for more (a keep-alive peer blocks that recv forever,
+# TASK-082 found it on a 500 with Content-Length: 0). Only a starved
+# unfinished cut asks for more.
 def frame.cl_go(+pending: List<&2, U32>, +cl: U32, +seen: U32, +chunk: List<&2, U32>, fin: Bool, empty: Bool) -> HTTP.UnitOut:
-  match empty:
+  match fin:
     case True{}:
-      HTTP.NeedMore{(cl - seen : U32), pending}
+      HTTP.Got{chunk, True{}, HTTP.x_drop32(HTTP.x_len32(chunk), pending)}
     case False{}:
-      HTTP.Got{chunk, fin, HTTP.x_drop32(HTTP.x_len32(chunk), pending)}
+      match empty:
+        case True{}:
+          HTTP.NeedMore{(cl - seen : U32), pending}
+        case False{}:
+          HTTP.Got{chunk, False{}, HTTP.x_drop32(HTTP.x_len32(chunk), pending)}
 
 def frame.cl_next(+pending: List<&2, U32>, +cl: U32, +seen: U32, ok: Bool) -> HTTP.UnitOut:
   match ok:

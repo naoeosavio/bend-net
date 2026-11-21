@@ -30,9 +30,9 @@
 #                          server.open.once_secure and the TLS triple:
 #                          the 101 head, the rest to ~K and the echo
 #                          back, all over the secure accept.
-# Cases 1, 3, 4, 5 and 6 ride the public alias (the exact call shape the
-# wsm lane makes); case 2 rides server.open.once and case 7 rides its
-# secure twin.
+# Cases 1, 3, 4, 5 and 6 ride server.open.start (the exact call shape
+# the wsm lane makes, TASK-082); case 2 rides server.open.once and case
+# 7 rides its secure twin.
 # Golden 7.
 import Base
 import ../../lib/tcp.bend as TCP
@@ -162,20 +162,20 @@ def filler(n: U32) -> String:
 def req_big_head() -> String:
   "GET /a HTTP/1.1\r\nHost: a\r\nx-pad: " ++ filler(17000) ++ "\r\n\r\n"
 
-# Server sides: accept here, then the entry under test. The alias side
+# Server sides: accept here, then the entry under test. The wsm-shape side
 # makes the exact call the wsm lane makes.
-def alias_conn(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Unit):
+def wsm_conn(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), m: Listener & Result<&1, &1, U32 & String, Socket>) -> IO(Unit):
   (l, r) = m
   match r:
     case Fail{e}:
       Listener.close(l)
     case Done{sock}:
-      HTTP1.x_h1.srv.head_open(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, 0, (sock, Done{Nil{}}), Nil{}, 64n, False{})
+      HTTP1.server.open.start(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, ~H, ~K, sock)
 
-def alias_side(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener) -> IO(Unit):
+def wsm_side(~H: HTTP.Request -> IO(HTTP.Response), ~K: Socket -> List<&2, U32> -> IO(Unit), l: Listener) -> IO(Unit):
   do IO<Unit>:
     m : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(l)
-    x : Unit <- alias_conn(~H, ~K, m)
+    x : Unit <- wsm_conn(~H, ~K, m)
     return Unit{}
 
 # Case 2's side: the named accept entry of the open family.
@@ -198,16 +198,16 @@ def side_secure(l: Listener) -> IO(Unit):
   HTTP1.server.open.once_secure(~up_h, ~tls_k_echo, l, "tests/io/tls_test_cert.pem", "tests/io/tls_test_key.pem")
 
 def side_up(l: Listener) -> IO(Unit):
-  alias_side(~up_h, ~k_echo, l)
+  wsm_side(~up_h, ~k_echo, l)
 
 def side_bad(l: Listener) -> IO(Unit):
-  alias_side(~bad_h, ~k_echo, l)
+  wsm_side(~bad_h, ~k_echo, l)
 
 def side_chunk(l: Listener) -> IO(Unit):
-  alias_side(~up_chunk_h, ~k_ok, l)
+  wsm_side(~up_chunk_h, ~k_ok, l)
 
 def side_trail(l: Listener) -> IO(Unit):
-  alias_side(~up_h, ~k_echo, l)
+  wsm_side(~up_h, ~k_echo, l)
 
 # Client drives of cases 1 and 5: the head read, then the echo read (the
 # echo can land in either read, so both score).

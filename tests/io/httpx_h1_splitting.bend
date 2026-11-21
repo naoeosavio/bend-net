@@ -7,7 +7,7 @@
 # hole was request splitting on the client (x_h1.render_req, the one-shot
 # and keep-alive lanes) and response splitting on the server
 # (x_h1.show_resp/show_resp_head) — and the request expression was copied
-# inline in a third site, the 101 upgrade lane (x_h1.cli.exch.open.fit).
+# inline in a third site, the 101 upgrade lane (client.open.fit).
 #
 # Phase 1 — pure vectors over the request render. A CR/LF in a value, a
 # CR/LF in a name and a NUL in a value are all Fail 400 before any byte is
@@ -38,7 +38,6 @@
 # Golden 9.
 import Base
 import ../../lib/tcp.bend as TCP
-import ../../lib/httpx.bend as HTTPX
 import ../../lib/http1.bend as HTTP1
 import ../../lib/http.bend as HTTP
 
@@ -238,6 +237,21 @@ def reply_500(r: Result<&1, &1, U32 & String, HTTP.Response>) -> U32:
     case Done{+resp}:
       reply_500.go(resp)
 
+# One exchange on the open socket over the modern lane (client.exch,
+# TASK-082): the answer carries the counts, the response and the
+# leftover seed; this ladder scores the response and keeps the socket,
+# so the extra fields drop here.
+def exch_drop(raw: Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>>) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
+  (sock, r) = raw
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Fail{e}))
+    case Done{ans}:
+      match ans:
+        case ((_t, _c), resp, _rest):
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Done{resp}))
+
 # The last step: score the guarded /bad answer and close. `ab` is the score
 # of the two exchanges that came before it on this same socket.
 def wire_done(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +ab: U32) ->
@@ -253,8 +267,8 @@ def wire_bad(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +a: U32,
   (s2, r2) = out
   do IO<U32>:
     +b : U32 = ok_reply(r2, "CLEAN")
-    out3 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s2, "127.0.0.1", port, "GET", "/bad", Nil{}, Nil{})
+    raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~HTTP1.client.no_event, True{}, s2, HTTP1.x_h1.render_req("GET", "/bad", "127.0.0.1", port, Nil{}, Nil{}), "GET", Nil{})
+    out3 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
     wire_done(out3, (a + b : U32))
 
 # The exchanges on one socket, in order. wire_go sends the bad-header
@@ -266,19 +280,22 @@ def wire_clean(out: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port:
   (s1, r1) = out
   do IO<U32>:
     +a : U32 = fail_code_req(r1, 400)
-    out2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, s1, "127.0.0.1", port, "POST", "/echo", Nil{}, HTTP.x_str_bytes("ho"))
+    raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~HTTP1.client.no_event, True{}, s1, HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", port, Nil{}, HTTP.x_str_bytes("ho")), "POST", Nil{})
+    out2 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
     wire_bad(out2, a, port)
 
 def wire_go(sock: Socket, +port: U32) -> IO(U32):
   do IO<U32>:
-    out1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-      HTTP1.x_h1.cli.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, "127.0.0.1", port, "POST", "/echo", [hdr("x", "a\r\nInjected: 1")], HTTP.x_str_bytes("hi"))
+    raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~HTTP1.client.no_event, True{}, sock, HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", port, [hdr("x", "a\r\nInjected: 1")], HTTP.x_str_bytes("hi")), "POST", Nil{})
+    out1 : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
     wire_clean(out1, port)
 
 def srv_side(l: Listener) -> IO(U32):
   do IO<U32>:
-    x : Unit <- HTTPX.server.on_h1_plain(~echo_service, l)
+    # The module's own buffered server, core types natively (TASK-082
+    # dropped the facade crossing; the test pins the module, not the
+    # facade's legacy copy).
+    x : Unit <- HTTP1.server.once(~echo_service, l)
     IO.pure(U32, 0)
 
 def wire_dial(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) -> IO(U32):

@@ -11,7 +11,7 @@
 #
 # Phase 2 — the reuse proof, four scenarios. A) server.once_h1 accepts
 # ONE connection and the client sends three POSTs over that same TLS
-# socket with x_h1.exch.send (the exchange that does not close): 3 can
+# socket with client.exch (the exchange that does not close): 3 can
 # only come out if all three were answered on the one connection, since
 # a one-shot server would close after the first and the next send/read
 # would fail. B) the opposite end: server.on_h1 with the one-shot client
@@ -179,6 +179,21 @@ def req_bytes(+port: U32, +body: String) ->
   HTTP1.x_h1.render_req("POST", "/echo", "127.0.0.1", port, Nil{},
     HTTP.x_str_bytes(body))
 
+# One exchange on the open socket over the modern lane (client.exch,
+# TASK-082): the answer carries the counts, the response and the
+# leftover seed; this ladder scores the response and keeps the socket,
+# so the extra fields drop here.
+def exch_drop(raw: Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>>) ->
+  IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
+  (sock, r) = raw
+  match r:
+    case Fail{e}:
+      IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Fail{e}))
+    case Done{ans}:
+      match ans:
+        case ((_t, _c), resp, _rest):
+          IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, (sock, Done{resp}))
+
 # One step of the sequential batch: score the response just read, then
 # either send the next request down the SAME socket (rest non-empty) or
 # close it once the last one scored. Never reconnects — that is the
@@ -199,8 +214,8 @@ def batch_next(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port:
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
-    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-      HTTP1.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, next), "POST")
+    raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~HTTP1.client.no_event, True{}, sock, req_bytes(port, next), "POST", Nil{})
+    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
     batch_step(out, port, next, more, acc)
 
 @unsafe
@@ -219,8 +234,8 @@ def batch_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-          HTTP1.x_h1.exch.send(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, sock, req_bytes(port, "hello-0"), "POST")
+        raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~HTTP1.client.no_event, True{}, sock, req_bytes(port, "hello-0"), "POST", Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
         batch_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def batch_side(l: Listener) -> IO(U32):
@@ -288,6 +303,19 @@ def eof_part(r: Result<&1, &1, U32 & String, List<&2, U32>>) -> U32:
         case h <> t:
           0
 
+# Scenario C reads the head only; the modern reader always answers the
+# leftover too, so it drops here (the old rest_drop leaf died with the
+# pre-loop ladder, TASK-082).
+def head_drop(out: Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>>) ->
+  Socket & Result<&1, &1, U32 & String, HTTP.Response>:
+  (sock, r) = out
+  match r:
+    case Fail{e}:
+      (sock, Fail{e})
+    case Done{p}:
+      (res, _rest) = p
+      (sock, Done{res})
+
 def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
   IO(Socket & Result<&1, &1, U32 & String, HTTP.Response>):
   (s, r) = sent
@@ -298,7 +326,7 @@ def close_sent(sent: Socket & Result<&1, &1, U32 & String, Unit>) ->
     case Done{u}:
       do IO<Socket & Result<&1, &1, U32 & String, HTTP.Response>>:
         out : Socket & Result<&1, &1, U32 & String, HTTP.Response & List<&2, U32>> <- HTTP1.client.head(~TLS.tls_recv_bytes, ~TLS.tls_send_bytes, ~TLS.tls_close, 0, (s, Done{Nil{}}), Nil{}, 64n, "GET", False{}, False{}, False{})
-        IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, HTTP1.x_h1.cli.rest_drop(out))
+        IO.pure(Socket & Result<&1, &1, U32 & String, HTTP.Response>, head_drop(out))
 
 def close_again(got: Socket & Result<&1, &1, U32 & String, List<&2, U32>>, +ans: U32) ->
   IO(U32):
@@ -340,7 +368,7 @@ def run_close(b: Listener & U32) -> IO(U32):
 
 # Scenario D: the plaintext instance of the shared lane. The same
 # three-requests-one-connection shape over Base's TCP through
-# x_h1.exch.send with the TCP triple — one grammar, two transports, so
+# client.exch with the TCP triple — one grammar, two transports, so
 # this proves the TCP instantiation keeps alive instead of a copy
 # needing its own proof. A divergence would leave this at 1 instead of 3.
 def plain_end(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +want: String, +sum: U32) ->
@@ -357,8 +385,8 @@ def plain_next(got: Socket & Result<&1, &1, U32 & String, HTTP.Response>, +port:
   (sock, r) = got
   +acc : U32 = (sum + score_echo(want, r) : U32)
   do IO<U32>:
-    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-      HTTP1.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, next), "POST")
+    raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~HTTP1.client.no_event, True{}, sock, req_bytes(port, next), "POST", Nil{})
+    out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
     plain_step(out, port, next, more, acc)
 
 @unsafe
@@ -377,8 +405,8 @@ def plain_run(conn: Result<&1, &1, U32 & String, Socket>, +port: U32) ->
       IO.pure(U32, 0)
     case Done{sock}:
       do IO<U32>:
-        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <-
-          HTTP1.x_h1.exch.send(~TCP.recv_bytes, ~TCP.send_bytes, ~Socket.close, sock, req_bytes(port, "hello-0"), "POST")
+        raw : Socket & Result<&1, &1, U32 & String, (U32 & U32) & HTTP.Response & List<&2, U32>> <- HTTP1.client.exch(~TCP.recv_bytes, ~TCP.send_bytes, ~HTTP1.client.no_event, True{}, sock, req_bytes(port, "hello-0"), "POST", Nil{})
+        out : Socket & Result<&1, &1, U32 & String, HTTP.Response> <- exch_drop(raw)
         plain_step(out, port, "hello-0", ["hello-1", "hello-2"], 0)
 
 def plain_side(l: Listener) -> IO(U32):

@@ -271,31 +271,10 @@ def framing_t() -> U32:
     + bool_is(HTTP1.x_h1.no_body("GET", 204), True{})
     + bool_is(HTTP1.x_h1.no_body("GET", 200), False{}) : U32)
 
-# RFC 9112 section 7.1: 4/Wiki + 5;ext=1/pedia + terminator.
-def chunked_body() -> List<&2, U32>:
-  [52, 13, 10, 87, 105, 107, 105, 13, 10, 53, 59, 101, 120, 116,
-    61, 49, 13, 10, 112, 101, 100, 105, 97, 13, 10, 48, 13, 10, 13, 10]
-
-def unchunk_is.go(r: Result<&1, &1, U32 & String, List<&2, U32>>,
-  want: List<&2, U32>) -> U32:
-  match r:
-    case Fail{e}:
-      0
-    case Done{out}:
-      same(out, want)
-
-def unchunk_fails.go(r: Result<&1, &1, U32 & String,
-  List<&2, U32>>) -> U32:
-  match r:
-    case Fail{e}:
-      1
-    case Done{out}:
-      0
-
-def chunked_t() -> U32:
-  (unchunk_is.go(HTTP1.x_h1.unchunk(chunked_body()), [87, 105, 107,
-      105, 112, 101, 100, 105, 97])
-    + unchunk_fails.go(HTTP1.x_h1.unchunk([52, 13, 10, 87, 105])) : U32)
+# The chunked decode case rode the retired x_h1.unchunk fold (TASK-082
+# deleted it, no module caller); the live decoder is x_h1.chunk_step,
+# pinned end to end by tests/io/http1_client_stream (the cases
+# fold_big_chunk and fold_500).
 
 # The 200 first line, read back off the rendered head (lines keep the
 # trailing CR, so trim is part of the read-back — same as req_valid).
@@ -346,9 +325,8 @@ law main:
 def main():
   do IO<U32>:
     +total : U32 = (ascii_t() + preface_t() + frame_t() + hpack_t()
-      + cut_t() + parse_t() + framing_t() + chunked_t() + status_t()
-      + url_t() : U32)
-    +want : U32 = (2 + 1 + 4 + 2 + 3 + 12 + 6 + 2 + 1 + 4 : U32)
+      + cut_t() + parse_t() + framing_t() + status_t() + url_t() : U32)
+    +want : U32 = (2 + 1 + 4 + 2 + 3 + 12 + 6 + 1 + 4 : U32)
     +pass : U32 = u32_is(total, want)
     w : Unit <- IO.print(U32.show(pass))
     z : Unit <- IO.die(Unit, 0, "")
